@@ -4,6 +4,7 @@
 //! It is built as an `rlib` for Rust consumers and as a `staticlib` for the
 //! native executables and shared libraries that clang produces.
 
+pub mod a64;
 pub mod error;
 pub mod npdm;
 pub mod romfs;

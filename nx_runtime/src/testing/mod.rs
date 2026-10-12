@@ -1,6 +1,11 @@
 //! Helpers for building synthetic fixtures inside tests. Compiled only for tests or with the
 //! `testing` feature; never part of a release build.
 
+pub mod asm;
+pub mod flatbus;
+
+pub use flatbus::FlatBus;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
