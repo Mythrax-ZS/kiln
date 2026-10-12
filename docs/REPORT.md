@@ -175,5 +175,7 @@ nothing of it is started.
 
 ## Repository state
 
-The commits since the report of M1 are local; only the work up to that commit was pushed to
-`https://github.com/Mythrax-ZS/recomp.git`. Pushing again waits for the owner's request.
+The author of this work pushed once (after the M1 report) and never again; pushing waits for the
+owner's request. `git log origin/main..` lists what the remote does not have. (The reflog of
+`origin/main` shows later pushes made under the owner's identity by something other than the
+author, so the remote may be ahead of what the first push suggests.)
