@@ -202,7 +202,17 @@ One mutation did not compile and three did not apply.
 
 ### Linux
 
-See the end of this file for the run on Linux.
+On Linux (WSL, Ubuntu 26.04, clang 21.1.8), on the commit that adds the mutation-driven tests: fmt
+and clippy clean; `cargo test --workspace` passes (125 `nx_gpu`, 298 `nx_runtime`, 85 `recomp`
+tests), and the 85 `recomp` tests also pass with `RECOMP_REQUIRE_EXTERNAL=1`, so every end-to-end
+program was built and run there. The Unicorn tests skip (the library is not installed in that
+environment), so those results come from Windows.
+
+The title, built on Linux from the same extracted directories (read through `/mnt/c`): discovery
+1.4 s, lifting and compiling 41.1 s, linking 0.8 s. Two runs of 30 frames and one of 600 give
+exactly the counts above, down to the GPU addresses and the macro instruction counts. The 600
+frames took 16 s there (the vsync pacing is the same; the extra time is reading the RomFS and the
+image through the Windows file system).
 
 ## Defects the work found
 
