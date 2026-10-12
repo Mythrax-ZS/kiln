@@ -1,14 +1,15 @@
 # recomp
 
-A static recompiler for Horizon OS (Nintendo Switch) AArch64 programs. It reads a title that the
-owner dumped from their own console (NSP or NCA files) plus the owner's `prod.keys`, and produces:
+A static recompiler for Horizon OS (Nintendo Switch) AArch64 programs. It reads the **already
+extracted ExeFS and RomFS** of a title the owner dumped from their own console (or a homebrew NRO)
+and produces:
 
 - a native executable (PE on Windows, ELF on Linux) for the guest program, and
 - a shared library exposing the same entry points for embedding.
 
 Both link against `nx_runtime`, the crate that holds the guest CPU model and the Horizon emulation
-layer. Keys, firmware and title data are never bundled, printed or logged, and none are stored in
-this repository.
+layer. The tool never reads `prod.keys` and contains no NSP, NCA or decryption code. No firmware,
+keys or title data are stored in this repository.
 
 ## Status
 

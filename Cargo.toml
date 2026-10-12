@@ -15,7 +15,6 @@ path = "src/main.rs"
 
 [dependencies]
 nx_runtime = { path = "nx_runtime" }
-aes = "0.8"
 sha2 = "0.10"
 
 [dev-dependencies]

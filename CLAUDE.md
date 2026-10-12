@@ -4,9 +4,17 @@ Static recompiler that turns Horizon OS (Nintendo Switch) AArch64 programs into 
 executables and shared libraries. LLVM IR is emitted as text and compiled with clang.
 
 Crates:
-- `recomp` (root): library + CLI. Containers, loader, analysis, lifter, codegen.
-- `nx_runtime` (`nx_runtime/`): guest CPU model (decoder, interpreter), guest memory and the Horizon
-  emulation layer. Built as `rlib` and `staticlib`; every produced binary links against it.
+- `recomp` (root): library + CLI. Input layer, loader, analysis, lifter, codegen.
+- `nx_runtime` (`nx_runtime/`): everything shared between compile time and run time: storage, RomFS,
+  NPDM, the A64 decoder and interpreter, guest memory and the Horizon emulation layer. Built as
+  `rlib` and `staticlib`; every produced binary links against it.
+
+## Inputs (owner instruction, 2026-10-12)
+
+The tool takes the **already extracted ExeFS and RomFS** of a game (a directory or an image for
+each), or a homebrew NRO. It does **not use `prod.keys` at all** and has no NSP, NCA, ticket or
+crypto code. Do not add any. The original brief's NCA/IVFC/key milestone M1 was replaced by an
+input layer (ExeFS directory or PFS0, RomFS image parser, RomFS builder for extracted directories).
 
 ## Gate before every commit
 
@@ -22,8 +30,7 @@ Small chunks. Title at most 50 characters. No body. No attribution lines of any 
 
 ## Hard rules
 
-- Never bundle, print or log keys. The owner supplies `prod.keys` at runtime by path or flag.
-- No keys, firmware or title data in the repository or in any committed output. Fixtures are
+- No firmware, keys or title data in the repository or in any committed output. Fixtures are
   synthetic or generated inside the test itself.
 - Do not describe the output as "1:1 accurate". Describe measured test coverage instead.
 - Every undocumented or assumed behavior goes in `docs/ASSUMPTIONS.md` with its source.

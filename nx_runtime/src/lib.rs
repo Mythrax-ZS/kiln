@@ -4,5 +4,11 @@
 //! It is built as an `rlib` for Rust consumers and as a `staticlib` for the
 //! native executables and shared libraries that clang produces.
 
+pub mod error;
+pub mod storage;
+pub mod util;
+
+pub use error::{Error, Result};
+
 /// Crate version, used in diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
