@@ -6,6 +6,7 @@
 
 pub mod a64;
 pub mod error;
+pub mod horizon;
 pub mod npdm;
 pub mod romfs;
 pub mod rt;

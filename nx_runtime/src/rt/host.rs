@@ -15,7 +15,7 @@ use std::ffi::{c_char, CStr};
 ///
 /// # Safety
 /// A non-empty range must be valid for reads.
-unsafe fn c_slice<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
+pub(crate) unsafe fn c_slice<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
     if len == 0 || ptr.is_null() {
         &[]
     } else {
@@ -24,7 +24,15 @@ unsafe fn c_slice<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
 }
 
 /// Bump when [`ModuleDesc`] or [`SegmentDesc`] change.
-pub const MODULE_ABI_VERSION: u32 = 1;
+pub const MODULE_ABI_VERSION: u32 = 2;
+
+/// How [`nx_rt_main`] starts the module: as a plain function (hosts and tests), as the `main` NSO
+/// of a title, or as a homebrew NRO. The last two run on the Horizon kernel layer.
+pub mod kind {
+    pub const PLAIN: u32 = 0;
+    pub const NSO: u32 = 1;
+    pub const NRO: u32 = 2;
+}
 
 /// Top of the main thread's stack in guest memory, and its size.
 pub const STACK_TOP: u64 = 0x1_0000_0000;
@@ -58,6 +66,9 @@ pub struct ExportDesc {
 pub struct ModuleDesc {
     pub abi_version: u32,
     pub nsegs: u32,
+    /// One of [`kind`].
+    pub kind: u32,
+    pub pad: u32,
     pub entry: u64,
     pub segs: *const SegmentDesc,
     pub image: *const u8,
@@ -155,6 +166,11 @@ pub fn describe_stop(cpu: &NativeCpu) -> String {
         ),
         stop::NO_CODE => format!("execution reached {pc:#x}, which holds no code"),
         stop::HALTED => format!("the interpreter stopped at {pc:#x}"),
+        stop::EXIT_THREAD => format!("the thread exited at {pc:#x}"),
+        stop::EXIT_PROCESS => format!("the process exited at {pc:#x}"),
+        stop::UNIMPLEMENTED => {
+            format!("the program used something the kernel layer does not implement at {pc:#x}")
+        }
         other => format!("stopped with reason {other} at {pc:#x}"),
     }
 }
@@ -192,6 +208,9 @@ pub unsafe extern "C" fn nx_rt_main(
     if let Err(e) = load_module(m) {
         eprintln!("recomp runtime: {e}");
         return STOPPED_EXIT_CODE;
+    }
+    if m.kind != kind::PLAIN {
+        return crate::horizon::process::run_module(m);
     }
     match start_main_thread(m.entry, argc) {
         Ok(x0) => x0 as i32,
@@ -319,6 +338,8 @@ mod tests {
         ];
         let m = ModuleDesc {
             abi_version: MODULE_ABI_VERSION,
+            kind: kind::PLAIN,
+            pad: 0,
             nsegs: 2,
             entry: 0x3000_0000,
             segs: segs.as_ptr(),
@@ -379,6 +400,8 @@ mod tests {
     fn a_bad_descriptor_is_refused() {
         let m = ModuleDesc {
             abi_version: 99,
+            kind: kind::PLAIN,
+            pad: 0,
             nsegs: 0,
             entry: 0,
             segs: std::ptr::null(),
@@ -404,6 +427,8 @@ mod tests {
         let image = [0u8; 0x100];
         let m = ModuleDesc {
             abi_version: MODULE_ABI_VERSION,
+            kind: kind::PLAIN,
+            pad: 0,
             nsegs: 1,
             segs: &seg,
             image: image.as_ptr(),

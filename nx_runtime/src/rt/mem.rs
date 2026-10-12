@@ -185,6 +185,34 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// Make `dst` refer to the same host bytes as `src` (`svcMapMemory`). Every page of `src` must
+    /// be mapped and every page of `dst` unmapped; the source keeps its permissions.
+    pub fn alias(
+        &self,
+        dst: u64,
+        src: u64,
+        size: u64,
+        dst_permissions: u32,
+    ) -> Result<(), MapError> {
+        Self::check_range(dst, size)?;
+        Self::check_range(src, size)?;
+        for page in 0..size / PAGE_SIZE {
+            if self.entry(src + page * PAGE_SIZE) & PRESENT == 0 {
+                return Err(MapError::Range);
+            }
+            if self.entry(dst + page * PAGE_SIZE) & PRESENT != 0 {
+                return Err(MapError::Overlap);
+            }
+        }
+        let flags = flags_of(dst_permissions);
+        for page in 0..size / PAGE_SIZE {
+            let host = self.entry(src + page * PAGE_SIZE) & !FLAGS;
+            let a = dst + page * PAGE_SIZE;
+            self.l2_for_map(a)[((a >> 12) & 511) as usize].store(host | flags, Ordering::Release);
+        }
+        Ok(())
+    }
+
     /// Make the pages unreachable. Their host bytes stay allocated (see the module comment).
     pub fn unmap(&self, addr: u64, size: u64) -> Result<(), MapError> {
         Self::check_range(addr, size)?;

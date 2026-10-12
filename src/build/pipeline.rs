@@ -11,7 +11,7 @@ use crate::lift::cfg::FuncCfg;
 use crate::lift::discover::{discover, Options, Report};
 use crate::lift::func::lift_function;
 use crate::lift::ModuleCode;
-use crate::loader::module::Module;
+use crate::loader::module::{Module, ModuleKind};
 use crate::program::Program;
 use crate::{Error, Result};
 use nx_runtime::rt::abi::perm;
@@ -331,6 +331,10 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
         .map(|e| (e.name.clone(), m.base + e.offset))
         .collect();
     let desc = Descriptor {
+        kind: match m.kind {
+            ModuleKind::Nso => nx_runtime::rt::host::kind::NSO,
+            ModuleKind::Nro => nx_runtime::rt::host::kind::NRO,
+        },
         entry: m.entry(),
         segments: &segments,
         image_path: &image,

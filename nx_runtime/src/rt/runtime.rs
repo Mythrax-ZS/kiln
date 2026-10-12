@@ -168,6 +168,30 @@ impl Runtime {
         self.mem.write(addr, size, value, order)
     }
 
+    /// A compare-and-exchange by `thread` (the kernel's atomic updates of guest words): like a
+    /// plain store, a successful exchange ends other threads' reservations on the location.
+    pub fn compare_exchange(
+        &self,
+        thread: u64,
+        addr: u64,
+        size: u8,
+        expected: u64,
+        new: u64,
+        order: Ordering,
+    ) -> Result<bool, FaultKind> {
+        if self.monitors.any_armed() {
+            let mut g = self.monitors.lock();
+            let done = self
+                .mem
+                .compare_exchange(addr, size, expected, new, order)?;
+            if done {
+                g.note_store(thread, addr, size, u128::from(new));
+            }
+            return Ok(done);
+        }
+        self.mem.compare_exchange(addr, size, expected, new, order)
+    }
+
     /// `LDXR`: read, then record the reservation.
     pub fn load_exclusive(
         &self,

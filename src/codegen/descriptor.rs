@@ -15,6 +15,8 @@ pub struct SegmentInfo {
 
 /// What the module descriptor carries.
 pub struct Descriptor<'a> {
+    /// `nx_runtime::rt::host::kind`: how the runtime starts the module.
+    pub kind: u32,
     pub entry: u64,
     pub segments: &'a [SegmentInfo],
     /// File holding the image bytes, embedded with `.incbin`.
@@ -104,11 +106,12 @@ pub fn descriptor_unit(triple: &str, d: &Descriptor, shared: bool) -> String {
     let export = if shared { "dllexport " } else { "" };
     let _ = writeln!(
         s,
-        "@nx_module = {export}constant {{ i32, i32, i64, ptr, ptr, i64, ptr, i64, ptr, i64 }} {{\n  \
-         i32 {}, i32 {}, i64 {}, ptr @nx_segments, ptr @nx_image, i64 {}, ptr @nx_npdm, i64 {},\n  \
-         ptr @nx_exports, i64 {}\n}}\n",
+        "@nx_module = {export}constant {{ i32, i32, i32, i32, i64, ptr, ptr, i64, ptr, i64, ptr, i64 }} {{\n  \
+         i32 {}, i32 {}, i32 {}, i32 0, i64 {}, ptr @nx_segments, ptr @nx_image, i64 {}, ptr @nx_npdm,\n  \
+         i64 {}, ptr @nx_exports, i64 {}\n}}\n",
         nx_runtime::rt::host::MODULE_ABI_VERSION,
         d.segments.len(),
+        d.kind,
         d.entry as i64,
         d.image_len as i64,
         d.npdm.len(),
@@ -139,6 +142,7 @@ mod tests {
     #[test]
     fn the_descriptor_matches_the_runtime_layout() {
         let d = Descriptor {
+            kind: nx_runtime::rt::host::kind::NSO,
             entry: 0x0800_0000,
             segments: &[SegmentInfo {
                 addr: 0x0800_0000,
@@ -155,13 +159,16 @@ mod tests {
         let ll = descriptor_unit("x86_64-pc-windows-msvc", &d, false);
         assert!(ll.contains(".incbin \\22C:/out/game.image\\22"), "{ll}");
         assert!(ll.contains("define i32 @main("), "{ll}");
-        assert!(ll.contains("i32 1, i32 1, i64 134217728"), "{ll}");
+        assert!(
+            ll.contains("i32 2, i32 1, i32 1, i32 0, i64 134217728"),
+            "{ll}"
+        );
         assert!(ll.contains("c\"nnMain\\00\""), "{ll}");
         let lib = descriptor_unit("x86_64-pc-windows-msvc", &d, true);
         assert!(lib.contains("dllexport i32 @recomp_main"));
         assert!(lib.contains("@nx_module = dllexport constant"));
         // The layout the runtime reads.
         assert_eq!(std::mem::size_of::<nx_runtime::rt::host::SegmentDesc>(), 40);
-        assert_eq!(std::mem::size_of::<nx_runtime::rt::host::ModuleDesc>(), 72);
+        assert_eq!(std::mem::size_of::<nx_runtime::rt::host::ModuleDesc>(), 80);
     }
 }

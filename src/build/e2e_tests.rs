@@ -148,7 +148,7 @@ fn a_program_that_stops_says_why_and_exits_nonzero() {
     assert_eq!(out.status.code(), Some(101));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("unhandled supervisor call SVC #0x2a at 0x8000184"),
+        err.contains("SVC 0x2a is not implemented (SVC at 0x8000184)"),
         "{err}"
     );
 

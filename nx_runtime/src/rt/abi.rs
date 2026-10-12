@@ -40,6 +40,13 @@ pub mod stop {
     pub const NO_CODE: u32 = 4;
     /// The slow path gave up (step limit).
     pub const HALTED: u32 = 5;
+    /// The thread called `ExitThread`.
+    pub const EXIT_THREAD: u32 = 6;
+    /// The process is ending (`ExitProcess`, or another thread ended it).
+    pub const EXIT_PROCESS: u32 = 7;
+    /// The guest asked for something the kernel layer does not implement; the kernel recorded a
+    /// report (`horizon::Kernel::exit_state`).
+    pub const UNIMPLEMENTED: u32 = 8;
 }
 
 /// Kinds of [`stop::TRAP`], with what `trap_aux` holds.
