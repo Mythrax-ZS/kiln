@@ -10,6 +10,7 @@ pub mod codegen;
 pub mod container;
 pub mod lift;
 pub mod loader;
+pub mod program;
 
 pub use nx_runtime::{error, npdm, romfs, storage, util};
 pub use nx_runtime::{Error, Result};

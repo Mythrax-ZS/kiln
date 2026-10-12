@@ -5,7 +5,10 @@
 //! `nx_rt_register` takes, and the init function that registers it. Splitting the output lets
 //! clang compile the units in parallel and keeps any one file a manageable size.
 
+mod descriptor;
 pub mod llvm;
+
+pub use descriptor::{descriptor_unit, Descriptor, SegmentInfo};
 
 use crate::lift::ir::Func;
 use llvm::{declarations, dispatcher, emit_function, func_symbol, METADATA};

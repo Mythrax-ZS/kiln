@@ -4,6 +4,10 @@
 //! (Windows) or the usual install locations (Linux). Objects link against the `nx_runtime`
 //! static library, found through `RECOMP_RUNTIME_LIB` or next to the running binary.
 
+#[cfg(test)]
+mod e2e_tests;
+pub mod pipeline;
+
 use crate::codegen;
 use crate::lift::ir::Func;
 use crate::{Error, Result};
@@ -137,33 +141,44 @@ impl Toolchain {
         shared: bool,
         exports: &[&str],
     ) -> Result<()> {
-        let mut cmd = Command::new(&self.clang);
-        cmd.arg(format!("--target={}", codegen::host_triple()));
-        cmd.arg("-fuse-ld=lld");
+        // A big program has hundreds of objects, which overflows the command line on Windows, so
+        // the arguments go in a response file.
+        let path_arg = |p: &Path| p.to_string_lossy().replace('\\', "/");
+        let mut args: Vec<String> = vec![
+            format!("--target={}", codegen::host_triple()),
+            "-fuse-ld=lld".to_string(),
+        ];
         if shared {
-            cmd.arg("-shared");
+            args.push("-shared".to_string());
         }
-        cmd.args(objs);
-        cmd.arg(runtime);
-        cmd.arg("-o").arg(out);
+        args.extend(objs.iter().map(|o| path_arg(o)));
+        args.push(path_arg(runtime));
+        args.push("-o".to_string());
+        args.push(path_arg(out));
         if cfg!(windows) {
             for l in [
                 "kernel32", "ntdll", "userenv", "ws2_32", "dbghelp", "bcrypt",
             ] {
-                cmd.arg(format!("-l{l}"));
+                args.push(format!("-l{l}"));
             }
             for e in exports {
-                cmd.arg(format!("-Wl,/EXPORT:{e}"));
+                args.push(format!("-Wl,/EXPORT:{e}"));
             }
         } else {
-            cmd.args(["-pthread", "-ldl", "-lm"]);
+            args.extend(["-pthread", "-ldl", "-lm"].map(String::from));
             for e in exports {
-                cmd.arg(format!("-Wl,--export-dynamic-symbol={e}"));
+                args.push(format!("-Wl,--export-dynamic-symbol={e}"));
             }
         }
+        let rsp = out.with_extension("rsp");
+        let quoted: Vec<String> = args.iter().map(|a| format!("\"{a}\"")).collect();
+        std::fs::write(&rsp, quoted.join("\n"))?;
+        let mut cmd = Command::new(&self.clang);
+        cmd.arg(format!("@{}", path_arg(&rsp)));
         let o = cmd
             .output()
             .map_err(|e| Error::Toolchain(format!("cannot run {}: {e}", self.clang.display())))?;
+        let _ = std::fs::remove_file(&rsp);
         if o.status.success() {
             Ok(())
         } else {
@@ -185,6 +200,8 @@ pub const RUNTIME_EXPORTS: &[&str] = &[
     "nx_rt_set_svc_handler",
     "nx_rt_set_spurious_failure_period",
     "nx_rt_run",
+    "nx_rt_interpret",
+    "nx_rt_set_counter",
     "nx_rt_unknown_count",
     "nx_rt_unknown_at",
     "nx_module_init",

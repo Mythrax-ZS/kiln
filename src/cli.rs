@@ -1,8 +1,12 @@
 //! Command line interface.
 
+use crate::build::pipeline::{self, BuildOptions};
+use crate::build::Toolchain;
 use crate::container::exefs::ExeFs;
+use crate::lift::discover;
 use crate::loader::module::{Module, GUEST_BASE};
 use crate::loader::nso;
+use crate::program::Program;
 use crate::romfs::{self, RomFs};
 use crate::util::hex_encode;
 use crate::{Error, Result};
@@ -16,6 +20,9 @@ recomp: static recompiler from Horizon OS AArch64 programs to native x86_64
 
 usage:
   recomp inspect --exefs <dir|pfs0> [--romfs <dir|image>]
+  recomp analyze (--exefs <dir|pfs0> | --nro <file>) [--hints <file>]
+  recomp build   (--exefs <dir|pfs0> | --nro <file>) --out <dir> [--name <name>] [--opt <0-3>]
+                 [--hints <file>] [--shared] [--keep-ir]
   recomp --version
 
 Inputs are the already extracted ExeFS and RomFS of a game. No keys are read.
@@ -31,7 +38,7 @@ pub struct Args {
 }
 
 /// Options that take no value.
-const SWITCHES: &[&str] = &["help", "version", "shared", "interpret"];
+const SWITCHES: &[&str] = &["help", "version", "shared", "interpret", "keep-ir"];
 
 pub fn parse_args(argv: &[String]) -> Result<Args> {
     let mut args = Args::default();
@@ -309,11 +316,106 @@ pub fn run(argv: &[String]) -> Result<String> {
             let romfs = args.path("romfs");
             inspect(&exefs, romfs.as_deref())
         }
+        "analyze" => analyze(&args),
+        "build" => build_command(&args),
         other => Err(Error::format(
             "command line",
             format!("unknown command `{other}`"),
         )),
     }
+}
+
+fn load_program(args: &Args) -> Result<Program> {
+    match (args.path("exefs"), args.path("nro")) {
+        (Some(p), None) => Program::from_exefs(&p),
+        (None, Some(p)) => Program::from_nro(&p),
+        _ => Err(Error::format(
+            "command line",
+            "give exactly one of --exefs and --nro",
+        )),
+    }
+}
+
+fn load_hints(args: &Args) -> Result<Vec<u64>> {
+    match args.path("hints") {
+        Some(p) => pipeline::parse_hints(&std::fs::read_to_string(p)?),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn describe_analysis(out: &mut String, a: &discover::Report) {
+    let _ = writeln!(
+        out,
+        "jump tables resolved {}, `BR` with no table {}, targets outside executable memory {}, \n         straight-line code running out of executable memory {}, interpreter fallbacks {} \n         instructions, instructions that stop the run {}",
+        a.jump_tables.len(),
+        a.unresolved_branches.len(),
+        a.bad_targets.len(),
+        a.out_of_code.len(),
+        a.fallbacks.len(),
+        a.traps.len()
+    );
+}
+
+/// Discover and lift a program, report the sizes, compile nothing.
+fn analyze(args: &Args) -> Result<String> {
+    let program = load_program(args)?;
+    let r = pipeline::analyze(&program, &load_hints(args)?, 6000)?;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}: {} functions, {} guest blocks, {} guest instructions
+lifted to {} IR instructions, {} bytes of LLVM IR text",
+        program.name, r.functions, r.blocks, r.guest_instructions, r.ir_instructions, r.llvm_bytes
+    );
+    describe_analysis(&mut out, &r.analysis);
+    let _ = writeln!(
+        out,
+        "discovery {:.1}s, lifting and emitting {:.1}s",
+        r.timings.discover, r.timings.lift_and_compile
+    );
+    Ok(out)
+}
+
+/// Recompile a program into a native executable (and optionally a shared library).
+fn build_command(args: &Args) -> Result<String> {
+    let program = load_program(args)?;
+    let out_dir = args.require_path("out")?;
+    let name = args
+        .options
+        .get("name")
+        .cloned()
+        .unwrap_or_else(|| program.name.clone());
+    let mut opts = BuildOptions::new(&out_dir, &name);
+    opts.hints = load_hints(args)?;
+    opts.shared = args.has("shared");
+    opts.keep_ir = args.has("keep-ir");
+    if let Some(o) = args.options.get("opt") {
+        opts.opt_level = o
+            .parse::<u8>()
+            .ok()
+            .filter(|n| *n <= 3)
+            .ok_or_else(|| Error::format("command line", "--opt takes 0, 1, 2 or 3"))?;
+    }
+    let tc = Toolchain::discover()?;
+    let r = pipeline::build(&program, &tc, &opts)?;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}: {} functions, {} guest blocks, {} guest instructions in {} units",
+        program.name, r.functions, r.blocks, r.guest_instructions, r.units
+    );
+    describe_analysis(&mut out, &r.analysis);
+    let _ = writeln!(
+        out,
+        "discovery {:.1}s, lifting and compiling {:.1}s, linking {:.1}s",
+        r.timings.discover, r.timings.lift_and_compile, r.timings.link
+    );
+    let _ = writeln!(out, "executable: {}", r.exe.display());
+    if let Some(l) = &r.library {
+        let _ = writeln!(out, "shared library: {}", l.display());
+    }
+    let _ = writeln!(out, "report: {}", r.report_file.display());
+    Ok(out)
 }
 
 #[cfg(test)]
