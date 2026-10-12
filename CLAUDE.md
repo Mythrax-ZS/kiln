@@ -41,12 +41,13 @@ Small chunks. Title at most 50 characters. No body. No attribution lines of any 
   return a made-up success.
 - Where Unicorn disagrees with the Arm pseudocode, the pseudocode wins and the disagreement is
   recorded in `docs/UNICORN_DISAGREEMENTS.md`.
-- Milestones M1..M8 (see `docs/reports/`): stop after each one, run the tests, write the report,
+- Milestones M1..M10 (see `docs/reports/`): stop after each one, run the tests, write the report,
   then move on. M8 passed (2026-10-12): the owner approved the GPU front, the `nx_gpu` crate
   (`nvdrv` and its device nodes, the display and buffer-queue path, a tracing command processor
-  with a macro engine). Shader translation (SASS to SPIR-V) and the Vulkan backend come after M8
-  and need the owner's go-ahead again; the report proposes them. Never describe the output as
-  playable before frames are measured.
+  with a macro engine). The owner approved shader translation (Maxwell SASS to SPIR-V, crate
+  `nx_shader`, M9) and the Vulkan backend (`ash`, crate `nx_vulkan`, M10) on 2026-10-13. Never
+  describe the output as playable before frames are measured; saying what a frame shows needs the
+  frame itself (a dumped image looked at), not a count.
 - Out of scope: online services, account checks, licensing checks, AArch32 (detect and error).
 
 ## External tools used by tests
