@@ -65,10 +65,13 @@ fn check_align(addr: u64, bytes: u64, write: bool) -> Result<(), Trap> {
     }
 }
 
-/// Writable FPCR bits for an ARMv8.0 core (docs/ASSUMPTIONS.md A-013).
-pub const FPCR_MASK: u32 = 0x07C0_9F00;
-/// Writable FPSR bits: QC and the cumulative exception flags.
-pub const FPSR_MASK: u32 = 0x0800_009F;
+/// Writable FPCR bits on a Cortex-A57 (docs/ASSUMPTIONS.md A-013): AHP, DN, FZ, RMode, Stride and
+/// Len. The trap-enable bits are RAZ/WI because the core cannot trap floating-point exceptions,
+/// and FZ16 is absent without FP16 arithmetic.
+pub const FPCR_MASK: u32 = 0x07F7_0000;
+/// Writable FPSR bits: the AArch32-visible N, Z, C, V and QC (31:27), IDC and the cumulative
+/// exception flags. The A57 implements AArch32, so bits 31:28 are storage.
+pub const FPSR_MASK: u32 = 0xF800_009F;
 
 /// Fetch, decode and execute one instruction.
 pub fn step<B: Bus>(cpu: &mut CpuState, bus: &mut B) -> Result<(), Trap> {

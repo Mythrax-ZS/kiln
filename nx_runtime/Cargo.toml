@@ -16,3 +16,5 @@ testing = []
 
 [dev-dependencies]
 libloading = "0.8"
+# Enables the `testing` helpers for this crate's own integration tests.
+nx_runtime = { path = ".", features = ["testing"] }

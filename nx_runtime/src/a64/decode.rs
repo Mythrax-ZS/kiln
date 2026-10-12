@@ -458,7 +458,13 @@ fn decode_single(w: u32) -> Inst {
         match bits(w, 11, 10) {
             0b00 => AddrMode::Offset(imm9),
             0b01 => AddrMode::PostIndex(imm9),
-            0b10 => AddrMode::Offset(imm9), // unprivileged LDTR/STTR behave as plain accesses at EL0
+            0b10 => {
+                // LDTR/STTR behave as plain accesses at EL0; there is no unprivileged prefetch.
+                if kind == MemKind::Prefetch {
+                    return Inst::Unallocated(w);
+                }
+                AddrMode::Offset(imm9)
+            }
             _ => AddrMode::PreIndex(imm9),
         }
     } else {
