@@ -40,14 +40,19 @@ struct ImageBus<'a> {
 
 impl Bus for ImageBus<'_> {
     fn read(&mut self, addr: u64, size: u8) -> Result<u128, Fault> {
-        match self.code.read(addr, usize::from(size)) {
-            Some(v) => Ok(u128::from(v)),
-            None => Err(Fault {
-                addr,
-                write: false,
-                kind: FaultKind::Unmapped,
-            }),
+        let fault = || Fault {
+            addr,
+            write: false,
+            kind: FaultKind::Unmapped,
+        };
+        let size = usize::from(size);
+        if size <= 8 {
+            return self.code.read(addr, size).map(u128::from).ok_or_else(fault);
         }
+        // A vector register is read as two halves.
+        let lo = self.code.read(addr, 8).ok_or_else(fault)?;
+        let hi = self.code.read(addr + 8, size - 8).ok_or_else(fault)?;
+        Ok(u128::from(lo) | u128::from(hi) << 64)
     }
 
     fn write(&mut self, _addr: u64, _size: u8, _value: u128) -> Result<(), Fault> {
@@ -265,5 +270,36 @@ pub fn is_br(inst: &Inst) -> Option<u8> {
             rn,
         } => Some(rn),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Bytes(Vec<u8>);
+
+    impl CodeSource for Bytes {
+        fn is_code(&self, _addr: u64) -> bool {
+            true
+        }
+
+        fn read(&self, addr: u64, size: usize) -> Option<u64> {
+            assert!((1..=8).contains(&size), "a source reads 1 to 8 bytes");
+            let at = addr as usize;
+            let mut v = [0u8; 8];
+            v[..size].copy_from_slice(self.0.get(at..at + size)?);
+            Some(u64::from_le_bytes(v))
+        }
+    }
+
+    #[test]
+    fn a_vector_sized_read_is_two_reads() {
+        let source = Bytes((0u8..32).collect());
+        let mut bus = ImageBus { code: &source };
+        let expected = u128::from_le_bytes(std::array::from_fn(|i| 8 + i as u8));
+        assert_eq!(bus.read(8, 16).unwrap(), expected);
+        assert_eq!(bus.read(8, 4).unwrap(), 0x0B0A_0908);
+        assert!(bus.read(24, 16).is_err(), "runs past the end");
     }
 }
