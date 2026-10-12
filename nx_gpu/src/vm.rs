@@ -622,6 +622,33 @@ mod tests {
         assert!(small < a.va_regions()[1].0);
         assert!(big >= a.va_regions()[1].0);
         assert!(big.is_multiple_of(0x10000));
+        // Exactly one big page is the smallest that gets one; a page less does not.
+        let exact = a.map_buffer(&req(3, 0x1_0000, 0x1_0000)).unwrap();
+        let under = a.map_buffer(&req(4, 0xF000, 0xF000)).unwrap();
+        assert!(exact >= a.va_regions()[1].0 && exact.is_multiple_of(0x10000));
+        assert!(under < a.va_regions()[1].0);
+    }
+
+    #[test]
+    fn free_placement_rounds_up_to_the_page_size_after_an_odd_start_or_end() {
+        // A split that is not a multiple of the (128 KiB) big page: the first big mapping starts at
+        // the next multiple.
+        let mut a = AddressSpace::new();
+        a.initialize(0, 0x20000, 0x0400_0000, 0x10_0000_0000, 0x1_0001_0000)
+            .unwrap();
+        let first = a.map_buffer(&req(1, 0x1000_0000, 0x20000)).unwrap();
+        assert_eq!(first, 0x1_0002_0000);
+        // A big-page mapping that ends between pages (lengths round to 4 KiB): the next one starts
+        // at the following multiple of its page size, not at the odd end.
+        let mut odd = req(2, 0x2000_0000, 0x21000);
+        odd.page_size = 0x20000;
+        let odd_at = a.map_buffer(&odd).unwrap();
+        assert!(odd_at.is_multiple_of(0x20000));
+        let mut next = req(3, 0x3000_0000, 0x20000);
+        next.page_size = 0x20000;
+        let next_at = a.map_buffer(&next).unwrap();
+        assert!(next_at.is_multiple_of(0x20000), "{next_at:#x}");
+        assert!(next_at >= odd_at + 0x21000);
     }
 
     fn remap_to(handle: u32, cpu: u64) -> Option<Remap> {

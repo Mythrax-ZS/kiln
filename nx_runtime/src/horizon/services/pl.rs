@@ -417,6 +417,12 @@ mod tests {
         assert_eq!(lookup(0x0020), 1);
         assert_eq!(lookup(u16::from(b'A')), u16::from(b'A') - 0x1F);
         assert_eq!(lookup(0x3042), 0x3042 - 0x1F, "hiragana");
+        assert_eq!(
+            lookup(0xFF21),
+            0xFF21 - 0x1F,
+            "a fullwidth letter, high in the plane"
+        );
+        assert_eq!(lookup(0xFFFD), 0xFFFD - 0x1F, "the replacement character");
         assert_eq!(lookup(LAST_CHAR) as usize, GLYPHS - 1, "the last glyph");
         assert_eq!(lookup(0x001F), 0, "control characters have none");
         assert_eq!(lookup(0xFFFF), 0);

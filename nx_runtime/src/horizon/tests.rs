@@ -2492,7 +2492,7 @@ fn hid_publishes_input_in_a_shared_memory_the_program_maps() {
     get.pid = true;
     get.payload = 7u64.to_le_bytes().to_vec();
     assert_eq!(e.call(hid, &get).data, 0x1Fu32.to_le_bytes());
-    for command in [1, 11, 21, 31, 103] {
+    for command in [1, 11, 21, 31, 66, 67, 103] {
         let mut m = Message::new(command);
         m.pid = true;
         m.payload = 7u64.to_le_bytes().to_vec();
@@ -2506,6 +2506,59 @@ fn hid_publishes_input_in_a_shared_memory_the_program_maps() {
     }
 }
 
+#[test]
+fn vibration_devices_are_listed_and_never_vibrate() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let hid = e.service("hid");
+    // GetVibrationDeviceInfo: a handle for device 0 and one for device 1 of the handheld pad.
+    let handle = |device: u32| (4u32 | 8 << 8 | device << 16).to_le_bytes().to_vec();
+    let mut info = Message::new(200);
+    info.payload = handle(0);
+    let left = e.call(hid, &info).data;
+    info.payload = handle(1);
+    let right = e.call(hid, &info).data;
+    // (type, position): a linear resonant actuator (1), on the left (1) and on the right (2).
+    assert_eq!(left, [1, 0, 0, 0, 1, 0, 0, 0]);
+    assert_eq!(right, [1, 0, 0, 0, 2, 0, 0, 0]);
+    // The list of active devices takes a device and accepts it.
+    let list = u64::from(e.call(hid, &Message::new(203)).moved[0]);
+    let mut activate = Message::new(0);
+    activate.payload = handle(0);
+    assert_eq!(e.call(list, &activate).result, 0);
+    // What a device actually vibrates with: nothing, at 160 Hz and 320 Hz.
+    let mut actual = Message::new(202);
+    actual.pid = true;
+    actual.payload = [handle(0), vec![0; 4], 7u64.to_le_bytes().to_vec()].concat();
+    let value = e.call(hid, &actual).data;
+    let floats: Vec<f32> = value
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect();
+    assert_eq!(floats, vec![0.0, 160.0, 0.0, 320.0]);
+    // Sending values is accepted; permission is remembered.
+    let mut send = Message::new(201);
+    send.pid = true;
+    send.payload = [
+        handle(0),
+        vec![0; 16],
+        vec![0; 4],
+        7u64.to_le_bytes().to_vec(),
+    ]
+    .concat();
+    assert_eq!(e.call(hid, &send).result, 0);
+    assert_eq!(
+        e.call(hid, &Message::new(205)).data[0],
+        1,
+        "permitted at first"
+    );
+    let mut permit = Message::new(204);
+    permit.payload = vec![0];
+    assert_eq!(e.call(hid, &permit).result, 0);
+    assert_eq!(e.call(hid, &Message::new(205)).data[0], 0);
+}
 #[test]
 fn the_handheld_controller_appears_once_the_program_has_asked_for_it() {
     let mut e = Env::new();
@@ -2669,7 +2722,7 @@ fn play_reports_are_accepted_and_discarded_and_nothing_else_is_offered() {
     let mut e = Env::new();
     super::services::register_defaults(&e.kernel);
     let prepo = e.service("prepo:u");
-    for command in [10100, 10101, 10102, 10103] {
+    for command in 10100..=10107 {
         let mut save = Message::new(command);
         save.pid = true;
         save.send = vec![(SCRATCH + 0x100, 8), (SCRATCH + 0x200, 0x10)];

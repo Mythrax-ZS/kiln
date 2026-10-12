@@ -682,6 +682,21 @@ mod tests {
     }
 
     #[test]
+    fn merge_replaces_the_field_and_keeps_the_rest() {
+        // r1 is all ones; the field of bits 8 to 11 is replaced by 0101 taken from bit 0 of r2.
+        let code = [
+            add_imm(MOVE, 2, 0, 0b0101),
+            merge(MOVE, 3, 1, 2, 8, 4, 0),
+            add_imm(MOVE_SET_ADDRESS, 4, 0, address(0x40, 0) as i32),
+            alu(OR, MOVE_EMIT, 0, 3, 0) | END_NEXT,
+            alu(OR, MOVE, 0, 0, 0),
+        ];
+        let (r, host) = exec(&code, &[0xFFFF_FFFF]);
+        r.unwrap();
+        assert_eq!(host.writes, vec![(0x40, 0xFFFF_F5FF)]);
+    }
+
+    #[test]
     fn bfe_lsl_with_a_register_for_the_destination_bit() {
         // r1 = parameter 4; r2 = 0xF0; take 4 bits from bit 4 of r2 and put them at bit r1.
         let code = [

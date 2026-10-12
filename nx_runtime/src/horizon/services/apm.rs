@@ -124,7 +124,11 @@ mod tests {
         let mut s = Session::new();
         // The normal mode starts with the default; the boost mode with nothing.
         let got = s.request(&req(1, &0u32.to_le_bytes())).unwrap();
-        assert_eq!(got.data, DEFAULT_NORMAL_CONFIGURATION.to_le_bytes());
+        assert_eq!(
+            got.data,
+            0x0002_0003u32.to_le_bytes(),
+            "the apm:sys default"
+        );
         let mut set = 1u32.to_le_bytes().to_vec();
         set.extend_from_slice(&0x0001_0001u32.to_le_bytes());
         assert!(s.request(&req(0, &set)).unwrap().result.is_success());

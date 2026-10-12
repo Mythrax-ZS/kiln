@@ -723,6 +723,20 @@ mod tests {
     }
 
     #[test]
+    fn a_single_inline_vertex_is_a_draw_when_the_primitive_ends() {
+        let ((), _, stats) = with_cx(|cx| {
+            let mut e = Engine::new(class::THREED);
+            e.write(cx, 0x1618 / 4, 1, true).unwrap();
+            e.write(cx, 0x1640 / 4, 0x1234, true).unwrap();
+            e.write(cx, 0x1614 / 4, 0, true).unwrap();
+            // A primitive with nothing inline is not a draw.
+            e.write(cx, 0x1618 / 4, 1, true).unwrap();
+            e.write(cx, 0x1614 / 4, 0, true).unwrap();
+        });
+        assert_eq!(stats.draws.draws(), 1);
+        assert_eq!(stats.draws.elements, 1);
+    }
+    #[test]
     fn draws_in_the_method_stream_are_decoded_too() {
         let ((), _, stats) = with_cx(|cx| {
             let mut e = Engine::new(class::THREED);

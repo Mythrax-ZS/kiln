@@ -496,7 +496,11 @@ mod tests {
             assert_eq!(u64_at(&memory, slot + 8), sample);
             assert_eq!(u64_at(&memory, slot + 0x10), 0, "buttons");
             assert_eq!(&memory[slot + 0x18..slot + 0x28], &[0u8; 16], "sticks");
-            assert_eq!(u32_at(&memory, slot + 0x28), ATTRIBUTES_ATTACHED);
+            assert_eq!(
+                u32_at(&memory, slot + 0x28),
+                0x3F,
+                "connected, wired, both sides"
+            );
         }
     }
 
