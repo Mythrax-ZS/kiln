@@ -210,6 +210,9 @@ impl<'a> Harness<'a> {
         self.engine.write(DATA_BASE, &case.data);
         let mut values = values_of(&case.state);
         self.engine.write_regs(&REG_IDS, &mut values);
+        for n in 0..32u8 {
+            self.engine.write_q(usize::from(n), case.state.vreg(n));
+        }
         let err = self.engine.run(case.state.pc, case.steps);
         let class = match err {
             unicorn::ERR_OK => Class::Ok,
@@ -222,10 +225,11 @@ impl<'a> Harness<'a> {
             other => Class::Other(format!("unicorn error {other}")),
         };
         let (state, data) = if class == Class::Ok {
-            (
-                state_of(&self.engine.read_regs(&REG_IDS)),
-                self.engine.read(DATA_BASE, DATA_SIZE),
-            )
+            let mut state = state_of(&self.engine.read_regs(&REG_IDS));
+            for n in 0..32u8 {
+                state.set_vreg(n, self.engine.read_q(usize::from(n)));
+            }
+            (state, self.engine.read(DATA_BASE, DATA_SIZE))
         } else {
             (case.state.clone(), case.data.clone())
         };
@@ -310,6 +314,15 @@ pub fn diff(uc: &Outcome, mine: &Outcome, compare_fp: bool) -> Option<String> {
         ));
     }
     if compare_fp {
+        for n in 0..32u8 {
+            if a.vreg(n) != b.vreg(n) {
+                out.push(format!(
+                    "v{n}: unicorn {:#034x}, interpreter {:#034x}",
+                    a.vreg(n),
+                    b.vreg(n)
+                ));
+            }
+        }
         if a.fpcr != b.fpcr {
             out.push(format!(
                 "fpcr: unicorn {:#x}, interpreter {:#x}",

@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+pub mod fpgen;
 pub mod gen;
 pub mod harness;
 pub mod unicorn;
