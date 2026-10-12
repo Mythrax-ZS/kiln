@@ -184,6 +184,7 @@ fn run(cpu: &mut CpuState, env: &mut Env, op: &VOp, src: u64, nzcv: u8) -> u64 {
             }
             0
         }
+        VOp::Simd(simd) => super::simd_exec::exec(cpu, env, &simd, src),
     }
 }
 
@@ -222,6 +223,92 @@ pub fn exec_mem<B: Bus + ?Sized>(
                 let b = cpu.vreg(rt2) & mask_bytes(bytes);
                 bus.write(addr, bytes, a)?;
                 bus.write(second, bytes, b)?;
+            }
+        }
+        VMem::Multi {
+            load,
+            q,
+            size,
+            rpt,
+            selem,
+            rt,
+        } => {
+            let ebytes = 1u32 << size;
+            let elements = (if q { 16 } else { 8 }) / ebytes;
+            let ebits = 8 * ebytes;
+            let mut regs = [0u128; 4];
+            let mut offs = 0u64;
+            for r in 0..u32::from(rpt) {
+                for e in 0..elements {
+                    for s in 0..u32::from(selem) {
+                        let idx = (r + s) as usize;
+                        let reg = ((u32::from(rt) + r + s) % 32) as u8;
+                        let at = addr.wrapping_add(offs);
+                        if load {
+                            let v = bus.read(at, ebytes as u8)?;
+                            let m = mask_bytes(ebytes as u8) << (e * ebits);
+                            regs[idx] = (regs[idx] & !m) | (v << (e * ebits));
+                        } else {
+                            let v = (cpu.vreg(reg) >> (e * ebits)) & mask_bytes(ebytes as u8);
+                            bus.write(at, ebytes as u8, v)?;
+                        }
+                        offs += u64::from(ebytes);
+                    }
+                }
+            }
+            if load {
+                for (i, v) in regs.iter().enumerate().take((rpt * selem) as usize) {
+                    cpu.set_vreg(((u32::from(rt) + i as u32) % 32) as u8, *v);
+                }
+            }
+        }
+        VMem::Lane {
+            load,
+            size,
+            selem,
+            index,
+            rt,
+        } => {
+            let ebytes = 1u32 << size;
+            let ebits = 8 * ebytes;
+            let mut loaded = [0u128; 4];
+            for s in 0..u32::from(selem) {
+                let at = addr.wrapping_add(u64::from(s * ebytes));
+                if load {
+                    loaded[s as usize] = bus.read(at, ebytes as u8)?;
+                } else {
+                    let reg = ((u32::from(rt) + s) % 32) as u8;
+                    let v =
+                        (cpu.vreg(reg) >> (u32::from(index) * ebits)) & mask_bytes(ebytes as u8);
+                    bus.write(at, ebytes as u8, v)?;
+                }
+            }
+            if load {
+                for s in 0..u32::from(selem) {
+                    let reg = ((u32::from(rt) + s) % 32) as u8;
+                    let m = mask_bytes(ebytes as u8) << (u32::from(index) * ebits);
+                    let old = cpu.vreg(reg);
+                    cpu.set_vreg(
+                        reg,
+                        (old & !m) | (loaded[s as usize] << (u32::from(index) * ebits)),
+                    );
+                }
+            }
+        }
+        VMem::Replicate { q, size, selem, rt } => {
+            let ebytes = 1u32 << size;
+            let ebits = 8 * ebytes;
+            let mut loaded = [0u128; 4];
+            for s in 0..u32::from(selem) {
+                loaded[s as usize] =
+                    bus.read(addr.wrapping_add(u64::from(s * ebytes)), ebytes as u8)?;
+            }
+            for s in 0..u32::from(selem) {
+                let mut v = 0u128;
+                for e in 0..(if q { 16 } else { 8 }) / ebytes {
+                    v |= loaded[s as usize] << (e * ebits);
+                }
+                cpu.set_vreg(((u32::from(rt) + s) % 32) as u8, v);
             }
         }
     }

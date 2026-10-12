@@ -557,6 +557,13 @@ pub fn sqrt(env: &mut Env, fmt: Fmt, a: u64) -> u64 {
 
 /// `FPMulAdd(addend, op1, op2)`: `addend + op1 * op2` with one rounding.
 pub fn mul_add(env: &mut Env, fmt: Fmt, addend: u64, op1: u64, op2: u64) -> u64 {
+    mul_add_scaled(env, fmt, addend, op1, op2, false)
+}
+
+/// `mul_add` with the exact result halved before it is rounded when `halve` is set: the fused
+/// step of `FRSQRTS`, `(3 - a * b) / 2`.
+fn mul_add_scaled(env: &mut Env, fmt: Fmt, addend: u64, op1: u64, op2: u64, halve: bool) -> u64 {
+    let scale = |x: Exact| -> Exact { (x.0, x.1 - i32::from(halve), x.2, x.3) };
     let ua = unpack(env, fmt, addend);
     let u1 = unpack(env, fmt, op1);
     let u2 = unpack(env, fmt, op2);
@@ -595,14 +602,15 @@ pub fn mul_add(env: &mut Env, fmt: Fmt, addend: u64, op1: u64, op2: u64) -> u64 
                 fmt.zero(rounding == Rounding::MinusInf)
             };
         }
-        return pack_unp(env, fmt, &ua, rounding);
+        let (s, e, m) = frame(&ua);
+        return pack_exact(env, fmt, scale((s, e, m, false)), rounding);
     }
     let (ps, pe, pm, _) = mul_exact(&u1, &u2);
     if ua.kind == Kind::Zero {
-        return pack_exact(env, fmt, (ps, pe, pm, false), rounding);
+        return pack_exact(env, fmt, scale((ps, pe, pm, false)), rounding);
     }
     match add_frames((ps, pe, pm), frame(&ua)) {
-        Some(x) => pack_exact(env, fmt, x, rounding),
+        Some(x) => pack_exact(env, fmt, scale(x), rounding),
         None => fmt.zero(rounding == Rounding::MinusInf),
     }
 }
@@ -1042,6 +1050,24 @@ fn recip_sqrt_estimate_table(a: u32) -> u32 {
     b.div_ceil(2)
 }
 
+/// `UnsignedRecipEstimate` (`URECPE`): operands up to `0x7FFF_FFFF` give all ones.
+pub fn unsigned_recip_estimate(operand: u32) -> u32 {
+    if operand >> 31 == 0 {
+        u32::MAX
+    } else {
+        recip_estimate_table(operand >> 23) << 23
+    }
+}
+
+/// `UnsignedRSqrtEstimate` (`URSQRTE`): operands up to `0x3FFF_FFFF` give all ones.
+pub fn unsigned_rsqrt_estimate(operand: u32) -> u32 {
+    if operand >> 30 == 0 {
+        u32::MAX
+    } else {
+        recip_sqrt_estimate_table(operand >> 23) << 23
+    }
+}
+
 /// The fraction of `a` left-justified to 52 bits and its biased exponent field.
 fn fraction52(fmt: Fmt, a: u64) -> (u64, i32) {
     let f = fmt.frac();
@@ -1189,9 +1215,6 @@ pub fn rsqrt_step(env: &mut Env, fmt: Fmt, a: u64, b: u64) -> u64 {
     match (ua.kind, ub.kind) {
         (Kind::Inf, Kind::Zero) | (Kind::Zero, Kind::Inf) => one_point_five(fmt),
         (Kind::Inf, _) | (_, Kind::Inf) => fmt.infinity(ua.sign != ub.sign),
-        _ => {
-            let r = mul_add(env, fmt, three(fmt), a, b);
-            div(env, fmt, r, two(fmt, false))
-        }
+        _ => mul_add_scaled(env, fmt, three(fmt), a, b, true),
     }
 }

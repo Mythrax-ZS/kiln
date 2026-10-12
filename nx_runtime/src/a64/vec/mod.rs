@@ -13,8 +13,12 @@
 //! - `nzcv`: the current flags, for the instructions that test a condition (`FCSEL`, `FCCMP`).
 
 pub mod decode;
+mod decode_simd;
+mod decode_simd_imm;
 pub mod exec;
 mod lanes;
+pub mod simd;
+mod simd_exec;
 
 use super::fp::{Fmt, MinMax, Rounding};
 use super::inst::{AddrMode, Reg};
@@ -153,6 +157,8 @@ pub enum VOp {
         rd: u8,
         rn: Reg,
     },
+    /// An Advanced SIMD instruction.
+    Simd(simd::SimdOp),
 }
 
 impl VOp {
@@ -160,6 +166,7 @@ impl VOp {
     pub fn int_source(&self) -> Option<Reg> {
         match *self {
             VOp::IntToFp { rn, .. } | VOp::FmovFromGeneral { rn, .. } => Some(rn),
+            VOp::Simd(op) => op.int_source(),
             _ => None,
         }
     }
@@ -168,6 +175,7 @@ impl VOp {
     pub fn int_dest(&self) -> Option<Reg> {
         match *self {
             VOp::FpToInt { rd, .. } | VOp::FmovToGeneral { rd, .. } => Some(rd),
+            VOp::Simd(op) => op.int_dest(),
             _ => None,
         }
     }
@@ -194,6 +202,31 @@ pub enum VMem {
         bytes: u8,
         rt: u8,
         rt2: u8,
+    },
+    /// `LD1` to `LD4` and `ST1` to `ST4` of whole registers: `rpt` registers of `selem`-element
+    /// structures with elements of `1 << size` bytes, interleaved when `selem` is above one.
+    Multi {
+        load: bool,
+        q: bool,
+        size: u8,
+        rpt: u8,
+        selem: u8,
+        rt: u8,
+    },
+    /// One lane of `LD1` to `LD4` / `ST1` to `ST4`.
+    Lane {
+        load: bool,
+        size: u8,
+        selem: u8,
+        index: u8,
+        rt: u8,
+    },
+    /// `LD1R` to `LD4R`: load one structure and replicate each element across a register.
+    Replicate {
+        q: bool,
+        size: u8,
+        selem: u8,
+        rt: u8,
     },
 }
 

@@ -13,13 +13,13 @@ use super::{FpBinary, FpUnary, Reject, VAddr, VMem, VOp};
 use crate::a64::fp::{Fmt, MinMax, Rounding};
 use crate::a64::inst::AddrMode;
 
-type Res<T> = Result<T, Reject>;
+pub(super) type Res<T> = Result<T, Reject>;
 
-fn bits(w: u32, hi: u32, lo: u32) -> u32 {
+pub(super) fn bits(w: u32, hi: u32, lo: u32) -> u32 {
     (w >> lo) & (u32::MAX >> (31 - (hi - lo)))
 }
 
-fn bit(w: u32, n: u32) -> bool {
+pub(super) fn bit(w: u32, n: u32) -> bool {
     (w >> n) & 1 != 0
 }
 
@@ -29,7 +29,7 @@ fn simm(w: u32, hi: u32, lo: u32) -> i64 {
     (v << (64 - len)) >> (64 - len)
 }
 
-const UNALLOC: Reject = Reject::Unallocated;
+pub(super) const UNALLOC: Reject = Reject::Unallocated;
 
 /// A floating-point type field for arithmetic: single or double (half is FEAT_FP16, absent).
 fn arith_fmt(ftype: u32) -> Res<Fmt> {
@@ -58,7 +58,7 @@ pub fn decode(w: u32) -> Res<VOp> {
     if op0 & 0b0101 == 0b0001 {
         return decode_scalar_fp(w);
     }
-    Err(Reject::Unsupported("Advanced SIMD"))
+    super::decode_simd::decode_simd(w).map(VOp::Simd)
 }
 
 fn decode_scalar_fp(w: u32) -> Res<VOp> {
@@ -355,7 +355,7 @@ pub fn decode_mem(w: u32) -> Res<(VMem, VAddr)> {
         0b011 => literal(w),
         0b101 => pair(w),
         0b111 => single(w),
-        0b001 => Err(Reject::Unsupported("Advanced SIMD load/store structures")),
+        0b001 => structures(w),
         _ => Err(UNALLOC),
     }
 }
@@ -460,5 +460,120 @@ fn single(w: u32) -> Res<(VMem, VAddr)> {
             rn: bits(w, 9, 5) as u8,
             mode,
         },
+    ))
+}
+
+/// The addressing of a structure load or store: `[Xn]`, or post-indexed by the number of bytes
+/// transferred (`Rm` is 31) or by a register.
+fn structure_address(w: u32, bytes: i64) -> Res<VAddr> {
+    let post = bit(w, 23);
+    let rm = bits(w, 20, 16) as u8;
+    let mode = if !post {
+        if rm != 0 {
+            return Err(UNALLOC);
+        }
+        AddrMode::Offset(0)
+    } else if rm == 31 {
+        AddrMode::PostIndex(bytes)
+    } else {
+        AddrMode::PostIndexReg(rm)
+    };
+    Ok(VAddr {
+        rn: bits(w, 9, 5) as u8,
+        mode,
+    })
+}
+
+/// Advanced SIMD load/store structures, multiple and single, with or without post-indexing.
+fn structures(w: u32) -> Res<(VMem, VAddr)> {
+    if bit(w, 31) || bit(w, 25) {
+        return Err(UNALLOC);
+    }
+    let (q, load, rt) = (bit(w, 30), bit(w, 22), bits(w, 4, 0) as u8);
+    let size = bits(w, 11, 10);
+    if !bit(w, 24) {
+        // Multiple structures: bit 21 must be zero in both forms.
+        if bit(w, 21) {
+            return Err(UNALLOC);
+        }
+        let (rpt, selem) = match bits(w, 15, 12) {
+            0b0000 => (1, 4),
+            0b0010 => (4, 1),
+            0b0100 => (1, 3),
+            0b0110 => (3, 1),
+            0b0111 => (1, 1),
+            0b1000 => (1, 2),
+            0b1010 => (2, 1),
+            _ => return Err(UNALLOC),
+        };
+        if size == 3 && !q && selem != 1 {
+            return Err(UNALLOC);
+        }
+        let bytes = i64::from(rpt) * i64::from(selem) * if q { 16 } else { 8 };
+        return Ok((
+            VMem::Multi {
+                load,
+                q,
+                size: size as u8,
+                rpt,
+                selem,
+                rt,
+            },
+            structure_address(w, bytes)?,
+        ));
+    }
+    // Single structure.
+    let opcode = bits(w, 15, 13);
+    let s = bit(w, 12);
+    let selem = (((opcode & 1) << 1) | bits(w, 21, 21)) as u8 + 1;
+    let scale = opcode >> 1;
+    if scale == 3 {
+        // Replicate: loads only, S clear.
+        if !load || s {
+            return Err(UNALLOC);
+        }
+        let bytes = i64::from(selem) << size;
+        return Ok((
+            VMem::Replicate {
+                q,
+                size: size as u8,
+                selem,
+                rt,
+            },
+            structure_address(w, bytes)?,
+        ));
+    }
+    let (esize, index) = match scale {
+        0 => (0u8, (u32::from(q) << 3) | (u32::from(s) << 2) | size),
+        1 => {
+            if size & 1 != 0 {
+                return Err(UNALLOC);
+            }
+            (1, (u32::from(q) << 2) | (u32::from(s) << 1) | (size >> 1))
+        }
+        _ => {
+            if size & 2 != 0 {
+                return Err(UNALLOC);
+            }
+            if size & 1 == 0 {
+                (2, (u32::from(q) << 1) | u32::from(s))
+            } else {
+                if s {
+                    return Err(UNALLOC);
+                }
+                (3, u32::from(q))
+            }
+        }
+    };
+    let bytes = i64::from(selem) << esize;
+    Ok((
+        VMem::Lane {
+            load,
+            size: esize,
+            selem,
+            index: index as u8,
+            rt,
+        },
+        structure_address(w, bytes)?,
     ))
 }
