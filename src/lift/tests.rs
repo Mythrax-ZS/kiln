@@ -15,7 +15,7 @@ use nx_runtime::testing::{asm, FlatBus, Rng};
 pub const CODE: u64 = 0x0800_0000;
 pub const DATA_SIZE: usize = 0x4000;
 pub const REGION: usize = 0x1_0000 + DATA_SIZE;
-pub const EXIT: u64 = 0xFFFF_0000;
+pub const EXIT: u64 = nx_runtime::rt::abi::EXIT_PC;
 
 /// A code image for the analysis: words at `base`.
 pub struct Image {
@@ -322,7 +322,7 @@ fn check(words: &[u32], g: &mut Gen, what: &str) -> Result<(), String> {
 
 /// Encoding groups as `(name, mask, value)`: the fixed bits of the group, with every other bit
 /// drawn at random. Purely random words rarely reach the narrow groups (`REV`, `ADC`, `CCMP`...).
-const TEMPLATES: &[(&str, u32, u32)] = &[
+pub const TEMPLATES: &[(&str, u32, u32)] = &[
     ("adr/adrp", 0x1F00_0000, 0x1000_0000),
     ("add/sub immediate", 0x1F80_0000, 0x1100_0000),
     ("logical immediate", 0x1F80_0000, 0x1200_0000),

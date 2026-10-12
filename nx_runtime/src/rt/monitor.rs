@@ -31,7 +31,8 @@ pub struct Reservation {
 
 impl Reservation {
     fn overlaps(&self, addr: u64, bytes: u64) -> bool {
-        self.addr < addr.saturating_add(bytes) && addr < self.addr + u64::from(self.bytes)
+        self.addr < addr.saturating_add(bytes)
+            && addr < self.addr.saturating_add(u64::from(self.bytes))
     }
 
     /// Account for a store by the reservation's own thread.
@@ -41,8 +42,8 @@ impl Reservation {
         buf[8..].copy_from_slice(&self.observed[1].to_le_bytes());
         let v = value.to_le_bytes();
         for i in 0..u64::from(bytes) {
-            let at = addr + i;
-            if at >= self.addr && at < self.addr + u64::from(self.bytes) {
+            let at = addr.wrapping_add(i);
+            if at >= self.addr && at < self.addr.saturating_add(u64::from(self.bytes)) {
                 buf[(at - self.addr) as usize] = v[i as usize];
             }
         }

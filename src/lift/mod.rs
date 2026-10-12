@@ -16,9 +16,9 @@ pub mod jumptable;
 pub mod sem;
 
 #[cfg(test)]
-mod flow_tests;
+pub(crate) mod flow_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use crate::loader::module::Module;
 use discover::CodeSource;

@@ -19,6 +19,7 @@ sha2 = "0.10"
 
 [dev-dependencies]
 nx_runtime = { path = "nx_runtime", features = ["testing"] }
+libloading = "0.8"
 
 [workspace]
 members = ["nx_runtime"]

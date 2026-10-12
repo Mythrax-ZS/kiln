@@ -16,3 +16,6 @@ pub use nx_runtime::{Error, Result};
 
 /// Version string reported by the CLI.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod native_tests;

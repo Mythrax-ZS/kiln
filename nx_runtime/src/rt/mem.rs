@@ -149,7 +149,7 @@ impl GuestMemory {
         if !addr.is_multiple_of(PAGE_SIZE)
             || !size.is_multiple_of(PAGE_SIZE)
             || size == 0
-            || end >> ADDRESS_BITS != 0
+            || end > 1 << ADDRESS_BITS
         {
             return Err(MapError::Range);
         }
@@ -268,12 +268,17 @@ impl GuestMemory {
             unsafe { store(p, size, value, order) };
             return Ok(());
         }
-        // Check both pages before writing anything.
+        // Check both pages before writing anything. Addresses beyond the 39-bit space (including a
+        // range that wraps past 2^64) fail at the first page that is not there.
+        let last = addr.checked_add(n as u64 - 1).ok_or(FaultKind::Unmapped)?;
         let mut at = addr;
-        let end = addr + n as u64;
-        while at < end {
+        loop {
             self.page_ptr(at, 0, true)?;
-            at = (at | (PAGE_SIZE - 1)) + 1;
+            let next = (at | (PAGE_SIZE - 1)) + 1;
+            if next > last {
+                break;
+            }
+            at = next;
         }
         self.write_bytes(addr, &value.to_le_bytes()[..n], false)
     }
@@ -482,7 +487,7 @@ mod tests {
         let m = GuestMemory::new();
         assert_eq!(m.map(0x123, 0x1000, RW), Err(MapError::Range));
         assert_eq!(m.map(0x1000, 0x123, RW), Err(MapError::Range));
-        assert_eq!(m.map(1 << 38, 1 << 38, RW), Err(MapError::Range));
+        assert_eq!(m.map(1 << 38, (1 << 38) + 0x1000, RW), Err(MapError::Range));
         m.map(0x4000_0000, 0x2000, RW).unwrap();
         assert_eq!(m.map(0x4000_1000, 0x1000, RW), Err(MapError::Overlap));
         m.write(0x4000_0000, 4, 7, Ordering::Relaxed).unwrap();
@@ -543,6 +548,23 @@ mod tests {
             m.compare_exchange(0x7000_0000, 4, 0, 1, Ordering::AcqRel),
             Err(FaultKind::Unmapped)
         );
+    }
+
+    #[test]
+    fn accesses_at_the_top_of_the_address_space_fault_instead_of_overflowing() {
+        let m = GuestMemory::new();
+        m.map(0x7F_FFFF_F000, 0x1000, RW).unwrap();
+        for addr in [u64::MAX - 3, u64::MAX, u64::MAX - 7, 1 << 39, (1 << 39) - 4] {
+            for size in [1u8, 2, 4, 8, 16] {
+                let r = m.read(addr, size, Ordering::Relaxed);
+                let w = m.write(addr, size, 1, Ordering::Relaxed);
+                let inside = addr
+                    .checked_add(u64::from(size))
+                    .is_some_and(|end| end <= 1 << 39);
+                assert_eq!(r.is_ok(), inside, "{addr:#x} {size}");
+                assert_eq!(w.is_ok(), inside, "{addr:#x} {size}");
+            }
+        }
     }
 
     #[test]

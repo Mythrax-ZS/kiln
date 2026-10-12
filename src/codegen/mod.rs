@@ -85,3 +85,108 @@ pub fn support_unit(triple: &str, entries: &[u64]) -> String {
     s.push_str(METADATA);
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lift::discover::{discover, Options};
+    use crate::lift::lift_all;
+    use crate::lift::tests::{Image, CODE};
+    use nx_runtime::testing::asm;
+
+    fn unit_for(words: Vec<u32>) -> String {
+        let d = discover(&Image::new(words), &[CODE], &Options::default());
+        let funcs = lift_all(&d);
+        let refs: Vec<&crate::lift::ir::Func> = funcs.values().collect();
+        function_unit(host_triple(), &refs)
+    }
+
+    #[test]
+    fn barriers_become_fences_that_stop_reordering() {
+        let ll = unit_for(vec![
+            asm::dmb(0b1001), // dmb ishld
+            asm::dmb(0b1010), // dmb ishst
+            asm::dmb(0b1011), // dmb ish
+            asm::dsb(0b1111), // dsb sy
+            asm::isb(0b1111),
+            asm::ret(30),
+        ]);
+        assert_eq!(ll.matches("fence acquire").count(), 1, "{ll}");
+        assert_eq!(ll.matches("fence release").count(), 1, "{ll}");
+        assert_eq!(ll.matches("fence seq_cst").count(), 2, "{ll}");
+        assert_eq!(
+            ll.matches("fence syncscope(\"singlethread\") seq_cst")
+                .count(),
+            1,
+            "{ll}"
+        );
+    }
+
+    #[test]
+    fn acquire_and_release_accesses_use_the_ordered_runtime_calls() {
+        // ldar x0, [x1] ; stlr x0, [x1] ; ldr x0, [x1] ; str x0, [x1]
+        let ll = unit_for(vec![
+            asm::exclusive(3, true, true, false, 31, true, 31, 1, 0),
+            asm::exclusive(3, true, false, false, 31, true, 31, 1, 0),
+            asm::ldst_unsigned(3, 1, 0, 1, 0),
+            asm::ldst_unsigned(3, 0, 0, 1, 0),
+            asm::ret(30),
+        ]);
+        assert!(ll.contains("@nx_ldar64(ptr %cpu"), "{ll}");
+        assert!(ll.contains("@nx_stlr64(ptr %cpu"), "{ll}");
+        assert!(ll.contains("@nx_ld64(ptr %cpu"), "{ll}");
+        assert!(ll.contains("@nx_st64(ptr %cpu"), "{ll}");
+        // Every access is followed by a test of the fault flag.
+        assert_eq!(ll.matches("icmp ne i32").count(), 4, "{ll}");
+    }
+
+    #[test]
+    fn divisions_are_guarded() {
+        let ll = unit_for(vec![
+            asm::dp2(true, 2, 1, 0, 2), // udiv x2, x0, x1
+            asm::dp2(true, 3, 1, 0, 3), // sdiv x3, x0, x1
+            asm::ret(30),
+        ]);
+        assert!(ll.contains("udiv i64"), "{ll}");
+        assert!(ll.contains("sdiv i64"), "{ll}");
+        // A zero divisor is replaced and the result forced to zero; MIN / -1 divides by one.
+        assert!(
+            ll.contains("icmp eq i64 %v") && ll.contains("select i1"),
+            "{ll}"
+        );
+        assert!(
+            ll.contains("-9223372036854775808") && ll.contains(", -1"),
+            "{ll}"
+        );
+    }
+
+    #[test]
+    fn every_runtime_function_the_code_calls_is_declared_and_exported() {
+        let declared: std::collections::BTreeSet<String> = llvm::declarations(false)
+            .lines()
+            .filter_map(|l| l.split('@').nth(1))
+            .filter_map(|r| r.split('(').next())
+            .map(str::to_string)
+            .collect();
+        let mut exported: std::collections::BTreeSet<String> =
+            nx_runtime::rt::exports::GENERATED_CODE_SYMBOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        // The dispatcher is generated, not part of the runtime.
+        exported.insert("nx_dispatch".into());
+        assert_eq!(declared, exported);
+    }
+
+    #[test]
+    fn the_support_unit_registers_a_sorted_table() {
+        let ll = support_unit(host_triple(), &[0x3000, 0x1000, 0x2000, 0x1000]);
+        let a = ll.find("i64 4096").expect("0x1000");
+        let b = ll.find("i64 8192").expect("0x2000");
+        let c = ll.find("i64 12288").expect("0x3000");
+        assert!(a < b && b < c);
+        assert!(ll.contains("[3 x { i64, ptr }]"), "{ll}");
+        assert!(ll.contains("@nx_rt_register(ptr @nx_functab, i64 3)"));
+        assert!(ll.contains("musttail call void %fn(ptr %cpu)"));
+    }
+}

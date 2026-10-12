@@ -84,6 +84,7 @@ dependencies = [
 name = "recomp"
 version = "0.1.0"
 dependencies = [
+ "libloading",
  "nx_runtime",
  "sha2",
 ]
