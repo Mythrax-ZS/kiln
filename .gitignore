@@ -1,0 +1,20 @@
+# build output
+/target
+/out
+
+# local tooling (Unicorn wheel for differential tests, scratch)
+/.venv
+/scratch
+
+# Never commit keys, firmware, or title data. Fixtures are generated inside tests.
+*.keys
+*.nsp
+*.nca
+*.nso
+*.nro
+*.xci
+*.tik
+*.cert
+*.romfs
+*.npdm
+*.bin

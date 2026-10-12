@@ -1,0 +1,33 @@
+[package]
+name = "recomp"
+version = "0.1.0"
+edition = "2021"
+description = "Static recompiler from Horizon OS AArch64 programs to native x86_64"
+publish = false
+
+[lib]
+name = "recomp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "recomp"
+path = "src/main.rs"
+
+[dependencies]
+nx_runtime = { path = "nx_runtime" }
+aes = "0.8"
+sha2 = "0.10"
+
+[dev-dependencies]
+nx_runtime = { path = "nx_runtime", features = ["asm"] }
+
+[workspace]
+members = ["nx_runtime"]
+default-members = [".", "nx_runtime"]
+
+[profile.release]
+debug = false
+lto = "thin"
+
+[profile.test]
+opt-level = 1

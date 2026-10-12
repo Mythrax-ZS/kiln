@@ -1,0 +1,18 @@
+[package]
+name = "nx_runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Guest CPU model and Horizon OS emulation layer linked into recompiled programs"
+publish = false
+
+[lib]
+name = "nx_runtime"
+path = "src/lib.rs"
+crate-type = ["rlib", "staticlib"]
+
+[features]
+# Test-only A64 assembler used to build synthetic fixtures. Never enabled in release builds.
+asm = []
+
+[dev-dependencies]
+libloading = "0.8"

@@ -1,0 +1,3 @@
+[alias]
+# The lint gate required before every commit: `cargo fmt --all --check` and `cargo lint`.
+lint = "clippy --all-targets -- -D warnings"
