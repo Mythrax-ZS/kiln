@@ -13,6 +13,7 @@ use super::sem;
 use nx_runtime::a64::bits::crc32_update;
 use nx_runtime::a64::bus::{Bus, Fault, FaultKind, ZVA_BLOCK};
 use nx_runtime::a64::state::CpuState;
+use nx_runtime::a64::vec;
 
 /// How a run of one function ended. For everything but `Fault` the architectural state is in the
 /// CPU structure.
@@ -322,6 +323,20 @@ impl<'f> Evaluator<'f> {
                     Field::Fpcr => cpu.fpcr = x as u32,
                     Field::Fpsr => cpu.fpsr = x as u32,
                 }
+                0
+            }
+            Op::Vec { word, src, nzcv } => {
+                let op = vec::decode::decode(*word)
+                    .expect("the lifter emits only encodings the decoder accepts");
+                let src = src.map_or(0, |s| self.get(s) as u64);
+                let nzcv = nzcv.map_or(0, |n| self.get(n) as u8);
+                u128::from(vec::exec::exec(cpu, &op, src, nzcv))
+            }
+            Op::VecMem { word, pc, addr } => {
+                let (mem, _) = vec::decode::decode_mem(*word)
+                    .expect("the lifter emits only encodings the decoder accepts");
+                vec::exec::exec_mem(cpu, bus, &mem, self.get(*addr) as u64)
+                    .map_err(|f| (f, *pc))?;
                 0
             }
         };

@@ -1166,9 +1166,9 @@ fn undefined_and_unsupported_instructions_stop_the_run() {
     let mut m = Machine::new(&[0x0000_0000]);
     assert_eq!(m.run(1), Err(Trap::Undefined(0)));
     assert_eq!(m.cpu.pc, CODE);
-    let fadd = 0x1E22_2820;
-    let mut m = Machine::new(&[fadd]);
-    assert!(matches!(m.run(1), Err(Trap::Unsupported { word, .. }) if word == fadd));
+    let aese = 0x4E28_4820;
+    let mut m = Machine::new(&[aese]);
+    assert!(matches!(m.run(1), Err(Trap::Unsupported { word, .. }) if word == aese));
     assert_eq!(m.cpu.pc, CODE);
 }
 

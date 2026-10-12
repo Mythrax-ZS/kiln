@@ -297,7 +297,7 @@ pub fn supervisor_calls(base: u64) -> Vec<u32> {
 pub fn unsupported_instruction(base: u64) -> Vec<u32> {
     let mut p = Prog::new(base);
     p.emit(asm::add_imm(true, 0, 0, 1));
-    p.emit(0x1E62_2820); // fadd d0, d1, d2: not implemented until M5
+    p.emit(0x4E28_4820); // aese v0.16b, v1.16b: the crypto extension is not implemented
     p.emit(asm::add_imm(true, 0, 0, 2));
     p.emit(asm::ret(30));
     p.finish()

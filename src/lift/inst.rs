@@ -327,6 +327,12 @@ impl<'a> Lifter<'a> {
                 let wb = self.add(base, k);
                 (base, Some(wb))
             }
+            AddrMode::PostIndexReg(rm) => {
+                let base = self.x(rn, true);
+                let m = self.x(rm, false);
+                let wb = self.add(base, m);
+                (base, Some(wb))
+            }
             AddrMode::Register { rm, extend, amount } => {
                 let m = self.x(rm, false);
                 let off = self.extend64(m, extend, amount);
@@ -973,6 +979,40 @@ impl<'a> Lifter<'a> {
                     self.set_x(rd, res, false);
                 }
             },
+
+            Inst::Vec { word, op } => {
+                let src = op.int_source().map(|r| self.x(r, false));
+                let nzcv = if op.reads_nzcv() {
+                    let packed = self.pack_nzcv();
+                    let nibble = self.lshr_c(packed, 28);
+                    Some(self.zext(nibble, Ty::I64))
+                } else {
+                    None
+                };
+                let result = self.b.vec_op(blk, word, src, nzcv);
+                if let Some(rd) = op.int_dest() {
+                    self.set_x(rd, result, false);
+                } else if op.writes_nzcv() {
+                    let flag = |l: &mut Self, bit: u32| {
+                        let shifted = l.lshr_c(result, bit);
+                        l.trunc(shifted, Ty::I1)
+                    };
+                    let f = Flags {
+                        n: flag(self, 3),
+                        z: flag(self, 2),
+                        c: flag(self, 1),
+                        v: flag(self, 0),
+                    };
+                    self.set_flags(f);
+                }
+            }
+            Inst::VecMem { word, addr, .. } => {
+                let (a, wb) = self.address(pc, addr.rn, addr.mode);
+                self.b.vec_mem(blk, word, pc, a);
+                if let Some(wb) = wb {
+                    self.set_x(addr.rn, wb, true);
+                }
+            }
 
             Inst::B { .. }
             | Inst::BCond { .. }

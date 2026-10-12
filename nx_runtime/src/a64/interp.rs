@@ -13,6 +13,7 @@ use super::bus::{Bus, Fault, FaultKind, ZVA_BLOCK};
 use super::decode::decode;
 use super::inst::*;
 use super::state::CpuState;
+use super::vec;
 
 /// Why `step` stopped short of finishing an instruction normally.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +73,30 @@ pub const FPCR_MASK: u32 = 0x07F7_0000;
 /// Writable FPSR bits: the AArch32-visible N, Z, C, V and QC (31:27), IDC and the cumulative
 /// exception flags. The A57 implements AArch32, so bits 31:28 are storage.
 pub const FPSR_MASK: u32 = 0xF800_009F;
+
+/// The address a load or store accesses and the value written back to its base register, if any.
+fn effective_address(cpu: &CpuState, pc: u64, rn: Reg, mode: AddrMode) -> (u64, Option<u64>) {
+    match mode {
+        AddrMode::Offset(imm) => (cpu.x_sp(rn).wrapping_add(imm as u64), None),
+        AddrMode::PreIndex(imm) => {
+            let a = cpu.x_sp(rn).wrapping_add(imm as u64);
+            (a, Some(a))
+        }
+        AddrMode::PostIndex(imm) => {
+            let base = cpu.x_sp(rn);
+            (base, Some(base.wrapping_add(imm as u64)))
+        }
+        AddrMode::PostIndexReg(rm) => {
+            let base = cpu.x_sp(rn);
+            (base, Some(base.wrapping_add(cpu.x_zr(rm))))
+        }
+        AddrMode::Register { rm, extend, amount } => {
+            let off = extend_value(cpu.x_zr(rm), extend, u32::from(amount), 64);
+            (cpu.x_sp(rn).wrapping_add(off), None)
+        }
+        AddrMode::Literal(imm) => (pc.wrapping_add(imm as u64), None),
+    }
+}
 
 /// Fetch, decode and execute one instruction.
 pub fn step<B: Bus + ?Sized>(cpu: &mut CpuState, bus: &mut B) -> Result<(), Trap> {
@@ -316,22 +341,7 @@ pub fn execute<B: Bus + ?Sized>(cpu: &mut CpuState, bus: &mut B, inst: Inst) -> 
             mode,
         } => {
             let bytes = 1u8 << size;
-            let (addr, writeback) = match mode {
-                AddrMode::Offset(imm) => (cpu.x_sp(rn).wrapping_add(imm as u64), None),
-                AddrMode::PreIndex(imm) => {
-                    let a = cpu.x_sp(rn).wrapping_add(imm as u64);
-                    (a, Some(a))
-                }
-                AddrMode::PostIndex(imm) => {
-                    let base = cpu.x_sp(rn);
-                    (base, Some(base.wrapping_add(imm as u64)))
-                }
-                AddrMode::Register { rm, extend, amount } => {
-                    let off = extend_value(cpu.x_zr(rm), extend, u32::from(amount), 64);
-                    (cpu.x_sp(rn).wrapping_add(off), None)
-                }
-                AddrMode::Literal(imm) => (pc.wrapping_add(imm as u64), None),
-            };
+            let (addr, writeback) = effective_address(cpu, pc, rn, mode);
             match kind {
                 MemKind::Store => {
                     let v = u128::from(cpu.x_zr(rt) & mask(8 * u32::from(bytes)));
@@ -351,6 +361,22 @@ pub fn execute<B: Bus + ?Sized>(cpu: &mut CpuState, bus: &mut B, inst: Inst) -> 
             }
             if let Some(wb) = writeback {
                 cpu.set_x_sp(rn, wb);
+            }
+        }
+        Inst::Vec { op, .. } => {
+            let src = op.int_source().map_or(0, |r| cpu.x_zr(r));
+            let r = vec::exec::exec(cpu, &op, src, cpu.nzcv4());
+            if let Some(rd) = op.int_dest() {
+                cpu.set_x_zr(rd, r);
+            } else if op.writes_nzcv() {
+                cpu.set_nzcv4(r as u8);
+            }
+        }
+        Inst::VecMem { mem, addr, .. } => {
+            let (a, writeback) = effective_address(cpu, pc, addr.rn, addr.mode);
+            vec::exec::exec_mem(cpu, bus, &mem, a)?;
+            if let Some(wb) = writeback {
+                cpu.set_x_sp(addr.rn, wb);
             }
         }
         Inst::LdStPair {

@@ -5,6 +5,8 @@
 //! encoding means. Register fields hold the raw 5-bit number; whether 31 means SP or ZR is a
 //! property of the operand and is stated on each variant.
 
+use super::vec::{VAddr, VMem, VOp};
+
 pub type Reg = u8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +134,8 @@ pub enum AddrMode {
     PreIndex(i64),
     /// `[Xn], #imm`
     PostIndex(i64),
+    /// `[Xn], Xm` (the Advanced SIMD structure loads and stores); Xm is never XZR here.
+    PostIndexReg(Reg),
     /// `[Xn, Xm{, extend {#amount}}]`; Xm = 31 is XZR.
     Register {
         rm: Reg,
@@ -411,6 +415,20 @@ pub enum Inst {
         rn: Reg,
         rm: Reg,
         ra: Reg,
+    },
+
+    // ---- floating point and Advanced SIMD ----
+    /// A computation on the vector registers (see `a64::vec`). `word` is the encoding, which
+    /// generated code passes to the runtime.
+    Vec {
+        word: u32,
+        op: VOp,
+    },
+    /// A load or store of vector registers.
+    VecMem {
+        word: u32,
+        mem: VMem,
+        addr: VAddr,
     },
 
     // ---- not executable ----

@@ -383,6 +383,21 @@ pub enum Op {
     Counter,
     LoadField(Field),
     StoreField(Field, ValueId),
+    /// A floating-point or SIMD computation on the vector registers, which stay in the CPU
+    /// structure (`nx_runtime::a64::vec`). `src` is the integer source register's value and
+    /// `nzcv` the flags in bits 3 to 0, for the encodings that take them. The `i64` result is the
+    /// integer destination's value, or the new flags, for the encodings that produce one.
+    Vec {
+        word: u32,
+        src: Option<ValueId>,
+        nzcv: Option<ValueId>,
+    },
+    /// A load or store of vector registers at `addr`; the base register's writeback is separate.
+    VecMem {
+        word: u32,
+        pc: u64,
+        addr: ValueId,
+    },
 }
 
 impl Op {
@@ -391,6 +406,10 @@ impl Op {
         match self {
             Op::Const(_) | Op::LoadVar(_) | Op::ClearExcl | Op::Fence(_) | Op::Counter => {}
             Op::LoadField(_) => {}
+            Op::Vec { src, nzcv, .. } => {
+                src.iter().chain(nzcv.iter()).for_each(|&v| f(v));
+            }
+            Op::VecMem { addr, .. } => f(*addr),
             Op::Phi(ops) => ops.iter().for_each(|&(_, v)| f(v)),
             Op::Bin(_, a, b) | Op::Icmp(_, a, b) => {
                 f(*a);
@@ -424,6 +443,12 @@ impl Op {
         match self {
             Op::Const(_) | Op::LoadVar(_) | Op::ClearExcl | Op::Fence(_) | Op::Counter => {}
             Op::LoadField(_) => {}
+            Op::Vec { src, nzcv, .. } => {
+                src.iter_mut()
+                    .chain(nzcv.iter_mut())
+                    .for_each(|v| *v = f(*v));
+            }
+            Op::VecMem { addr, .. } => *addr = f(*addr),
             Op::Phi(ops) => ops.iter_mut().for_each(|(_, v)| *v = f(*v)),
             Op::Bin(_, a, b) | Op::Icmp(_, a, b) => {
                 *a = f(*a);
@@ -1078,6 +1103,16 @@ impl Func {
                     return bad("field store type");
                 }
             }
+            Op::Vec { src, nzcv, .. } => {
+                if inst.ty != Ty::I64 || src.iter().chain(nzcv.iter()).any(|&x| t(x) != Ty::I64) {
+                    return bad("vector operation takes and gives i64");
+                }
+            }
+            Op::VecMem { addr, .. } => {
+                if t(*addr) != Ty::I64 || inst.ty != Ty::Void {
+                    return bad("vector memory operation types");
+                }
+            }
             Op::Phi(_) | Op::LoadVar(_) | Op::ClearExcl | Op::Fence(_) => {}
         }
         Ok(())
@@ -1227,5 +1262,16 @@ fn fmt_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
         Op::Counter => write!(f, "counter"),
         Op::LoadField(fl) => write!(f, "loadfield {}", fl.name()),
         Op::StoreField(fl, v) => write!(f, "storefield {} %{v}", fl.name()),
+        Op::Vec { word, src, nzcv } => {
+            write!(f, "vec {word:#010x}")?;
+            if let Some(s) = src {
+                write!(f, " src=%{s}")?;
+            }
+            if let Some(n) = nzcv {
+                write!(f, " nzcv=%{n}")?;
+            }
+            Ok(())
+        }
+        Op::VecMem { word, pc, addr } => write!(f, "vecmem {word:#010x} %{addr} @{pc:#x}"),
     }
 }

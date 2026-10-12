@@ -7,6 +7,7 @@
 
 use super::bits::{decode_bit_masks, sign_extend};
 use super::inst::*;
+use super::vec::{self, Reject};
 
 fn bits(w: u32, hi: u32, lo: u32) -> u32 {
     (w >> lo) & (u32::MAX >> (31 - (hi - lo)))
@@ -30,7 +31,11 @@ pub fn decode(w: u32) -> Inst {
         0b1010 | 0b1011 => decode_branch(w),
         0b0100 | 0b0110 | 0b1100 | 0b1110 => decode_ldst(w),
         0b0101 | 0b1101 => decode_dp_reg(w),
-        0b0111 | 0b1111 => unsupported(w, "scalar floating point and Advanced SIMD (milestone M5)"),
+        0b0111 | 0b1111 => match vec::decode::decode(w) {
+            Ok(op) => Inst::Vec { word: w, op },
+            Err(Reject::Unallocated) => Inst::Unallocated(w),
+            Err(Reject::Unsupported(what)) => unsupported(w, what),
+        },
         0b0010 => unsupported(w, "SVE"),
         _ => Inst::Unallocated(w),
     }
@@ -321,7 +326,11 @@ fn decode_system(w: u32) -> Inst {
 
 fn decode_ldst(w: u32) -> Inst {
     if bit(w, 26) {
-        return unsupported(w, "SIMD&FP load/store (milestone M5)");
+        return match vec::decode::decode_mem(w) {
+            Ok((mem, addr)) => Inst::VecMem { word: w, mem, addr },
+            Err(Reject::Unallocated) => Inst::Unallocated(w),
+            Err(Reject::Unsupported(what)) => unsupported(w, what),
+        };
     }
     match bits(w, 29, 27) {
         0b001 => decode_exclusive(w),

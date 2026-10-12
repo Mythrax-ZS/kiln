@@ -13,6 +13,7 @@ pub mod interp;
 #[cfg(test)]
 mod interp_tests;
 pub mod state;
+pub mod vec;
 
 pub use bus::{Bus, Fault, FaultKind};
 pub use decode::decode;

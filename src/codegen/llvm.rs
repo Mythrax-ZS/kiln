@@ -53,6 +53,8 @@ pub fn declarations(defines_dispatcher: bool) -> String {
         "declare void @nx_dczva(ptr, i64, i64)",
         "declare i64 @nx_counter()",
         "declare i32 @nx_crc32(i32, i64, i32, i32) memory(none) nounwind",
+        "declare i64 @nx_vec(ptr, i32, i64, i64)",
+        "declare void @nx_vecmem(ptr, i32, i64, i64)",
         "declare void @nx_trap(ptr, i32, i64, i64, i64)",
         "declare void @nx_svc(ptr, i32)",
         "declare void @nx_interp1(ptr)",
@@ -133,6 +135,7 @@ fn can_fault(op: &Op) -> bool {
             | Op::LoadExcl { .. }
             | Op::StoreExcl { .. }
             | Op::DcZva { .. }
+            | Op::VecMem { .. }
     )
 }
 
@@ -498,6 +501,25 @@ impl<'a> Emitter<'a> {
                 let p = self.ptr(fld.offset());
                 let line = format!("store {}, ptr {p}", self.tv(val));
                 self.line(&line);
+            }
+            Op::Vec { word, src, nzcv } => {
+                let src = src.map_or_else(|| "0".to_string(), |s| self.val(s));
+                let nzcv = nzcv.map_or_else(|| "0".to_string(), |n| self.val(n));
+                let line = format!(
+                    "{r} = call i64 @nx_vec(ptr %cpu, i32 {}, i64 {src}, i64 {nzcv})",
+                    word as i32
+                );
+                self.line(&line);
+            }
+            Op::VecMem { word, pc, addr } => {
+                let line = format!(
+                    "call void @nx_vecmem(ptr %cpu, i32 {}, i64 {}, i64 {})",
+                    word as i32,
+                    self.val(addr),
+                    pc as i64
+                );
+                self.line(&line);
+                self.fault_check(b, split);
             }
         }
     }

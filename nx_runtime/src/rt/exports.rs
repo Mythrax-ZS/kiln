@@ -10,10 +10,11 @@ use super::abi::{perm, stop, trap, FuncEntry, NativeCpu, STOP_PC};
 use super::mem::MapError;
 use super::runtime::{
     handle_trap, interpret, interpret_one, record_fault, record_stop, record_trap, rt, run,
-    service_svc, slow_path, SvcHandler,
+    service_svc, slow_path, NativeBus, SvcHandler,
 };
 use crate::a64::bits::crc32_update;
 use crate::a64::bus::{FaultKind, ZVA_BLOCK};
+use crate::a64::vec;
 use std::ffi::c_void;
 use std::sync::atomic::Ordering::{self, Acquire, Relaxed, Release};
 
@@ -166,6 +167,41 @@ pub extern "C" fn nx_counter() -> u64 {
 #[no_mangle]
 pub extern "C" fn nx_crc32(acc: u32, data: u64, size: u32, castagnoli: u32) -> u32 {
     crc32_update(acc, data, size as u8, castagnoli != 0)
+}
+
+/// A floating-point or SIMD computation (see [`crate::a64::vec`]): `word` is the instruction,
+/// `src` the integer source register's value and `nzcv` the flags in bits 3 to 0, for the
+/// encodings that take them. Returns the integer result, or the new flags. The vector registers,
+/// `FPCR` and `FPSR` are read and written in the CPU structure.
+#[no_mangle]
+pub extern "C" fn nx_vec(p: *mut NativeCpu, word: u32, src: u64, nzcv: u64) -> u64 {
+    let c = cpu(p);
+    match vec::decode::decode(word) {
+        Ok(op) => vec::exec::exec(&mut c.state, &op, src, nzcv as u8),
+        Err(_) => {
+            // The code generator emits only encodings the decoder accepts, so this means the
+            // generated code and the runtime come from different versions.
+            let pc = c.state.pc;
+            record_trap(c, trap::UNSUPPORTED, pc, u64::from(word), 0);
+            0
+        }
+    }
+}
+
+/// A vector register load or store at `addr`; a failed access is recorded like any other.
+#[no_mangle]
+pub extern "C" fn nx_vecmem(p: *mut NativeCpu, word: u32, addr: u64, pc: u64) {
+    let c = cpu(p);
+    let Ok((mem, _)) = vec::decode::decode_mem(word) else {
+        record_trap(c, trap::UNSUPPORTED, pc, u64::from(word), 0);
+        return;
+    };
+    let mut bus = NativeBus {
+        thread: c.ctl.thread_id,
+    };
+    if let Err(f) = vec::exec::exec_mem(&mut c.state, &mut bus, &mem, addr) {
+        record_fault(c, f.addr, pc, f.write, f.kind);
+    }
 }
 
 /// Stop the run at an instruction that always stops it. `kind` is a [`trap`] constant.
@@ -359,6 +395,8 @@ pub const GENERATED_CODE_SYMBOLS: &[&str] = &[
     "nx_dczva",
     "nx_counter",
     "nx_crc32",
+    "nx_vec",
+    "nx_vecmem",
     "nx_trap",
     "nx_svc",
     "nx_interp1",

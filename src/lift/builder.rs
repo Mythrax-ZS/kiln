@@ -454,6 +454,25 @@ impl Builder {
         self.effect(b, Ty::Void, Op::StoreField(f, v));
     }
 
+    /// A floating-point or SIMD computation; see [`Op::Vec`].
+    pub fn vec_op(
+        &mut self,
+        b: BlockId,
+        word: u32,
+        src: Option<ValueId>,
+        nzcv: Option<ValueId>,
+    ) -> ValueId {
+        let src = src.map(|v| self.resolve(v));
+        let nzcv = nzcv.map(|v| self.resolve(v));
+        self.effect(b, Ty::I64, Op::Vec { word, src, nzcv })
+    }
+
+    /// A vector register load or store; see [`Op::VecMem`].
+    pub fn vec_mem(&mut self, b: BlockId, word: u32, pc: u64, addr: ValueId) {
+        let addr = self.resolve(addr);
+        self.effect(b, Ty::Void, Op::VecMem { word, pc, addr });
+    }
+
     // ---- variables ----
 
     pub fn write(&mut self, var: Var, b: BlockId, v: ValueId) {
