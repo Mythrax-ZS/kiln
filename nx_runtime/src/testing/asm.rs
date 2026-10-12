@@ -364,6 +364,60 @@ pub fn dp3(sf: bool, op31: u32, o0: bool, rm: u8, ra: u8, rn: u8, rd: u8) -> u32
         | r(rd)
 }
 
+// ---- mnemonics, for tests that read like assembly ----
+
+pub fn movz(sf: bool, rd: u8, imm16: u32, hw: u32) -> u32 {
+    mov_wide(sf, 2, hw, imm16, rd)
+}
+
+pub fn movk(sf: bool, rd: u8, imm16: u32, hw: u32) -> u32 {
+    mov_wide(sf, 3, hw, imm16, rd)
+}
+
+pub fn br(rn: u8) -> u32 {
+    branch_reg(0, rn)
+}
+
+pub fn blr(rn: u8) -> u32 {
+    branch_reg(1, rn)
+}
+
+pub fn ret(rn: u8) -> u32 {
+    branch_reg(2, rn)
+}
+
+/// `bl` with a byte offset from the instruction.
+pub fn call(bytes: i32) -> u32 {
+    b_imm(true, bytes / 4)
+}
+
+/// `b` with a byte offset from the instruction.
+pub fn jmp(bytes: i32) -> u32 {
+    b_imm(false, bytes / 4)
+}
+
+pub fn add_imm(sf: bool, rd: u8, rn: u8, imm12: u32) -> u32 {
+    add_sub_imm(sf, false, false, false, imm12, rn, rd)
+}
+
+pub fn sub_imm(sf: bool, rd: u8, rn: u8, imm12: u32) -> u32 {
+    add_sub_imm(sf, true, false, false, imm12, rn, rd)
+}
+
+pub fn cmp_imm(sf: bool, rn: u8, imm12: u32) -> u32 {
+    add_sub_imm(sf, true, true, false, imm12, rn, 31)
+}
+
+/// `ldr xt, [xn, #byte_off]` (offset a multiple of 8).
+pub fn ldr_x(rt: u8, rn: u8, byte_off: u32) -> u32 {
+    ldst_unsigned(3, 1, byte_off / 8, rn, rt)
+}
+
+/// `str xt, [xn, #byte_off]` (offset a multiple of 8).
+pub fn str_x(rt: u8, rn: u8, byte_off: u32) -> u32 {
+    ldst_unsigned(3, 0, byte_off / 8, rn, rt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

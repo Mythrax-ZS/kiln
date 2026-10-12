@@ -74,7 +74,7 @@ pub const FPCR_MASK: u32 = 0x07F7_0000;
 pub const FPSR_MASK: u32 = 0xF800_009F;
 
 /// Fetch, decode and execute one instruction.
-pub fn step<B: Bus>(cpu: &mut CpuState, bus: &mut B) -> Result<(), Trap> {
+pub fn step<B: Bus + ?Sized>(cpu: &mut CpuState, bus: &mut B) -> Result<(), Trap> {
     let word = bus.fetch(cpu.pc)?;
     execute(cpu, bus, decode(word))
 }
@@ -86,7 +86,7 @@ fn set_logic_flags(cpu: &mut CpuState, res: u64, w: u32) {
 }
 
 /// Execute one decoded instruction at `cpu.pc`.
-pub fn execute<B: Bus>(cpu: &mut CpuState, bus: &mut B, inst: Inst) -> Result<(), Trap> {
+pub fn execute<B: Bus + ?Sized>(cpu: &mut CpuState, bus: &mut B, inst: Inst) -> Result<(), Trap> {
     let pc = cpu.pc;
     let mut next = pc.wrapping_add(4);
     match inst {
