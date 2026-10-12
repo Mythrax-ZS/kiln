@@ -79,7 +79,8 @@ pub mod sm {
         ResultCode::new(21, description)
     }
 
-    pub const NOT_INITIALIZED: ResultCode = s(2);
+    /// The client did not call `RegisterClient` first (Atmosphère: `ResultInvalidClient`).
+    pub const INVALID_CLIENT: ResultCode = s(2);
     pub const INVALID_SERVICE_NAME: ResultCode = s(6);
     pub const NOT_REGISTERED: ResultCode = s(7);
     pub const NOT_ALLOWED: ResultCode = s(8);
@@ -116,7 +117,7 @@ mod tests {
         assert_eq!(kernel::LIMIT_REACHED.0, 0x10801);
         assert_eq!(sm::NOT_ALLOWED.0, 0x1015);
         assert_eq!(sm::NOT_REGISTERED.0, 0xE15);
-        assert_eq!(sm::NOT_INITIALIZED.0, 0x415);
+        assert_eq!(sm::INVALID_CLIENT.0, 0x415);
         let r = ResultCode::new(2, 3);
         assert_eq!((r.module(), r.description()), (2, 3));
     }

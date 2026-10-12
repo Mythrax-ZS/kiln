@@ -310,9 +310,8 @@ impl Service for ApplicationFunctions {
     fn request(&mut self, req: &Request) -> ServiceResult {
         match req.command {
             // PopLaunchParameter(u32 LaunchParameterKind) -> IStorage: this program was not
-            // started with any (docs/ASSUMPTIONS.md A-043), which the service reports as "no
-            // data in the channel".
-            1 => Ok(Response::error(NO_DATA_IN_CHANNEL)),
+            // started with any (docs/ASSUMPTIONS.md A-043), so there is no storage to give.
+            1 => Ok(Response::error(STORAGE_NOT_AVAILABLE)),
             // GetDesiredLanguage() -> LanguageCode
             21 => Ok(Response::ok().with_u64(LANGUAGE_CODE)),
             // BeginBlockingHomeButtonShortAndLongPressed(s64), EndBlocking...(),
@@ -370,8 +369,9 @@ impl Service for ApplicationFunctions {
 /// console (docs/ASSUMPTIONS.md A-043).
 const PSEUDO_DEVICE_ID: [u8; 16] = *b"recomp-pseudo-id";
 
-/// `PopLaunchParameter` with nothing to pop: module 128, description 2.
-const NO_DATA_IN_CHANNEL: ResultCode = ResultCode::new(128, 2);
+/// `PopLaunchParameter` with nothing to pop: 2128-0002, "IStorage not available" in Switchbrew's
+/// error code list.
+const STORAGE_NOT_AVAILABLE: ResultCode = ResultCode::new(128, 2);
 
 /// `nn::am::service::ILibraryAppletCreator`. No library applet can be created: there is no home
 /// menu and no applet to launch; storages, which programs also use for their own purposes, work.
@@ -455,7 +455,7 @@ impl Service for StorageAccessor {
                 };
                 let end = (offset >= 0).then(|| offset as u64 + buf.size);
                 let Some(end) = end.filter(|&e| e <= data.len() as u64) else {
-                    return Err(out_of_range(req.command, offset, buf.size, data.len()));
+                    return Ok(Response::error(STORAGE_OUT_OF_BOUNDS));
                 };
                 let Some(bytes) = kernel.read_buffer(buf, buf.size) else {
                     return Ok(Response::error(
@@ -476,7 +476,7 @@ impl Service for StorageAccessor {
                 };
                 let end = (offset >= 0).then(|| offset as u64 + buf.size);
                 let Some(end) = end.filter(|&e| e <= data.len() as u64) else {
-                    return Err(out_of_range(req.command, offset, buf.size, data.len()));
+                    return Ok(Response::error(STORAGE_OUT_OF_BOUNDS));
                 };
                 if !kernel.write_memory(buf.addr, &data[offset as usize..end as usize]) {
                     return Ok(Response::error(
@@ -490,13 +490,9 @@ impl Service for StorageAccessor {
     }
 }
 
-/// An access outside a storage: the result the service gives is not documented, so the run stops.
-fn out_of_range(command: u32, offset: i64, size: u64, len: usize) -> Stop {
-    Stop(format!(
-        "IStorageAccessor command {command} at offset {offset} for {size} bytes lies outside the 
-         {len}-byte storage; the result the service answers with is not documented"
-    ))
-}
+/// A read or write outside a storage: 2128-0503, "IStorage read/write out of bounds" in
+/// Switchbrew's error code list.
+const STORAGE_OUT_OF_BOUNDS: ResultCode = ResultCode::new(128, 503);
 
 #[cfg(test)]
 mod tests {

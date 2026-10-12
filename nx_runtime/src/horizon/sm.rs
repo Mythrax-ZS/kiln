@@ -61,14 +61,14 @@ impl Service for Sm {
             cmd::REGISTER_CLIENT => {
                 // The client's process id travels in the message header.
                 if req.pid.is_none() {
-                    return Ok(Response::error(sm_err::NOT_INITIALIZED));
+                    return Ok(Response::error(sm_err::INVALID_CLIENT));
                 }
                 self.initialized = true;
                 Ok(Response::ok())
             }
             cmd::GET_SERVICE_HANDLE => {
                 if !self.initialized {
-                    return Ok(Response::error(sm_err::NOT_INITIALIZED));
+                    return Ok(Response::error(sm_err::INVALID_CLIENT));
                 }
                 let Some(name) = decode_name(&req.data) else {
                     return Ok(Response::error(sm_err::INVALID_SERVICE_NAME));

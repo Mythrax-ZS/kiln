@@ -1408,6 +1408,8 @@ fn the_main_thread_can_start_another_and_wait_for_it() {
 struct Message {
     pid: bool,
     copy_handles: Vec<u32>,
+    /// Send (A) descriptors: what the service may read.
+    send: Vec<(u64, u64)>,
     /// Receive (B) descriptors: where the service may write.
     receive: Vec<(u64, u64)>,
     command: u32,
@@ -1419,6 +1421,7 @@ impl Message {
         Message {
             pid: false,
             copy_handles: Vec::new(),
+            send: Vec::new(),
             receive: Vec::new(),
             command,
             payload: Vec::new(),
@@ -1438,7 +1441,7 @@ impl Message {
                 m.extend_from_slice(&h.to_le_bytes());
             }
         }
-        for &(addr, size) in &self.receive {
+        for &(addr, size) in self.send.iter().chain(&self.receive) {
             // size[31:0], address[31:0], then address[38:36] in bits 2-4, size[35:32] in 24-27
             // and address[35:32] in 28-31 of the last word.
             m.extend_from_slice(&(size as u32).to_le_bytes());
@@ -1456,7 +1459,7 @@ impl Message {
         m.extend_from_slice(&0u32.to_le_bytes());
         m.extend_from_slice(&self.payload);
         let words = (m.len() - after_descriptors).div_ceil(4);
-        let h0 = 4u32 | ((self.receive.len() as u32) << 24);
+        let h0 = 4u32 | ((self.send.len() as u32) << 20) | ((self.receive.len() as u32) << 24);
         m[0..4].copy_from_slice(&h0.to_le_bytes());
         m[4..8].copy_from_slice(&(words as u32 | (u32::from(special) << 31)).to_le_bytes());
         m
@@ -1592,13 +1595,17 @@ fn the_romfs_is_read_through_the_file_system_proxy() {
     // The file data is in the image where the tables say.
     let rom = crate::romfs::RomFs::open(image.clone()).unwrap();
     assert_eq!(rom.read_file("/data/pattern.bin").unwrap(), pattern);
-    // A read past the end stops the run: the result the service gives is not documented.
-    let mut read = Message::new(0);
-    read.payload.extend_from_slice(&(size - 4).to_le_bytes());
-    read.payload.extend_from_slice(&16u64.to_le_bytes());
-    read.receive = vec![(SCRATCH + 0x1000, 16)];
-    assert!(e.send(storage, &read.bytes(), false).is_none());
-    assert!(matches!(e.kernel.exit_state(), Some(Exit::Fatal(m)) if m.contains("IStorage::Read")));
+    // A read past the end is `ResultOutOfRange`, 2002-3005; so is one whose end overflows.
+    for (offset, len) in [(size - 4, 16u64), (u64::MAX - 3, 8)] {
+        let mut read = Message::new(0);
+        read.payload.extend_from_slice(&offset.to_le_bytes());
+        read.payload.extend_from_slice(&len.to_le_bytes());
+        read.receive = vec![(SCRATCH + 0x1000, len)];
+        let r = e.call(storage, &read);
+        assert_eq!(r.result, ResultCode::new(2, 3005).0);
+        assert_eq!(r.result, 0x0017_7A02);
+    }
+    assert!(e.kernel.exit_state().is_none());
 }
 
 #[test]
@@ -1611,4 +1618,57 @@ fn asking_for_a_romfs_the_process_does_not_have_stops_the_run() {
         Some(Exit::Fatal(m)) => assert!(m.contains("--romfs") && m.contains("NX_ROMFS"), "{m}"),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn a_storage_the_program_creates_holds_what_it_writes() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let applet = e.service("appletOE");
+    let mut open = Message::new(0);
+    open.pid = true;
+    open.copy_handles = vec![CURRENT_PROCESS];
+    open.payload = vec![0; 8];
+    let proxy = u64::from(e.call(applet, &open).moved[0]);
+    // GetLibraryAppletCreator, CreateStorage(0x40), IStorage::Open.
+    let creator = u64::from(e.call(proxy, &Message::new(11)).moved[0]);
+    let mut create = Message::new(10);
+    create.payload = 0x40u64.to_le_bytes().to_vec();
+    let storage = u64::from(e.call(creator, &create).moved[0]);
+    let accessor = u64::from(e.call(storage, &Message::new(0)).moved[0]);
+    let size = |e: &mut Env| {
+        u64::from_le_bytes(
+            e.call(accessor, &Message::new(0)).data[..8]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert_eq!(size(&mut e), 0x40);
+    // Write(s64 offset, buffer in), then Read(s64 offset, buffer out).
+    e.write(SCRATCH + 0x800, b"storage!");
+    let mut write = Message::new(10);
+    write.payload = 4i64.to_le_bytes().to_vec();
+    write.send = vec![(SCRATCH + 0x800, 8)];
+    assert_eq!(e.call(accessor, &write).result, 0);
+    let mut read = Message::new(11);
+    read.payload = 0i64.to_le_bytes().to_vec();
+    read.receive = vec![(SCRATCH + 0x900, 16)];
+    assert_eq!(e.call(accessor, &read).result, 0);
+    assert_eq!(e.read(SCRATCH + 0x900, 16), b"\0\0\0\0storage!\0\0\0\0");
+    // A write or read that leaves the storage is 2128-0503, and a negative offset too.
+    let out_of_bounds = ResultCode::new(128, 503).0;
+    write.payload = 0x3Ci64.to_le_bytes().to_vec();
+    assert_eq!(e.call(accessor, &write).result, out_of_bounds);
+    read.payload = (-1i64).to_le_bytes().to_vec();
+    assert_eq!(e.call(accessor, &read).result, out_of_bounds);
+    // Nothing was changed by the refused write.
+    read.payload = 0x38i64.to_le_bytes().to_vec();
+    read.receive = vec![(SCRATCH + 0x900, 8)];
+    assert_eq!(e.call(accessor, &read).result, 0);
+    assert_eq!(e.read(SCRATCH + 0x900, 8), [0u8; 8]);
+    // PopLaunchParameter: this program was started with none (2128-0002).
+    let functions = u64::from(e.call(proxy, &Message::new(20)).moved[0]);
+    let mut pop = Message::new(1);
+    pop.payload = 1u32.to_le_bytes().to_vec();
+    assert_eq!(e.call(functions, &pop).result, ResultCode::new(128, 2).0);
 }

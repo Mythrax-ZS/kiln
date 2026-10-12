@@ -6,10 +6,14 @@
 //! data, the SD card, other partitions) is not implemented and stops the run when asked for.
 
 use super::super::kernel::Kernel;
+use super::super::result::ResultCode;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
 use crate::romfs;
 use crate::storage::SharedStorage;
 use std::sync::{Arc, Mutex, Weak};
+
+/// `fs::ResultOutOfRange`: module 2, description 3005 (2002-3005).
+const OUT_OF_RANGE: ResultCode = ResultCode::new(2, 3005);
 
 /// What every connection to the proxy shares: the RomFS, opened on first use.
 #[derive(Default)]
@@ -119,11 +123,19 @@ impl Service for RomStorage {
                         buf.size
                     )));
                 }
+                // A range that leaves the storage is `ResultOutOfRange`, 2002-3005 in
+                // Switchbrew's error code list.
+                if offset
+                    .checked_add(size)
+                    .is_none_or(|end| end > self.storage.size())
+                {
+                    return Ok(Response::error(OUT_OF_RANGE));
+                }
                 let mut data = vec![0u8; size as usize];
                 if let Err(e) = self.storage.read_at(offset, &mut data) {
                     return Err(Stop(format!(
                         "IStorage::Read of {size} bytes at {offset:#x} fails on the {}-byte \
-                         RomFS ({e}); the result the service answers with is not documented",
+                         RomFS ({e})",
                         self.storage.size()
                     )));
                 }

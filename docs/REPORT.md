@@ -124,7 +124,7 @@ source and its status. The ones with the widest effect:
 
 ## Tests, in short
 
-- Windows: 248 `nx_runtime` unit tests, 30 Unicorn differential tests, 84 `recomp` tests, and the
+- Windows: 249 `nx_runtime` unit tests, 30 Unicorn differential tests, 84 `recomp` tests, and the
   opt-in real-title tests (`RECOMP_TITLE_DIR`). Linux (WSL, Ubuntu, clang 21): the same suite with
   every external tool required except Unicorn, and the title built and run to the same stop.
 - Layers compared with an independent oracle: the decoder with LLVM's assembler; the soft-float with

@@ -106,7 +106,7 @@ the 52 `SendSyncRequest` calls carry the IPC requests to the services listed bel
 
 ## Tests
 
-`cargo test --workspace` on Windows (fmt and clippy clean, exit status of each step checked): 248
+`cargo test --workspace` on Windows (fmt and clippy clean, exit status of each step checked): 249
 `nx_runtime` unit tests, 30 Unicorn differential tests (14 integer, 7 floating point, 9 SIMD and crypto), 84 `recomp` tests.
 
 | Layer | Test | Result |
@@ -118,7 +118,8 @@ the 52 `SendSyncRequest` calls carry the IPC requests to the services listed bel
 | Jump-table bus | a 16-byte read is two reads | pass |
 | Transfer memory | argument checks, reprotection, the locked attribute, the lent range visible to a service, release on close, memory restored with its contents (a mutation that skips the release is caught) | pass |
 | Applet manager | through real IPC messages: the process handle copied in, the event handle copied out, the event signalled once, `ReceiveMessage` gives 15 and then `0x680` (a mutation that drops the message is caught) | pass |
-| `fsp-srv` | the data storage is read through real receive descriptors and compared byte for byte with the image: header, an inner range, the tail, the whole image; a read past the end and a program without a RomFS stop the run (a mutation of the offset is caught) | pass |
+| `fsp-srv` | the data storage is read through real receive descriptors and compared byte for byte with the image: header, an inner range, the tail, the whole image; a read past the end (or one whose end overflows) answers 2002-3005 and a program without a RomFS stops the run (a mutation of the offset is caught) | pass |
+| Storages | a storage created through the library applet creator: size, a write from a send buffer, a read into a receive buffer, writes and reads outside it (2128-0503, nothing changed), `PopLaunchParameter` (2128-0002) | pass |
 | Each service | unit tests on the commands, the refusals and the stops (`lm` decodes log packets; `apm` remembers configurations per mode; ...) | pass |
 | Cryptographic extension, algorithms | the S-box against FIPS 197; MixColumns against its published example; a whole AES-128 encryption and decryption against the FIPS 197 example (the round keys come from an independent key schedule); SHA-1 and SHA-256 of "abc" computed with the instructions against the known digests (the round constants are derived from primes in the test) | pass |
 | Cryptographic extension vs Unicorn | the three encoding groups, 60,000 to 120,000 cases each: 60,000 AES, 104,914 SHA-1/SHA-256 three-register and 44,872 two-register instructions executed on both sides with random registers, plus the reserved neighbours both sides reject | 0 differences |
@@ -156,10 +157,11 @@ supervisor calls in the trace.
 - Nothing was run on a Switch. Every service answer is Switchbrew's command table plus choices of
   ours (A-042 to A-049), and the `libnx` layouts of the commands Switchbrew leaves open; none was
   compared with a console. Where the real answer is not documented the run stops instead of guessing
-  (a read past the end of the RomFS, `GetPerformanceConfiguration` before any `Set`, a storage
-  access outside its size), with one exception that is recorded: `PopLaunchParameter` answers
-  `0x500`, a value I remember from the applet manager and could not confirm (A-043). The title did
-  not call it before it stopped.
+  (`GetPerformanceConfiguration` before any `Set`, a RomFS the program does not have). The result
+  codes the services answer with come from Switchbrew's error code list (2128-0002, 2128-0003,
+  2128-0503, 2002-3005), which names them but does not say which command gives which, and from
+  Atmosphère's `sm_results.hpp` (the `sm:` codes); `PopLaunchParameter` answering 2128-0002 is the
+  one I am least sure of, and the title did not call it before it stopped (A-043).
 - One title. Its start-up ends at `nvdrv`; what a different title asks for first is unknown.
 - Everything after `nvdrv`: `hid`, `time:u`, `set`, `acc:u0`, `nifm:u`, `bsd:u`, the audio services,
   `friend:u`, `ldr:ro` and the rest of the 42 services the title may use, which it has not asked for
