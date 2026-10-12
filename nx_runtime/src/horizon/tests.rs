@@ -2507,6 +2507,73 @@ fn hid_publishes_input_in_a_shared_memory_the_program_maps() {
 }
 
 #[test]
+fn the_handheld_controller_appears_once_the_program_has_asked_for_it() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let hid = e.service("hid");
+    let mut create = Message::new(0);
+    create.pid = true;
+    create.payload = 7u64.to_le_bytes().to_vec();
+    let resource = u64::from(e.call(hid, &create).moved[0]);
+    let memory = e.call(resource, &Message::new(0)).copied[0];
+    e.svc(0x13, &[u64::from(memory), 0x7000_0000, 0x4_0000, 1]);
+    assert_eq!(e.r(), 0);
+    let entry = 0x7000_0000 + 0x9A00 + 8 * 0x5000;
+    let style = |e: &Env| u32::from_le_bytes(e.read(entry, 4).try_into().unwrap());
+    assert_eq!(style(&e), 0, "nothing is connected before the program asks");
+    // The program says which styles and ids it supports and activates the controllers.
+    let mut styles = Message::new(100);
+    styles.pid = true;
+    styles.payload = [
+        0x1Fu32.to_le_bytes().to_vec(),
+        vec![0; 4],
+        7u64.to_le_bytes().to_vec(),
+    ]
+    .concat();
+    assert_eq!(e.call(hid, &styles).result, 0);
+    let ids: Vec<u8> = [0u32, 1, 0x20]
+        .iter()
+        .flat_map(|i| i.to_le_bytes())
+        .collect();
+    e.write(SCRATCH + 0x300, &ids);
+    let mut supported = Message::new(102);
+    supported.pid = true;
+    supported.payload = 7u64.to_le_bytes().to_vec();
+    supported.pointer = vec![(SCRATCH + 0x300, ids.len() as u64)];
+    assert_eq!(e.call(hid, &supported).result, 0);
+    let mut activate = Message::new(103);
+    activate.pid = true;
+    activate.payload = 7u64.to_le_bytes().to_vec();
+    assert_eq!(e.call(hid, &activate).result, 0);
+    // Within a second the sampling thread has published the handheld Npad and a few samples.
+    let lifo = entry + 0x0378;
+    let count = |e: &Env| u64::from_le_bytes(e.read(lifo + 0x18, 8).try_into().unwrap());
+    let mut waited = 0;
+    while count(&e) < 3 && waited < 100 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waited += 1;
+    }
+    assert_eq!(style(&e), 2, "the handheld style");
+    assert!(count(&e) >= 3, "samples arrive");
+    let tail = u64::from_le_bytes(e.read(lifo + 0x10, 8).try_into().unwrap());
+    let slot = e.read(lifo + 0x20 + tail * 0x30, 0x30);
+    let sample = u64::from_le_bytes(slot[..8].try_into().unwrap());
+    assert!(sample >= 3, "{sample}");
+    assert_eq!(
+        &slot[..8],
+        &slot[8..16],
+        "the slot and its state carry the same number"
+    );
+    assert_eq!(
+        u32::from_le_bytes(slot[0x28..0x2C].try_into().unwrap()),
+        0x3F
+    );
+    // The other controllers stay unplugged.
+    assert_eq!(e.read(0x7000_0000 + 0x9A00, 4), [0, 0, 0, 0]);
+    e.svc(0x14, &[u64::from(memory), 0x7000_0000, 0x4_0000]);
+}
+
+#[test]
 fn the_clocks_read_the_host_and_the_time_zone_is_utc() {
     let mut e = Env::new();
     super::services::register_defaults(&e.kernel);
