@@ -4,7 +4,7 @@
 use super::args::{unimplemented, Args, Fail, IoResult, Ioctl};
 use super::{Node, Nvdrv};
 use crate::error::NvError;
-use crate::vm::MapRequest;
+use crate::vm::{MapRequest, Remap};
 
 /// The type byte of the address space ioctls (`'A'`).
 pub const TYPE: u32 = 0x41;
@@ -17,6 +17,7 @@ pub const MAP_BUFFER_EX: u32 = 6;
 pub const ALLOC_AS: u32 = 7;
 pub const GET_VA_REGIONS: u32 = 8;
 pub const ALLOC_AS_EX: u32 = 9;
+pub const REMAP: u32 = 0x14;
 
 pub fn name(code: Ioctl) -> Option<&'static str> {
     if code.ty() != TYPE {
@@ -31,6 +32,7 @@ pub fn name(code: Ioctl) -> Option<&'static str> {
         ALLOC_AS => "NVGPU_AS_IOCTL_ALLOC_AS",
         GET_VA_REGIONS => "NVGPU_AS_IOCTL_GET_VA_REGIONS",
         ALLOC_AS_EX => "NVGPU_AS_IOCTL_ALLOC_AS_EX",
+        REMAP => "NVGPU_AS_IOCTL_REMAP",
         _ => return None,
     })
 }
@@ -113,6 +115,38 @@ impl Nvdrv {
                 self.space_mut(space)?
                     .initialize(flags, big_page_size, start, end, split)?;
             }
+            // An array of operations, 20 bytes each: u16 flags (bit 2 cacheable), u16 kind,
+            // u32 nvmap handle (0 unmaps), u32 offset in the handle in big pages, u32 offset in
+            // the address space in big pages, u32 number of big pages.
+            (REMAP, n) if n > 0 && n % 20 == 0 => {
+                for i in 0..n / 20 {
+                    let op = args.bytes(i * 20, 20).to_vec();
+                    let word = |o: usize| u32::from_le_bytes(op[o..o + 4].try_into().unwrap());
+                    let (flags, kind) = (
+                        u32::from(u16::from_le_bytes([op[0], op[1]])),
+                        u32::from(u16::from_le_bytes([op[2], op[3]])),
+                    );
+                    let (handle, from, to, count) = (word(4), word(8), word(12), word(16));
+                    let (start, len) = (u64::from(to) << 16, u64::from(count) << 16);
+                    let target = if handle == 0 {
+                        None
+                    } else {
+                        let h = self.gpu.nvmap.get(handle).ok_or(NvError::BAD_VALUE)?;
+                        let cpu = h.addr.ok_or(NvError::INVALID_STATE)?;
+                        let begin = u64::from(from) << 16;
+                        if begin + len > u64::from(h.size) {
+                            return Err(NvError::BAD_VALUE.into());
+                        }
+                        Some(Remap {
+                            handle,
+                            cpu: cpu + begin,
+                            kind,
+                            cacheable: flags & 4 != 0,
+                        })
+                    };
+                    self.space_mut(space)?.remap(start, len, target)?;
+                }
+            }
             // u64 buf_addr, u32 buf_size, u32 reserved, va_region regions[2] (24 bytes each)
             (GET_VA_REGIONS, 64) => {
                 let regions = self.space_mut(space)?.va_regions();
@@ -181,6 +215,49 @@ mod tests {
         a[32..40].copy_from_slice(&0x1_0000_0000u64.to_le_bytes());
         let (e, _) = call(nv, fd, ALLOC_AS_EX_CODE, &a);
         assert_eq!(e, NvError::SUCCESS);
+    }
+
+    #[test]
+    fn remap_maps_big_pages_of_a_handle_and_unmaps_with_handle_zero() {
+        let (mut nv, nvmap, fd) = setup();
+        call(&mut nv, fd, ALLOC_AS_EX_CODE, &[0u8; 40]);
+        let handle = backed_handle(&mut nv, nvmap, 0x40000, 0x4000_0000);
+        // flags 4 (cacheable), kind 0xFE, the handle, 1 page into it, to page 0x500000 of the
+        // address space, 2 pages; the ioctl number carries the size of one operation (20).
+        let mut op = vec![0u8; 20];
+        op[0..2].copy_from_slice(&4u16.to_le_bytes());
+        op[2..4].copy_from_slice(&0xFEu16.to_le_bytes());
+        op[4..8].copy_from_slice(&handle.to_le_bytes());
+        op[8..12].copy_from_slice(&1u32.to_le_bytes());
+        op[12..16].copy_from_slice(&0x50_0000u32.to_le_bytes());
+        op[16..20].copy_from_slice(&2u32.to_le_bytes());
+        let (e, _) = call(&mut nv, fd, 0xC014_4114, &op);
+        assert_eq!(e, NvError::SUCCESS);
+        let space = nv.gpu.spaces.values().next().unwrap();
+        let va = 0x50_0000u64 << 16;
+        assert_eq!(space.translate(va), Some((0x4001_0000, 0x20000)));
+        assert!(space.mappings().next().unwrap().cacheable);
+        // Handle 0 takes it away again; two operations in one call work too.
+        let mut two = op.clone();
+        two[4..8].copy_from_slice(&0u32.to_le_bytes());
+        two.extend_from_slice(&op);
+        let (e, _) = call(&mut nv, fd, 0xC028_4114, &two);
+        assert_eq!(e, NvError::SUCCESS);
+        let space = nv.gpu.spaces.values().next().unwrap();
+        assert_eq!(
+            space.translate(va),
+            Some((0x4001_0000, 0x20000)),
+            "mapped by the second"
+        );
+        // A handle that does not exist, and a range past the end of the handle.
+        let mut bad = op.clone();
+        bad[4..8].copy_from_slice(&99u32.to_le_bytes());
+        let (e, _) = call(&mut nv, fd, 0xC014_4114, &bad);
+        assert_eq!(e, NvError::BAD_VALUE);
+        let mut long = op.clone();
+        long[16..20].copy_from_slice(&4u32.to_le_bytes());
+        let (e, _) = call(&mut nv, fd, 0xC014_4114, &long);
+        assert_eq!(e, NvError::BAD_VALUE, "1 + 4 pages of a 4-page handle");
     }
 
     #[test]

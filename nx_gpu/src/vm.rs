@@ -68,6 +68,16 @@ pub struct MapRequest {
     pub offset: u64,
 }
 
+/// Where a `REMAP` points a range of an address space.
+#[derive(Clone, Copy, Debug)]
+pub struct Remap {
+    pub handle: u32,
+    /// The CPU address the start of the range corresponds to.
+    pub cpu: u64,
+    pub kind: u32,
+    pub cacheable: bool,
+}
+
 #[derive(Debug)]
 pub struct AddressSpace {
     start: u64,
@@ -317,6 +327,69 @@ impl AddressSpace {
         self.maps.remove(&offset).ok_or(NvError::BAD_VALUE)
     }
 
+    /// Cut `[start, start + len)` out of the mappings: those inside go, those that stick out on
+    /// either side are shortened (a mapping that spans the range becomes two).
+    fn carve(&mut self, start: u64, len: u64) {
+        let end = start + len;
+        let hit: Vec<u64> = self
+            .maps
+            .range(..end)
+            .filter(|(_, m)| m.start + m.len > start)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in hit {
+            let Some(m) = self.maps.remove(&k) else {
+                continue;
+            };
+            if m.start < start {
+                let left = Mapping {
+                    len: start - m.start,
+                    ..m.clone()
+                };
+                self.maps.insert(left.start, left);
+            }
+            if m.start + m.len > end {
+                let right = Mapping {
+                    start: end,
+                    len: m.start + m.len - end,
+                    cpu: m.cpu + (end - m.start),
+                    ..m
+                };
+                self.maps.insert(right.start, right);
+            }
+        }
+    }
+
+    /// `REMAP`: make `[start, start + len)` window onto the CPU memory at `target`'s address
+    /// (or onto nothing, when `target` is `None`), replacing whatever was mapped there.
+    pub fn remap(&mut self, start: u64, len: u64, target: Option<Remap>) -> NvResult<()> {
+        let page = u64::from(self.big_page_size);
+        if len == 0
+            || !start.is_multiple_of(page)
+            || !len.is_multiple_of(page)
+            || start < self.start
+            || start.checked_add(len).is_none_or(|e| e > self.end)
+        {
+            return Err(NvError::BAD_VALUE);
+        }
+        self.carve(start, len);
+        if let Some(t) = target {
+            self.maps.insert(
+                start,
+                Mapping {
+                    start,
+                    len,
+                    handle: t.handle,
+                    cpu: t.cpu,
+                    kind: t.kind,
+                    page_size: self.big_page_size,
+                    cacheable: t.cacheable,
+                },
+            );
+        }
+        Ok(())
+    }
+
     pub fn mappings(&self) -> impl Iterator<Item = &Mapping> {
         self.maps.values()
     }
@@ -539,6 +612,68 @@ mod tests {
         assert!(small < a.va_regions()[1].0);
         assert!(big >= a.va_regions()[1].0);
         assert!(big.is_multiple_of(0x10000));
+    }
+
+    fn remap_to(handle: u32, cpu: u64) -> Option<Remap> {
+        Some(Remap {
+            handle,
+            cpu,
+            kind: 0,
+            cacheable: true,
+        })
+    }
+
+    #[test]
+    fn remap_replaces_what_was_there_and_shortens_what_sticks_out() {
+        let mut a = AddressSpace::new();
+        let page = 0x10000u64;
+        let base = 0x100_0000_0000 / 2; // inside the default range, 64 KiB aligned
+                                        // One handle mapped over four pages.
+        a.remap(base, 4 * page, remap_to(1, 0x1_0000_0000)).unwrap();
+        assert_eq!(a.translate(base + 3 * page), Some((0x1_0003_0000, page)));
+        // A different handle over the middle two: the first is cut into two pieces around it.
+        a.remap(base + page, 2 * page, remap_to(2, 0x2_0000_0000))
+            .unwrap();
+        assert_eq!(a.translate(base), Some((0x1_0000_0000, page)));
+        assert_eq!(a.translate(base + page), Some((0x2_0000_0000, 2 * page)));
+        assert_eq!(a.translate(base + 3 * page), Some((0x1_0003_0000, page)));
+        assert_eq!(a.mappings().count(), 3);
+        // Nothing (a sparse hole) over the first page and half of the second.
+        a.remap(base, page, None).unwrap();
+        assert_eq!(a.translate(base), None);
+        assert_eq!(a.translate(base + page), Some((0x2_0000_0000, 2 * page)));
+        // A range that overlaps the end of one mapping and the start of the next.
+        a.remap(base + 2 * page, 2 * page, remap_to(3, 0x3_0000_0000))
+            .unwrap();
+        assert_eq!(a.translate(base + page), Some((0x2_0000_0000, page)));
+        assert_eq!(
+            a.translate(base + 2 * page),
+            Some((0x3_0000_0000, 2 * page))
+        );
+        assert_eq!(a.translate(base + 4 * page), None);
+    }
+
+    #[test]
+    fn remap_ranges_are_checked() {
+        let mut a = AddressSpace::new();
+        let page = 0x10000u64;
+        assert_eq!(a.remap(0x500_0001, page, None), Err(NvError::BAD_VALUE));
+        assert_eq!(a.remap(0x500_0000, page - 1, None), Err(NvError::BAD_VALUE));
+        assert_eq!(a.remap(0x500_0000, 0, None), Err(NvError::BAD_VALUE));
+        assert_eq!(
+            a.remap(0x1_0000, page, None),
+            Err(NvError::BAD_VALUE),
+            "below the range"
+        );
+        assert_eq!(
+            a.remap(DEFAULT_END, page, None),
+            Err(NvError::BAD_VALUE),
+            "above it"
+        );
+        assert_eq!(
+            a.remap(u64::MAX - page + 1, page, None),
+            Err(NvError::BAD_VALUE)
+        );
     }
 
     #[test]
