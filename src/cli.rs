@@ -24,6 +24,7 @@ usage:
   recomp build   (--exefs <dir|pfs0> | --nro <file>) --out <dir> [--name <name>] [--opt <0-3>]
                  [--hints <file>] [--shared] [--keep-ir] [--main-only] [--romfs <dir|image>] [--reuse-objects]
   recomp relink  --out <dir> --name <name>
+  recomp symbols (--exefs <dir|pfs0> | --nro <file>) [--match <text>] [<address>...]
   recomp --version
 
 Inputs are the already extracted ExeFS and RomFS of a game. No keys are read. From an ExeFS
@@ -344,11 +345,59 @@ pub fn run(argv: &[String]) -> Result<String> {
         "analyze" => analyze(&args),
         "build" => build_command(&args),
         "relink" => relink_command(&args),
+        "symbols" => symbols_command(&args),
         other => Err(Error::format(
             "command line",
             format!("unknown command `{other}`"),
         )),
     }
+}
+
+/// `recomp symbols --exefs <dir> <address>...`: the exported function each guest address lies in,
+/// with the offset into it. For reading a fault address or a trace.
+fn symbols_command(args: &Args) -> Result<String> {
+    let program = load_program(args)?;
+    let mut out = String::new();
+    if let Some(text) = args.options.get("match") {
+        for m in &program.modules {
+            for e in m.exports.iter().filter(|e| e.name.contains(text.as_str())) {
+                let _ = writeln!(
+                    out,
+                    "{:#x}: {} ({:#x} bytes)",
+                    m.base + e.offset,
+                    e.name,
+                    e.size
+                );
+            }
+        }
+    }
+    for text in &args.positional {
+        let addr = text
+            .strip_prefix("0x")
+            .map_or_else(|| text.parse::<u64>(), |h| u64::from_str_radix(h, 16))
+            .map_err(|_| Error::format("command line", format!("`{text}` is not an address")))?;
+        let found = program.modules.iter().find_map(|m| {
+            let offset = addr.checked_sub(m.base)?;
+            m.exports
+                .iter()
+                .filter(|e| e.offset <= offset)
+                .max_by_key(|e| e.offset)
+                .map(|e| (m, e, offset - e.offset))
+        });
+        match found {
+            Some((m, e, inside)) => {
+                let _ = writeln!(
+                    out,
+                    "{addr:#x}: {} + {inside:#x} (module at {:#x}, function of {:#x} bytes)",
+                    e.name, m.base, e.size
+                );
+            }
+            None => {
+                let _ = writeln!(out, "{addr:#x}: no exported function precedes it");
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn load_program(args: &Args) -> Result<Program> {
@@ -529,6 +578,30 @@ mod tests {
         build_nso(&build_parts(&spec), flags)
     }
 
+    #[test]
+    fn symbols_names_the_function_around_an_address() {
+        let t = TempDir::new("cli-symbols");
+        t.write("exefs/main", &synthetic_nso());
+        let exefs = t.join("exefs").display().to_string();
+        let out = run(&argv(&[
+            "symbols",
+            "--exefs",
+            &exefs,
+            "0x8000184",
+            "0x8000100",
+        ]))
+        .unwrap();
+        // `nnMain` is at 0x180 of the module at the guest base.
+        assert!(out.contains("0x8000184: nnMain + 0x4"), "{out}");
+        assert!(
+            out.contains("0x8000100: no exported function precedes it"),
+            "{out}"
+        );
+        let out = run(&argv(&["symbols", "--exefs", &exefs, "--match", "nnMa"])).unwrap();
+        assert!(out.contains("0x8000180: nnMain"), "{out}");
+        assert!(run(&argv(&["symbols", "--exefs", &exefs, "banana"])).is_err());
+        assert!(run(&argv(&["symbols"])).is_err());
+    }
     #[test]
     fn inspect_reports_exefs_nso_npdm_and_romfs() {
         use nx_runtime::npdm::builder::{build, enable_svcs, NpdmSpec};
