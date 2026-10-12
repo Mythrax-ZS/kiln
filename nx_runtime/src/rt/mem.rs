@@ -248,8 +248,9 @@ impl GuestMemory {
             // SAFETY: `p` points at `n` readable bytes inside one page.
             return Ok(unsafe { load(p, size, order) });
         }
+        // Straddles a page boundary: both pages must be readable.
         let mut buf = [0u8; 16];
-        self.read_bytes(addr, &mut buf[..n], false)?;
+        self.read_bytes(addr, &mut buf[..n], true)?;
         Ok(u128::from_le_bytes(buf))
     }
 
@@ -508,6 +509,43 @@ mod tests {
         // The address space can be reused.
         m.map(0x4000_1000, 0x1000, RW).unwrap();
         assert_eq!(m.read(0x4000_1000, 8, Ordering::Relaxed), Ok(0));
+    }
+
+    #[test]
+    fn accesses_that_straddle_pages_respect_both_pages_permissions() {
+        let m = GuestMemory::new();
+        m.map(0x9000_0000, 0x1000, RW).unwrap();
+        m.map(0x9000_1000, 0x1000, 0).unwrap();
+        m.map(0x9000_2000, 0x1000, RW).unwrap();
+        m.map(0x9000_3000, 0x1000, RO).unwrap();
+        for size in [2u8, 4, 8, 16] {
+            let at = 0x9000_1000 - u64::from(size) / 2;
+            assert_eq!(
+                m.read(at, size, Ordering::Relaxed),
+                Err(FaultKind::Permission),
+                "read of {size} bytes into a page with no access"
+            );
+            assert_eq!(
+                m.write(at, size, 1, Ordering::Relaxed),
+                Err(FaultKind::Permission),
+                "write of {size} bytes into a page with no access"
+            );
+            // The page that does allow the access is untouched by the failed write.
+            assert_eq!(m.read(0x9000_0ff0, 16, Ordering::Relaxed), Ok(0));
+            // Leaving a page with no access is just as much a fault.
+            let at = 0x9000_2000 - u64::from(size) / 2;
+            assert_eq!(
+                m.read(at, size, Ordering::Relaxed),
+                Err(FaultKind::Permission)
+            );
+            // A read crossing from one readable page into a read-only page is allowed, a write is not.
+            let at = 0x9000_3000 - u64::from(size) / 2;
+            assert!(m.read(at, size, Ordering::Relaxed).is_ok());
+            assert_eq!(
+                m.write(at, size, 1, Ordering::Relaxed),
+                Err(FaultKind::Permission)
+            );
+        }
     }
 
     #[test]
