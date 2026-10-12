@@ -271,10 +271,11 @@ mod homebrew {
         p.emit(mov_reg(25, X1));
     }
 
-    /// The NRO's guest code. It prints, grows the heap, starts a thread that increments a shared
-    /// counter 1000 times with exclusive loads and stores while it does the same, waits on an
-    /// event the thread signals, checks the counter, and talks to `sm:`.
-    fn hello_nro() -> Vec<u32> {
+    /// The NRO's guest code and the address of its worker thread. It prints, grows the heap,
+    /// starts a thread that increments a shared counter 1000 times with exclusive loads and stores
+    /// while it does the same, waits on an event the thread signals, checks the counter, and talks
+    /// to `sm:`.
+    fn hello_nro() -> (Vec<u32>, u64) {
         let mut p = Prog::new(GUEST_BASE + CODE_OFF as u64);
         p.emit(mov_reg(19, X0)); // the loader configuration
         print(&mut p, "hello", "hello from a homebrew NRO\n");
@@ -367,7 +368,8 @@ mod homebrew {
         data_string(&mut p, "done", "done\n");
         data_string(&mut p, "failed", "FAILED\n");
         data_string(&mut p, "sm_name", "sm:");
-        p.finish()
+        let worker = p.addr_of("worker");
+        (p.finish(), worker)
     }
 
     fn nro_program(code: Vec<u32>) -> Program {
@@ -384,14 +386,23 @@ mod homebrew {
         }
     }
 
-    #[test]
-    fn a_homebrew_nro_prints_runs_threads_and_talks_to_the_service_manager() {
+    /// Build and run `hello_nro`. Only `ADR` refers to the worker, so the analysis does not find
+    /// it by itself: with `worker_is_native` its address is given as a root (the `--hints` of the
+    /// command line) and the thread runs compiled code; without it the thread starts in the slow
+    /// path and runs interpreted, racing the compiled main thread.
+    fn run_hello(worker_is_native: bool, name: &str) {
         let Some(tc) = toolchain_or_skip() else {
             return;
         };
-        let program = nro_program(hello_nro());
-        let dir = TempDir::new("e2e-nro");
-        let report = build(&program, &tc, &BuildOptions::new(dir.path(), "hello")).unwrap();
+        let (code, worker) = hello_nro();
+        let program = nro_program(code);
+        let dir = TempDir::new(name);
+        let mut options = BuildOptions::new(dir.path(), "hello");
+        if worker_is_native {
+            options.hints = vec![worker];
+        }
+        let report = build(&program, &tc, &options).unwrap();
+        assert_eq!(report.functions, if worker_is_native { 2 } else { 1 });
         let out = run(&report.exe);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(
@@ -404,6 +415,16 @@ mod homebrew {
             String::from_utf8_lossy(&out.stdout),
             "hello from a homebrew NRO\ncounter ok\nsm ok\ndone\n"
         );
+    }
+
+    #[test]
+    fn a_homebrew_nro_prints_runs_threads_and_talks_to_the_service_manager() {
+        run_hello(true, "e2e-nro");
+    }
+
+    #[test]
+    fn a_thread_that_starts_in_the_slow_path_races_compiled_code_correctly() {
+        run_hello(false, "e2e-nro-slow");
     }
 
     #[test]
@@ -456,6 +477,7 @@ mod homebrew {
         let report = build(&program, &tc, &BuildOptions::new(dir.path(), "entry")).unwrap();
         assert_eq!(run(&report.exe).status.code(), Some(42));
     }
+
     #[test]
     fn exit_process_ends_the_program_while_another_thread_still_runs() {
         let Some(tc) = toolchain_or_skip() else {
