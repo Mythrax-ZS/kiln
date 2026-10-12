@@ -14,6 +14,9 @@ crate-type = ["rlib", "staticlib"]
 # Test-only helpers (temp dirs, PRNG, A64 assembler) used to build synthetic fixtures.
 testing = []
 
+[dependencies]
+nx_gpu = { path = "../nx_gpu" }
+
 [dev-dependencies]
 libloading = "0.8"
 # Enables the `testing` helpers for this crate's own integration tests.

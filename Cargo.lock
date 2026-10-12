@@ -81,6 +81,7 @@ name = "nx_runtime"
 version = "0.1.0"
 dependencies = [
  "libloading",
+ "nx_gpu",
  "nx_runtime",
 ]
 

@@ -9,7 +9,9 @@ mod apm;
 mod applet;
 mod fsp;
 mod lm;
+mod nvdrv;
 mod pctl;
+mod vi;
 
 use super::kernel::Kernel;
 use super::service::Service;
@@ -38,6 +40,11 @@ pub fn implemented_names() -> Vec<String> {
 /// kernel itself answers.
 pub fn register_defaults(kernel: &Arc<Kernel>) {
     let applet = applet::Shared::default();
+    let display = Arc::new(vi::Shared::new());
+    applet.lock().unwrap_or_else(|e| e.into_inner()).display = Some(display.clone());
+    register(kernel, "vi:u", move |k| {
+        vi::RootService::new(k, display.clone())
+    });
     register(kernel, "appletOE", move |k| {
         applet::AppletOe::new(k, applet.clone())
     });
@@ -48,5 +55,7 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
         fsp::FileSystemProxy::new(k, fs.clone())
     });
     register(kernel, "lm", lm::LogService::new);
+    let gpu = Arc::new(nvdrv::Shared::new());
+    register(kernel, "nvdrv", move |k| nvdrv::NvDrv::new(k, gpu.clone()));
     register(kernel, "pctl", pctl::Factory::new);
 }

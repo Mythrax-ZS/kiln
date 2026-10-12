@@ -1686,3 +1686,334 @@ fn a_storage_the_program_creates_holds_what_it_writes() {
     pop.payload = 1u32.to_le_bytes().to_vec();
     assert_eq!(e.call(functions, &pop).result, ResultCode::new(128, 2).0);
 }
+
+// ---------------------------------------------------------------------------------------------
+// nvdrv
+// ---------------------------------------------------------------------------------------------
+
+impl Env {
+    /// `nvdrv`, initialized the way `libnx` does (process and transfer memory handles).
+    fn nvdrv(&mut self) -> u64 {
+        super::services::register_defaults(&self.kernel);
+        let nv = self.service("nvdrv");
+        let mut init = Message::new(3);
+        init.copy_handles = vec![CURRENT_PROCESS, CURRENT_PROCESS];
+        init.payload = 0x80_0000u32.to_le_bytes().to_vec();
+        let r = self.call(nv, &init);
+        assert_eq!((r.result, r.data), (0, vec![0; 4]));
+        nv
+    }
+
+    /// `Open` a device by path; returns `(fd, nv error)`.
+    fn nv_open(&mut self, nv: u64, path: &str) -> (u32, u32) {
+        self.write(SCRATCH + 0x800, path.as_bytes());
+        let mut open = Message::new(0);
+        open.send = vec![(SCRATCH + 0x800, path.len() as u64)];
+        let r = self.call(nv, &open);
+        assert_eq!(r.result, 0);
+        let word = |i: usize| u32::from_le_bytes(r.data[i..i + 4].try_into().unwrap());
+        (word(0), word(4))
+    }
+
+    /// `Ioctl` with the argument struct in guest memory at `SCRATCH + 0x1000`: it is sent and read
+    /// back as the number says. Returns the nv error and the struct as the driver left it.
+    fn nv_ioctl(&mut self, nv: u64, fd: u32, code: u32, args: &[u8]) -> (u32, Vec<u8>) {
+        let size = ((code >> 16) & 0x3FFF) as usize;
+        let at = SCRATCH + 0x1000;
+        let mut buf = args.to_vec();
+        buf.resize(size, 0);
+        self.write(at, &buf);
+        let mut m = Message::new(1);
+        m.payload = [fd.to_le_bytes(), code.to_le_bytes()].concat();
+        m.send = vec![(at, if code >> 30 & 1 != 0 { size as u64 } else { 0 })];
+        m.receive = vec![(at, if code >> 30 & 2 != 0 { size as u64 } else { 0 })];
+        let r = self.call(nv, &m);
+        assert_eq!(r.result, 0);
+        (
+            u32::from_le_bytes(r.data[..4].try_into().unwrap()),
+            self.read(at, size),
+        )
+    }
+}
+
+#[test]
+fn memory_handles_are_created_and_backed_through_the_driver_service() {
+    let mut e = Env::new();
+    let nv = e.nvdrv();
+    let (fd, err) = e.nv_open(nv, "/dev/nvmap");
+    assert_eq!((fd, err), (1, 0));
+    // NVMAP_IOC_CREATE(size) -> handle
+    let (err, out) = e.nv_ioctl(nv, fd, 0xC008_0101, &0x4000u32.to_le_bytes());
+    assert_eq!(err, 0);
+    let handle = u32::from_le_bytes(out[4..8].try_into().unwrap());
+    assert_eq!(handle, 1);
+    // NVMAP_IOC_PARAM(handle, SIZE) -> 0x4000
+    let mut param = Vec::new();
+    param.extend_from_slice(&handle.to_le_bytes());
+    param.extend_from_slice(&1u32.to_le_bytes());
+    let (err, out) = e.nv_ioctl(nv, fd, 0xC00C_0109, &param);
+    assert_eq!(err, 0);
+    assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 0x4000);
+    // A failure is the driver's error code, not a failed request.
+    let (err, _) = e.nv_ioctl(nv, fd, 0xC00C_0109, &[9, 0, 0, 0, 1, 0, 0, 0]);
+    assert_eq!(err, 0xB, "BadValue for a handle that does not exist");
+    // Closing twice: the second is an error code too.
+    let mut close = Message::new(2);
+    close.payload = fd.to_le_bytes().to_vec();
+    assert_eq!(e.call(nv, &close).data, [0, 0, 0, 0]);
+    assert_eq!(e.call(nv, &close).data, [4, 0, 0, 0]);
+}
+
+#[test]
+fn a_syncpoint_event_comes_through_a_kernel_event_handle() {
+    let mut e = Env::new();
+    let nv = e.nvdrv();
+    let (ctrl, _) = e.nv_open(nv, "/dev/nvhost-ctrl");
+    // SYNCPT_ALLOC_EVENT(slot 3), then QueryEvent(0x10000003) -> the event.
+    let (err, _) = e.nv_ioctl(nv, ctrl, 0xC004_001F, &3u32.to_le_bytes());
+    assert_eq!(err, 0);
+    let mut query = Message::new(4);
+    query.payload = [ctrl.to_le_bytes(), 0x1000_0003u32.to_le_bytes()].concat();
+    let r = e.call(nv, &query);
+    assert_eq!((r.result, r.data.clone()), (0, vec![0; 4]));
+    let event = r.copied[0];
+    e.write(SCRATCH + 0x400, &event.to_le_bytes());
+    // SYNCPT_WAIT_EVENT_EX(syncpoint 5, threshold 1, timeout, slot 3): not reached yet.
+    let wait = [5u32, 1, 0, 3]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
+    let (err, out) = e.nv_ioctl(nv, ctrl, 0xC010_001E, &wait);
+    assert_eq!(err, 5, "Timeout: wait on the event");
+    assert_eq!(
+        u32::from_le_bytes(out[12..16].try_into().unwrap()),
+        3 | (5 << 4)
+    );
+    e.svc(0x18, &[0, SCRATCH + 0x400, 1, 0]);
+    assert_eq!(e.r(), err::TIMED_OUT.0, "not signalled");
+    // The CPU increments the syncpoint: the event is signalled.
+    let (err, _) = e.nv_ioctl(nv, ctrl, 0x4004_0015, &5u32.to_le_bytes());
+    assert_eq!(err, 0);
+    e.svc(0x18, &[0, SCRATCH + 0x400, 1, 0]);
+    assert_eq!((e.r(), e.x(1)), (0, 0), "signalled");
+}
+
+#[test]
+fn a_device_the_driver_does_not_have_stops_the_run() {
+    let mut e = Env::new();
+    let nv = e.nvdrv();
+    e.write(SCRATCH + 0x800, b"/dev/nvhost-nvdec");
+    let mut open = Message::new(0);
+    open.send = vec![(SCRATCH + 0x800, 17)];
+    assert!(e.send(nv, &open.bytes(), false).is_none());
+    match e.kernel.exit_state() {
+        Some(Exit::Fatal(m)) => assert!(m.contains("/dev/nvhost-nvdec"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn an_ioctl_nobody_implemented_stops_the_run_with_its_number() {
+    let mut e = Env::new();
+    let nv = e.nvdrv();
+    let (fd, _) = e.nv_open(nv, "/dev/nvmap");
+    let mut m = Message::new(1);
+    m.payload = [fd.to_le_bytes(), 0xC028_0106u32.to_le_bytes()].concat();
+    m.send = vec![(SCRATCH + 0x1000, 0x28)];
+    m.receive = vec![(SCRATCH + 0x1000, 0x28)];
+    assert!(e.send(nv, &m.bytes(), false).is_none());
+    match e.kernel.exit_state() {
+        Some(Exit::Fatal(m)) => assert!(m.contains("0xc0280106"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// vi and the binder driver
+// ---------------------------------------------------------------------------------------------
+
+/// A flattened graphic buffer as libnx writes one: the nvmap id is the second word of the native
+/// handle.
+fn flat_graphic_buffer(nvmap_id: u32) -> Vec<u8> {
+    let mut ints = vec![0u32; 51];
+    ints[1] = nvmap_id;
+    ints[3] = 0xDAFF_CAFF;
+    let mut b = Vec::new();
+    for v in [0x4742_4652u32, 1280, 720, 1280, 1, 0xB00, 42, 0, 0, 51] {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in ints {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
+fn binder_parcel(f: impl FnOnce(&mut nx_gpu::parcel::ParcelWriter)) -> Vec<u8> {
+    let mut w = nx_gpu::parcel::ParcelWriter::new();
+    w.write_interface_token("android.gui.IGraphicBufferProducer");
+    f(&mut w);
+    w.finish()
+}
+
+impl Env {
+    /// A binder transaction: the parcel goes in at `SCRATCH + 0x1800`, the reply comes back from
+    /// `SCRATCH + 0x2000` as the data of its parcel.
+    fn transact(&mut self, binder: u64, id: i32, code: u32, parcel: &[u8]) -> Vec<u8> {
+        self.write(SCRATCH + 0x1800, parcel);
+        let mut m = Message::new(3);
+        m.payload = [id.to_le_bytes(), code.to_le_bytes(), 0u32.to_le_bytes()].concat();
+        m.send = vec![(SCRATCH + 0x1800, parcel.len() as u64)];
+        m.receive = vec![(SCRATCH + 0x2000, 0x400)];
+        let r = self.call(binder, &m);
+        assert_eq!(r.result, 0);
+        let reply = self.read(SCRATCH + 0x2000, 0x400);
+        let size = u32::from_le_bytes(reply[0..4].try_into().unwrap()) as usize;
+        reply[16..16 + size].to_vec()
+    }
+}
+
+#[test]
+fn a_layer_is_created_and_its_buffer_queue_runs_through_the_binder_driver() {
+    use nx_gpu::parcel::ParcelReader;
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let root = e.service("vi:u");
+    // GetDisplayService(0) -> IApplicationDisplayService; a privileged session is not offered.
+    let mut get = Message::new(0);
+    get.payload = 0u32.to_le_bytes().to_vec();
+    let display = u64::from(e.call(root, &get).moved[0]);
+    get.payload = 1u32.to_le_bytes().to_vec();
+    assert_eq!(e.call(root, &get).result, ResultCode::new(114, 5).0);
+    // GetRelayService -> IHOSBinderDriver; the system and manager displays are not available.
+    let binder = u64::from(e.call(display, &Message::new(100)).moved[0]);
+    assert_eq!(e.call(display, &Message::new(101)).result, 0xA72);
+    // OpenDisplay("Default") -> display id, then its resolution.
+    let mut open = Message::new(1010);
+    open.payload = {
+        let mut name = vec![0u8; 0x40];
+        name[..7].copy_from_slice(b"Default");
+        name
+    };
+    let id = e.call(display, &open).data;
+    let mut res = Message::new(1102);
+    res.payload = id.clone();
+    let r = e.call(display, &res);
+    assert_eq!(&r.data[..8], &1280u64.to_le_bytes());
+    assert_eq!(&r.data[8..16], &720u64.to_le_bytes());
+    // CreateStrayLayer(flags, display id) -> layer id and the native window in the buffer.
+    let mut stray = Message::new(2030);
+    stray.payload = [0u32.to_le_bytes().to_vec(), vec![0; 4], id.clone()].concat();
+    stray.receive = vec![(SCRATCH + 0x400, 0x100)];
+    let r = e.call(display, &stray);
+    assert_eq!(r.result, 0);
+    let size = u64::from_le_bytes(r.data[8..16].try_into().unwrap()) as usize;
+    let window = e.read(SCRATCH + 0x400, size);
+    let mut w = ParcelReader::parse(&window).unwrap();
+    w.read_u32();
+    w.read_u32();
+    let bq = w.read_i32().unwrap();
+    assert_eq!(bq, 1, "the first layer's binder id");
+
+    // GetNativeHandle(id, 0xF) -> the event of free buffers: nothing is free yet.
+    let mut native = Message::new(2);
+    native.payload = [bq.to_le_bytes(), 0xFu32.to_le_bytes()].concat();
+    let event = e.call(binder, &native).copied[0];
+    e.write(SCRATCH + 0x600, &event.to_le_bytes());
+    e.svc(0x18, &[0, SCRATCH + 0x600, 1, 0]);
+    assert_eq!(e.r(), err::TIMED_OUT.0);
+
+    // connect(no listener, api 2, not controlled by the app) -> the layer size and status 0.
+    let reply = e.transact(
+        binder,
+        bq,
+        10,
+        &binder_parcel(|w| {
+            w.write_i32(0);
+            w.write_i32(2);
+            w.write_i32(0);
+        }),
+    );
+    assert_eq!(reply.len(), 20);
+    assert_eq!(&reply[..8], &[0x00, 0x05, 0, 0, 0xD0, 0x02, 0, 0]);
+    assert_eq!(&reply[16..], &[0, 0, 0, 0]);
+
+    // Two buffers registered make the event signalled.
+    for slot in 0..2 {
+        let parcel = binder_parcel(|w| {
+            w.write_i32(slot);
+            w.write_i32(1);
+            w.write_flattened(&flat_graphic_buffer(10 + slot as u32));
+        });
+        e.transact(binder, bq, 14, &parcel);
+    }
+    e.svc(0x18, &[0, SCRATCH + 0x600, 1, 0]);
+    assert_eq!((e.r(), e.x(1)), (0, 0));
+
+    // dequeueBuffer -> slot 0, a fence of no entries, status 0; queueBuffer shows it.
+    let dequeue = binder_parcel(|w| {
+        w.write_i32(1);
+        w.write_u32(1280);
+        w.write_u32(720);
+        w.write_i32(1);
+        w.write_u32(0xB00);
+    });
+    let reply = e.transact(binder, bq, 3, &dequeue);
+    assert_eq!(i32::from_le_bytes(reply[..4].try_into().unwrap()), 0);
+    let status = i32::from_le_bytes(reply[reply.len() - 4..].try_into().unwrap());
+    assert_eq!(status, 0);
+    let queue = binder_parcel(|w| {
+        w.write_i32(0);
+        w.write_flattened(&[0u8; 84]);
+    });
+    let reply = e.transact(binder, bq, 7, &queue);
+    assert_eq!(i32::from_le_bytes(reply[16..20].try_into().unwrap()), 0);
+    // A transaction the queue does not implement stops the run and names the code.
+    let mut m = Message::new(3);
+    m.payload = [bq.to_le_bytes(), 4u32.to_le_bytes(), 0u32.to_le_bytes()].concat();
+    let p = binder_parcel(|w| w.write_i32(0));
+    e.write(SCRATCH + 0x1800, &p);
+    m.send = vec![(SCRATCH + 0x1800, p.len() as u64)];
+    m.receive = vec![(SCRATCH + 0x2000, 0x400)];
+    assert!(e.send(binder, &m.bytes(), false).is_none());
+    match e.kernel.exit_state() {
+        Some(Exit::Fatal(m)) => assert!(m.contains("transaction 4"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_managed_layer_from_the_applet_manager_can_be_opened_with_its_id() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let applet = e.service("appletOE");
+    let mut open = Message::new(0);
+    open.pid = true;
+    open.copy_handles = vec![CURRENT_PROCESS];
+    open.payload = vec![0; 8];
+    let proxy = u64::from(e.call(applet, &open).moved[0]);
+    let self_controller = u64::from(e.call(proxy, &Message::new(1)).moved[0]);
+    // CreateManagedDisplayLayer() -> u64 layer id
+    let r = e.call(self_controller, &Message::new(40));
+    assert_eq!(r.result, 0);
+    let layer = u64::from_le_bytes(r.data[..8].try_into().unwrap());
+
+    let root = e.service("vi:u");
+    let mut get = Message::new(0);
+    get.payload = 0u32.to_le_bytes().to_vec();
+    let display = u64::from(e.call(root, &get).moved[0]);
+    // OpenLayer(DisplayName, layer id, aruid, pid) -> the native window
+    let mut name = vec![0u8; 0x40];
+    name[..7].copy_from_slice(b"Default");
+    let mut open_layer = Message::new(2020);
+    open_layer.pid = true;
+    open_layer.payload = [name, layer.to_le_bytes().to_vec(), vec![0; 8]].concat();
+    open_layer.receive = vec![(SCRATCH + 0x400, 0x100)];
+    let r = e.call(display, &open_layer);
+    assert_eq!(r.result, 0);
+    assert_eq!(u64::from_le_bytes(r.data[..8].try_into().unwrap()), 0x3C);
+    let window = e.read(SCRATCH + 0x400, 0x3C);
+    assert_eq!(&window[16 + 24..16 + 32], b"dispdrv\0");
+    // A layer nobody created is not opened out of thin air.
+    open_layer.payload = [vec![0u8; 0x40], 99u64.to_le_bytes().to_vec(), vec![0; 8]].concat();
+    assert!(e.send(display, &open_layer.bytes(), false).is_none());
+}

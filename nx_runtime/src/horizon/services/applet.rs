@@ -44,6 +44,8 @@ pub struct AppletState {
     audio_volume: [f32; 2],
     /// The first `OpenApplicationProxy` queues the message an application starts with.
     started: bool,
+    /// The display the program's layers are made on (`CreateManagedDisplayLayer`).
+    pub display: Option<Arc<super::vi::Shared>>,
 }
 
 pub type Shared = Arc<Mutex<AppletState>>;
@@ -239,6 +241,18 @@ impl Service for SelfController {
             // SetPerformanceModeChangedNotification(bool), SetFocusHandlingMode(3 x bool),
             // SetRestartMessageEnabled(bool), SetOutOfFocusSuspendingEnabled(bool)
             10..=14 | 16 => Ok(Response::ok()),
+            // CreateManagedDisplayLayer() -> u64 layer id, for `vi`'s OpenLayer
+            40 => {
+                let display = lock(&self.shared).display.clone();
+                let Some(display) = display else {
+                    return Err(Stop("a layer was asked for but there is no display".into()));
+                };
+                let mut comp = display.comp();
+                let Some(d) = comp.open_display("Default") else {
+                    return Err(Stop("the default display cannot be opened".into()));
+                };
+                Ok(Response::ok().with_u64(comp.create_layer(d)))
+            }
             other => Err(Stop::unknown_command("ISelfController", other)),
         }
     }
