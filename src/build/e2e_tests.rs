@@ -207,7 +207,7 @@ mod homebrew {
     fn data_string(p: &mut Prog, label: &str, text: &str) {
         p.label(label);
         let mut bytes = text.as_bytes().to_vec();
-        while bytes.len() % 4 != 0 {
+        while !bytes.len().is_multiple_of(4) {
             bytes.push(0);
         }
         for c in bytes.chunks(4) {
