@@ -132,9 +132,51 @@ impl Kernel {
     /// Stop the run for a reason that is the program's or this runtime's, with the report.
     fn stop_run(&self, cpu: &mut NativeCpu, message: String) -> Flow {
         let pc = cpu.state.pc.wrapping_sub(4);
-        self.fatal(format!("{message} (SVC at {pc:#x})"));
+        let stack = self.guest_call_stack(cpu);
+        let stack = if stack.is_empty() {
+            String::new()
+        } else {
+            let frames: Vec<String> = stack.iter().map(|a| format!("{a:#x}")).collect();
+            format!("; return addresses up the stack: {}", frames.join(" "))
+        };
+        self.fatal(format!("{message} (SVC at {pc:#x}){stack}"));
         record_stop(cpu, stop::UNIMPLEMENTED, pc, 0);
         Flow::Stop
+    }
+
+    /// The return addresses of the thread's frames, innermost first, found by following the frame
+    /// pointer chain (`x29` points at a saved `x29` and `x30`, as the compilers of Horizon
+    /// programs lay out their frames). The walk stops at the first pointer that does not look like
+    /// a frame.
+    fn guest_call_stack(&self, cpu: &NativeCpu) -> Vec<u64> {
+        let mut out = Vec::new();
+        // A value that is not an address of the 39-bit space is a marker (the return address of
+        // a thread entry point, say), not a place in the program.
+        let plausible = |a: u64| a != 0 && a < 1 << 39;
+        if plausible(cpu.state.x[30]) {
+            out.push(cpu.state.x[30]);
+        }
+        let mut fp = cpu.state.x[29];
+        for _ in 0..24 {
+            if fp == 0 || !fp.is_multiple_of(8) {
+                break;
+            }
+            let mut frame = [0u8; 16];
+            if !self.read_memory(fp, &mut frame) {
+                break;
+            }
+            let next = u64::from_le_bytes(frame[..8].try_into().unwrap_or([0; 8]));
+            let lr = u64::from_le_bytes(frame[8..].try_into().unwrap_or([0; 8]));
+            if !plausible(lr) {
+                break;
+            }
+            out.push(lr);
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+        out
     }
 
     /// Execute `SVC #imm` for `thread`. On entry `cpu.state.pc` is the instruction after it.
@@ -157,6 +199,9 @@ impl Kernel {
                 "[svc] thread {thread} at {pc:#x}: {name} ({imm:#x}) x0..x3 = {:#x} {:#x} {:#x} {:#x} (may block)",
                 args[0], args[1], args[2], args[3]
             );
+            if imm == 0x18 {
+                self.trace_wait_list(thread, args[1], args[2]);
+            }
         }
         let flow = self.svc_dispatch(cpu, thread, imm);
         eprintln!(
@@ -170,6 +215,28 @@ impl Kernel {
             if flow == Flow::Stop { " (stop)" } else { "" }
         );
         flow
+    }
+
+    /// Trace what a `WaitSynchronization` waits on: each handle and the object it names.
+    fn trace_wait_list(&self, thread: u64, list: u64, count: u64) {
+        let count = (count as u32 as i32).clamp(0, 0x40) as usize;
+        let mut raw = vec![0u8; 4 * count];
+        if count == 0 || !self.read_memory(list, &mut raw) {
+            return;
+        }
+        let waits: Vec<String> = raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| {
+                let h = u32::from_le_bytes(*c);
+                match self.object(h, thread) {
+                    Some(o) => format!("{h:#x} ({o:?})"),
+                    None => format!("{h:#x} (no object)"),
+                }
+            })
+            .collect();
+        eprintln!("[svc]   thread {thread} waits on {}", waits.join(", "));
     }
 
     fn svc_dispatch(self: &Arc<Kernel>, cpu: &mut NativeCpu, thread: u64, imm: u32) -> Flow {

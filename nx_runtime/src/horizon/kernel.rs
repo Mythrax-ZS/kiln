@@ -645,6 +645,9 @@ impl Kernel {
         let mut st = self.lock();
         let index = st.events.len();
         st.events.push(Event { signaled: false });
+        if self.trace {
+            eprintln!("[evt] event {index} made for a service");
+        }
         (KObject::WritableEvent(index), KObject::ReadableEvent(index))
     }
 
