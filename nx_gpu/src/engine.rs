@@ -8,6 +8,7 @@
 use crate::event::EventToken;
 use crate::gpu::class;
 use crate::mem::GuestMemory;
+use crate::mme;
 use crate::names;
 use crate::syncpt::Syncpoints;
 use crate::vm::AddressSpace;
@@ -15,6 +16,26 @@ use std::collections::BTreeMap;
 
 /// How many registers (words) an engine has: methods are 12 bits wide.
 pub const REGISTERS: usize = 0x1000;
+
+/// The draws and clears the 3D engine was asked for. Nothing is drawn: this is what a renderer
+/// would be given.
+#[derive(Debug, Default)]
+pub struct DrawStats {
+    /// Draws by the method that started them.
+    pub by_kind: BTreeMap<&'static str, u64>,
+    /// The vertices or indices the draws named, in all.
+    pub elements: u64,
+    /// `CLEAR_SURFACE` writes.
+    pub clears: u64,
+    /// The first draws, each described (kept for the report).
+    pub first: Vec<String>,
+}
+
+impl DrawStats {
+    pub fn draws(&self) -> u64 {
+        self.by_kind.values().sum()
+    }
+}
 
 /// What the processor counted.
 #[derive(Debug, Default)]
@@ -27,6 +48,11 @@ pub struct Stats {
     pub per_method: BTreeMap<(u32, u32), u64>,
     /// Macro calls per macro number: (calls, parameters).
     pub macro_calls: BTreeMap<u32, (u64, u64)>,
+    /// Instructions the macros ran.
+    pub macro_steps: u64,
+    /// Method writes the macros made, per (class, byte offset of the method).
+    pub macro_writes: BTreeMap<(u32, u32), u64>,
+    pub draws: DrawStats,
     pub semaphore_releases: u64,
 }
 
@@ -60,6 +86,33 @@ impl Stats {
                     "  {calls:>8} x macro {id} ({params} parameters in all)\n"
                 ));
             }
+            let written: u64 = self.macro_writes.values().sum();
+            s.push_str(&format!(
+                "  macros ran {} instructions and wrote {written} methods, most often:\n",
+                self.macro_steps
+            ));
+            let mut by_count: Vec<_> = self.macro_writes.iter().collect();
+            by_count.sort_by_key(|(k, c)| (std::cmp::Reverse(**c), **k));
+            for ((class_num, offset), count) in by_count.into_iter().take(top) {
+                s.push_str(&format!(
+                    "  {count:>8} x {} {}\n",
+                    names::class_name(*class_num),
+                    names::method_name(*class_num, *offset)
+                ));
+            }
+        }
+        let d = &self.draws;
+        s.push_str(&format!(
+            "  draws: {} ({} elements named), clears: {}\n",
+            d.draws(),
+            d.elements,
+            d.clears
+        ));
+        for (kind, count) in &d.by_kind {
+            s.push_str(&format!("  {count:>8} x {kind}\n"));
+        }
+        for first in &d.first {
+            s.push_str(&format!("  first draws: {first}\n"));
         }
         s
     }
@@ -132,6 +185,25 @@ mod m3d {
     /// `CALL_MME_MACRO(j)` is `0x3800 + 8 j`, `CALL_MME_DATA(j)` is `0x3804 + 8 j`.
     pub const CALL_MME_FIRST: u32 = 0x3800 / 4;
     pub const CALL_MME_LAST: u32 = 0x3ffc / 4;
+    // Draws.
+    pub const DRAW_ZERO_INDEX: u32 = 0x304 / 4;
+    pub const SET_VERTEX_ARRAY_START: u32 = 0xd74 / 4;
+    pub const DRAW_VERTEX_ARRAY: u32 = 0xd78 / 4;
+    pub const DRAW_VERTEX_ARRAY_BEGIN_END_FIRST: u32 = 0x1214 / 4;
+    pub const DRAW_VERTEX_ARRAY_BEGIN_END_SUBSEQUENT: u32 = 0x1218 / 4;
+    pub const DRAW_AUTO: u32 = 0x123c / 4;
+    pub const DRAW_INLINE_INDEX4X8: u32 = 0x1304 / 4;
+    pub const DRAW_INLINE_INDEX: u32 = 0x15e8 / 4;
+    pub const DRAW_INLINE_INDEX2X16: u32 = 0x15f0 / 4;
+    pub const END: u32 = 0x1614 / 4;
+    pub const BEGIN: u32 = 0x1618 / 4;
+    pub const DRAW_INLINE_VERTEX: u32 = 0x1640 / 4;
+    pub const DRAW_INDEX_BUFFER: u32 = 0x17e0 / 4;
+    /// `DRAW_INDEX_BUFFER32/16/8_BEGIN_END_INSTANCE_FIRST` then the same three `_SUBSEQUENT`.
+    pub const DRAW_INDEX_BEGIN_END_FIRST: u32 = 0x17e4 / 4;
+    pub const DRAW_INDEX_BEGIN_END_LAST: u32 = 0x17f8 / 4;
+    pub const CLEAR_SURFACE: u32 = 0x19d0 / 4;
+    pub const SET_COLOR_TARGET_A: u32 = 0x800 / 4;
 }
 
 #[derive(Debug)]
@@ -141,6 +213,74 @@ pub struct Engine {
     pub mme: Mme,
     /// A macro call being collected: its number and the parameters so far.
     pending: Option<(u32, Vec<u32>)>,
+    /// The macro that is running, while one is.
+    running: Option<u32>,
+    /// The primitive type of the last `BEGIN`.
+    topology: u32,
+    /// Vertices or indices sent inline since the last `BEGIN`.
+    inline_elements: u32,
+}
+
+/// The name of a primitive type (`BEGIN`'s operation; the topology field of the combined draws).
+fn topology_name(op: u32) -> String {
+    const NAMES: [&str; 15] = [
+        "points",
+        "lines",
+        "line loop",
+        "line strip",
+        "triangles",
+        "triangle strip",
+        "triangle fan",
+        "quads",
+        "quad strip",
+        "polygon",
+        "line list with adjacency",
+        "line strip with adjacency",
+        "triangle list with adjacency",
+        "triangle strip with adjacency",
+        "patches",
+    ];
+    NAMES
+        .get(op as usize)
+        .map_or_else(|| format!("primitive {op}"), |n| (*n).to_string())
+}
+
+/// What a macro sees of the engine it runs in.
+struct MacroHost<'a, 'b> {
+    engine: &'a mut Engine,
+    cx: &'a mut Cx<'b>,
+    id: u32,
+}
+
+impl mme::Host for MacroHost<'_, '_> {
+    fn state(&mut self, method: u32) -> u32 {
+        self.engine.reg(method / 4)
+    }
+
+    fn emit(&mut self, method: u32, data: u32) -> Result<(), String> {
+        let word = method / 4;
+        if (m3d::CALL_MME_FIRST..=m3d::CALL_MME_LAST).contains(&word) {
+            return Err(format!(
+                "macro {} called a macro (a write to {})",
+                self.id,
+                names::method_name(class::THREED, method)
+            ));
+        }
+        *self
+            .cx
+            .stats
+            .macro_writes
+            .entry((class::THREED, method))
+            .or_default() += 1;
+        if self.cx.level >= 2 {
+            eprintln!(
+                "[gpu]   macro {} writes {} = {data:#x}",
+                self.id,
+                names::method_name(class::THREED, method)
+            );
+        }
+        self.engine.write(self.cx, word, data, false)
+    }
 }
 
 impl Engine {
@@ -150,6 +290,9 @@ impl Engine {
             regs: vec![0; REGISTERS],
             mme: Mme::default(),
             pending: None,
+            running: None,
+            topology: 0,
+            inline_elements: 0,
         }
     }
 
@@ -209,7 +352,7 @@ impl Engine {
                 if (method - m3d::CALL_MME_FIRST).is_multiple_of(2) {
                     // A call begins: a call still open is finished first.
                     if self.pending.is_some() {
-                        self.finish_macro(cx);
+                        self.finish_macro(cx)?;
                     }
                     self.pending = Some((j, vec![data]));
                 } else {
@@ -223,29 +366,139 @@ impl Engine {
                     }
                 }
                 if last {
-                    self.finish_macro(cx);
+                    self.finish_macro(cx)?;
                 }
             }
+            m3d::BEGIN => {
+                self.topology = data & 0xFFFF;
+                self.inline_elements = 0;
+            }
+            // Vertices and indices sent in the method stream are drawn when the primitive ends.
+            m3d::DRAW_INLINE_VERTEX | m3d::DRAW_INLINE_INDEX => self.inline_elements += 1,
+            m3d::DRAW_INLINE_INDEX2X16 => self.inline_elements += 2,
+            m3d::DRAW_INLINE_INDEX4X8 => self.inline_elements += 4,
+            m3d::END => {
+                if self.inline_elements > 0 {
+                    let count = std::mem::take(&mut self.inline_elements);
+                    self.note_draw(cx, "inline vertices or indices", 0, count, self.topology);
+                }
+            }
+            m3d::DRAW_VERTEX_ARRAY => {
+                let first = self.reg(m3d::SET_VERTEX_ARRAY_START);
+                self.note_draw(cx, "DRAW_VERTEX_ARRAY", first, data, self.topology);
+            }
+            m3d::DRAW_VERTEX_ARRAY_BEGIN_END_FIRST
+            | m3d::DRAW_VERTEX_ARRAY_BEGIN_END_SUBSEQUENT => {
+                let kind = if method == m3d::DRAW_VERTEX_ARRAY_BEGIN_END_FIRST {
+                    "DRAW_VERTEX_ARRAY_BEGIN_END_INSTANCE_FIRST"
+                } else {
+                    "DRAW_VERTEX_ARRAY_BEGIN_END_INSTANCE_SUBSEQUENT"
+                };
+                self.note_draw(cx, kind, data & 0xFFFF, (data >> 16) & 0xFFF, data >> 28);
+            }
+            m3d::DRAW_INDEX_BUFFER => {
+                self.note_draw(cx, "DRAW_INDEX_BUFFER", 0, data, self.topology);
+            }
+            m3d::DRAW_INDEX_BEGIN_END_FIRST..=m3d::DRAW_INDEX_BEGIN_END_LAST => {
+                const KINDS: [&str; 6] = [
+                    "DRAW_INDEX_BUFFER32_BEGIN_END_INSTANCE_FIRST",
+                    "DRAW_INDEX_BUFFER16_BEGIN_END_INSTANCE_FIRST",
+                    "DRAW_INDEX_BUFFER8_BEGIN_END_INSTANCE_FIRST",
+                    "DRAW_INDEX_BUFFER32_BEGIN_END_INSTANCE_SUBSEQUENT",
+                    "DRAW_INDEX_BUFFER16_BEGIN_END_INSTANCE_SUBSEQUENT",
+                    "DRAW_INDEX_BUFFER8_BEGIN_END_INSTANCE_SUBSEQUENT",
+                ];
+                let kind = KINDS[(method - m3d::DRAW_INDEX_BEGIN_END_FIRST) as usize];
+                self.note_draw(cx, kind, data & 0xFFFF, (data >> 16) & 0xFFF, data >> 28);
+            }
+            m3d::DRAW_AUTO => self.note_draw(cx, "DRAW_AUTO", 0, data, self.topology),
+            m3d::DRAW_ZERO_INDEX => self.note_draw(cx, "DRAW_ZERO_INDEX", 0, data, self.topology),
+            m3d::CLEAR_SURFACE => cx.stats.draws.clears += 1,
             _ => {}
         }
         Ok(())
     }
 
-    /// A macro call is complete: it is counted (macros are not run yet).
-    fn finish_macro(&mut self, cx: &mut Cx<'_>) {
+    /// A draw was asked for: count it, and describe the first few.
+    fn note_draw(
+        &mut self,
+        cx: &mut Cx<'_>,
+        kind: &'static str,
+        first: u32,
+        count: u32,
+        topology: u32,
+    ) {
+        let d = &mut cx.stats.draws;
+        *d.by_kind.entry(kind).or_default() += 1;
+        d.elements += u64::from(count);
+        let number = d.draws();
+        if number <= 3 {
+            let target = (u64::from(self.reg(m3d::SET_COLOR_TARGET_A) & 0xFF) << 32)
+                | u64::from(self.reg(m3d::SET_COLOR_TARGET_A + 1));
+            let via = match self.running {
+                Some(id) => format!("macro {id}"),
+                None => "the method stream".to_string(),
+            };
+            let text = format!(
+                "#{number} {kind}, {} first {first}, count {count}, color target 0 at {target:#x} \
+                 {}x{}, from {via}",
+                topology_name(topology),
+                self.reg(m3d::SET_COLOR_TARGET_A + 2),
+                self.reg(m3d::SET_COLOR_TARGET_A + 3),
+            );
+            if cx.level >= 1 {
+                eprintln!("[gpu] draw {text}");
+            }
+            d.first.push(text);
+        }
+    }
+
+    /// A macro call is complete: it is counted and run.
+    fn finish_macro(&mut self, cx: &mut Cx<'_>) -> Result<(), String> {
         let Some((id, params)) = self.pending.take() else {
-            return;
+            return Ok(());
         };
         let e = cx.stats.macro_calls.entry(id).or_default();
         e.0 += 1;
         e.1 += params.len() as u64;
+        let Some(start) = self.mme.starts.get(id as usize).copied() else {
+            return Err(format!("macro {id} was called and has no start address"));
+        };
         if cx.level >= 2 {
-            let start = self.mme.starts.get(id as usize).copied().unwrap_or(0);
             eprintln!(
                 "[gpu]   macro {id} (code at {start:#x}) called with {} parameters: {:x?}",
                 params.len(),
                 &params[..params.len().min(8)]
             );
+        }
+        let code = self.mme.code.clone();
+        self.running = Some(id);
+        let outcome = {
+            let mut host = MacroHost {
+                engine: &mut *self,
+                cx: &mut *cx,
+                id,
+            };
+            mme::run(&code, start as usize, &params, &mut host)
+        };
+        self.running = None;
+        match outcome {
+            Ok(summary) => {
+                cx.stats.macro_steps += summary.steps;
+                Ok(())
+            }
+            Err(fault) => {
+                if cx.level >= 1 {
+                    eprintln!(
+                        "[gpu] macro {id} stopped ({fault}); its code from instruction {start}:\n{}",
+                        mme::listing(&code, start as usize, 40)
+                    );
+                }
+                Err(format!(
+                    "macro {id} (code at instruction {start}, {} parameters): {fault}",
+                    params.len()
+                ))
+            }
         }
     }
 
@@ -365,10 +618,34 @@ mod tests {
         });
     }
 
+    /// Load macro code and set the start address of macro `id`.
+    fn load_macro(cx: &mut Cx<'_>, e: &mut Engine, id: u32, at: u32, code: &[u32]) {
+        e.write(cx, 0x114 / 4, at, false).unwrap();
+        for w in code {
+            e.write(cx, 0x118 / 4, *w, false).unwrap();
+        }
+        e.write(cx, 0x11c / 4, id, false).unwrap();
+        e.write(cx, 0x120 / 4, at, false).unwrap();
+    }
+
+    /// A macro that reads `n` parameters and does nothing else.
+    fn reader(n: usize) -> Vec<u32> {
+        use crate::mme::asm::*;
+        let mut code: Vec<u32> = (1..n).map(|_| alu(ADD, LOAD, 2, 0, 0)).collect();
+        match code.last_mut() {
+            Some(last) => *last |= END_NEXT,
+            None => code.push(alu(ADD, MOVE, 2, 0, 0) | END_NEXT),
+        }
+        code.push(alu(ADD, MOVE, 2, 0, 0));
+        code
+    }
+
     #[test]
     fn a_macro_call_collects_its_parameters_until_the_command_ends() {
         let ((), _, stats) = with_cx(|cx| {
             let mut e = Engine::new(class::THREED);
+            load_macro(cx, &mut e, 3, 0, &reader(3));
+            load_macro(cx, &mut e, 0, 8, &reader(1));
             // CALL_MME_MACRO(3) is word 0xE06, CALL_MME_DATA(3) the next.
             e.write(cx, 0xE06, 9, false).unwrap();
             e.write(cx, 0xE07, 1, false).unwrap();
@@ -380,6 +657,105 @@ mod tests {
         });
         assert_eq!(stats.macro_calls.get(&3), Some(&(1, 3)));
         assert_eq!(stats.macro_calls.get(&0), Some(&(1, 1)));
+        assert!(stats.macro_steps > 0);
+    }
+
+    #[test]
+    fn calling_a_macro_that_was_never_loaded_is_an_error() {
+        with_cx(|cx| {
+            let mut e = Engine::new(class::THREED);
+            let err = e.write(cx, 0xE00, 5, true).unwrap_err();
+            assert!(err.contains("no start address"), "{err}");
+        });
+    }
+
+    #[test]
+    fn a_macro_that_misbehaves_names_itself_and_what_went_wrong() {
+        with_cx(|cx| {
+            let mut e = Engine::new(class::THREED);
+            // Reads two parameters and is called with one.
+            load_macro(cx, &mut e, 2, 0, &reader(2));
+            let err = e.write(cx, 0xE04, 1, true).unwrap_err();
+            assert!(
+                err.contains("macro 2") && err.contains("more parameters"),
+                "{err}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_macro_that_draws_is_counted_with_its_primitive_and_where_it_came_from() {
+        use crate::mme::asm::*;
+        let ((), _, stats) = with_cx(|cx| {
+            let mut e = Engine::new(class::THREED);
+            // BEGIN triangles, DRAW_VERTEX_ARRAY with the first parameter as the count, END.
+            let code = [
+                add_imm(MOVE_SET_ADDRESS, 2, 0, address(0x1618, 0) as i32),
+                add_imm(MOVE_EMIT, 3, 0, 4),
+                add_imm(MOVE_SET_ADDRESS, 2, 0, address(0xd78, 0) as i32),
+                alu(OR, MOVE_EMIT, 3, 1, 0),
+                add_imm(MOVE_SET_ADDRESS, 2, 0, address(0x1614, 0) as i32),
+                add_imm(MOVE_EMIT, 3, 0, 0) | END_NEXT,
+                alu(OR, MOVE, 0, 0, 0),
+            ];
+            load_macro(cx, &mut e, 5, 0, &code);
+            // SET_VERTEX_ARRAY_START 30, then the call: 6 vertices.
+            e.write(cx, 0xd74 / 4, 30, false).unwrap();
+            e.write(cx, 0xE0A, 6, true).unwrap();
+            e.write(cx, 0xE0A, 12, true).unwrap();
+        });
+        let d = &stats.draws;
+        assert_eq!(d.draws(), 2);
+        assert_eq!(d.by_kind["DRAW_VERTEX_ARRAY"], 2);
+        assert_eq!(d.elements, 18);
+        assert!(
+            d.first[0].contains("triangles first 30, count 6")
+                && d.first[0].contains("from macro 5"),
+            "{:?}",
+            d.first
+        );
+        // Everything the macro wrote is counted as the macro's, with the methods by name.
+        assert_eq!(stats.macro_writes[&(class::THREED, 0xd78)], 2);
+        assert_eq!(stats.macro_writes[&(class::THREED, 0x1618)], 2);
+        let report = stats.report(8);
+        assert!(report.contains("draws: 2 (18 elements named)"), "{report}");
+        assert!(report.contains("macros ran"), "{report}");
+    }
+
+    #[test]
+    fn draws_in_the_method_stream_are_decoded_too() {
+        let ((), _, stats) = with_cx(|cx| {
+            let mut e = Engine::new(class::THREED);
+            // Combined begin-draw-end: first 3, count 9, triangle strip (5).
+            e.write(cx, 0x1214 / 4, 3 | 9 << 16 | 5 << 28, true)
+                .unwrap();
+            // A 16-bit indexed draw, first 0, count 600, triangles (4).
+            e.write(cx, 0x17e8 / 4, 600 << 16 | 4 << 28, true).unwrap();
+            // A plain indexed draw inside BEGIN/END, and a draw with inline indices.
+            e.write(cx, 0x1618 / 4, 7, true).unwrap();
+            e.write(cx, 0x17e0 / 4, 12, true).unwrap();
+            e.write(cx, 0x1614 / 4, 0, true).unwrap();
+            e.write(cx, 0x1618 / 4, 4, true).unwrap();
+            e.write(cx, 0x15f0 / 4, 1 | 2 << 16, true).unwrap();
+            e.write(cx, 0x1614 / 4, 0, true).unwrap();
+            e.write(cx, 0x19d0 / 4, 0xF0, true).unwrap();
+        });
+        let d = &stats.draws;
+        assert_eq!(d.draws(), 4);
+        assert_eq!(d.elements, 9 + 600 + 12 + 2);
+        assert_eq!(d.clears, 1);
+        assert!(
+            d.first[0].contains("triangle strip first 3, count 9"),
+            "{:?}",
+            d.first
+        );
+        assert!(
+            d.first[0].contains("from the method stream"),
+            "{:?}",
+            d.first
+        );
+        assert_eq!(d.by_kind["DRAW_INDEX_BUFFER16_BEGIN_END_INSTANCE_FIRST"], 1);
+        assert_eq!(d.by_kind["inline vertices or indices"], 1);
     }
 
     #[test]

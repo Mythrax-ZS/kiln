@@ -19,6 +19,7 @@ pub mod event;
 pub mod gpu;
 pub mod mem;
 pub mod methods;
+pub mod mme;
 pub mod names;
 pub mod nvdrv;
 pub mod nvmap;
