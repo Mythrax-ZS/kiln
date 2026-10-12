@@ -1,8 +1,12 @@
 //! Command line interface.
 
 use crate::container::exefs::ExeFs;
+use crate::loader::module::{Module, GUEST_BASE};
+use crate::loader::nso;
 use crate::romfs::{self, RomFs};
+use crate::util::hex_encode;
 use crate::{Error, Result};
+use nx_runtime::npdm::Npdm;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -101,6 +105,17 @@ pub fn inspect(exefs: &std::path::Path, romfs_path: Option<&std::path::Path>) ->
             "warning: ExeFS has no main.npdm; no service access list is available"
         );
     }
+    if fs.contains("main") {
+        describe_main(&mut out, &fs)?;
+    }
+    for name in fs.nso_names() {
+        if name != "main" {
+            describe_other_nso(&mut out, &name, &fs.read(&name)?)?;
+        }
+    }
+    if let Some(bytes) = fs.npdm()? {
+        describe_npdm(&mut out, &bytes)?;
+    }
     if let Some(p) = romfs_path {
         let storage = romfs::open_path(p)?;
         let rom = RomFs::open(storage)?;
@@ -114,6 +129,169 @@ pub fn inspect(exefs: &std::path::Path, romfs_path: Option<&std::path::Path>) ->
         );
     }
     Ok(out)
+}
+
+fn yes_no(b: bool) -> &'static str {
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn describe_module(out: &mut String, m: &Module) {
+    let _ = writeln!(
+        out,
+        "  mapped at {:#x}, {:#x} bytes; build id {}",
+        m.base,
+        m.image.len(),
+        hex_encode(&m.build_id)
+    );
+    for s in &m.segments {
+        let _ = writeln!(
+            out,
+            "  {:<7} {:#010x} +{:#x} {}{}{}",
+            s.name,
+            s.offset,
+            s.size,
+            if s.perm.read { 'r' } else { '-' },
+            if s.perm.write { 'w' } else { '-' },
+            if s.perm.exec { 'x' } else { '-' }
+        );
+    }
+    match &m.mod0 {
+        Some(mod0) => {
+            let _ = writeln!(
+                out,
+                "  MOD0 at {:#x}: dynamic {:#x}, bss {:#x}..{:#x}, eh_frame_hdr {:#x}..{:#x}",
+                mod0.header_offset,
+                mod0.dynamic,
+                mod0.bss_start,
+                mod0.bss_end,
+                mod0.eh_frame_hdr_start,
+                mod0.eh_frame_hdr_end
+            );
+        }
+        None => {
+            let _ = writeln!(out, "  no MOD0 header: nothing was relocated");
+        }
+    }
+    let r = &m.relocs;
+    let _ = writeln!(
+        out,
+        "  relocations: {} relative, {} abs64, {} glob_dat, {} jump_slot; {} unresolved imports, {} unsupported",
+        r.relative,
+        r.abs64,
+        r.glob_dat,
+        r.jump_slot,
+        r.unresolved.len(),
+        r.unsupported.len()
+    );
+    let _ = writeln!(
+        out,
+        "  exported functions: {}; init array {}, fini array {}; DT_INIT {}, DT_FINI {}",
+        m.exports.len(),
+        m.init_array.len(),
+        m.fini_array.len(),
+        yes_no(m.init_fn.is_some()),
+        yes_no(m.fini_fn.is_some())
+    );
+    match m.eh_functions() {
+        Ok(f) => {
+            let bytes: u64 = f.iter().map(|r| r.len).sum();
+            let _ = writeln!(
+                out,
+                "  .eh_frame functions: {} ({} bytes of code); RELATIVE code pointers: {}",
+                f.len(),
+                bytes,
+                m.code_pointers().len()
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(out, "  .eh_frame_hdr could not be read: {e}");
+        }
+    }
+}
+
+fn describe_main(out: &mut String, fs: &ExeFs) -> Result<()> {
+    let bytes = fs.main()?;
+    let loaded = nso::load(&bytes, "main", GUEST_BASE, &nso::LoadOptions::default())?;
+    let h = &loaded.header;
+    let _ = writeln!(out, "main: NSO0, loaded as the phase-one module");
+    describe_module(out, &loaded.module);
+    let _ = writeln!(
+        out,
+        "  segments compressed: text {}, rodata {}, data {}; hashes checked and matching: {}, {}, {}",
+        yes_no(h.compressed(0)),
+        yes_no(h.compressed(1)),
+        yes_no(h.compressed(2)),
+        yes_no(loaded.hash_verified[0]),
+        yes_no(loaded.hash_verified[1]),
+        yes_no(loaded.hash_verified[2])
+    );
+    Ok(())
+}
+
+fn describe_other_nso(out: &mut String, name: &str, bytes: &[u8]) -> Result<()> {
+    let h = nso::NsoHeader::parse(bytes)?;
+    let _ = writeln!(
+        out,
+        "{name}: NSO0, not loaded in phase one; text {:#x}, rodata {:#x}, data {:#x}, bss {:#x} bytes",
+        h.segs[0].size, h.segs[1].size, h.segs[2].size, h.bss_size
+    );
+    Ok(())
+}
+
+fn describe_npdm(out: &mut String, bytes: &[u8]) -> Result<()> {
+    let n = Npdm::parse(bytes)?;
+    let _ = writeln!(
+        out,
+        "main.npdm: name `{}`, program id {:#018x}",
+        n.meta.name, n.program_id
+    );
+    let _ = writeln!(
+        out,
+        "  64-bit {}, address space {:?}, main thread priority {} core {} stack {:#x}",
+        yes_no(n.meta.is_64bit),
+        n.meta.address_space,
+        n.meta.main_thread_priority,
+        n.meta.main_thread_core,
+        n.meta.main_thread_stack_size
+    );
+    n.require_aarch64()?;
+    let k = &n.kernel;
+    let _ = writeln!(
+        out,
+        "  kernel capabilities: {} SVCs enabled, handle table {:?}, program type {:?}, kernel version {:?}",
+        k.svcs.count(),
+        k.handle_table_size,
+        k.program_type,
+        k.kernel_version
+    );
+    let ids: Vec<String> = k.svcs.ids().iter().map(|i| format!("{i:#x}")).collect();
+    let _ = writeln!(out, "  enabled SVCs: {}", ids.join(" "));
+    let (client, server): (Vec<_>, Vec<_>) = n.services.iter().partition(|s| !s.is_server);
+    let names = |v: &[&nx_runtime::npdm::ServiceAccess]| {
+        v.iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let _ = writeln!(
+        out,
+        "  service access list ({} connect): {}",
+        client.len(),
+        names(&client)
+    );
+    if !server.is_empty() {
+        let _ = writeln!(
+            out,
+            "  services it may register ({}): {}",
+            server.len(),
+            names(&server)
+        );
+    }
+    Ok(())
 }
 
 /// Run the CLI. Returns the text to print on success.
@@ -179,26 +357,100 @@ mod tests {
             .contains("--exefs"));
     }
 
+    fn synthetic_nso() -> Vec<u8> {
+        use crate::loader::testing::{build_nso, build_parts, NsoFlags, Spec};
+        let spec = Spec {
+            code: vec![0xD65F03C0],
+            with_mod0: true,
+            relatives: vec![(0x2200, 0x180)],
+            exports: vec![("nnMain", 0x180)],
+            eh_funcs: vec![(0x180, 4)],
+            ..Spec::default()
+        };
+        let flags = NsoFlags {
+            compress: [true, true, false],
+            hash: [true; 3],
+        };
+        build_nso(&build_parts(&spec), flags)
+    }
+
     #[test]
-    fn inspect_reports_exefs_and_romfs() {
+    fn inspect_reports_exefs_nso_npdm_and_romfs() {
+        use nx_runtime::npdm::builder::{build, enable_svcs, NpdmSpec};
         let t = TempDir::new("cli-inspect");
-        t.write("exefs/main", &[0u8; 300]);
-        t.write("exefs/main.npdm", &[0u8; 20]);
-        t.write("exefs/subsdk0", &[0u8; 5]);
+        let main = synthetic_nso();
+        t.write("exefs/main", &main);
+        let npdm = build(&NpdmSpec {
+            kc: vec![enable_svcs(0, &[1, 2, 7])],
+            ..NpdmSpec::default()
+        });
+        t.write("exefs/main.npdm", &npdm);
+        t.write("exefs/subsdk0", &main);
         t.write("romfs/a/b.bin", &[1u8; 70]);
         t.write("romfs/c.txt", &[2u8; 30]);
         let text = inspect(&t.join("exefs"), Some(&t.join("romfs"))).unwrap();
-        assert!(text.contains("main"), "{text}");
-        assert!(text.contains("300 bytes"));
+        assert!(
+            text.contains(&format!("{:>12} bytes", main.len())),
+            "{text}"
+        );
+        assert!(text.contains("present but not loaded: subsdk0"), "{text}");
+        assert!(
+            text.contains("main: NSO0, loaded as the phase-one module"),
+            "{text}"
+        );
+        assert!(text.contains("text    0x00000000 +0x1000 r-x"), "{text}");
+        assert!(text.contains("bss     0x00003000 +0x2000 rw-"), "{text}");
+        assert!(text.contains("1 relative, 0 abs64"), "{text}");
+        assert!(text.contains("exported functions: 1"), "{text}");
+        assert!(
+            text.contains(".eh_frame functions: 1 (4 bytes of code)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("compressed: text yes, rodata yes, data no"),
+            "{text}"
+        );
+        assert!(text.contains("matching: yes, yes, yes"), "{text}");
+        assert!(
+            text.contains("subsdk0: NSO0, not loaded in phase one"),
+            "{text}"
+        );
+        assert!(text.contains("name `Application`"), "{text}");
+        assert!(text.contains("3 SVCs enabled"), "{text}");
+        assert!(text.contains("enabled SVCs: 0x1 0x2 0x7"), "{text}");
+        assert!(text.contains("(3 connect): fsp-srv, sm:, nvdrv*"), "{text}");
         assert!(
             text.contains("2 files, 1 directories, 100 bytes of file data"),
             "{text}"
         );
-        assert!(text.contains("present but not loaded: subsdk0"));
         let no_npdm = TempDir::new("cli-nonpdm");
-        no_npdm.write("main", b"x");
+        no_npdm.write("main", &main);
         assert!(inspect(no_npdm.path(), None)
             .unwrap()
             .contains("no main.npdm"));
+    }
+
+    #[test]
+    fn inspect_fails_cleanly_on_bad_inputs() {
+        let t = TempDir::new("cli-badnso");
+        t.write("exefs/main", &[0u8; 300]);
+        assert!(inspect(&t.join("exefs"), None)
+            .unwrap_err()
+            .to_string()
+            .contains("NSO"));
+
+        // an AArch32 main.npdm stops the run with the AArch32 error
+        use nx_runtime::npdm::builder::{build, NpdmSpec};
+        let t = TempDir::new("cli-a32");
+        t.write("exefs/main", &synthetic_nso());
+        t.write(
+            "exefs/main.npdm",
+            &build(&NpdmSpec {
+                flags0: 0,
+                ..NpdmSpec::default()
+            }),
+        );
+        let err = inspect(&t.join("exefs"), None).unwrap_err();
+        assert!(matches!(err, Error::Aarch32(_)), "{err}");
     }
 }

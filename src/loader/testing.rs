@@ -22,6 +22,9 @@ pub const FINI_ARRAY_OFF: usize = 0x2180;
 /// Scratch slots that relocations write to.
 pub const SLOTS_OFF: usize = 0x2200;
 pub const BSS_SIZE: u32 = 0x1800;
+/// `.eh_frame_hdr` and `.eh_frame` live at the end of rodata.
+pub const EH_HDR_OFF: usize = 0x1C00;
+pub const EH_OFF: usize = 0x1C80;
 
 /// What the synthetic module contains.
 #[derive(Clone, Default)]
@@ -43,6 +46,8 @@ pub struct Spec {
     pub fini_fn: Option<u64>,
     /// `R_AARCH64_JUMP_SLOT` entries in the PLT table: (target offset, symbol name).
     pub jmprel: Vec<(u64, &'static str)>,
+    /// Functions with unwind info: (start offset, length). Written as an `.eh_frame_hdr`.
+    pub eh_funcs: Vec<(u32, u32)>,
 }
 
 #[derive(Clone)]
@@ -62,6 +67,49 @@ fn put64(v: &mut [u8], at: usize, x: u64) {
     v[at..at + 8].copy_from_slice(&x.to_le_bytes());
 }
 
+/// Write an `.eh_frame_hdr` (pcrel sdata4 frame pointer, udata4 count, datarel sdata4 table) and
+/// an `.eh_frame` with one `zR` CIE and one FDE per function. Returns the header length, or 0
+/// when there are no functions.
+fn write_eh(ro: &mut [u8], funcs: &[(u32, u32)]) -> usize {
+    if funcs.is_empty() {
+        return 0;
+    }
+    let padded = |mut body: Vec<u8>| -> Vec<u8> {
+        while !(body.len() + 4).is_multiple_of(8) {
+            body.push(0);
+        }
+        let mut out = (body.len() as u32).to_le_bytes().to_vec();
+        out.extend(body);
+        out
+    };
+    // CIE: id 0, version 1, "zR", code align 4, data align -8, return register 30, one byte of
+    // augmentation data holding the FDE encoding (pcrel | sdata4).
+    let cie = padded(vec![0, 0, 0, 0, 1, b'z', b'R', 0, 4, 0x78, 30, 1, 0x1b]);
+    let mut eh = cie.clone();
+    let mut table: Vec<(u32, u32)> = Vec::new();
+    for &(start, len) in funcs {
+        let fde_off = EH_OFF + eh.len();
+        let mut body = Vec::new();
+        body.extend_from_slice(&((fde_off + 4 - EH_OFF) as u32).to_le_bytes());
+        body.extend_from_slice(&((start as i64 - (fde_off + 8) as i64) as i32).to_le_bytes());
+        body.extend_from_slice(&(len as i32).to_le_bytes());
+        body.push(0); // augmentation data length
+        eh.extend(padded(body));
+        table.push((start, fde_off as u32));
+    }
+    table.sort();
+    ro[EH_OFF - RO_OFF..EH_OFF - RO_OFF + eh.len()].copy_from_slice(&eh);
+    let mut hdr = vec![1u8, 0x1b, 0x03, 0x3b];
+    hdr.extend_from_slice(&((EH_OFF as i64 - (EH_HDR_OFF as i64 + 4)) as i32).to_le_bytes());
+    hdr.extend_from_slice(&(table.len() as u32).to_le_bytes());
+    for (start, fde) in table {
+        hdr.extend_from_slice(&((start as i64 - EH_HDR_OFF as i64) as i32).to_le_bytes());
+        hdr.extend_from_slice(&((fde as i64 - EH_HDR_OFF as i64) as i32).to_le_bytes());
+    }
+    ro[EH_HDR_OFF - RO_OFF..EH_HDR_OFF - RO_OFF + hdr.len()].copy_from_slice(&hdr);
+    hdr.len()
+}
+
 pub fn build_parts(spec: &Spec) -> Parts {
     let mut text = vec![0u8; SEG_SIZE];
     let mut ro = vec![0u8; SEG_SIZE];
@@ -77,6 +125,7 @@ pub fn build_parts(spec: &Spec) -> Parts {
     for (i, w) in spec.code.iter().enumerate() {
         put32(&mut text, CODE_OFF + 4 * i, *w);
     }
+    let eh_hdr_len = write_eh(&mut ro, &spec.eh_funcs);
     if spec.with_mod0 {
         let rel = |target: usize| (target as i64 - MOD0_OFF as i64) as i32 as u32;
         let bss_start = DATA_OFF + SEG_SIZE;
@@ -84,8 +133,13 @@ pub fn build_parts(spec: &Spec) -> Parts {
         put32(&mut text, MOD0_OFF + 4, rel(DYNAMIC_OFF));
         put32(&mut text, MOD0_OFF + 8, rel(bss_start));
         put32(&mut text, MOD0_OFF + 12, rel(bss_start + BSS_SIZE as usize));
-        put32(&mut text, MOD0_OFF + 16, 0);
-        put32(&mut text, MOD0_OFF + 20, 0);
+        if eh_hdr_len > 0 {
+            put32(&mut text, MOD0_OFF + 16, rel(EH_HDR_OFF));
+            put32(&mut text, MOD0_OFF + 20, rel(EH_HDR_OFF + eh_hdr_len));
+        } else {
+            put32(&mut text, MOD0_OFF + 16, 0);
+            put32(&mut text, MOD0_OFF + 20, 0);
+        }
         put32(&mut text, MOD0_OFF + 24, rel(bss_start));
     }
 

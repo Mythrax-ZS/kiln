@@ -7,6 +7,7 @@
 //! Relocation follows the MOD0 header (Switchbrew MOD page) to the `.dynamic` section and applies
 //! the RELA tables the way the Horizon runtime linker does for a module linked at address zero.
 
+use super::ehframe;
 use crate::{Error, Result};
 use nx_runtime::util::{u32_at, u64_at};
 
@@ -107,6 +108,8 @@ pub struct RelocReport {
     pub unresolved: Vec<UnresolvedReloc>,
     /// Relocation types this loader does not implement; the slot is left untouched.
     pub unsupported: Vec<UnsupportedReloc>,
+    /// Addends of the RELATIVE relocations: module offsets that pointers in memory refer to.
+    pub relative_targets: Vec<u64>,
 }
 
 impl RelocReport {
@@ -392,6 +395,9 @@ fn apply_table(
         let value = match r_type {
             R_AARCH64_RELATIVE => {
                 report.relative += 1;
+                if r_addend >= 0 {
+                    report.relative_targets.push(r_addend as u64);
+                }
                 base.wrapping_add(r_addend as u64)
             }
             R_AARCH64_ABS64 | R_AARCH64_GLOB_DAT | R_AARCH64_JUMP_SLOT => {
@@ -566,6 +572,35 @@ impl Module {
     pub fn segment_bytes(&self, name: &str) -> Option<&[u8]> {
         let s = self.segment(name)?;
         self.image.get(s.offset as usize..s.end() as usize)
+    }
+
+    /// Function ranges the toolchain recorded in `.eh_frame_hdr`, found through MOD0. Empty when
+    /// the module has no MOD0 or no such header.
+    pub fn eh_functions(&self) -> Result<Vec<ehframe::FuncRange>> {
+        match &self.mod0 {
+            Some(m) => {
+                ehframe::function_ranges(&self.image, m.eh_frame_hdr_start, m.eh_frame_hdr_end)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Module offsets inside the text segment that RELATIVE relocations point at: vtable entries
+    /// and callbacks, so very likely function entries reached through indirect calls.
+    pub fn code_pointers(&self) -> Vec<u64> {
+        let Some(text) = self.segment("text") else {
+            return Vec::new();
+        };
+        let mut v: Vec<u64> = self
+            .relocs
+            .relative_targets
+            .iter()
+            .copied()
+            .filter(|&t| text.contains(t) && t % 4 == 0)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 
     /// Every address the loader knows to be a function entry: the module start, exported

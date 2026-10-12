@@ -1,5 +1,6 @@
 //! Loader: NSO and NRO executables mapped at a fixed guest base and relocated through MOD0.
 
+pub mod ehframe;
 pub mod lz4;
 pub mod module;
 pub mod nro;

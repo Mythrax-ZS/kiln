@@ -572,6 +572,52 @@ mod tests {
     }
 
     #[test]
+    fn eh_frame_functions_and_code_pointers_come_through_mod0() {
+        use crate::loader::ehframe::FuncRange;
+        let spec = Spec {
+            eh_funcs: vec![(0x1C0, 0x20), (0x180, 0x40)],
+            relatives: vec![
+                (SLOTS_OFF as u64, 0x200),       // text, aligned: a code pointer
+                (SLOTS_OFF as u64 + 8, 0x203),   // text but unaligned: not a function entry
+                (SLOTS_OFF as u64 + 16, 0x2800), // data, not code
+                (SLOTS_OFF as u64 + 24, 0x200),  // duplicate
+                (SLOTS_OFF as u64 + 32, -4),     // negative addend is ignored
+            ],
+            init_array: vec![0x300],
+            ..simple_spec()
+        };
+        let l = load_ok(&build_nso(&build_parts(&spec), NsoFlags::default()));
+        let m = &l.module;
+        assert_eq!(
+            m.eh_functions().unwrap(),
+            [
+                FuncRange {
+                    start: 0x180,
+                    len: 0x40
+                },
+                FuncRange {
+                    start: 0x1C0,
+                    len: 0x20
+                }
+            ]
+        );
+        assert_eq!(m.code_pointers(), [0x200, 0x300]);
+        // a module without eh data or without MOD0 reports none
+        let plain = load_ok(&build_nso(
+            &build_parts(&simple_spec()),
+            NsoFlags::default(),
+        ));
+        assert!(plain.module.eh_functions().unwrap().is_empty());
+        let bare = Spec {
+            with_mod0: false,
+            ..simple_spec()
+        };
+        let bare = load_ok(&build_nso(&build_parts(&bare), NsoFlags::default()));
+        assert!(bare.module.eh_functions().unwrap().is_empty());
+        assert!(bare.module.code_pointers().is_empty());
+    }
+
+    #[test]
     fn aarch32_modules_are_rejected() {
         let mut parts = build_parts(&simple_spec());
         parts.text[0..4].copy_from_slice(&0xEA00_0010u32.to_le_bytes()); // A32: b <label>
