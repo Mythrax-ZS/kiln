@@ -14,7 +14,27 @@ keys or title data are stored in this repository.
 ## Status
 
 Work proceeds in milestones M1 to M7. Each milestone has a report under `docs/reports/` that states
-what was implemented, what was tested and how, and what was not verified.
+what was implemented, what was tested and how, and what was not verified. `docs/ARCHITECTURE.md`
+explains how the pieces fit together.
+
+Done: M1 (input layer), M2 (loader), M3 (decoder and interpreter, integer ISA), M4 (lifter and
+LLVM code generation, integer ISA). Nothing renders: GPU work is out of scope until M7 passes.
+
+## Using it
+
+```
+recomp inspect --exefs <dir|pfs0> [--romfs <dir|image>]
+recomp analyze (--exefs <dir|pfs0> | --nro <file>) [--hints <file>]
+recomp build   (--exefs <dir|pfs0> | --nro <file>) --out <dir> [--name <name>] [--opt <0-3>]
+               [--hints <file>] [--shared] [--keep-ir]
+```
+
+`build` writes `<name>.exe` (or `<name>`), optionally `<name>.dll` with `--shared`, the embedded
+image, and `<name>.report.txt` listing everything the analysis could not settle: indirect branches
+no jump table explains, interpreter fallbacks by address range, and instructions that stop the
+run. A produced program that stops says why on stderr and exits with status 101. Addresses it
+reached that no function covers can be logged with `NX_UNKNOWN_LOG=<file>` and fed back with
+`--hints`.
 
 ## What "accuracy" means here
 
