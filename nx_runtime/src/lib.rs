@@ -5,6 +5,7 @@
 //! native executables and shared libraries that clang produces.
 
 pub mod error;
+pub mod npdm;
 pub mod romfs;
 pub mod storage;
 pub mod util;
