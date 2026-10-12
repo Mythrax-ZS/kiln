@@ -827,6 +827,10 @@ impl Kernel {
         if word != (owner | MUTEX_WAIT_MASK) {
             return ResultCode::SUCCESS;
         }
+        // The owner has to be a thread of this process.
+        if st.thread_of(owner, current).is_none() {
+            return err::INVALID_HANDLE;
+        }
         let seq = st.next_seq();
         let priority = st.threads.get(&current).map_or(0x2C, |t| t.priority);
         st.mutex_waiters.entry(addr).or_default().push(Waiter {
@@ -894,6 +898,9 @@ impl Kernel {
             },
             mutex,
         });
+        // The kernel tells user mode that somebody waits by setting the key word to 1; a failed
+        // write is not an error (Atmosphère's `KConditionVariable::Wait`).
+        let _ = self.write_u32(key, 1);
         if let Some(t) = st.threads.get_mut(&current) {
             t.wake = None;
         }
@@ -966,6 +973,10 @@ impl Kernel {
                     .push(cw.waiter);
                 break;
             }
+        }
+        // When nobody waits on the key any more the key word goes back to 0.
+        if st.cv_waiters.get(&key).is_none_or(|l| l.is_empty()) {
+            let _ = self.write_u32(key, 0);
         }
         drop(st);
         self.notify();

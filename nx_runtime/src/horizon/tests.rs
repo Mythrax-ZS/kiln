@@ -704,11 +704,12 @@ fn a_waiter_gets_the_mutex_when_the_owner_unlocks() {
     let k = Arc::clone(&e.kernel);
     let m = SCRATCH + 0x40;
     let (b, _cpu) = second_thread(&k);
-    // The owner (handle 0x111) holds the lock and knows there is a waiter.
-    set_word(m, 0x111 | WAIT);
+    // The owner is a thread of the process; it holds the lock and knows there is a waiter.
+    let (owner, _) = k.create_thread(0, 0, 0, 0x2C, 0, false).unwrap();
+    set_word(m, owner | WAIT);
     let waiter = {
         let k = Arc::clone(&k);
-        std::thread::spawn(move || k.arbitrate_lock(b, 0x111, m, 0x222))
+        std::thread::spawn(move || k.arbitrate_lock(b, owner, m, 0x222))
     };
     std::thread::sleep(Duration::from_millis(40));
     assert!(!waiter.is_finished());
@@ -721,6 +722,9 @@ fn a_waiter_gets_the_mutex_when_the_owner_unlocks() {
     );
     // A lock whose word no longer names the owner returns at once.
     assert_eq!(k.arbitrate_lock(b, 0x999, m, 0x222), ResultCode::SUCCESS);
+    // An owner that is not a thread handle of the process is an invalid handle.
+    set_word(m, 0x555 | WAIT);
+    assert_eq!(k.arbitrate_lock(b, 0x555, m, 0x222), err::INVALID_HANDLE);
     // Unlocking a mutex nobody waits for clears it.
     assert_eq!(k.arbitrate_unlock(m), ResultCode::SUCCESS);
     assert_eq!(word(m), 0);
@@ -741,15 +745,16 @@ fn the_highest_priority_waiter_gets_the_mutex_first_and_the_next_still_waits() {
         let (h, id) = k.create_thread(0, 0, 0, 0x10, 0, false).unwrap();
         (id, h)
     };
-    set_word(m, 0x111 | WAIT);
+    let (owner, _) = k.create_thread(0, 0, 0, 0x2C, 0, false).unwrap();
+    set_word(m, owner | WAIT);
     let low = {
         let k = Arc::clone(&k);
-        std::thread::spawn(move || k.arbitrate_lock(lo_id, 0x111, m, lo_h))
+        std::thread::spawn(move || k.arbitrate_lock(lo_id, owner, m, lo_h))
     };
     std::thread::sleep(Duration::from_millis(30));
     let high = {
         let k = Arc::clone(&k);
-        std::thread::spawn(move || k.arbitrate_lock(hi_id, 0x111, m, hi_h))
+        std::thread::spawn(move || k.arbitrate_lock(hi_id, owner, m, hi_h))
     };
     std::thread::sleep(Duration::from_millis(30));
     k.arbitrate_unlock(m);
@@ -772,6 +777,7 @@ fn a_condition_variable_wait_releases_the_mutex_and_takes_it_back_when_signalled
     let (m, key) = (SCRATCH + 0xC0, SCRATCH + 0xD0);
     let (w, _cpu) = second_thread(&k);
     set_word(m, 0x333); // the waiter holds the mutex
+    set_word(key, 0);
     let waiter = {
         let k = Arc::clone(&k);
         std::thread::spawn(move || k.wait_process_wide_key(w, m, key, 0x333, -1))
@@ -779,11 +785,19 @@ fn a_condition_variable_wait_releases_the_mutex_and_takes_it_back_when_signalled
     std::thread::sleep(Duration::from_millis(40));
     assert!(!waiter.is_finished());
     assert_eq!(word(m), 0, "waiting released the mutex");
+    assert_eq!(word(key), 1, "the key word says somebody waits");
     k.signal_process_wide_key(key, 1);
     assert_eq!(waiter.join().unwrap(), ResultCode::SUCCESS);
     assert_eq!(word(m), 0x333, "and the waiter holds it again");
-    // Signalling with nobody waiting does nothing.
+    assert_eq!(
+        word(key),
+        0,
+        "nobody waits any more, so the key word is clear"
+    );
+    // Signalling with nobody waiting leaves the key word clear.
+    set_word(key, 1);
     k.signal_process_wide_key(key, -1);
+    assert_eq!(word(key), 0);
 }
 
 #[test]

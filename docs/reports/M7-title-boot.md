@@ -129,15 +129,16 @@ the 52 `SendSyncRequest` calls carry the IPC requests to the services listed bel
 
 ### Linux
 
-The same checks on Linux (WSL, Ubuntu, clang 21), on the commit that adds the cryptographic
-extension: fmt and clippy clean, 248 `nx_runtime` unit tests and 84 `recomp` tests pass, and the 84
-`recomp` library tests also pass with `RECOMP_REQUIRE_EXTERNAL=1` (so every end-to-end program,
-the two-module program included, was built and run there). The Unicorn tests skip there (the
-library is not installed in that environment), so those results come from Windows.
+The same checks on Linux (WSL, Ubuntu, clang 21), on the commit that corrected the result codes
+(after the cryptographic extension): fmt and clippy clean, 249 `nx_runtime` unit tests and 84
+`recomp` tests pass, and the 84 `recomp` library tests also pass with `RECOMP_REQUIRE_EXTERNAL=1`
+(so every end-to-end program, the two-module program included, was built and run there). The
+Unicorn tests skip there (the library is not installed in that environment), so those results come
+from Windows.
 
 The title itself, built and run on Linux from the same extracted directories (read through
 `/mnt/c`): 115,538 functions and 4,869,883 instructions (the same numbers as on Windows), 0
-interpreter fallbacks, discovery 1.6 s, lifting and compiling 46.2 s, linking 0.8 s, and the run
+interpreter fallbacks, discovery 1.6 s, lifting and compiling 44.4 s, linking 0.9 s, and the run
 ends the same way: the same stop at `nvdrv`, at the same guest address, with the same count of
 supervisor calls in the trace.
 
