@@ -9,8 +9,8 @@
 use super::abi::{perm, stop, trap, FuncEntry, NativeCpu, STOP_PC};
 use super::mem::MapError;
 use super::runtime::{
-    handle_trap, interpret_one, record_fault, record_stop, record_trap, rt, run, service_svc,
-    slow_path, SvcHandler,
+    handle_trap, interpret, interpret_one, record_fault, record_stop, record_trap, rt, run,
+    service_svc, slow_path, SvcHandler,
 };
 use crate::a64::bits::crc32_update;
 use crate::a64::bus::{FaultKind, ZVA_BLOCK};
@@ -268,7 +268,11 @@ pub extern "C" fn nx_rt_protect(addr: u64, size: u64, permissions: u32) -> i32 {
 /// `data` must point at `len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn nx_rt_write(addr: u64, data: *const u8, len: u64) -> i32 {
-    let bytes = std::slice::from_raw_parts(data, len as usize);
+    let bytes = if len == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(data, len as usize)
+    };
     i32::from(rt().mem.write_bytes(addr, bytes, false).is_err())
 }
 
@@ -278,7 +282,11 @@ pub unsafe extern "C" fn nx_rt_write(addr: u64, data: *const u8, len: u64) -> i3
 /// `out` must point at `len` writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn nx_rt_read(addr: u64, out: *mut u8, len: u64) -> i32 {
-    let bytes = std::slice::from_raw_parts_mut(out, len as usize);
+    let bytes = if len == 0 {
+        &mut [][..]
+    } else {
+        std::slice::from_raw_parts_mut(out, len as usize)
+    };
     i32::from(rt().mem.read_bytes(addr, bytes, false).is_err())
 }
 
@@ -288,7 +296,9 @@ pub unsafe extern "C" fn nx_rt_read(addr: u64, out: *mut u8, len: u64) -> i32 {
 /// `table` must point at `count` valid entries whose functions outlive the process.
 #[no_mangle]
 pub unsafe extern "C" fn nx_rt_register(table: *const FuncEntry, count: u64) {
-    rt().register(std::slice::from_raw_parts(table, count as usize));
+    if count != 0 {
+        rt().register(std::slice::from_raw_parts(table, count as usize));
+    }
 }
 
 #[no_mangle]
@@ -361,4 +371,21 @@ pub fn __trap_handler_linked() -> bool {
     // Referenced so the helpers used only through the C ABI stay in the rlib's public surface.
     let _ = handle_trap as fn(&mut NativeCpu, crate::a64::interp::Trap) -> bool;
     STOP_PC != 0
+}
+
+/// Run a thread in the interpreter only (see [`interpret`]); for tests that compare it with the
+/// generated code.
+///
+/// # Safety
+/// `p` must be a CPU from [`nx_rt_cpu_new`] used by one thread at a time.
+#[no_mangle]
+pub unsafe extern "C" fn nx_rt_interpret(p: *mut NativeCpu, entry: u64, max_steps: u64) -> u32 {
+    interpret(p, entry, max_steps)
+}
+
+/// Make the system counter deterministic, starting at `start` and counting one per read; 0
+/// restores the real counter.
+#[no_mangle]
+pub extern "C" fn nx_rt_set_counter(start: u64) {
+    rt().set_counter_fixed(start);
 }

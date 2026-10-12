@@ -29,6 +29,9 @@ pub struct Runtime {
     /// `(n, attempts so far)`. Empty in normal runs.
     spurious: Mutex<BTreeMap<u64, (u64, u64)>>,
     spurious_any: AtomicBool,
+    /// When non-zero, the system counter returns this value and adds one per read, so a test can
+    /// replay a run and get the same readings.
+    counter_fixed: AtomicU64,
     unknown: Mutex<BTreeSet<u64>>,
     next_thread: AtomicU64,
     start: Instant,
@@ -49,6 +52,7 @@ impl Runtime {
             svc: Mutex::new(None),
             spurious: Mutex::new(BTreeMap::new()),
             spurious_any: AtomicBool::new(false),
+            counter_fixed: AtomicU64::new(0),
             unknown: Mutex::new(BTreeSet::new()),
             next_thread: AtomicU64::new(1),
             start: Instant::now(),
@@ -129,8 +133,16 @@ impl Runtime {
         self.unknown.lock().unwrap().iter().copied().collect()
     }
 
+    /// Make the counter deterministic, starting at `start` (0 restores the real counter).
+    pub fn set_counter_fixed(&self, start: u64) {
+        self.counter_fixed.store(start, Ordering::Relaxed);
+    }
+
     /// The free-running system counter at `COUNTER_FREQUENCY`.
     pub fn counter(&self) -> u64 {
+        if self.counter_fixed.load(Ordering::Relaxed) != 0 {
+            return self.counter_fixed.fetch_add(1, Ordering::Relaxed);
+        }
         let ns = self.start.elapsed().as_nanos();
         (ns * u128::from(COUNTER_FREQUENCY) / 1_000_000_000) as u64
     }
@@ -491,4 +503,42 @@ pub unsafe fn run(cpu: *mut NativeCpu, entry: u64) -> u32 {
 /// Used by tests and the CLI to see what [`abi`] promises.
 pub fn exit_pc() -> u64 {
     abi::EXIT_PC
+}
+
+/// Run a thread in the interpreter only, from `entry` until the entry function returns (returns
+/// 0), something stops the run (returns the [`stop`] reason), or `max_steps` instructions have
+/// executed (returns [`stop::HALTED`]). The reference the native code is compared against.
+///
+/// # Safety
+/// `cpu` must be valid and exclusively used by the caller.
+pub unsafe fn interpret(cpu: *mut NativeCpu, entry: u64, max_steps: u64) -> u32 {
+    (*cpu).state.pc = entry;
+    (*cpu).state.x[30] = EXIT_PC;
+    (*cpu).ctl.stop = stop::NONE;
+    (*cpu).ctl.fault_flag = 0;
+    let thread = (*cpu).ctl.thread_id;
+    let mut bus = NativeBus { thread };
+    let state: *mut CpuState = &mut (*cpu).state;
+    for _ in 0..max_steps {
+        if (*state).pc == EXIT_PC {
+            return 0;
+        }
+        if let Err(t) = step(&mut *state, &mut bus) {
+            // A failed instruction fetch means there is no code there, as in the slow path.
+            if let Trap::Fault(f) = t {
+                if f.kind == FaultKind::Unmapped && !f.write && f.addr == (*state).pc {
+                    record_stop(&mut *cpu, stop::NO_CODE, f.addr, 0);
+                    return stop::NO_CODE;
+                }
+            }
+            if !handle_trap(&mut *cpu, t) {
+                return (*cpu).ctl.stop;
+            }
+        }
+    }
+    if (*state).pc == EXIT_PC {
+        return 0;
+    }
+    record_stop(&mut *cpu, stop::HALTED, (*state).pc, 0);
+    stop::HALTED
 }

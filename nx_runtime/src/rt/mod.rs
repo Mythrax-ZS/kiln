@@ -7,6 +7,7 @@
 
 pub mod abi;
 pub mod exports;
+pub mod host;
 pub mod mem;
 pub mod monitor;
 pub mod runtime;
