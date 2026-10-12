@@ -4,6 +4,7 @@
 //! does is written from the Switchbrew page of the service; where the page leaves a value open, the
 //! choice is recorded in docs/ASSUMPTIONS.md. A command nobody implemented stops the run.
 
+pub(super) mod acc;
 mod aoc;
 mod apm;
 mod applet;
@@ -11,6 +12,8 @@ mod fsp;
 mod lm;
 mod nvdrv;
 mod pctl;
+pub(super) mod savefs;
+mod set;
 mod vi;
 
 use super::kernel::Kernel;
@@ -48,6 +51,7 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     register(kernel, "appletOE", move |k| {
         applet::AppletOe::new(k, applet.clone())
     });
+    register(kernel, "acc:u0", acc::AccountService::new);
     register(kernel, "aoc:u", aoc::AddOnContent::new);
     register(kernel, "apm", apm::Apm::new);
     let fs = std::sync::Arc::new(fsp::Shared::default());
@@ -60,4 +64,5 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     kernel.on_finish(Box::new(move || report.report()));
     register(kernel, "nvdrv", move |k| nvdrv::NvDrv::new(k, gpu.clone()));
     register(kernel, "pctl", pctl::Factory::new);
+    register(kernel, "set", set::SettingsServer::new);
 }

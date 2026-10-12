@@ -76,6 +76,59 @@ impl Service for FileSystemProxy {
         match req.command {
             // SetCurrentProcess(u64 reserved, pid): the process the proxy answers for.
             1 => Ok(Response::ok()),
+            // CreateSaveDataFileSystem(SaveDataAttribute, SaveDataCreationInfo, meta info): the
+            // save data is a directory on the host (docs/ASSUMPTIONS.md A-068).
+            22 => {
+                let kernel = self
+                    .kernel
+                    .upgrade()
+                    .ok_or_else(|| Stop("the process is gone".into()))?;
+                let Some(dir) = super::savefs::save_dir(kernel.process.program_id, &req.data)
+                else {
+                    return Err(Stop(format!(
+                        "CreateSaveDataFileSystem of a kind of save data this runtime does not keep \
+                         (type {})",
+                        req.data.get(32).copied().unwrap_or(0)
+                    )));
+                };
+                match std::fs::create_dir_all(&dir) {
+                    Ok(()) => Ok(Response::ok()),
+                    Err(e) => Err(Stop(format!(
+                        "the save data directory {} cannot be made: {e}",
+                        dir.display()
+                    ))),
+                }
+            }
+            // OpenSaveDataFileSystem(u8 space, SaveDataAttribute) -> IFileSystem; 53 is the
+            // read-only variant
+            51 | 53 => {
+                let kernel = self
+                    .kernel
+                    .upgrade()
+                    .ok_or_else(|| Stop("the process is gone".into()))?;
+                let attr = req.data.get(8..0x48).unwrap_or(&[]);
+                let Some(dir) = super::savefs::save_dir(kernel.process.program_id, attr) else {
+                    return Err(Stop(format!(
+                        "OpenSaveDataFileSystem of a kind of save data this runtime does not keep \
+                         (type {})",
+                        attr.get(32).copied().unwrap_or(0)
+                    )));
+                };
+                if !dir.is_dir() {
+                    return Err(Stop(format!(
+                        "the program opened save data that was never created (expected {}); \
+                         EnsureSaveData or CreateSaveDataFileSystem should come first",
+                        dir.display()
+                    )));
+                }
+                Ok(
+                    Response::ok().with_object(Box::new(super::savefs::HostFileSystem::new(
+                        self.kernel.clone(),
+                        dir,
+                        req.command == 53,
+                    ))),
+                )
+            }
             // GetGlobalAccessLogMode() -> u32: access logging is off.
             1005 => Ok(Response::ok().with_u32(0)),
             // OpenDataStorageByCurrentProcess() -> IStorage
@@ -85,6 +138,12 @@ impl Service for FileSystemProxy {
             }))),
             other => Err(Stop::unknown_command("fsp-srv", other)),
         }
+    }
+
+    fn pointer_buffer_size(&self) -> u16 {
+        // Paths travel through pointer buffers (0x301 bytes each, two for a rename), and the SDK
+        // fails a call whose buffers do not fit the size reported here (result 0x11A0B).
+        0x800
     }
 }
 

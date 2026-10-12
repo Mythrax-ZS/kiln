@@ -999,6 +999,8 @@ struct Reply {
     moved: Vec<u32>,
     copied: Vec<u32>,
     object_ids: Vec<u32>,
+    /// Pointer (X) descriptors of the reply: (index, address, size).
+    pointers: Vec<(u32, u64, u64)>,
 }
 
 impl Env {
@@ -1017,6 +1019,7 @@ impl Env {
         }
         assert_eq!(self.r(), 0, "SendSyncRequest failed");
         let out = self.read(self.tls(), 0x100);
+        let h0 = u32::from_le_bytes(out[0..4].try_into().unwrap());
         let h1 = u32::from_le_bytes(out[4..8].try_into().unwrap());
         let mut off = 8;
         let mut moved = Vec::new();
@@ -1032,6 +1035,16 @@ impl Env {
                 moved.push(u32::from_le_bytes(out[off..off + 4].try_into().unwrap()));
                 off += 4;
             }
+        }
+        let mut pointers = Vec::new();
+        for _ in 0..(h0 >> 16) & 0xF {
+            let d0 = u32::from_le_bytes(out[off..off + 4].try_into().unwrap());
+            let lo = u32::from_le_bytes(out[off + 4..off + 8].try_into().unwrap());
+            let addr = u64::from(lo)
+                | (u64::from((d0 >> 12) & 0xF) << 32)
+                | (u64::from((d0 >> 6) & 7) << 36);
+            pointers.push((d0 & 0xF, addr, u64::from(d0 >> 16)));
+            off += 8;
         }
         let raw_start = off.next_multiple_of(16);
         let raw_end = off + 4 * (h1 & 0x3FF) as usize;
@@ -1060,6 +1073,7 @@ impl Env {
             moved,
             copied,
             object_ids,
+            pointers,
         })
     }
 
@@ -1426,6 +1440,10 @@ struct Message {
     send: Vec<(u64, u64)>,
     /// Receive (B) descriptors: where the service may write.
     receive: Vec<(u64, u64)>,
+    /// Pointer (X) descriptors: data the service reads through its pointer buffer.
+    pointer: Vec<(u64, u64)>,
+    /// The receive list (C): where pointer data the service returns is delivered.
+    recv_list: Vec<(u64, u64)>,
     command: u32,
     payload: Vec<u8>,
 }
@@ -1437,6 +1455,8 @@ impl Message {
             copy_handles: Vec::new(),
             send: Vec::new(),
             receive: Vec::new(),
+            pointer: Vec::new(),
+            recv_list: Vec::new(),
             command,
             payload: Vec::new(),
         }
@@ -1454,6 +1474,16 @@ impl Message {
             for h in &self.copy_handles {
                 m.extend_from_slice(&h.to_le_bytes());
             }
+        }
+        for (index, &(addr, size)) in self.pointer.iter().enumerate() {
+            // index in bits 0-3, address[38:36] in 6-8, address[35:32] in 12-15, size in 16-31,
+            // then address[31:0].
+            let d0 = index as u32
+                | ((((addr >> 36) & 0x7) as u32) << 6)
+                | ((((addr >> 32) & 0xF) as u32) << 12)
+                | ((size as u32) << 16);
+            m.extend_from_slice(&d0.to_le_bytes());
+            m.extend_from_slice(&(addr as u32).to_le_bytes());
         }
         for &(addr, size) in self.send.iter().chain(&self.receive) {
             // size[31:0], address[31:0], then address[38:36] in bits 2-4, size[35:32] in 24-27
@@ -1473,9 +1503,28 @@ impl Message {
         m.extend_from_slice(&0u32.to_le_bytes());
         m.extend_from_slice(&self.payload);
         let words = (m.len() - after_descriptors).div_ceil(4);
-        let h0 = 4u32 | ((self.send.len() as u32) << 20) | ((self.receive.len() as u32) << 24);
+        m.resize(after_descriptors + 4 * words, 0);
+        // The receive list comes after the raw data: address[31:0], then address[38:32] in the
+        // low bits and the size in the high half of the second word.
+        for &(addr, size) in &self.recv_list {
+            m.extend_from_slice(&(addr as u32).to_le_bytes());
+            m.extend_from_slice(
+                &((((addr >> 32) & 0x7F) as u32) | ((size as u32) << 16)).to_le_bytes(),
+            );
+        }
+        let recv_count = if self.recv_list.is_empty() {
+            0
+        } else {
+            self.recv_list.len() as u32 + 2
+        };
+        let h0 = 4u32
+            | ((self.pointer.len() as u32) << 16)
+            | ((self.send.len() as u32) << 20)
+            | ((self.receive.len() as u32) << 24);
         m[0..4].copy_from_slice(&h0.to_le_bytes());
-        m[4..8].copy_from_slice(&(words as u32 | (u32::from(special) << 31)).to_le_bytes());
+        m[4..8].copy_from_slice(
+            &(words as u32 | (recv_count << 10) | (u32::from(special) << 31)).to_le_bytes(),
+        );
         m
     }
 }
@@ -2016,4 +2065,293 @@ fn a_managed_layer_from_the_applet_manager_can_be_opened_with_its_id() {
     // A layer nobody created is not opened out of thin air.
     open_layer.payload = [vec![0u8; 0x40], 99u64.to_le_bytes().to_vec(), vec![0; 8]].concat();
     assert!(e.send(display, &open_layer.bytes(), false).is_none());
+}
+
+// ---------------------------------------------------------------------------------------------
+// acc:u0, set, and save data
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn the_account_service_has_one_open_user_listed_through_a_pointer_buffer() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let acc = e.service("acc:u0");
+    assert_eq!(e.call(acc, &Message::new(0)).data, [1, 0, 0, 0], "one user");
+    // The user is the same for every call.
+    let uid = e.call(acc, &Message::new(4)).data;
+    assert_eq!(uid.len(), 16);
+    assert_ne!(uid, vec![0; 16]);
+    let mut exists = Message::new(1);
+    exists.payload = uid.clone();
+    assert_eq!(e.call(acc, &exists).data[0], 1);
+    exists.payload = vec![7; 16];
+    assert_eq!(e.call(acc, &exists).data[0], 0);
+
+    // ListAllUsers returns eight Uids through a receive-list entry; the reply names the entry.
+    let mut list = Message::new(2);
+    list.recv_list = vec![(SCRATCH + 0x600, 0x80)];
+    let r = e.call(acc, &list);
+    assert_eq!(r.result, 0);
+    assert_eq!(r.pointers, vec![(0, SCRATCH + 0x600, 0x80)]);
+    let users = e.read(SCRATCH + 0x600, 0x80);
+    assert_eq!(&users[..16], &uid[..]);
+    assert!(
+        users[16..].iter().all(|&b| b == 0),
+        "the rest of the list is empty"
+    );
+    // A smaller buffer gets what fits.
+    let mut short = Message::new(3);
+    short.recv_list = vec![(SCRATCH + 0x700, 0x20)];
+    assert_eq!(
+        e.call(acc, &short).pointers,
+        vec![(0, SCRATCH + 0x700, 0x20)]
+    );
+
+    // GetProfile(Uid) -> IProfile: GetBase answers the user and the nickname, Get fills user
+    // data through a pointer buffer too.
+    let mut profile = Message::new(5);
+    profile.payload = uid.clone();
+    let profile = u64::from(e.call(acc, &profile).moved[0]);
+    let base = e.call(profile, &Message::new(1)).data;
+    assert_eq!(&base[..16], &uid[..]);
+    assert_eq!(&base[0x18..0x1E], b"recomp");
+    let mut get = Message::new(0);
+    get.recv_list = vec![(SCRATCH + 0x800, 0x80)];
+    let r = e.call(profile, &get);
+    assert_eq!(&r.data[..0x38], &base[..]);
+    assert_eq!(r.pointers, vec![(0, SCRATCH + 0x800, 0x80)]);
+    // A user that does not exist has no profile: the run stops.
+    let mut missing = Message::new(5);
+    missing.payload = vec![9; 16];
+    assert!(e.send(acc, &missing.bytes(), false).is_none());
+}
+
+#[test]
+fn the_launch_parameter_names_the_user_once() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let applet = e.service("appletOE");
+    let mut open = Message::new(0);
+    open.pid = true;
+    open.copy_handles = vec![CURRENT_PROCESS];
+    open.payload = vec![0; 8];
+    let proxy = u64::from(e.call(applet, &open).moved[0]);
+    let functions = u64::from(e.call(proxy, &Message::new(20)).moved[0]);
+    // PopLaunchParameter(2): the pre-selected user, 0x88 bytes with the magic.
+    let mut pop = Message::new(1);
+    pop.payload = 2u32.to_le_bytes().to_vec();
+    let storage = u64::from(e.call(functions, &pop).moved[0]);
+    let accessor = u64::from(e.call(storage, &Message::new(0)).moved[0]);
+    let size = u64::from_le_bytes(
+        e.call(accessor, &Message::new(0)).data[..8]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(size, 0x88);
+    let mut read = Message::new(11);
+    read.payload = 0i64.to_le_bytes().to_vec();
+    read.receive = vec![(SCRATCH + 0x900, 0x88)];
+    assert_eq!(e.call(accessor, &read).result, 0);
+    let data = e.read(SCRATCH + 0x900, 0x88);
+    assert_eq!(&data[..4], &0xC794_97CAu32.to_le_bytes());
+    assert_eq!(data[4], 1);
+    // It is the user the account service has.
+    let acc = e.service("acc:u0");
+    let uid = e.call(acc, &Message::new(4)).data;
+    assert_eq!(&data[8..24], &uid[..]);
+    // A second pop has nothing; so does any other kind.
+    assert_eq!(e.call(functions, &pop).result, ResultCode::new(128, 2).0);
+    pop.payload = 1u32.to_le_bytes().to_vec();
+    assert_eq!(e.call(functions, &pop).result, ResultCode::new(128, 2).0);
+}
+
+#[test]
+fn the_settings_service_lists_languages_through_a_pointer_buffer() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let set = e.service("set");
+    assert_eq!(&e.call(set, &Message::new(0)).data, b"en-US\0\0\0");
+    assert_eq!(e.call(set, &Message::new(4)).data, [1, 0, 0, 0], "USA");
+    assert_eq!(e.call(set, &Message::new(3)).data, [15, 0, 0, 0]);
+    assert_eq!(e.call(set, &Message::new(6)).data, [18, 0, 0, 0]);
+    let mut list = Message::new(1);
+    list.recv_list = vec![(SCRATCH + 0xA00, 0x100)];
+    let r = e.call(set, &list);
+    assert_eq!(r.data, [15, 0, 0, 0]);
+    assert_eq!(r.pointers, vec![(0, SCRATCH + 0xA00, 15 * 8)]);
+    let codes = e.read(SCRATCH + 0xA00, 16);
+    assert_eq!(&codes[..2], b"ja");
+    assert_eq!(&codes[8..13], b"en-US");
+    // The newer command fills an ordinary buffer.
+    let mut list2 = Message::new(5);
+    list2.receive = vec![(SCRATCH + 0xB00, 0x200)];
+    let r = e.call(set, &list2);
+    assert_eq!(r.data, [18, 0, 0, 0]);
+    assert!(r.pointers.is_empty());
+    assert_eq!(&e.read(SCRATCH + 0xB00 + 17 * 8, 5), b"pt-BR");
+    // The pointer buffer size it reports is what the SDK needs.
+    let q = e.send_control(set, 3);
+    assert_eq!(u32::from_le_bytes(q.data[..4].try_into().unwrap()), 0x1000);
+}
+
+impl Env {
+    /// A control message (`QueryPointerBufferSize` and the like) on a session.
+    fn send_control(&mut self, session: u64, command: u32) -> Reply {
+        let mut m = request_bytes(command, &[], false, 5);
+        m.resize(0x100, 0);
+        self.send(session, &m, false).unwrap()
+    }
+}
+
+#[test]
+fn a_save_file_system_is_a_directory_with_files_and_listings() {
+    use crate::testing::TempDir;
+    let dir = TempDir::new("savefs");
+    let mut e = Env::new();
+    let root = dir.path().to_path_buf();
+    let kernel = Arc::downgrade(&e.kernel);
+    e.kernel.register_service(
+        "tst:fs",
+        Box::new(move || {
+            Box::new(super::services::savefs::HostFileSystem::new(
+                kernel.clone(),
+                root.clone(),
+                false,
+            ))
+        }),
+    );
+    let fs = e.service("tst:fs");
+    let path = |e: &Env, at: u64, text: &str| {
+        let mut bytes = text.as_bytes().to_vec();
+        bytes.push(0);
+        e.write(at, &bytes);
+        (at, 0x301u64)
+    };
+    // CreateDirectory(/data), CreateFile(/data/a.bin, 16 bytes of zeros)
+    let mut mk = Message::new(2);
+    mk.pointer = vec![path(&e, SCRATCH + 0x100, "/data")];
+    assert_eq!(e.call(fs, &mk).result, 0);
+    assert_eq!(
+        e.call(fs, &mk).result,
+        ResultCode::new(2, 2).0,
+        "already there: 2002-2"
+    );
+    let mut create = Message::new(0);
+    create.payload = [
+        0u32.to_le_bytes().to_vec(),
+        vec![0; 4],
+        16u64.to_le_bytes().to_vec(),
+    ]
+    .concat();
+    create.pointer = vec![path(&e, SCRATCH + 0x100, "/data/a.bin")];
+    assert_eq!(e.call(fs, &create).result, 0);
+    assert_eq!(
+        std::fs::metadata(dir.path().join("data/a.bin"))
+            .unwrap()
+            .len(),
+        16
+    );
+    // GetEntryType: directory 0, file 1, missing is 2002-1.
+    let mut ty = Message::new(7);
+    ty.pointer = vec![path(&e, SCRATCH + 0x100, "/data")];
+    assert_eq!(e.call(fs, &ty).data, [0, 0, 0, 0]);
+    ty.pointer = vec![path(&e, SCRATCH + 0x100, "/data/a.bin")];
+    assert_eq!(e.call(fs, &ty).data, [1, 0, 0, 0]);
+    ty.pointer = vec![path(&e, SCRATCH + 0x100, "/data/none")];
+    assert_eq!(e.call(fs, &ty).result, ResultCode::new(2, 1).0);
+    // A path that climbs out of the root is refused.
+    ty.pointer = vec![path(&e, SCRATCH + 0x100, "/../escape")];
+    assert_eq!(e.call(fs, &ty).result, ResultCode::new(2, 6001).0);
+
+    // OpenFile(read and write), write 5 bytes at 4, read 8 back from 2.
+    let mut open = Message::new(8);
+    open.payload = 3u32.to_le_bytes().to_vec();
+    open.pointer = vec![path(&e, SCRATCH + 0x100, "/data/a.bin")];
+    let file = u64::from(e.call(fs, &open).moved[0]);
+    e.write(SCRATCH + 0x400, b"hello");
+    let mut write = Message::new(1);
+    write.payload = [
+        0u32.to_le_bytes().to_vec(),
+        vec![0; 4],
+        4u64.to_le_bytes().to_vec(),
+        5u64.to_le_bytes().to_vec(),
+    ]
+    .concat();
+    write.send = vec![(SCRATCH + 0x400, 5)];
+    assert_eq!(e.call(file, &write).result, 0);
+    let mut read = Message::new(0);
+    read.payload = [
+        0u32.to_le_bytes().to_vec(),
+        vec![0; 4],
+        2u64.to_le_bytes().to_vec(),
+        8u64.to_le_bytes().to_vec(),
+    ]
+    .concat();
+    read.receive = vec![(SCRATCH + 0x500, 8)];
+    let r = e.call(file, &read);
+    assert_eq!(u64::from_le_bytes(r.data[..8].try_into().unwrap()), 8);
+    assert_eq!(e.read(SCRATCH + 0x500, 8), b"\0\0hello\0");
+    // Growing a file opened without the append mode is refused: 0x307202.
+    write.payload = [
+        0u32.to_le_bytes().to_vec(),
+        vec![0; 4],
+        14u64.to_le_bytes().to_vec(),
+        5u64.to_le_bytes().to_vec(),
+    ]
+    .concat();
+    assert_eq!(e.call(file, &write).result, 0x30_7202);
+    // GetSize, SetSize.
+    assert_eq!(e.call(file, &Message::new(4)).data, 16u64.to_le_bytes());
+    let mut set = Message::new(3);
+    set.payload = 8u64.to_le_bytes().to_vec();
+    assert_eq!(e.call(file, &set).result, 0);
+    assert_eq!(e.call(file, &Message::new(4)).data, 8u64.to_le_bytes());
+    // Reading past the end gives what is there.
+    read.payload = [
+        0u32.to_le_bytes().to_vec(),
+        vec![0; 4],
+        6u64.to_le_bytes().to_vec(),
+        8u64.to_le_bytes().to_vec(),
+    ]
+    .concat();
+    let r = e.call(file, &read);
+    assert_eq!(u64::from_le_bytes(r.data[..8].try_into().unwrap()), 2);
+
+    // OpenDirectory(/data, files and directories): one entry, a.bin, 8 bytes.
+    let mut opendir = Message::new(9);
+    opendir.payload = 3u32.to_le_bytes().to_vec();
+    opendir.pointer = vec![path(&e, SCRATCH + 0x100, "/data")];
+    let d = u64::from(e.call(fs, &opendir).moved[0]);
+    assert_eq!(e.call(d, &Message::new(1)).data, 1u64.to_le_bytes());
+    let mut dread = Message::new(0);
+    dread.receive = vec![(SCRATCH + 0x1000, 0x310 * 4)];
+    let r = e.call(d, &dread);
+    assert_eq!(r.data, 1u64.to_le_bytes());
+    let entry = e.read(SCRATCH + 0x1000, 0x310);
+    assert_eq!(&entry[..5], b"a.bin");
+    assert_eq!(entry[0x304], 1);
+    assert_eq!(
+        u64::from_le_bytes(entry[0x308..0x310].try_into().unwrap()),
+        8
+    );
+    assert_eq!(
+        e.call(d, &dread).data,
+        0u64.to_le_bytes(),
+        "no more entries"
+    );
+
+    // Rename, then delete.
+    let mut rename = Message::new(5);
+    rename.pointer = vec![
+        path(&e, SCRATCH + 0x100, "/data/a.bin"),
+        path(&e, SCRATCH + 0x500, "/data/b.bin"),
+    ];
+    assert_eq!(e.call(fs, &rename).result, 0);
+    assert!(dir.path().join("data/b.bin").exists());
+    let mut del = Message::new(1);
+    del.pointer = vec![path(&e, SCRATCH + 0x100, "/data/b.bin")];
+    assert_eq!(e.call(fs, &del).result, 0);
+    assert_eq!(e.call(fs, &del).result, ResultCode::new(2, 1).0);
+    // Commit has nothing to do.
+    assert_eq!(e.call(fs, &Message::new(10)).result, 0);
 }

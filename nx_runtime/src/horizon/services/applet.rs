@@ -46,6 +46,8 @@ pub struct AppletState {
     started: bool,
     /// The display the program's layers are made on (`CreateManagedDisplayLayer`).
     pub display: Option<Arc<super::vi::Shared>>,
+    /// Has the pre-selected user been popped? A launch parameter can be popped once.
+    preselected_popped: bool,
 }
 
 pub type Shared = Arc<Mutex<AppletState>>;
@@ -323,11 +325,54 @@ impl Service for ApplicationFunctions {
 
     fn request(&mut self, req: &Request) -> ServiceResult {
         match req.command {
-            // PopLaunchParameter(u32 LaunchParameterKind) -> IStorage: this program was not
-            // started with any (docs/ASSUMPTIONS.md A-043), so there is no storage to give.
-            1 => Ok(Response::error(STORAGE_NOT_AVAILABLE)),
+            // PopLaunchParameter(u32 LaunchParameterKind) -> IStorage. The program was started
+            // with the user it selected (kind 2, once) and with no other parameter
+            // (docs/ASSUMPTIONS.md A-043, A-066).
+            1 => {
+                let popped = req.u32_at(0) == 2
+                    && !std::mem::replace(&mut lock(&self.shared).preselected_popped, true);
+                if !popped {
+                    return Ok(Response::error(STORAGE_NOT_AVAILABLE));
+                }
+                Ok(Response::ok().with_object(Box::new(Storage {
+                    data: Arc::new(Mutex::new(super::acc::preselected_user_selection())),
+                    kernel: self.kernel.clone(),
+                })))
+            }
+            // EnsureSaveData(Uid) -> u64: the save data of the user exists afterwards (it is a
+            // directory on the host); the answer is the space it still needs, none
+            // (docs/ASSUMPTIONS.md A-068)
+            20 => {
+                let kernel = self.kernel.upgrade().ok_or_else(gone)?;
+                let mut attr = [0u8; 0x40];
+                attr[8..24].copy_from_slice(&req.data[..16.min(req.data.len())]);
+                attr[32] = 1; // account save data
+                let dir = super::savefs::save_dir(kernel.process.program_id, &attr);
+                match dir.map(|d| (std::fs::create_dir_all(&d), d)) {
+                    Some((Ok(()), _)) => Ok(Response::ok().with_u64(0)),
+                    Some((Err(e), d)) => Err(Stop(format!(
+                        "the save data directory {} cannot be made: {e}",
+                        d.display()
+                    ))),
+                    None => Err(Stop("EnsureSaveData has no directory to use".into())),
+                }
+            }
             // GetDesiredLanguage() -> LanguageCode
             21 => Ok(Response::ok().with_u64(LANGUAGE_CODE)),
+            // SetTerminateResult(Result): nothing reads the result the program ends with
+            22 => {
+                if let Some(kernel) = self.kernel.upgrade() {
+                    if kernel.tracing() {
+                        let r = req.u32_at(0);
+                        eprintln!(
+                            "[am] SetTerminateResult({r:#x}): module {}, description {}",
+                            (r & 0x1FF) + 2000,
+                            r >> 9
+                        );
+                    }
+                }
+                Ok(Response::ok())
+            }
             // BeginBlockingHomeButtonShortAndLongPressed(s64), EndBlocking...(),
             // BeginBlockingHomeButton(s64), EndBlockingHomeButton()
             30..=33 => Ok(Response::ok()),
