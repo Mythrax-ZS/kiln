@@ -1,11 +1,17 @@
-//! The device as a whole: what the nvdrv nodes share.
+//! The device as a whole: what the nvdrv nodes share, and the submission of commands.
 
+use crate::engine::{Cx, Stats};
+use crate::error::NvError;
+use crate::event::EventToken;
 use crate::mem::GuestMemory;
 use crate::nvmap::Nvmap;
-use crate::syncpt::Syncpoints;
+use crate::pushbuf::GpEntry;
+use crate::syncpt::{reached, Syncpoints};
 use crate::vm::AddressSpace;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+pub use crate::channel::Channel;
 
 /// The engine classes `ALLOC_OBJ_CTX` accepts (the ones the characteristics ioctl reports).
 pub mod class {
@@ -17,22 +23,37 @@ pub mod class {
     pub const GPFIFO: u32 = 0xB06F;
 }
 
-/// A GPU channel: the command queue behind one `/dev/nvhost-gpu` descriptor.
-#[derive(Debug, Default)]
-pub struct Channel {
-    /// The address space commands run in, once `BIND_CHANNEL` has been called.
-    pub space: Option<u32>,
-    /// The syncpoint the channel's fences count on, reserved by `ALLOC_GPFIFO_EX2`.
-    pub syncpt: Option<u32>,
-    pub gpfifo_entries: u32,
-    pub nvmap_fd: Option<u32>,
-    pub priority: u32,
-    pub timeslice: u32,
-    pub timeout: u32,
-    pub user_data: u64,
-    pub error_notifier: bool,
-    /// The classes bound with `ALLOC_OBJ_CTX`, with the object id answered for each.
-    pub objects: Vec<(u32, u64)>,
+/// `SUBMIT_GPFIFO` flags (Switchbrew, "NV services", section 9; bit 8 is what `libnx` sets).
+pub mod submit_flags {
+    /// Wait for the fence given before running the entries.
+    pub const FENCE_WAIT: u32 = 1 << 0;
+    /// Increment the channel's syncpoint once the entries are done and return the fence.
+    pub const FENCE_GET: u32 = 1 << 1;
+    /// The entries are in the GPU's own format (they always have the same bits here).
+    pub const HW_FORMAT: u32 = 1 << 2;
+    /// The fence is a sync file descriptor.
+    pub const SYNC_FENCE: u32 = 1 << 3;
+    /// `fence.value` is the number of syncpoint increments the entries perform; return the fence
+    /// of the last.
+    pub const INCREMENT: u32 = 1 << 8;
+}
+
+/// Why a submission did not complete.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SubmitError {
+    /// The driver answers with this error.
+    Nv(NvError),
+    /// The commands ask for something the model does not implement; the run stops.
+    Unimplemented(String),
+}
+
+/// What a completed submission leaves.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Submitted {
+    /// The fence to give back: (syncpoint id, value).
+    pub fence: (u32, u32),
+    /// The events the syncpoint increments have set.
+    pub woken: Vec<EventToken>,
 }
 
 /// The state every node of `nvdrv` shares.
@@ -42,8 +63,19 @@ pub struct Gpu {
     pub spaces: BTreeMap<u32, AddressSpace>,
     pub channels: BTreeMap<u32, Channel>,
     pub syncpoints: Syncpoints,
+    pub stats: Stats,
+    /// The trace level from `NX_TRACE_GPU`: 0 none, 1 submissions, 2 every method.
+    pub level: u8,
     next_space: u32,
     next_channel: u32,
+}
+
+/// The trace level `NX_TRACE_GPU` asks for: a number, or any other value for 1.
+pub fn trace_level() -> u8 {
+    match std::env::var("NX_TRACE_GPU") {
+        Ok(v) => v.parse().unwrap_or(1),
+        Err(_) => 0,
+    }
 }
 
 impl Gpu {
@@ -54,6 +86,8 @@ impl Gpu {
             spaces: BTreeMap::new(),
             channels: BTreeMap::new(),
             syncpoints: Syncpoints::new(),
+            stats: Stats::default(),
+            level: trace_level(),
             next_space: 1,
             next_channel: 1,
         }
@@ -71,6 +105,127 @@ impl Gpu {
         self.next_channel += 1;
         self.channels.insert(id, Channel::default());
         id
+    }
+
+    /// Run GPFIFO entries on a channel to completion, then do what the flags say about fences.
+    pub fn submit(
+        &mut self,
+        channel: u32,
+        entries: &[u64],
+        flags: u32,
+        fence: (u32, u32),
+    ) -> Result<Submitted, SubmitError> {
+        let mut ch = self
+            .channels
+            .remove(&channel)
+            .ok_or(SubmitError::Nv(NvError::INVALID_STATE))?;
+        let result = self.run(&mut ch, channel, entries, flags, fence);
+        self.channels.insert(channel, ch);
+        result
+    }
+
+    fn run(
+        &mut self,
+        ch: &mut Channel,
+        channel: u32,
+        entries: &[u64],
+        flags: u32,
+        fence: (u32, u32),
+    ) -> Result<Submitted, SubmitError> {
+        use submit_flags::*;
+        let space_id = ch.space.ok_or(SubmitError::Nv(NvError::INVALID_STATE))?;
+        let syncpt = ch.syncpt.ok_or(SubmitError::Nv(NvError::INVALID_STATE))?;
+        let unimplemented = |why: String| SubmitError::Unimplemented(why);
+        if flags & SYNC_FENCE != 0 {
+            return Err(unimplemented(
+                "a submission whose fence is a sync file descriptor".into(),
+            ));
+        }
+        if flags & FENCE_WAIT != 0 && !self.syncpoints.is_reached(fence.0, fence.1) {
+            return Err(unimplemented(format!(
+                "a submission that waits for syncpoint {} to reach {}, which no work will bring \
+                 it to",
+                fence.0, fence.1
+            )));
+        }
+        let promised = self.syncpoints.max(syncpt).unwrap_or(0);
+        let space = self
+            .spaces
+            .get(&space_id)
+            .ok_or(SubmitError::Nv(NvError::INVALID_STATE))?;
+        let mut woken = Vec::new();
+        self.stats.submits += 1;
+        if self.level >= 1 {
+            eprintln!(
+                "[gpu] channel {channel}: {} entries, flags {flags:#x}, fence ({}, {})",
+                entries.len(),
+                fence.0,
+                fence.1
+            );
+        }
+        for (i, raw) in entries.iter().enumerate() {
+            let entry = GpEntry::decode(*raw);
+            self.stats.entries += 1;
+            if entry.words == 0 {
+                continue;
+            }
+            let mut bytes = vec![0u8; entry.words as usize * 4];
+            if !space.read(&*self.mem, entry.va, &mut bytes) {
+                return Err(unimplemented(format!(
+                    "pushbuffer entry {i} ({} words at GPU address {:#x}) is not mapped",
+                    entry.words, entry.va
+                )));
+            }
+            if self.level >= 1 {
+                eprintln!(
+                    "[gpu]   entry {i}: {} words at {:#x}{}",
+                    entry.words,
+                    entry.va,
+                    if entry.sync_wait { ", sync" } else { "" }
+                );
+            }
+            let mut cx = Cx {
+                mem: &*self.mem,
+                space,
+                syncpoints: &mut self.syncpoints,
+                woken: &mut woken,
+                stats: &mut self.stats,
+                channel,
+                syncpt,
+                level: self.level,
+            };
+            for chunk in bytes.as_chunks::<4>().0 {
+                let word = u32::from_le_bytes(*chunk);
+                cx.stats.words += 1;
+                match ch.pusher.feed(word) {
+                    Ok(Some(w)) => ch.execute(&mut cx, w).map_err(unimplemented)?,
+                    Ok(None) => {}
+                    Err(e) => return Err(unimplemented(e.0)),
+                }
+            }
+        }
+        // Fences. The increments the commands performed are in the counter already; the ones
+        // the program promised and the one it asked for are completed here.
+        let mut out = fence;
+        if flags & INCREMENT != 0 {
+            let target = promised.wrapping_add(fence.1);
+            let value = self.syncpoints.value(syncpt).unwrap_or(0);
+            if !reached(value, target) {
+                woken.extend(
+                    self.syncpoints
+                        .increment(syncpt, target.wrapping_sub(value)),
+                );
+            }
+            out = (syncpt, target);
+        }
+        if flags & FENCE_GET != 0 {
+            woken.extend(self.syncpoints.increment(syncpt, 1));
+            out = (syncpt, self.syncpoints.value(syncpt).unwrap_or(0));
+        }
+        if self.level >= 1 && out != fence {
+            eprintln!("[gpu]   fence out ({}, {})", out.0, out.1);
+        }
+        Ok(Submitted { fence: out, woken })
     }
 }
 

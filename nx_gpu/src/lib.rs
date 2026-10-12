@@ -11,14 +11,19 @@
 //! [`mem::GuestMemory`]. Every layout is from Switchbrew, the NVIDIA class headers or `libnx`, and
 //! every choice the public documentation leaves open is recorded in docs/ASSUMPTIONS.md.
 
+pub mod channel;
 pub mod display;
+pub mod engine;
 pub mod error;
 pub mod event;
 pub mod gpu;
 pub mod mem;
+pub mod methods;
+pub mod names;
 pub mod nvdrv;
 pub mod nvmap;
 pub mod parcel;
+pub mod pushbuf;
 pub mod syncpt;
 pub mod vm;
 

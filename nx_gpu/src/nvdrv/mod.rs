@@ -183,8 +183,9 @@ impl Nvdrv {
             Err(Fail::Nv(e)) => e,
             Err(Fail::Unimplemented(what)) => {
                 return Err(format!(
-                    "ioctl {code:#010x}{} on `{kind}` (fd {fd}): {what}",
-                    name.map(|n| format!(" ({n})")).unwrap_or_default()
+                    "ioctl {code:#010x}{} on `{kind}` (fd {fd}, argument {}): {what}",
+                    name.map(|n| format!(" ({n})")).unwrap_or_default(),
+                    hex(&args.data)
                 ));
             }
         };

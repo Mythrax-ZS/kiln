@@ -3,7 +3,7 @@
 use super::args::{unimplemented, Args, Fail, IoResult, Ioctl};
 use super::{Node, Nvdrv};
 use crate::error::NvError;
-use crate::gpu::class;
+use crate::gpu::{class, SubmitError};
 
 /// The type byte of the GPU channel ioctls (`'H'`). `SET_USER_DATA` and `GET_USER_DATA` use `'G'`.
 pub const TYPE: u32 = 0x48;
@@ -71,7 +71,7 @@ impl Nvdrv {
         id: u32,
         code: Ioctl,
         args: &mut Args,
-        _extra_in: &[u8],
+        extra_in: &[u8],
     ) -> IoResult {
         let (ty, nr, size) = (code.ty(), code.nr(), code.size());
         match (ty, nr, size) {
@@ -160,10 +160,35 @@ impl Nvdrv {
             (TYPE, EVENT_ID_CONTROL, 8) => {}
             // The channel never faults: no error to report.
             (TYPE, GET_ERROR_INFO, 128) | (TYPE, GET_ERROR_NOTIFICATION, 16) => {}
-            (TYPE, SUBMIT_GPFIFO | SUBMIT_GPFIFO2, _) => {
-                return unimplemented(
-                    "a submission to the command processor, which is not built yet",
-                )
+            // u64 gpfifo (ignored), u32 num_entries, u32 flags, fence {id, value} (in and out),
+            // then the entries; SUBMIT_GPFIFO2 sends the entries in the second input buffer.
+            (TYPE, SUBMIT_GPFIFO | SUBMIT_GPFIFO2, 24..) => {
+                let n = args.u32(8) as usize;
+                let (flags, fence) = (args.u32(12), (args.u32(16), args.u32(20)));
+                let raw = if nr == SUBMIT_GPFIFO {
+                    args.data.get(24..)
+                } else {
+                    Some(extra_in)
+                };
+                let Some(raw) = raw.filter(|r| r.len() >= n * 8) else {
+                    return Err(NvError::INVALID_SIZE.into());
+                };
+                let entries: Vec<u64> = raw
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .take(n)
+                    .map(|c| u64::from_le_bytes(*c))
+                    .collect();
+                match self.gpu.submit(id, &entries, flags, fence) {
+                    Ok(done) => {
+                        args.set_u32(16, done.fence.0);
+                        args.set_u32(20, done.fence.1);
+                        self.signal(done.woken);
+                    }
+                    Err(SubmitError::Nv(e)) => return Err(e.into()),
+                    Err(SubmitError::Unimplemented(why)) => return unimplemented(why),
+                }
             }
             _ => {
                 return unimplemented(format!(
@@ -186,6 +211,7 @@ impl Nvdrv {
 mod tests {
     use super::super::testing::*;
     use super::*;
+    use crate::mem::GuestMemory;
 
     const SET_NVMAP_FD_CODE: u32 = 0x4004_4801;
     const ALLOC_GPFIFO_EX2_CODE: u32 = 0xC020_481A;
@@ -265,11 +291,188 @@ mod tests {
         assert_eq!(nv.gpu.syncpoints.allocate(), Some(syncpt));
     }
 
+    /// A channel ready to take work: an nvmap handle of 0x1000 bytes at CPU address 0x2000_0000
+    /// mapped at GPU address 0x500_0000, an address space bound, a queue, and a 3D object.
+    /// Returns the driver, the memory, the channel descriptor and the channel's syncpoint.
+    fn ready() -> (
+        Nvdrv,
+        std::sync::Arc<crate::mem::testing::TestMemory>,
+        u32,
+        u32,
+    ) {
+        let (mut nv, mem) = nvdrv();
+        mem.map(0x2000_0000, 0x1000);
+        let nvmap = nv.open("/dev/nvmap").unwrap();
+        let as_fd = nv.open("/dev/nvhost-as-gpu").unwrap();
+        let ch = nv.open("/dev/nvhost-gpu").unwrap();
+        let (_, out) = call(&mut nv, nvmap, 0xC008_0101, &u32s(&[0x1000, 0]));
+        let handle = out.u32(4);
+        let mut alloc = vec![0u8; 32];
+        alloc[..4].copy_from_slice(&handle.to_le_bytes());
+        alloc[12..16].copy_from_slice(&0x1000u32.to_le_bytes());
+        alloc[24..].copy_from_slice(&0x2000_0000u64.to_le_bytes());
+        call(&mut nv, nvmap, 0xC020_0104, &alloc);
+        call(&mut nv, as_fd, 0x4028_4109, &[0u8; 40]);
+        let mut map = vec![0u8; 40];
+        map[0..4].copy_from_slice(&1u32.to_le_bytes());
+        map[8..12].copy_from_slice(&handle.to_le_bytes());
+        map[32..40].copy_from_slice(&0x500_0000u64.to_le_bytes());
+        let (e, _) = call(&mut nv, as_fd, 0xC028_4106, &map);
+        assert_eq!(e, NvError::SUCCESS);
+        call(&mut nv, as_fd, BIND_CHANNEL_CODE, &ch.to_le_bytes());
+        let mut ex2 = vec![0u8; 32];
+        ex2[..4].copy_from_slice(&0x800u32.to_le_bytes());
+        let (_, out) = call(&mut nv, ch, ALLOC_GPFIFO_EX2_CODE, &ex2);
+        let syncpt = out.u32(12);
+        let (e, _) = call(&mut nv, ch, ALLOC_OBJ_CTX_CODE, &u32s(&[0xB197, 0, 0, 0]));
+        assert_eq!(e, NvError::SUCCESS);
+        (nv, mem, ch, syncpt)
+    }
+
+    /// A pushbuffer entry for `words` words at GPU address `va`.
+    fn entry(va: u64, words: u64) -> [u8; 8] {
+        ((va & 0xFFFF_FFFF) | ((va >> 32) << 32) | (words << (32 + 10))).to_le_bytes()
+    }
+
+    /// `SUBMIT_GPFIFO` with entries inline.
+    fn submit(
+        nv: &mut Nvdrv,
+        ch: u32,
+        entries: &[[u8; 8]],
+        flags: u32,
+        fence: (u32, u32),
+    ) -> (NvError, Args) {
+        let mut a = vec![0u8; 24];
+        a[8..12].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        a[12..16].copy_from_slice(&flags.to_le_bytes());
+        a[16..20].copy_from_slice(&fence.0.to_le_bytes());
+        a[20..24].copy_from_slice(&fence.1.to_le_bytes());
+        for e in entries {
+            a.extend_from_slice(e);
+        }
+        let code = 0xC000_4808 | ((a.len() as u32) << 16);
+        call(nv, ch, code, &a)
+    }
+
+    fn words(ws: &[u32]) -> Vec<u8> {
+        ws.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
     #[test]
-    fn a_submission_is_not_answered_before_the_processor_exists() {
-        let (mut nv, _, _, ch) = channel();
-        let err = nv.ioctl(ch, 0xC018_4808, &[0; 24], &[]).unwrap_err();
-        assert!(err.contains("SUBMIT_GPFIFO"), "{err}");
+    fn a_pushbuffer_binds_an_engine_and_releases_a_semaphore() {
+        let (mut nv, mem, ch, syncpt) = ready();
+        // SET_OBJECT(3D) on subchannel 0; then SET_REPORT_SEMAPHORE_A..D as one increasing
+        // command: upper address 0, lower address, payload, operation RELEASE with four words.
+        let pb = words(&[
+            0x2001_0000,
+            0xB197,
+            0x2004_06C0,
+            0,
+            0x500_0100,
+            0xFEED_F00D,
+            0,
+        ]);
+        assert!(mem.write(0x2000_0000, &pb));
+        let (e, out) = submit(&mut nv, ch, &[entry(0x500_0000, 7)], 2, (0, 0));
+        assert_eq!(e, NvError::SUCCESS);
+        assert_eq!(mem.read_u32(0x2000_0100), Some(0xFEED_F00D));
+        // FENCE_GET incremented the channel's syncpoint once and returned the fence.
+        assert_eq!((out.u32(16), out.u32(20)), (syncpt, 1));
+        assert_eq!(nv.gpu.syncpoints.value(syncpt), Some(1));
+        assert_eq!(nv.gpu.stats.submits, 1);
+        assert_eq!(nv.gpu.stats.words, 7);
+        assert_eq!(nv.gpu.stats.semaphore_releases, 1);
+        assert_eq!(
+            nv.gpu.channels.values().next().unwrap().subchannels[0],
+            0xB197
+        );
+    }
+
+    #[test]
+    fn promised_increments_are_completed_and_wake_the_waiters() {
+        let (mut nv, _mem, ch, syncpt) = ready();
+        let ctrl = nv.open("/dev/nvhost-ctrl").unwrap();
+        call(&mut nv, ctrl, 0xC004_001F, &u32s(&[2]));
+        let token = nv.query_event(ctrl, 0x1000_0002).unwrap();
+        // Wait for the second increment.
+        let wait = u32s(&[syncpt, 2, 0, 2]);
+        let (e, _) = call(&mut nv, ctrl, 0xC010_001E, &wait);
+        assert_eq!(e, NvError::TIMEOUT);
+        // Two increments promised (flag 0x100: fence.value is the count): no commands at all.
+        let (e, out) = submit(&mut nv, ch, &[], 0x100, (syncpt, 2));
+        assert_eq!(e, NvError::SUCCESS);
+        assert_eq!((out.u32(16), out.u32(20)), (syncpt, 2));
+        assert_eq!(nv.gpu.syncpoints.value(syncpt), Some(2));
+        let signals = nv.take_signals();
+        assert!(signals.iter().any(|s| s.token == token && s.signaled));
+    }
+
+    #[test]
+    fn work_that_cannot_run_stops_the_run_and_says_why() {
+        let (mut nv, mem, ch, _) = ready();
+        // An entry at an address nothing is mapped at.
+        let err = nv
+            .ioctl(
+                ch,
+                0xC020_4808,
+                &{
+                    let mut a = vec![0u8; 24];
+                    a[8] = 1;
+                    a.extend_from_slice(&entry(0x900_0000, 4));
+                    a
+                },
+                &[],
+            )
+            .unwrap_err();
+        assert!(err.contains("not mapped"), "{err}");
+        // A command nothing implements.
+        mem.write(0x2000_0000, &words(&[0xC000_0000]));
+        let err = nv
+            .ioctl(
+                ch,
+                0xC020_4808,
+                &{
+                    let mut a = vec![0u8; 24];
+                    a[8] = 1;
+                    a.extend_from_slice(&entry(0x500_0000, 1));
+                    a
+                },
+                &[],
+            )
+            .unwrap_err();
+        assert!(err.contains("operation 6"), "{err}");
+        // A wait for a fence nothing brings about.
+        let err = nv
+            .ioctl(
+                ch,
+                0xC018_4808,
+                &{
+                    let mut a = vec![0u8; 24];
+                    a[12] = 1;
+                    a[16] = 9;
+                    a[20] = 5;
+                    a
+                },
+                &[],
+            )
+            .unwrap_err();
+        assert!(err.contains("waits for syncpoint 9"), "{err}");
+    }
+
+    #[test]
+    fn entries_can_come_in_the_second_buffer() {
+        let (mut nv, mem, ch, _) = ready();
+        mem.write(0x2000_0000, &words(&[0x2001_0000, 0xB197]));
+        let mut header = vec![0u8; 24];
+        header[8] = 1;
+        let r = nv
+            .ioctl(ch, 0xC018_481B, &header, &entry(0x500_0000, 2))
+            .unwrap();
+        assert_eq!(r.error, NvError::SUCCESS);
+        assert_eq!(nv.gpu.stats.words, 2);
+        // Too few bytes for the entries announced.
+        let r = nv.ioctl(ch, 0xC018_481B, &header, &[0; 4]).unwrap();
+        assert_eq!(r.error, NvError::INVALID_SIZE);
     }
 
     #[test]
