@@ -29,6 +29,9 @@ returning a value.
 | U-6 | `LDXR`/`STXR` are a compare-and-swap of the value `LDXR` observed. An intervening plain store that changes the monitored location makes the store-exclusive fail, and an ABA write would wrongly let it succeed. | The monitor is a state machine: the PE's own plain stores do not affect it. This is the "plain compare-and-swap is not equivalent" point. | 195 of 40,000 |
 | U-7 | Uses -1 as its "monitor open" marker, so a store-exclusive to address `0xFFFF_FFFF_FFFF_FFFF` looks armed and faults on the unmapped address. | An unarmed monitor fails the store with no memory access. | not drawn in the last run; rule kept |
 | U-8 | `CNTFRQ_EL0` reads 62,500,000 (QEMU's generic timer default). | The Switch counter runs at 19,200,000 Hz (docs/ASSUMPTIONS.md A-001). A platform property, not a CPU behavior. | `cache_identification_registers_match_the_a57` |
+| U-9 | Executes `FCMP`/`FCMPE` against `#0.0` when the `Rm` field, which the zero form fixes at zero, is not zero. | No encoding matches: the decoder reports it as unallocated. | 8 of 8,000,000 random words |
+| U-10 | A misaligned `LDAR`/`STLR`/`LDXR`/`STXR` to an unmapped or read-only address reports the translation or permission fault. | `AArch64.CheckAlignment` runs before the address is translated, so the access is an alignment fault. Both stop the run; only the reported cause differs. | 1 of 8,000,000 random words |
+| U-11 | Executes system registers and `SYS` operations that are not EL0 operations on the Switch's core or that the model does not provide (debug and PMU registers, the physical timer, `TLBI` and `DC` operations), because it runs the guest at EL1. | The interpreter stops with a report naming the encoding and never invents a value; a title that needs the register shows up as a stop with its address. | 16 of 8,000,000 random words |
 
 ## Not compared (CONSTRAINED UNPREDICTABLE)
 

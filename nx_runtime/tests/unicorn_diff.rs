@@ -7,6 +7,7 @@ mod common;
 use common::gen::Gen;
 use common::harness::{Case, Class, Harness, Outcome, CODE_BASE, CODE_SIZE, DATA_BASE, DATA_SIZE};
 use common::{case_count, run_batch, unicorn_or_skip, Accepted};
+use nx_runtime::a64::inst::SysReg;
 use nx_runtime::a64::{decode, Inst};
 use nx_runtime::testing::asm;
 
@@ -47,6 +48,12 @@ fn known_exclusive_differences(case: &Case, uc: &Outcome, mine: &Outcome) -> Opt
             // U-4: QEMU 5 (Unicorn 2.1) does not fault on a misaligned LDAR/STLR; the pseudocode
             // requires alignment for ordered accesses.
             (Class::Ok, Inst::AcqRel { .. }) => Some(Accepted { id: "U-4" }),
+            // U-10: a misaligned ordered or exclusive access to an unmapped or read-only address.
+            // The pseudocode checks alignment before translating the address; QEMU reports the
+            // translation or permission fault.
+            (Class::Unmapped, Inst::AcqRel { .. } | Inst::Exclusive { .. }) => {
+                Some(Accepted { id: "U-10" })
+            }
             _ => None,
         };
     }
@@ -751,15 +758,18 @@ fn random_words_decode_and_execute_like_unicorn() {
     let mut supported = 0usize;
     let mut unallocated_both = 0usize;
     let mut skipped_unsupported = 0usize;
+    let mut unsupported_what: std::collections::BTreeMap<&'static str, usize> = Default::default();
     let mut skipped_unpredictable = 0usize;
+    let mut extra_sysregs = 0usize;
     // Encodings the decoder rejects but Unicorn executes, by family.
     let mut gaps: std::collections::BTreeMap<&'static str, Vec<u32>> = Default::default();
     let mut failures: Vec<String> = Vec::new();
     for i in 0..n {
         let word = g.rng.next_u32();
         let inst = decode(word);
-        if matches!(inst, Inst::Unsupported { .. }) {
+        if let Inst::Unsupported { what, .. } = inst {
             skipped_unsupported += 1;
+            *unsupported_what.entry(what).or_default() += 1;
             continue;
         }
         if constrained_unpredictable(&inst) {
@@ -767,7 +777,8 @@ fn random_words_decode_and_execute_like_unicorn() {
             continue;
         }
         // Registers: a mix of data pointers and boundary values so that memory forms hit mapped memory.
-        let mut case = g.case(vec![word]);
+        // Vector registers and the floating-point control registers are random too, and compared.
+        let mut case = g.simd_case(vec![word]);
         for r in 0..31 {
             if g.below(3) == 0 {
                 case.state.x[r] = g.data_pointer(0x1000, 0x1000);
@@ -786,12 +797,29 @@ fn random_words_decode_and_execute_like_unicorn() {
             }
             _ => {
                 supported += 1;
+                // U-11: a system register Unicorn implements and the model does not. The interpreter
+                // stops with a report instead of inventing a value.
+                if matches!(
+                    inst,
+                    Inst::Mrs {
+                        reg: SysReg::Other(..),
+                        ..
+                    } | Inst::Msr {
+                        reg: SysReg::Other(..),
+                        ..
+                    } | Inst::Sys { .. }
+                ) && uc.class == Class::Ok
+                    && mine.class == Class::Exception
+                {
+                    extra_sysregs += 1;
+                    continue;
+                }
                 if wild_branch_target(&case, &uc, &mine).is_some()
                     || known_exclusive_differences(&case, &uc, &mine).is_some()
                 {
                     continue;
                 }
-                if let Some(d) = common::harness::diff(&uc, &mine, false) {
+                if let Some(d) = common::harness::diff(&uc, &mine, true) {
                     if failures.len() < 10 {
                         failures.push(format!(
                             "word {i}:\n{}  {d}",
@@ -802,10 +830,14 @@ fn random_words_decode_and_execute_like_unicorn() {
             }
         }
     }
+    for (what, count) in &unsupported_what {
+        eprintln!("  not implemented: {what}: {count} words");
+    }
     let total_gaps: usize = gaps.values().map(Vec::len).sum();
     eprintln!(
         "random words: {n} drawn; {supported} executed on both, {unallocated_both} unallocated on both, \
          {skipped_unsupported} in unsupported groups, {skipped_unpredictable} CONSTRAINED UNPREDICTABLE (not compared), \
+         {extra_sysregs} system registers only Unicorn implements, \
          {total_gaps} strict-decoder rejections Unicorn executes"
     );
     let mut unexplained = 0usize;
@@ -876,6 +908,16 @@ fn gap_family(word: u32) -> &'static str {
     // SMULH/UMULH with Ra not 31.
     if bits(28, 24) == 0b11011 && matches!(bits(23, 21), 0b010 | 0b110) && bits(14, 10) != 0b11111 {
         return "SMULH/UMULH with should-be-one Ra field not all ones";
+    }
+    // FCMP/FCMPE against zero with the should-be-zero Rm field set.
+    if bits(31, 24) == 0x1E
+        && bits(21, 21) == 1
+        && bits(13, 10) == 0b1000
+        && bits(3, 3) == 1
+        && bits(2, 0) == 0
+        && bits(20, 16) != 0
+    {
+        return "FCMP/FCMPE with #0.0 and a non-zero Rm field";
     }
     "other"
 }

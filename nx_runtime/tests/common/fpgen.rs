@@ -117,6 +117,54 @@ impl Gen {
         }
     }
 
+    /// A register of integer lanes at the boundaries (zero, one, extremes, all ones, small values
+    /// and random bits) for a lane size picked at random.
+    pub fn lane_register(&mut self) -> u128 {
+        let esize = 8u32 << self.below(4);
+        let mask = if esize == 64 {
+            u64::MAX
+        } else {
+            (1u64 << esize) - 1
+        };
+        let mut r = 0u128;
+        for i in 0..128 / esize {
+            let v = match self.below(10) {
+                0 => 0,
+                1 => 1,
+                2 => mask,
+                3 => 1u64 << (esize - 1),
+                4 => (1u64 << (esize - 1)) - 1,
+                5 => self.below(8),
+                6 => mask - self.below(8),
+                7 => (1u64 << (esize - 1)).wrapping_add(self.below(4)) & mask,
+                _ => self.rng.next_u64() & mask,
+            };
+            r |= u128::from(v & mask) << (i * esize);
+        }
+        r
+    }
+
+    /// A state for the integer SIMD tests: lane-boundary registers, a few floating-point ones.
+    pub fn simd_state(&mut self) -> CpuState {
+        let mut s = self.fp_state();
+        for n in 0..32u8 {
+            if self.below(4) != 0 {
+                let v = self.lane_register();
+                s.set_vreg(n, v);
+            }
+        }
+        s
+    }
+
+    pub fn simd_case(&mut self, words: Vec<u32>) -> Case {
+        Case {
+            steps: words.len(),
+            words,
+            state: self.simd_state(),
+            data: self.data(),
+        }
+    }
+
     pub fn fpcr(&mut self) -> u32 {
         match self.below(10) {
             0..=3 => 0,
