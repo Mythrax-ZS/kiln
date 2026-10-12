@@ -11,7 +11,7 @@ ExeFS / NRO ──loader──▶ Module ──discover──▶ per-function CF
 | Step | Code | What it does |
 |------|------|--------------|
 | Input | `src/container`, `nx_runtime/src/{storage,romfs,npdm}.rs` | ExeFS directory or PFS0, RomFS directory or image, NPDM. No keys. |
-| Load | `src/loader` | NSO0 / NRO0: LZ4, SHA-256, MOD0 relocations, exports, `.eh_frame_hdr` function extents. Fixed guest base `0x0800_0000`. |
+| Load | `src/loader`, `src/program.rs` | NSO0 / NRO0: LZ4, SHA-256, MOD0 relocations, exports, `.eh_frame_hdr` function extents. Fixed guest base `0x0800_0000`. All NSOs of an ExeFS are mapped back to back (`rtld`, `main`, `subsdk0-9`, `sdk`) and the program starts in the first; the embedded image is the unrelocated one, as the kernel's loader leaves it (A-041). |
 | Decode | `nx_runtime/src/a64/decode.rs` | 32-bit word to `Inst`; strict (unallocated is distinct from unsupported). |
 | Floating point and SIMD | `nx_runtime/src/a64/{fp.rs,vec/}` | Exact soft-float (`fp.rs`), the decoder for the scalar FP and Advanced SIMD space and the executor (`vec/`). One implementation, used by the interpreter and by generated code. |
 | Interpret | `nx_runtime/src/a64/interp.rs` | The oracle, and the fallback for anything not translated. |
@@ -76,8 +76,16 @@ results there as the Switchbrew SVC pages lay them out, and the generated code r
 - **IPC**: `ipc.rs` parses and builds HIPC messages and the CMIF headers, handles domains and the
   control commands; a `Service` (`service.rs`) answers a request with a `Response`, whose objects
   become move handles or domain object ids. `sm:` (`sm.rs`) is the only named port; it hands out a
-  service only if the program's NPDM service access list allows the name. `services.rs` registers
-  the services; none besides `sm:` exists yet.
+  service only if the program's NPDM service access list allows the name. `services/` holds the
+  services (each a file, registered in `services/mod.rs`): `lm`, `apm`, `appletOE`, `aoc:u`,
+  `pctl` and `fsp-srv`; a service is handed a weak reference to its kernel for events, transfer
+  memory and guest buffers.
+- **Lent memory**: `CreateTransferMemory` reprotects a range of the program's heap and marks it
+  locked until the handle is closed (`memobj.rs`); the services, which run in the process, read
+  and write it through the same addresses.
+- **RomFS**: `fsp-srv` serves the directory or image given with `--romfs` (or `NX_ROMFS`) as a
+  virtual image (`nx_runtime/src/romfs.rs`), read on demand, so a multi-gigabyte RomFS costs no
+  memory.
 - **Stops**: an SVC, a named port, a service or a command nobody implemented does not get an
   answer. The kernel records a report with the guest address and the number, ends the process and
   the produced program exits with status 101.

@@ -18,19 +18,22 @@ what was implemented, what was tested and how, and what was not verified. `docs/
 explains how the pieces fit together.
 
 Done: M1 (input layer), M2 (loader), M3 (decoder and interpreter, integer ISA), M4 (lifter and
-LLVM code generation, integer ISA), M5 (floating point and Advanced SIMD in all four layers; the
-cryptographic extension is the one thing left out), M6 (the Horizon kernel layer: a homebrew NRO
-built by `recomp build` runs natively, prints through `svcOutputDebugString`, starts threads and
-talks to `sm:`; `sm:` is the only service). Nothing renders: GPU work is out of scope until M7
-passes.
+LLVM code generation, integer ISA), M5 (floating point and Advanced SIMD in all four layers), M6
+(the Horizon kernel layer: a homebrew NRO built by `recomp build` runs natively, prints through
+`svcOutputDebugString`, starts threads and talks to `sm:`), M7 (a title with a RomFS boots on that
+layer, through its own `rtld` and SDK start-up, until it asks for the GPU driver; the
+cryptographic extension was added on the way). Nothing renders: the GPU is the next blocker and a
+separate milestone.
 
 ## Using it
 
 ```
 recomp inspect --exefs <dir|pfs0> [--romfs <dir|image>]
-recomp analyze (--exefs <dir|pfs0> | --nro <file>) [--hints <file>]
+recomp analyze (--exefs <dir|pfs0> | --nro <file>) [--hints <file>] [--main-only]
 recomp build   (--exefs <dir|pfs0> | --nro <file>) --out <dir> [--name <name>] [--opt <0-3>]
-               [--hints <file>] [--shared] [--keep-ir]
+               [--hints <file>] [--shared] [--keep-ir] [--main-only] [--romfs <dir|image>]
+               [--reuse-objects]
+recomp relink  --out <dir> --name <name>
 ```
 
 `build` writes `<name>.exe` (or `<name>`), optionally `<name>.dll` with `--shared`, the embedded
@@ -43,10 +46,18 @@ reached that no function covers can be logged with `NX_UNKNOWN_LOG=<file>` and f
 A produced NSO or NRO runs on the project's own Horizon kernel layer. What the guest sends to
 `svcOutputDebugString` goes to the program's standard output. An SVC, a service or a service
 command nobody implemented stops the run: the report on standard error names the guest address and
-the number, and the exit status is 101. Two environment variables help while debugging:
-`NX_TRACE_SVC=1` logs every supervisor call with its arguments and result on standard error, and
-`NX_RANDOM_SEED=<decimal number>` makes the kernel's pseudo-random values (loader configuration, `GetInfo`
-entropy) reproducible.
+the number, and the exit status is 101.
+
+From an ExeFS, `analyze` and `build` take every NSO (`rtld`, `main`, `subsdk0-9`, `sdk`) and the
+produced program starts in the first, the way the console starts a title; `--main-only` takes `main`
+alone. A title's RomFS is given with `--romfs` when building (the produced program remembers the
+path) or with `NX_ROMFS=<dir|image>` when running. Environment variables that help while
+debugging: `NX_TRACE_SVC=1` logs every supervisor call and every IPC request with its result on
+standard error, `NX_TRACE_LOG=1` prints what the program logs through the log manager, and
+`NX_RANDOM_SEED=<decimal number>` makes the kernel's pseudo-random values (loader configuration,
+`GetInfo` entropy) reproducible. `recomp relink` links the objects of an earlier build against the
+current runtime and `--reuse-objects` skips recompiling unchanged code, which keeps the loop of
+trying a title short.
 
 ## What "accuracy" means here
 

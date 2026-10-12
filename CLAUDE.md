@@ -63,7 +63,12 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   words).
 - Kernel layer: `nx_runtime/src/horizon/tests.rs` drives the SVC interface with real host threads
   and needs no external tool. The homebrew tests in `src/build/e2e_tests.rs` build small NROs
-  from assembled words and run them (clang needed). `NX_TRACE_SVC=1` logs every SVC of a produced
-  program; `NX_RANDOM_SEED=<n>` makes the kernel's entropy reproducible.
+  from assembled words and run them (clang needed). `NX_TRACE_SVC=1` logs every SVC and IPC
+  request of a produced program; `NX_TRACE_LOG=1` prints what it logs through `lm`;
+  `NX_RANDOM_SEED=<n>` makes the kernel's entropy reproducible; `NX_ROMFS=<dir|image>` names the
+  RomFS it reads at run time.
+- A real title through the whole pipeline (opt-in, by hand; nothing from it is stored): build with
+  `recomp build --exefs <exefs> --romfs <romfs> --out <dir>`, run `<dir>/<name>` with
+  `NX_TRACE_SVC=1`, and use `recomp relink` / `--reuse-objects` to iterate on the runtime.
 - Unicorn (AArch64 oracle): `UNICORN_DLL`, else `.venv` (`py -m venv .venv`, then
   `.venv\Scripts\pip install unicorn`). The shared library is loaded with `libloading`.
