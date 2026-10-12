@@ -76,6 +76,8 @@ pub struct AddressSpace {
     split: u64,
     pub big_page_size: u32,
     initialized: bool,
+    /// The program chooses every address itself (`ALLOC_AS_EX` flag 0).
+    pub userspace_managed: bool,
     regions: BTreeMap<u64, Region>,
     maps: BTreeMap<u64, Mapping>,
 }
@@ -98,14 +100,17 @@ impl AddressSpace {
             split: DEFAULT_START + (DEFAULT_END - DEFAULT_START) / 2,
             big_page_size: BIG_PAGE,
             initialized: false,
+            userspace_managed: false,
             regions: BTreeMap::new(),
             maps: BTreeMap::new(),
         }
     }
 
-    /// `ALLOC_AS_EX`: set the range. Allowed once, before anything is reserved.
+    /// `ALLOC_AS_EX`: set the range. Allowed once, before anything is reserved. A range of zeros
+    /// keeps the default one. Bit 0 of `flags` says the program manages the addresses itself.
     pub fn initialize(
         &mut self,
+        flags: u32,
         big_page_size: u32,
         start: u64,
         end: u64,
@@ -114,9 +119,15 @@ impl AddressSpace {
         if self.initialized || !self.regions.is_empty() || !self.maps.is_empty() {
             return Err(NvError::INVALID_STATE);
         }
-        if start >= end || split < start || split > end {
+        let (start, end, split) = if (start, end, split) == (0, 0, 0) {
+            (self.start, self.end, self.split)
+        } else {
+            (start, end, split)
+        };
+        if start >= end || split < start || split > end || end > DEFAULT_END {
             return Err(NvError::BAD_VALUE);
         }
+        self.userspace_managed = flags & 1 != 0;
         if big_page_size != 0 {
             if !valid_page_size(big_page_size) || big_page_size < BIG_PAGE {
                 return Err(NvError::BAD_VALUE);
@@ -378,7 +389,7 @@ mod tests {
     #[test]
     fn the_range_and_regions_follow_alloc_as_ex() {
         let mut a = AddressSpace::new();
-        a.initialize(0x20000, 0x0400_0000, 0x10_0000_0000, 0x1_0000_0000)
+        a.initialize(0, 0x20000, 0x0400_0000, 0x10_0000_0000, 0x1_0000_0000)
             .unwrap();
         assert_eq!(a.big_page_size, 0x20000);
         let r = a.va_regions();
@@ -388,25 +399,43 @@ mod tests {
         );
         assert_eq!(r[1], (0x1_0000_0000, 0x20000, 0xF_0000_0000 / 0x20000));
         assert_eq!(
-            a.initialize(0, 0, 1 << 20, 0),
+            a.initialize(0, 0, 0, 1 << 20, 0),
             Err(NvError::INVALID_STATE),
             "only once"
         );
         let mut b = AddressSpace::new();
         assert_eq!(
-            b.initialize(0, 0x2000, 0x1000, 0x2000),
+            b.initialize(0, 0, 0x2000, 0x1000, 0x2000),
             Err(NvError::BAD_VALUE)
         );
         assert_eq!(
-            b.initialize(0x3000, 0, 1 << 30, 1 << 20),
+            b.initialize(0, 0x3000, 0, 1 << 30, 1 << 20),
             Err(NvError::BAD_VALUE)
         );
     }
 
     #[test]
+    fn a_zero_range_keeps_the_default_and_the_flag_is_remembered() {
+        let mut a = AddressSpace::new();
+        assert!(!a.userspace_managed);
+        a.initialize(1, 0x10000, 0, 0, 0).unwrap();
+        assert!(a.userspace_managed);
+        assert_eq!(a.range(), (DEFAULT_START, DEFAULT_END));
+        assert_eq!(a.big_page_size, 0x10000);
+        let r = a.va_regions();
+        assert_eq!(r[0].0, DEFAULT_START);
+        assert_eq!(r[1].0, DEFAULT_START + (DEFAULT_END - DEFAULT_START) / 2);
+        // A range past what the GPU can address (40 bits) is refused.
+        let mut b = AddressSpace::new();
+        assert_eq!(
+            b.initialize(0, 0, 0x1000, DEFAULT_END + 1, 0x2000),
+            Err(NvError::BAD_VALUE)
+        );
+    }
+    #[test]
     fn reservations_are_aligned_distinct_and_in_the_right_half() {
         let mut a = AddressSpace::new();
-        a.initialize(0, 0x1_0000, 0x100_0000, 0x80_0000).unwrap();
+        a.initialize(0, 0, 0x1_0000, 0x100_0000, 0x80_0000).unwrap();
         let s1 = a.alloc_space(4, SMALL_PAGE, 0, 0).unwrap();
         let s2 = a.alloc_space(2, SMALL_PAGE, 0, 0x4000).unwrap();
         assert_eq!(s1, 0x1_0000);
@@ -421,7 +450,7 @@ mod tests {
     #[test]
     fn fixed_reservations_must_not_overlap() {
         let mut a = AddressSpace::new();
-        a.initialize(0, 0x1_0000, 0x100_0000, 0x80_0000).unwrap();
+        a.initialize(0, 0, 0x1_0000, 0x100_0000, 0x80_0000).unwrap();
         let f = alloc_flags::FIXED_OFFSET;
         assert_eq!(a.alloc_space(16, BIG_PAGE, f, 0x20_0000), Ok(0x20_0000));
         assert_eq!(
@@ -444,7 +473,7 @@ mod tests {
     #[test]
     fn freeing_a_reservation_takes_its_mappings_with_it() {
         let mut a = AddressSpace::new();
-        a.initialize(0, 0x1_0000, 0x100_0000, 0x80_0000).unwrap();
+        a.initialize(0, 0, 0x1_0000, 0x100_0000, 0x80_0000).unwrap();
         let s = a.alloc_space(8, SMALL_PAGE, 0, 0).unwrap();
         let mut r = req(1, 0x1000_0000, 0x2000);
         r.flags = map_flags::FIXED_OFFSET;

@@ -4,7 +4,7 @@
 use super::args::{unimplemented, Args, Fail, IoResult, Ioctl};
 use super::{Node, Nvdrv};
 use crate::error::NvError;
-use crate::vm::{MapRequest, DEFAULT_END, DEFAULT_START};
+use crate::vm::MapRequest;
 
 /// The type byte of the address space ioctls (`'A'`).
 pub const TYPE: u32 = 0x41;
@@ -103,24 +103,15 @@ impl Nvdrv {
                 let at = self.space_mut(space)?.map_buffer(&req)?;
                 args.set_u64(32, at);
             }
-            // u32 big_page_size, s32 as_fd, u64 reserved: the old form, no range
-            (ALLOC_AS, 16) => {
-                self.space_mut(space)?.initialize(
-                    args.u32(0),
-                    DEFAULT_START,
-                    DEFAULT_END,
-                    DEFAULT_START + (DEFAULT_END - DEFAULT_START) / 2,
-                )?;
-            }
-            // u32 big_page_size, s32 as_fd, u32 flags, u32 reserved, u64 va_range_start,
-            // u64 va_range_end, u64 va_range_split
+            // u32 flags, s32 as_fd, u32 big_page_size, u32 reserved, u64 va_range_start,
+            // u64 va_range_end, u64 va_range_split. This is the order a title sends (libnx's
+            // `nvioctlNvhostAsGpu_InitializeEx`; Switchbrew lists big_page_size and flags the
+            // other way round, docs/ASSUMPTIONS.md). A zero range keeps the default one.
             (ALLOC_AS_EX, 40) => {
-                self.space_mut(space)?.initialize(
-                    args.u32(0),
-                    args.u64(16),
-                    args.u64(24),
-                    args.u64(32),
-                )?;
+                let (flags, big_page_size) = (args.u32(0), args.u32(8));
+                let (start, end, split) = (args.u64(16), args.u64(24), args.u64(32));
+                self.space_mut(space)?
+                    .initialize(flags, big_page_size, start, end, split)?;
             }
             // u64 buf_addr, u32 buf_size, u32 reserved, va_region regions[2] (24 bytes each)
             (GET_VA_REGIONS, 64) => {
@@ -183,12 +174,33 @@ mod tests {
 
     fn alloc_as_ex(nv: &mut Nvdrv, fd: u32) {
         let mut a = vec![0u8; 40];
-        a[0..4].copy_from_slice(&0x20000u32.to_le_bytes());
+        a[0..4].copy_from_slice(&1u32.to_le_bytes()); // flags: the program manages addresses
+        a[8..12].copy_from_slice(&0x20000u32.to_le_bytes()); // big page size
         a[16..24].copy_from_slice(&0x0400_0000u64.to_le_bytes());
         a[24..32].copy_from_slice(&0x100_0000_0000u64.to_le_bytes());
         a[32..40].copy_from_slice(&0x1_0000_0000u64.to_le_bytes());
         let (e, _) = call(nv, fd, ALLOC_AS_EX_CODE, &a);
         assert_eq!(e, NvError::SUCCESS);
+    }
+
+    #[test]
+    fn alloc_as_ex_in_the_order_libnx_sends_it_with_no_range() {
+        let (mut nv, _, fd) = setup();
+        // flags 1, as_fd 0, big page size 0x10000, reserved 0, then three zero range words.
+        let mut a = vec![0u8; 40];
+        a[0..4].copy_from_slice(&1u32.to_le_bytes());
+        a[8..12].copy_from_slice(&0x10000u32.to_le_bytes());
+        let (e, _) = call(&mut nv, fd, ALLOC_AS_EX_CODE, &a);
+        assert_eq!(e, NvError::SUCCESS);
+        let space = nv.gpu.spaces.values().next().unwrap();
+        assert!(space.userspace_managed);
+        assert_eq!(
+            space.range(),
+            (crate::vm::DEFAULT_START, crate::vm::DEFAULT_END)
+        );
+        let r = nv.ioctl(fd, VA_REGIONS_CODE, &[0u8; 64], &[]).unwrap();
+        assert_eq!(r.args.u64(16), crate::vm::DEFAULT_START);
+        assert_eq!(r.args.u32(48), 0x10000);
     }
 
     #[test]

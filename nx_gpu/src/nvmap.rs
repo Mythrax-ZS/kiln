@@ -100,9 +100,11 @@ impl Nvmap {
         if h.addr.is_some() {
             return Err(NvError::ALREADY_ALLOCATED);
         }
-        // The alignment is a power of two (zero means a page) and the address obeys it.
+        // The alignment is a power of two (zero means a page). It is what the driver would use to
+        // place memory of its own; the address a program passes only has to be a page's (the
+        // addresses titles pass are not aligned to the alignment they ask for).
         let align = if align == 0 { PAGE as u32 } else { align };
-        if !align.is_power_of_two() || !addr.is_multiple_of(u64::from(align.max(PAGE as u32))) {
+        if !align.is_power_of_two() || !addr.is_multiple_of(PAGE) {
             return Err(NvError::BAD_VALUE);
         }
         h.heap_mask = heap_mask;
@@ -195,11 +197,15 @@ mod tests {
         let mut m = Nvmap::new();
         let h = m.create(0x10000).unwrap();
         assert_eq!(
-            m.alloc(h, 0, 1, 0x10000, 0, 0x1_0001_0000 + 0x1000),
+            m.alloc(h, 0, 1, 0x1000, 0, 0x1_0000_0800),
             Err(NvError::BAD_VALUE),
-            "address not aligned to the requested 64 KiB"
+            "the address is not a page's"
         );
         assert_eq!(m.alloc(h, 0, 1, 0x3000, 0, 0x1000), Err(NvError::BAD_VALUE));
+        // A title asks for 128 KiB alignment and passes a page-aligned address: accepted.
+        let big = m.create(0x1000).unwrap();
+        assert_eq!(m.alloc(big, 0, 0, 0x20000, 0, 0x30_0003_7000), Ok(()));
+        assert_eq!(m.param(big, param::ALIGNMENT), Ok(0x20000));
         assert_eq!(m.alloc(h, 0x1, 1, 0x1000, 6, 0x1_0000_0000), Ok(()));
         assert_eq!(m.get(h).unwrap().addr, Some(0x1_0000_0000));
         assert_eq!(
