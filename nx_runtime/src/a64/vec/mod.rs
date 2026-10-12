@@ -238,4 +238,6 @@ pub struct VAddr {
 }
 
 #[cfg(test)]
+mod scalar_tests;
+#[cfg(test)]
 mod tests;
