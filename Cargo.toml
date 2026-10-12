@@ -18,7 +18,7 @@ nx_runtime = { path = "nx_runtime" }
 sha2 = "0.10"
 
 [dev-dependencies]
-nx_runtime = { path = "nx_runtime", features = ["asm"] }
+nx_runtime = { path = "nx_runtime", features = ["testing"] }
 
 [workspace]
 members = ["nx_runtime"]

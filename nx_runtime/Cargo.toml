@@ -11,8 +11,8 @@ path = "src/lib.rs"
 crate-type = ["rlib", "staticlib"]
 
 [features]
-# Test-only A64 assembler used to build synthetic fixtures. Never enabled in release builds.
-asm = []
+# Test-only helpers (temp dirs, PRNG, A64 assembler) used to build synthetic fixtures.
+testing = []
 
 [dev-dependencies]
 libloading = "0.8"

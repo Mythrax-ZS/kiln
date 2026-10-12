@@ -62,6 +62,31 @@ impl Storage for VecStorage {
     }
 }
 
+#[cfg(windows)]
+fn read_some(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
+}
+
+#[cfg(unix)]
+fn read_some(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+/// Fill `buf` from `file` at `offset` using positioned reads, which need no shared cursor.
+pub fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = read_some(file, &mut buf[done..], offset + done as u64)?;
+        if n == 0 {
+            return Err(Error::Io(std::io::ErrorKind::UnexpectedEof.into()));
+        }
+        done += n;
+    }
+    Ok(())
+}
+
 /// File-backed storage using positioned reads, so it needs no lock.
 pub struct FileStorage {
     file: File,
@@ -78,18 +103,6 @@ impl FileStorage {
     pub fn shared(path: &Path) -> Result<SharedStorage> {
         Ok(Arc::new(FileStorage::open(path)?))
     }
-
-    #[cfg(windows)]
-    fn read_some(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
-        use std::os::windows::fs::FileExt;
-        self.file.seek_read(buf, offset)
-    }
-
-    #[cfg(unix)]
-    fn read_some(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
-        use std::os::unix::fs::FileExt;
-        self.file.read_at(buf, offset)
-    }
 }
 
 impl Storage for FileStorage {
@@ -99,15 +112,7 @@ impl Storage for FileStorage {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         check_range(offset, buf.len() as u64, self.size)?;
-        let mut done = 0usize;
-        while done < buf.len() {
-            let n = self.read_some(&mut buf[done..], offset + done as u64)?;
-            if n == 0 {
-                return Err(Error::Io(std::io::ErrorKind::UnexpectedEof.into()));
-            }
-            done += n;
-        }
-        Ok(())
+        read_exact_at(&self.file, offset, buf)
     }
 }
 

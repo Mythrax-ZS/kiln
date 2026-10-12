@@ -5,8 +5,12 @@
 //! native executables and shared libraries that clang produces.
 
 pub mod error;
+pub mod romfs;
 pub mod storage;
 pub mod util;
+
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub use error::{Error, Result};
 
