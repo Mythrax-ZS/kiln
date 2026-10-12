@@ -674,6 +674,18 @@ pub fn plan(dirs: &[String], files: &[(String, u64)]) -> Result<Plan> {
     })
 }
 
+/// Open a RomFS given as an extracted directory (served through a virtual image) or as a flat
+/// image file.
+pub fn open_path(path: &Path) -> Result<SharedStorage> {
+    if path.is_dir() {
+        DirImage::shared(path)
+    } else if path.is_file() {
+        crate::storage::FileStorage::shared(path)
+    } else {
+        Err(Error::NotFound(format!("RomFS {}", path.display())))
+    }
+}
+
 /// Build a whole image in memory from (path, contents) pairs. Meant for small images and tests;
 /// use [`DirImage`] for real titles.
 pub fn build_image(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
