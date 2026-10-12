@@ -24,15 +24,7 @@ use args::{unimplemented, Args, Fail, IoResult, Ioctl};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// A kernel event the Horizon layer creates on first use and signals on request.
-pub type EventToken = u32;
-
-/// An instruction to set (`true`) or clear (`false`) the event behind a token.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Signal {
-    pub token: EventToken,
-    pub signaled: bool,
-}
+pub use crate::event::{EventToken, Signal};
 
 /// How many event slots one `/dev/nvhost-ctrl` descriptor has.
 pub const CTRL_EVENT_SLOTS: usize = 64;
