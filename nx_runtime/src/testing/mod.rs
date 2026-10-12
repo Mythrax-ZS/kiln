@@ -3,6 +3,7 @@
 
 pub mod asm;
 pub mod flatbus;
+pub mod prog;
 
 pub use flatbus::FlatBus;
 

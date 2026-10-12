@@ -16,6 +16,8 @@ pub mod jumptable;
 pub mod sem;
 
 #[cfg(test)]
+mod flow_tests;
+#[cfg(test)]
 mod tests;
 
 use crate::loader::module::Module;
