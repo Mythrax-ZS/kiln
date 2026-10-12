@@ -39,7 +39,11 @@ Small chunks. Title at most 50 characters. No body. No attribution lines of any 
 - Where Unicorn disagrees with the Arm pseudocode, the pseudocode wins and the disagreement is
   recorded in `docs/UNICORN_DISAGREEMENTS.md`.
 - Milestones M1..M7 (see `docs/reports/`): stop after each one, run the tests, write the report,
-  then move on. GPU work, Maxwell shader translation and NVN stay out of scope until M7 passes.
+  then move on. M7 passed. The owner approved the GPU work on 2026-10-12 (M8, the `nx_gpu`
+  crate): `nvdrv` and its device nodes, the display and buffer-queue path, then a tracing
+  command processor. Shader translation (SASS to SPIR-V) and the Vulkan backend come after M8
+  and need the owner's go-ahead again. Never describe the output as playable before frames are
+  measured.
 - Out of scope: online services, account checks, licensing checks, AArch32 (detect and error).
 
 ## External tools used by tests
