@@ -5,6 +5,9 @@ pub mod bus;
 pub mod decode;
 #[cfg(test)]
 mod decode_tests;
+pub mod fp;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod fp_tests;
 pub mod inst;
 pub mod interp;
 #[cfg(test)]
