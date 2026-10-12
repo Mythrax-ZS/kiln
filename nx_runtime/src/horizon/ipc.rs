@@ -38,6 +38,8 @@ pub struct Message {
     pub send: Vec<Buffer>,
     pub receive: Vec<Buffer>,
     pub exchange: Vec<Buffer>,
+    /// Receive-list (C) descriptors: where pointer data the service returns is delivered.
+    pub receive_list: Vec<Buffer>,
     /// The raw data region: from the first byte after the descriptors to the end of the raw words.
     pub raw: Vec<u8>,
     /// Where the 16-byte aligned CMIF data starts inside `raw`.
@@ -129,7 +131,48 @@ pub fn parse_message(buf: &[u8]) -> Option<Message> {
     let raw_end = off + 4 * raw_words;
     m.raw = buf.get(off..raw_end)?.to_vec();
     m.raw_aligned_at = (off.next_multiple_of(16) - off).min(m.raw.len());
+    // The receive list follows the raw data (or starts where the header says): 2 is one buffer,
+    // more than 2 is that many less two. Count 1 is a buffer inlined after the raw data, which no
+    // service here uses.
+    let recv_count = (h1 >> 10) & 0xF;
+    let entries = match recv_count {
+        0 | 1 => 0,
+        2 => 1,
+        n => n as usize - 2,
+    };
+    let list_at = match (h1 >> 20) & 0x7FF {
+        0 => raw_end,
+        words => 4 * words as usize,
+    };
+    for i in 0..entries {
+        m.receive_list
+            .push(receive_list_entry(buf, list_at + 8 * i)?);
+    }
     Some(m)
+}
+
+/// A receive-list (C) entry: 8 bytes, the address low word, then address bits 38:32 in bits 6:0
+/// and the size in bits 31:16.
+fn receive_list_entry(b: &[u8], off: usize) -> Option<Buffer> {
+    let lo = u32_at(b, off)?;
+    let hi = u32_at(b, off + 4)?;
+    Some(Buffer {
+        addr: u64::from(lo) | (u64::from(hi & 0x7F) << 32),
+        size: u64::from(hi >> 16),
+    })
+}
+
+/// A pointer (X) descriptor of a reply: the entry of the receive list the data went to, the
+/// address and the size. The caller's own buffer is where the data is.
+fn pointer_reply_descriptor(index: u8, addr: u64, size: u64) -> [u8; 8] {
+    let d0 = u32::from(index & 0xF)
+        | ((((addr >> 36) & 0x7) as u32) << 6)
+        | ((((addr >> 32) & 0xF) as u32) << 12)
+        | ((size.min(0xFFFF) as u32) << 16);
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&d0.to_le_bytes());
+    out[4..].copy_from_slice(&(addr as u32).to_le_bytes());
+    out
 }
 
 /// What the kernel does with one request, before the reply is built.
@@ -146,6 +189,8 @@ pub struct Reply {
     pub move_handles: Vec<Handle>,
     pub object_ids: Vec<u32>,
     pub domain: bool,
+    /// Pointer (X) descriptors: (index of the caller's receive-list entry, address, size).
+    pub pointers: Vec<(u8, u64, u64)>,
 }
 
 /// Lay out a reply in a message buffer. Fails when it does not fit the 0x100 bytes.
@@ -162,6 +207,11 @@ pub fn build_reply(r: &Reply) -> Option<[u8; MESSAGE_BYTES]> {
             out.get_mut(off..off + 4)?.copy_from_slice(&h.to_le_bytes());
             off += 4;
         }
+    }
+    for &(index, addr, size) in &r.pointers {
+        out.get_mut(off..off + 8)?
+            .copy_from_slice(&pointer_reply_descriptor(index, addr, size));
+        off += 8;
     }
     let raw_start = off.next_multiple_of(16);
     let mut raw = Vec::new();
@@ -182,6 +232,8 @@ pub fn build_reply(r: &Reply) -> Option<[u8; MESSAGE_BYTES]> {
         return None;
     }
     let h1 = words as u32 | (u32::from(special) << 31);
+    let h0 = (r.pointers.len() as u32) << 16;
+    out[0..4].copy_from_slice(&h0.to_le_bytes());
     out[4..8].copy_from_slice(&h1.to_le_bytes());
     out[raw_start..raw_start + raw.len()].copy_from_slice(&raw);
     Some(out)
@@ -253,6 +305,7 @@ impl Kernel {
         let Some((copies, moves)) = self.resolve_handles(current, &msg) else {
             return Ok(err::INVALID_HANDLE);
         };
+        let receive_list = msg.receive_list.clone();
         let routed = self.route(&session, msg, copies, moves);
         let (response, domain, object_ids) = match routed {
             Routed::Stop(s) => return Err(s),
@@ -279,6 +332,15 @@ impl Kernel {
                 }
             }
         }
+        // Data the service returned through a pointer buffer went to the caller's receive-list
+        // entry; the reply says where, and how much.
+        let mut pointers = Vec::new();
+        for &(index, size) in &response.pointer_replies {
+            let Some(entry) = receive_list.get(usize::from(index)) else {
+                return Ok(ipc_err::INVALID_REQUEST);
+            };
+            pointers.push((index, entry.addr, size));
+        }
         let reply = Reply {
             result: response.result,
             data: response.data,
@@ -286,6 +348,7 @@ impl Kernel {
             move_handles,
             object_ids,
             domain,
+            pointers,
         };
         let Some(bytes) = build_reply(&reply) else {
             return Ok(err::OUT_OF_RESOURCE);
@@ -330,6 +393,14 @@ impl Kernel {
                     let ids = (0..nobjects)
                         .filter_map(|i| u32_at(cmif, 16 + size + 4 * i))
                         .collect();
+                    if self.trace {
+                        eprintln!(
+                            "[ipc] domain message on `{}`: kind {kind}, object {target}, {} data \
+                             bytes, {nobjects} objects",
+                            sess.root.name(),
+                            size
+                        );
+                    }
                     if kind == 2 {
                         // Release the object.
                         if target != 1 {
@@ -357,7 +428,7 @@ impl Kernel {
                     send_buffers: msg.send,
                     receive_buffers: msg.receive,
                     exchange_buffers: msg.exchange,
-                    receive_list: Vec::new(),
+                    receive_list: msg.receive_list,
                 };
                 let service: &mut dyn Service = if !domain || target == 1 {
                     sess.root.as_mut()
@@ -392,6 +463,13 @@ impl Kernel {
         command: u32,
         data: &[u8],
     ) -> Routed {
+        if self.trace {
+            eprintln!(
+                "[ipc] {} control command {command} ({} data bytes)",
+                sess.root.name(),
+                data.len()
+            );
+        }
         match command {
             // ConvertCurrentObjectToDomain
             0 => {
@@ -409,8 +487,12 @@ impl Kernel {
                 Response::ok().with_move_handle(KObject::Session(session.clone())),
                 false,
             ),
-            // QueryPointerBufferSize: the services here take no pointer descriptors.
-            3 => Routed::Reply(Response::ok().with_u32(0), false),
+            // QueryPointerBufferSize: what the service says it can take through pointer buffers
+            // (zero for most of them, so that clients send everything by mapping memory).
+            3 => Routed::Reply(
+                Response::ok().with_u32(u32::from(sess.root.pointer_buffer_size())),
+                false,
+            ),
             other => Routed::Stop(Stop(format!(
                 "IPC control command {other} on `{}` is not implemented{}",
                 sess.root.name(),
@@ -540,6 +622,68 @@ mod tests {
     }
 
     #[test]
+    fn a_receive_list_follows_the_raw_data() {
+        // A request with no descriptors, two raw words, and a receive list of two entries
+        // (the count field holds the number of entries plus two).
+        let mut m = vec![0u8; MESSAGE_BYTES];
+        m[0..4].copy_from_slice(&msg::REQUEST.to_le_bytes());
+        m[4..8].copy_from_slice(&(2u32 | (4 << 10)).to_le_bytes());
+        // The raw data is 8 bytes at offset 8; the list starts at 16.
+        m[16..20].copy_from_slice(&0x1234_5000u32.to_le_bytes());
+        m[20..24].copy_from_slice(&(0x2u32 | (0x100 << 16)).to_le_bytes());
+        m[24..28].copy_from_slice(&0x8000u32.to_le_bytes());
+        m[28..32].copy_from_slice(&(0x40u32 << 16).to_le_bytes());
+        let p = parse_message(&m).unwrap();
+        assert_eq!(
+            p.receive_list,
+            vec![
+                Buffer {
+                    addr: 0x2_1234_5000,
+                    size: 0x100
+                },
+                Buffer {
+                    addr: 0x8000,
+                    size: 0x40
+                }
+            ]
+        );
+        // A count of 2 is a single buffer; 0 is none.
+        m[4..8].copy_from_slice(&(2u32 | (2 << 10)).to_le_bytes());
+        assert_eq!(parse_message(&m).unwrap().receive_list.len(), 1);
+        m[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert!(parse_message(&m).unwrap().receive_list.is_empty());
+    }
+
+    #[test]
+    fn a_reply_names_where_pointer_data_went() {
+        let r = Reply {
+            result: ResultCode::SUCCESS,
+            data: vec![1, 2, 3, 4],
+            copy_handles: vec![],
+            move_handles: vec![],
+            object_ids: vec![],
+            domain: false,
+            pointers: vec![(1, 0x3_4000_1000, 0x80)],
+        };
+        let out = build_reply(&r).unwrap();
+        // One pointer descriptor in the header word.
+        assert_eq!(u32_at(&out, 0), Some(1 << 16));
+        let parsed = parse_message(&out).unwrap();
+        assert_eq!(
+            parsed.pointer,
+            vec![Buffer {
+                addr: 0x3_4000_1000,
+                size: 0x80
+            }]
+        );
+        assert_eq!(u32_at(&out, 8).unwrap() & 0xF, 1, "the index");
+        // The CMIF output header still starts on a 16-byte boundary after it.
+        let cmif = &parsed.raw[parsed.raw_aligned_at..];
+        assert_eq!(u32_at(cmif, 0), Some(SFCO));
+        assert_eq!(&cmif[16..20], &[1, 2, 3, 4]);
+    }
+
+    #[test]
     fn truncated_messages_do_not_parse() {
         assert!(parse_message(&[0u8; 4]).is_none());
         // Claims a pid but the buffer ends.
@@ -558,6 +702,7 @@ mod tests {
             move_handles: vec![0xAB],
             object_ids: vec![],
             domain: false,
+            pointers: vec![],
         };
         let out = build_reply(&r).unwrap();
         let parsed = parse_message(&out).unwrap();
@@ -578,6 +723,7 @@ mod tests {
             move_handles: vec![],
             object_ids: vec![5, 6],
             domain: true,
+            pointers: vec![],
         };
         let out = build_reply(&r).unwrap();
         let parsed = parse_message(&out).unwrap();
@@ -598,6 +744,7 @@ mod tests {
             move_handles: vec![],
             object_ids: vec![],
             domain: false,
+            pointers: vec![],
         };
         assert!(build_reply(&r).is_none());
     }

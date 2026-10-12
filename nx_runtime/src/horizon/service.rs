@@ -72,9 +72,15 @@ impl Request {
             .copied()
     }
 
-    /// The `index`th buffer the caller gave for the service to fill (a receive (B) descriptor).
+    /// The `index`th buffer the caller gave for the service to fill: a receive (B) descriptor.
     pub fn output_buffer(&self, index: usize) -> Option<Buffer> {
         self.receive_buffers.get(index).copied()
+    }
+
+    /// The `index`th receive-list (C) entry: where a command that returns data through a pointer
+    /// buffer writes it. The reply names the entry and the size ([`Response::with_pointer_reply`]).
+    pub fn pointer_output(&self, index: usize) -> Option<Buffer> {
+        self.receive_list.get(index).copied()
     }
 }
 
@@ -88,6 +94,9 @@ pub struct Response {
     /// New interface objects: each becomes a new session handle, or a domain object id when the
     /// request came through a domain.
     pub objects: Vec<Box<dyn Service>>,
+    /// Data written into the caller's receive-list (C) entries: (entry index, bytes written).
+    /// The reply tells the caller where each went.
+    pub pointer_replies: Vec<(u8, u64)>,
 }
 
 impl Response {
@@ -98,6 +107,7 @@ impl Response {
             copy_handles: Vec::new(),
             move_handles: Vec::new(),
             objects: Vec::new(),
+            pointer_replies: Vec::new(),
         }
     }
 
@@ -121,6 +131,12 @@ impl Response {
 
     pub fn with_bytes(mut self, b: &[u8]) -> Response {
         self.data.extend_from_slice(b);
+        self
+    }
+
+    /// Report that `size` bytes were written to the caller's receive-list entry `index`.
+    pub fn with_pointer_reply(mut self, index: u8, size: u64) -> Response {
+        self.pointer_replies.push((index, size));
         self
     }
 
@@ -164,6 +180,14 @@ pub trait Service: Send + std::fmt::Debug {
     /// Handle one request. A command that is not implemented is `Err(Stop::unknown_command(..))`;
     /// it must never answer success without doing what the command does.
     fn request(&mut self, req: &Request) -> ServiceResult;
+
+    /// The size of the pointer buffer the service reports (`QueryPointerBufferSize`). A client
+    /// sends a buffer through a pointer descriptor only when it fits; zero makes every client map
+    /// memory instead. Services whose commands return arrays through pointer buffers need a size
+    /// the SDK accepts (docs/ASSUMPTIONS.md A-067).
+    fn pointer_buffer_size(&self) -> u16 {
+        0
+    }
 }
 
 /// Builds the object a session to a named service talks to.
