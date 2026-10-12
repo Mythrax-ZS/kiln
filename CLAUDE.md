@@ -8,6 +8,9 @@ Crates:
 - `nx_runtime` (`nx_runtime/`): everything shared between compile time and run time: storage, RomFS,
   NPDM, the A64 decoder and interpreter, guest memory and the Horizon emulation layer. Built as
   `rlib` and `staticlib`; every produced binary links against it.
+- `nx_gpu` (`nx_gpu/`): the GPU front, with no knowledge of Horizon: the driver service's device nodes,
+  the display buffer queue and a Maxwell command processor with a macro engine. `nx_runtime`
+  depends on it. Nothing is drawn.
 
 ## Inputs (owner instruction, 2026-10-12)
 
@@ -38,12 +41,12 @@ Small chunks. Title at most 50 characters. No body. No attribution lines of any 
   return a made-up success.
 - Where Unicorn disagrees with the Arm pseudocode, the pseudocode wins and the disagreement is
   recorded in `docs/UNICORN_DISAGREEMENTS.md`.
-- Milestones M1..M7 (see `docs/reports/`): stop after each one, run the tests, write the report,
-  then move on. M7 passed. The owner approved the GPU work on 2026-10-12 (M8, the `nx_gpu`
-  crate): `nvdrv` and its device nodes, the display and buffer-queue path, then a tracing
-  command processor. Shader translation (SASS to SPIR-V) and the Vulkan backend come after M8
-  and need the owner's go-ahead again. Never describe the output as playable before frames are
-  measured.
+- Milestones M1..M8 (see `docs/reports/`): stop after each one, run the tests, write the report,
+  then move on. M8 passed (2026-10-12): the owner approved the GPU front, the `nx_gpu` crate
+  (`nvdrv` and its device nodes, the display and buffer-queue path, a tracing command processor
+  with a macro engine). Shader translation (SASS to SPIR-V) and the Vulkan backend come after M8
+  and need the owner's go-ahead again; the report proposes them. Never describe the output as
+  playable before frames are measured.
 - Out of scope: online services, account checks, licensing checks, AArch32 (detect and error).
 
 ## External tools used by tests
@@ -71,6 +74,13 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   request of a produced program; `NX_TRACE_LOG=1` prints what it logs through `lm`;
   `NX_RANDOM_SEED=<n>` makes the kernel's entropy reproducible; `NX_ROMFS=<dir|image>` names the
   RomFS it reads at run time.
+- GPU front: `nx_gpu`'s unit tests need no external tool. `NX_TRACE_GPU=1` prints every submission
+  of a produced program and, when it ends, what the command processor counted (`NX_GPU_TOP=<n>` is
+  how many of the busiest methods it lists, 0 for all); `NX_TRACE_GPU=2` prints every method write
+  and macro call; `NX_MAX_FRAMES=<n>` ends the run after `n` presented frames; `NX_SAVE_DIR=<dir>`
+  is where save data goes (default `./nx_save`). `recomp symbols --exefs <dir> [--match <text>]
+  [<address>...]` names the function around an address, for reading the return addresses a stop
+  report ends with.
 - A real title through the whole pipeline (opt-in, by hand; nothing from it is stored): build with
   `recomp build --exefs <exefs> --romfs <romfs> --out <dir>`, run `<dir>/<name>` with
   `NX_TRACE_SVC=1`, and use `recomp relink` / `--reuse-objects` to iterate on the runtime.

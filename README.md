@@ -13,7 +13,7 @@ keys or title data are stored in this repository.
 
 ## Status
 
-Work proceeds in milestones M1 to M7. Each milestone has a report under `docs/reports/` that states
+Work proceeds in milestones M1 to M8. Each milestone has a report under `docs/reports/` that states
 what was implemented, what was tested and how, and what was not verified. `docs/ARCHITECTURE.md`
 explains how the pieces fit together.
 
@@ -22,8 +22,14 @@ LLVM code generation, integer ISA), M5 (floating point and Advanced SIMD in all 
 (the Horizon kernel layer: a homebrew NRO built by `recomp build` runs natively, prints through
 `svcOutputDebugString`, starts threads and talks to `sm:`), M7 (a title with a RomFS boots on that
 layer, through its own `rtld` and SDK start-up, until it asks for the GPU driver; the
-cryptographic extension was added on the way). Nothing renders: the GPU is the next blocker and a
-separate milestone.
+cryptographic extension was added on the way), M8 (the GPU front, `nx_gpu`: the driver service and
+its device nodes, the display and buffer queue, a Maxwell command processor with a macro engine
+that traces what a title sends; the same title now runs its main loop and submits draw calls).
+
+**Nothing renders.** The command processor decodes and counts what the title sends (in 600 frames:
+1,201 submissions, 30,641 macro calls, 138,125 draws), but no shader is read, no picture is made
+and no sound or input reaches the title from a person. Shader translation and a Vulkan backend are
+the next, separate work. Nothing here is a claim that a game is playable.
 
 ## Using it
 
@@ -34,6 +40,7 @@ recomp build   (--exefs <dir|pfs0> | --nro <file>) --out <dir> [--name <name>] [
                [--hints <file>] [--shared] [--keep-ir] [--main-only] [--romfs <dir|image>]
                [--reuse-objects]
 recomp relink  --out <dir> --name <name>
+recomp symbols (--exefs <dir|pfs0> | --nro <file>) [--match <text>] [<address>...]
 ```
 
 `inspect` also says which of the SVCs and services a program may use this runtime does not implement.
@@ -60,6 +67,13 @@ standard error, `NX_TRACE_LOG=1` prints what the program logs through the log ma
 `GetInfo` entropy) reproducible. `recomp relink` links the objects of an earlier build against the
 current runtime and `--reuse-objects` skips recompiling unchanged code, which keeps the loop of
 trying a title short.
+
+For the GPU: `NX_TRACE_GPU=1` prints every submission and, when the run ends, what the command
+processor counted (`NX_GPU_TOP=<n>` sets how many of the busiest methods it lists, 0 lists all);
+`NX_TRACE_GPU=2` also prints every method write and macro call; `NX_MAX_FRAMES=<n>` ends the run
+after `n` presented frames; `NX_SAVE_DIR=<dir>` is where a program's save data goes (default
+`./nx_save`). `recomp symbols --exefs <dir> [--match <text>] [<address>...]` names the function
+around an address (the return addresses a stop report ends with), which is how a stop is read.
 
 ## What "accuracy" means here
 

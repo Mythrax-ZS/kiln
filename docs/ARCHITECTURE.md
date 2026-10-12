@@ -20,7 +20,8 @@ ExeFS / NRO ──loader──▶ Module ──discover──▶ per-function CF
 | Emit | `src/codegen` | LLVM IR text, one unit per batch of functions, plus the support unit and the module descriptor. |
 | Build | `src/build` | clang discovery, parallel compile, link against `nx_runtime`. |
 | Run | `nx_runtime/src/rt` | Guest memory, exclusive monitor, function table, slow path, process start-up. |
-| Horizon | `nx_runtime/src/horizon` | The kernel a produced NSO or NRO runs on: SVCs, threads, synchronization, IPC, `sm:`. |
+| Horizon | `nx_runtime/src/horizon` | The kernel a produced NSO or NRO runs on: SVCs, threads, synchronization, IPC, `sm:`, and the services. |
+| GPU | `nx_gpu` | The driver service and its device nodes, the display and buffer queue, and a command processor with a macro engine (nothing is drawn). |
 
 ## Calling protocol (generated code)
 
@@ -78,8 +79,16 @@ results there as the Switchbrew SVC pages lay them out, and the generated code r
   become move handles or domain object ids. `sm:` (`sm.rs`) is the only named port; it hands out a
   service only if the program's NPDM service access list allows the name. `services/` holds the
   services (each a file, registered in `services/mod.rs`): `lm`, `apm`, `appletOE`, `aoc:u`,
-  `pctl` and `fsp-srv`; a service is handed a weak reference to its kernel for events, transfer
-  memory and guest buffers.
+  `pctl`, `fsp-srv` (with save data on the host), `nvdrv`, `vi:u`, `acc:u0`, `set`, `hid`, `time:u`,
+  `nifm:u`, `bsd:u`, `ssl`, `prepo:u`, `nfp:user`, `friend:u`, `pl:u` and `audren:u`; a service is
+  handed a weak reference to its kernel for events, transfer memory, shared memory and guest
+  buffers, and may reply through the caller's receive list (pointer buffers). The services that
+  need a host thread (the vsync event of `vi:u`, the input samples of `hid`, the frame event of
+  `audren:u`) start it on first use and stop it when the process ends.
+- **Shared memory**: a service creates a shared memory object (`shmem.rs`) in a region of the
+  address space the program cannot see, writes its pages there, and gives the program a handle;
+  `MapSharedMemory` puts the same pages into the program (`hid` publishes input this way, `pl:u`
+  the fonts).
 - **Lent memory**: `CreateTransferMemory` reprotects a range of the program's heap and marks it
   locked until the handle is closed (`memobj.rs`); the services, which run in the process, read
   and write it through the same addresses.
@@ -89,6 +98,36 @@ results there as the Switchbrew SVC pages lay them out, and the generated code r
 - **Stops**: an SVC, a named port, a service or a command nobody implemented does not get an
   answer. The kernel records a report with the guest address and the number, ends the process and
   the produced program exits with status 101.
+
+## The GPU front (`nx_gpu`)
+
+`nx_gpu/` is a separate crate with no knowledge of Horizon: it depends on nothing, and `nx_runtime`
+depends on it. It models what the NVIDIA driver service and the display stack do, and a command
+processor for the Maxwell engines that decodes and counts what a title sends. Nothing is drawn
+(`docs/reports/M8-gpu-front.md`).
+
+```
+guest ──SendSyncRequest──▶ nvdrv service ──▶ nx_gpu::nvdrv ──▶ nvmap, address space, syncpoints
+                                                          └──▶ channel ──▶ Gpu::submit ──▶ pushbuffer
+guest ──IHOSBinderDriver──▶ vi service ──▶ nx_gpu::display (parcels, buffer queue, compositor)     │
+                                                                                                   ▼
+                                    engines (3D, compute, 2D, copy, I2M): register files, MME ◀── methods
+```
+
+- `nvdrv/` is a byte-level state machine: `open`, `close`, `ioctl`, `query_event`, `take_signals`.
+  The service (`nx_runtime/src/horizon/services/nvdrv.rs`) copies the argument buffers and turns the
+  event tokens the core returns into kernel events. The core reads and writes guest memory only
+  through the `GuestMemory` trait, which `nx_runtime` implements over the guest address space.
+- `gpu.rs`, `channel.rs`, `pushbuf.rs` and `engine.rs` are the command processor: a GPFIFO entry is
+  decoded, its pushbuffer is run through the pusher state machine, and each method write goes to the
+  host methods or to the engine bound to its subchannel. `mme.rs` is the 3D engine's macro
+  processor (the Fermi macro instruction set): a macro call is run when its command ends, and its
+  writes go through the same path.
+- `methods.rs` is generated (`tools/gen_methods.sh`) from NVIDIA's open-gpu-doc headers and only
+  gives names to offsets, for traces.
+- `parcel.rs` and `display.rs` are the Android `Parcel` codec and the buffer queue of a layer.
+- Time: syncpoint fences complete at once; the vsync is a 60 Hz host thread that sets the display's
+  event (`vi.rs`), and the audio renderer's frame event a 200 Hz one (`audren.rs`).
 
 ## Guest memory
 
@@ -109,3 +148,4 @@ runtime functions the emitter calls against the runtime's exports.
 | Native code | the interpreter | `src/native_tests.rs` (synthetic), `tests/real_code.rs` (a real title, opt-in) |
 | Kernel layer | the Switchbrew contract of each call, with real host threads | `nx_runtime/src/horizon/tests.rs` and the unit tests next to each file |
 | Homebrew NRO and NSO | expected output and exit status of built programs | `src/build/e2e_tests.rs` (`mod homebrew`) |
+| GPU front | hand-built ioctl argument bytes, pushbuffers and assembled macros, with the layouts of NVIDIA's headers and `libnx` | `nx_gpu` unit tests and the service tests in `nx_runtime/src/horizon/tests.rs` |
