@@ -10,7 +10,7 @@ use super::lift_all;
 use nx_runtime::a64::bits::decode_bit_masks;
 use nx_runtime::a64::inst::{BranchReg, Inst, LogicOp};
 use nx_runtime::a64::{decode, step, CpuState, Trap};
-use nx_runtime::testing::{asm, FlatBus, Rng};
+use nx_runtime::testing::{asm, fpvalues, FlatBus, Rng};
 
 pub const CODE: u64 = 0x0800_0000;
 pub const DATA_SIZE: usize = 0x4000;
@@ -179,6 +179,15 @@ pub fn compare(a: &RunResult, b: &RunResult) -> Option<String> {
                 ));
             }
         }
+        for n in 0..32u8 {
+            if x.vreg(n) != y.vreg(n) {
+                return Some(format!(
+                    "v{n}: interpreter {:#034x}, lifted {:#034x}",
+                    x.vreg(n),
+                    y.vreg(n)
+                ));
+            }
+        }
         return Some(format!(
             "state: interpreter sp={:#x} pc={:#x} nzcv={:#x} fpcr={:#x} fpsr={:#x} excl={:#x}/{}, \
              lifted sp={:#x} pc={:#x} nzcv={:#x} fpcr={:#x} fpsr={:#x} excl={:#x}/{}",
@@ -272,7 +281,12 @@ impl Gen {
         }
         s.sp = base + 0x1_0000 + 0x2000 + 16 * self.below(64);
         s.nzcv = (self.below(16) as u32) << 28;
-        s.fpcr = 0;
+        for n in 0..32u8 {
+            let v = fpvalues::vector_register(&mut self.rng);
+            s.set_vreg(n, v);
+        }
+        s.fpcr = fpvalues::fpcr(&mut self.rng);
+        s.fpsr = fpvalues::fpsr(&mut self.rng);
         s.tpidr_el0 = self.rng.next_u64();
         s.tpidrro_el0 = self.rng.next_u64();
         s
@@ -350,6 +364,40 @@ pub const TEMPLATES: &[(&str, u32, u32)] = &[
     ("system instruction", 0xFFD8_0000, 0xD508_0000),
     ("hint", 0xFFFF_F01F, 0xD503_201F),
     ("barrier", 0xFFFF_F01F, 0xD503_301F),
+    ("fp one source", 0xFF20_7C00, 0x1E20_4000),
+    ("fp two source", 0xFF20_0C00, 0x1E20_0800),
+    ("fp three source", 0xFF00_0000, 0x1F00_0000),
+    ("fp compare", 0xFF20_FC00, 0x1E20_2000),
+    ("fp conditional compare", 0xFF20_0C00, 0x1E20_0400),
+    ("fp conditional select", 0xFF20_0C00, 0x1E20_0C00),
+    ("fp immediate", 0xFF20_1FE0, 0x1E20_1000),
+    ("fp integer conversion", 0x7F20_FC00, 0x1E20_0000),
+    ("fp fixed-point conversion", 0x7F20_0000, 0x1E00_0000),
+    ("simd load/store unsigned offset", 0x3F00_0000, 0x3D00_0000),
+    ("simd load/store immediate", 0x3F20_0000, 0x3C00_0000),
+    ("simd load/store register", 0x3F20_0C00, 0x3C20_0800),
+    ("simd load literal", 0x3F00_0000, 0x1C00_0000),
+    ("simd load/store pair", 0x3E00_0000, 0x2C00_0000),
+    ("simd structures, multiple", 0xBF00_0000, 0x0C00_0000),
+    ("simd structures, single", 0xBF00_0000, 0x0D00_0000),
+    ("simd three same", 0x9F20_0400, 0x0E20_0400),
+    ("simd three different", 0x9F20_0C00, 0x0E20_0000),
+    ("simd two-register misc", 0x9F3E_0C00, 0x0E20_0800),
+    ("simd across lanes", 0x9F3E_0C00, 0x0E30_0800),
+    ("simd permute", 0xBF20_8C00, 0x0E00_0800),
+    ("simd extract", 0xBFE0_8400, 0x2E00_0000),
+    ("simd table lookup", 0xBFE0_8C00, 0x0E00_0000),
+    ("simd copy", 0x9FE0_8400, 0x0E00_0400),
+    ("simd modified immediate", 0x9FF8_0400, 0x0F00_0400),
+    ("simd shift by immediate", 0x9F80_0400, 0x0F00_0400),
+    ("simd x indexed element", 0x9F00_0400, 0x0F00_0000),
+    ("simd scalar three same", 0xDF20_0400, 0x5E20_0400),
+    ("simd scalar three different", 0xDF20_0C00, 0x5E20_0000),
+    ("simd scalar two-register misc", 0xDF3E_0C00, 0x5E20_0800),
+    ("simd scalar pairwise", 0xDF3E_0C00, 0x5E30_0800),
+    ("simd scalar shift", 0xDF80_0400, 0x5F00_0400),
+    ("simd scalar x indexed element", 0xDF00_0400, 0x5F00_0000),
+    ("simd scalar copy", 0xDFE0_8400, 0x5E00_0400),
 ];
 
 fn per_template() -> usize {
@@ -443,8 +491,8 @@ fn encodings_that_trap_stop_the_same_way() {
         asm::sysreg(false, 3, 3, 13, 0, 3, 3), // msr tpidrro_el0, x3 (read only)
         asm::sys(false, 3, 7, 5, 0, 3),        // ic iallu is EL1
         asm::sys(true, 0, 1, 2, 3, 3),         // sysl
-        0x1E20_1000,                           // an FP instruction: unsupported until M5
-        0x4EA0_8400,                           // a NEON instruction
+        0x4E28_4820, // aese: the cryptographic extension is not implemented
+        0x4EA0_8400, // add v0.4s, v0.4s, v0.4s (implemented)
     ];
     for w in words {
         for _ in 0..20 {
