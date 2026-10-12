@@ -12,7 +12,9 @@
 //! every choice the public documentation leaves open is recorded in docs/ASSUMPTIONS.md.
 
 pub mod error;
+pub mod gpu;
 pub mod mem;
+pub mod nvdrv;
 pub mod nvmap;
 pub mod syncpt;
 pub mod vm;
