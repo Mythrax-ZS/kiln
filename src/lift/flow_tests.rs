@@ -209,6 +209,56 @@ pub fn jump_table_bytes(base: u64) -> Vec<u32> {
     words
 }
 
+/// The compare is on one register and the table is indexed through a copy of it.
+pub fn jump_table_copied_index(base: u64) -> Vec<u32> {
+    let mut p = Prog::new(base);
+    p.emit(asm::logical_imm(false, 0, false, 0, 3, 0, 0)); // and w0, w0, #15
+    p.emit(asm::logical_shifted(false, 1, 0, false, 0, 0, 31, 8)); // mov w8, w0
+    p.emit(asm::cmp_imm(false, 0, 5));
+    p.b_cond(8, "default"); // b.hi
+    p.adr(9, "table");
+    p.emit(asm::ldst_reg(2, 2, 8, 3, true, 9, 8)); // ldrsw x8, [x9, x8, lsl #2]
+    p.emit(asm::add_sub_shifted(true, false, false, 0, 8, 0, 9, 9)); // add x9, x9, x8
+    p.emit(asm::br(9));
+    for i in 0..6u32 {
+        p.label(&format!("case{i}"))
+            .emit(asm::movz(true, 0, 200 + i, 0));
+        p.emit(asm::ret(30));
+    }
+    p.label("default").emit(asm::movz(true, 0, 998, 0));
+    p.emit(asm::ret(30));
+    p.label("table");
+    for i in 0..6 {
+        p.rel32(&format!("case{i}"), "table");
+    }
+    p.finish()
+}
+
+/// A switch whose first case is 1: the index is adjusted before the compare.
+pub fn jump_table_offset_index(base: u64) -> Vec<u32> {
+    let mut p = Prog::new(base);
+    p.emit(asm::logical_imm(false, 0, false, 0, 3, 0, 0)); // and w0, w0, #15
+    p.emit(asm::sub_imm(false, 8, 0, 1)); // sub w8, w0, #1
+    p.emit(asm::cmp_imm(false, 8, 3));
+    p.b_cond(8, "default"); // b.hi
+    p.adr(9, "table");
+    p.emit(asm::ldst_reg(2, 2, 8, 3, true, 9, 10)); // ldrsw x10, [x9, x8, lsl #2]
+    p.emit(asm::add_sub_shifted(true, false, false, 0, 10, 0, 9, 9)); // add x9, x9, x10
+    p.emit(asm::br(9));
+    for i in 1..5u32 {
+        p.label(&format!("case{i}"))
+            .emit(asm::movz(true, 0, 300 + i, 0));
+        p.emit(asm::ret(30));
+    }
+    p.label("default").emit(asm::movz(true, 0, 997, 0));
+    p.emit(asm::ret(30));
+    p.label("table");
+    for i in 1..5 {
+        p.rel32(&format!("case{i}"), "table");
+    }
+    p.finish()
+}
+
 pub fn unexplained_branch(base: u64) -> Vec<u32> {
     let mut p = Prog::new(base);
     p.adr(16, "mid");
@@ -369,6 +419,8 @@ pub fn catalogue(base: u64) -> Vec<Entry> {
         entry("flags across a join", flags_across_a_join(base)),
         entry("jump table of words", jump_table_words(base, 8)),
         entry("jump table of bytes", jump_table_bytes(base)),
+        entry("jump table, index copied", jump_table_copied_index(base)),
+        entry("jump table, index adjusted", jump_table_offset_index(base)),
         entry("supervisor calls", supervisor_calls(base)),
         entry("unsupported instruction", unsupported_instruction(base)),
     ];
@@ -472,6 +524,13 @@ fn discovery_finds_the_functions_and_tables() {
     let d = discovery(&jump_table_bytes(CODE));
     assert_eq!(d.report.jump_tables.len(), 1, "{:?}", d.report);
     assert_eq!(d.report.jump_tables[0].targets.len(), 5);
+
+    let d = discovery(&jump_table_copied_index(CODE));
+    assert_eq!(d.report.jump_tables.len(), 1, "{:?}", d.report);
+    assert_eq!(d.report.jump_tables[0].targets.len(), 6);
+    let d = discovery(&jump_table_offset_index(CODE));
+    assert_eq!(d.report.jump_tables.len(), 1, "{:?}", d.report);
+    assert_eq!(d.report.jump_tables[0].targets.len(), 4);
 
     let d = discovery(&unexplained_branch(CODE));
     assert_eq!(d.report.unresolved_branches.len(), 1);

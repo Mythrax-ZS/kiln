@@ -24,7 +24,7 @@
 
 use super::discover::CodeSource;
 use nx_runtime::a64::bus::{Bus, Fault, FaultKind};
-use nx_runtime::a64::inst::{BranchReg, Inst};
+use nx_runtime::a64::inst::{BranchReg, Inst, MemKind};
 use nx_runtime::a64::interp::execute;
 use nx_runtime::a64::state::CpuState;
 use std::collections::BTreeMap;
@@ -133,12 +133,12 @@ pub fn resolve(
         )
     })?;
     let Inst::AddSubImm {
+        sf,
         sub: true,
         set_flags: true,
         rd: 31,
         rn: idx,
         imm,
-        ..
     } = window[jc].1
     else {
         return None;
@@ -156,27 +156,95 @@ pub fn resolve(
     }
     let prefix = &window[..jc];
     let post = &window[jb + 1..];
-
-    let mut results: Vec<Vec<u64>> = Vec::new();
-    for fill in [0u64, 0x5A5A_5A5A_5A5A_5A5A] {
+    let wmask = if sf { u64::MAX } else { 0xFFFF_FFFF };
+    let fresh = |fill: u64| {
         let mut cpu = CpuState {
             sp: fill,
             ..CpuState::default()
         };
         cpu.x = [fill; 31];
-        run(code, &mut cpu, prefix, true)?;
-        let mut targets = Vec::with_capacity(last as usize + 1);
-        for i in 0..=last {
-            let mut c = cpu.clone();
-            c.x[usize::from(idx)] = i;
-            run(code, &mut c, post, false)?;
-            targets.push(c.x_zr(rn));
+        cpu
+    };
+    let observed = usize::from(idx);
+
+    // Where does the compared register get its value? It may be a copy or adjustment of a
+    // register (`mov w8, w0 ; cmp w0, #5`, `sub w9, w8, #3 ; cmp w9, #3`) or be loaded from memory.
+    // Try injecting a value just after each instruction of the code in front of the compare, into
+    // each register that instruction wrote (and, first of all, into every register before the
+    // first instruction). Two probes show how the compared register moves with the injected
+    // value; if it moves by one per step, the value that makes it equal each index can be
+    // solved for, and the rest of the code is run with it.
+    let attempt = |pos: usize, var: usize| -> Option<Vec<Vec<u64>>> {
+        let mut results = Vec::new();
+        for fill in [0u64, 0x5A5A_5A5A_5A5A_5A5A] {
+            let start = |v0: u64| -> Option<CpuState> {
+                let mut c = fresh(fill);
+                run(code, &mut c, &prefix[..pos], true)?;
+                c.x[var] = v0;
+                run(code, &mut c, &prefix[pos..], true)?;
+                Some(c)
+            };
+            let c0 = start(0)?.x[observed] & wmask;
+            let c1 = start(1)?.x[observed] & wmask;
+            let step = c1.wrapping_sub(c0) & wmask;
+            let mut targets = Vec::with_capacity(last as usize + 1);
+            for i in 0..=last {
+                let v0 = if step == 1 {
+                    i.wrapping_sub(c0) & wmask
+                } else if step == wmask {
+                    c0.wrapping_sub(i) & wmask
+                } else {
+                    return None;
+                };
+                let mut c = start(v0)?;
+                if c.x[observed] & wmask != i {
+                    return None;
+                }
+                run(code, &mut c, post, false)?;
+                targets.push(c.x_zr(rn));
+            }
+            results.push(targets);
         }
-        results.push(targets);
+        (results[0] == results[1]).then_some(results)
+    };
+    // The registers each instruction of the prefix changes, seen from a state where every
+    // register holds a different value.
+    let mut distinct = CpuState::default();
+    for (r, x) in distinct.x.iter_mut().enumerate() {
+        *x = 0x0101_0101_0101_0101u64.wrapping_mul(r as u64 + 1);
     }
-    if results[0] != results[1] {
-        return None;
+    let mut changed: Vec<Vec<usize>> = vec![(0..31).collect()];
+    for k in 0..prefix.len() {
+        let before = distinct.clone();
+        run(code, &mut distinct, &prefix[k..=k], true)?;
+        let mut regs: Vec<usize> = (0..31).filter(|&r| distinct.x[r] != before.x[r]).collect();
+        // A load from memory the image does not have changes nothing here, but it still defines
+        // its destination: the value being switched on may be loaded.
+        match prefix[k].1 {
+            Inst::LdSt {
+                kind: MemKind::Load | MemKind::LoadSigned32 | MemKind::LoadSigned64,
+                rt,
+                ..
+            } if rt < 31 => regs.push(usize::from(rt)),
+            Inst::LdStPair {
+                load: true,
+                rt,
+                rt2,
+                ..
+            } => regs.extend(
+                [usize::from(rt), usize::from(rt2)]
+                    .into_iter()
+                    .filter(|&r| r < 31),
+            ),
+            _ => {}
+        }
+        regs.sort_unstable();
+        regs.dedup();
+        changed.push(regs);
     }
+    let mut results = (0..=prefix.len())
+        .rev()
+        .find_map(|pos| changed[pos].iter().find_map(|&var| attempt(pos, var)))?;
     let mut out = results.swap_remove(0);
     if !out
         .iter()
