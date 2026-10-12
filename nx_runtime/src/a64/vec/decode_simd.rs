@@ -5,11 +5,10 @@
 //! tables. Encodings the architecture leaves unallocated, and the ones only later architecture
 //! versions allocate (half-precision arithmetic, the dot-product, complex-number and rounding
 //! multiply-accumulate extensions), are [`Reject::Unallocated`] because the Cortex-A57 lacks them;
-//! the cryptographic extension is [`Reject::Unsupported`].
+//! the cryptographic extension (AES, SHA-1, SHA-256, 64-bit `PMULL`) is decoded like the rest.
 
 use super::decode::{bit, bits, Res, UNALLOC};
 use super::simd::*;
-use super::Reject;
 use crate::a64::fp::{Fmt, MinMax, Rounding};
 
 pub(super) fn rd(w: u32) -> u8 {
@@ -23,8 +22,6 @@ pub(super) fn rn(w: u32) -> u8 {
 pub(super) fn rm(w: u32) -> u8 {
     bits(w, 20, 16) as u8
 }
-
-const CRYPTO: Reject = Reject::Unsupported("cryptographic extension");
 
 /// Decode a word of the Advanced SIMD space that is not a scalar floating-point instruction.
 pub fn decode_simd(w: u32) -> Res<SimdOp> {
@@ -85,14 +82,21 @@ pub fn decode_simd(w: u32) -> Res<SimdOp> {
 
 fn crypto_aes(w: u32) -> Res<SimdOp> {
     // 0100 1110 size 10100 opcode 10 Rn Rd, with opcode 00100..00111 and size 0.
-    if bits(w, 31, 24) == 0x4E
-        && bits(w, 23, 22) == 0
-        && (0b00100..=0b00111).contains(&bits(w, 16, 12))
-    {
-        Err(CRYPTO)
-    } else {
-        Err(UNALLOC)
+    if bits(w, 31, 24) != 0x4E || bits(w, 23, 22) != 0 {
+        return Err(UNALLOC);
     }
+    let op = match bits(w, 16, 12) {
+        0b00100 => Aes::Aese,
+        0b00101 => Aes::Aesd,
+        0b00110 => Aes::Aesmc,
+        0b00111 => Aes::Aesimc,
+        _ => return Err(UNALLOC),
+    };
+    Ok(SimdOp::Aes {
+        op,
+        rd: rd(w),
+        rn: rn(w),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------

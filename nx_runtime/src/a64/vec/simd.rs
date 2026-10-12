@@ -279,9 +279,47 @@ pub enum FpUn {
     Cmlt0,
 }
 
+/// The cryptographic AES instructions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aes {
+    Aese,
+    Aesd,
+    Aesmc,
+    Aesimc,
+}
+
+/// The cryptographic SHA-1 and SHA-256 instructions. The three-register ones take `Vm`; the
+/// two-register ones (`Sha1h`, `Sha1su1`, `Sha256su0`) ignore it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sha {
+    Sha1c,
+    Sha1p,
+    Sha1m,
+    Sha1su0,
+    Sha256h,
+    Sha256h2,
+    Sha256su1,
+    Sha1h,
+    Sha1su1,
+    Sha256su0,
+}
+
 /// A decoded Advanced SIMD instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SimdOp {
+    /// `AESE`, `AESD`, `AESMC`, `AESIMC`.
+    Aes {
+        op: Aes,
+        rd: u8,
+        rn: u8,
+    },
+    /// The SHA-1 and SHA-256 round and schedule operations.
+    Sha {
+        op: Sha,
+        rd: u8,
+        rn: u8,
+        rm: u8,
+    },
     Logic {
         op: Logic,
         q: bool,

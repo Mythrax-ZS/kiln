@@ -3,10 +3,7 @@
 use super::decode::{bit, bits, Res, UNALLOC};
 use super::decode_simd::{fp_scalar_three_same_op, fp_vector_shape, rd, rm, rn};
 use super::simd::*;
-use super::Reject;
 use crate::a64::fp::{Fmt, Rounding};
-
-const CRYPTO: Reject = Reject::Unsupported("cryptographic extension");
 
 // ---------------------------------------------------------------------------------------------
 // Vector: shift by immediate
@@ -270,19 +267,44 @@ pub fn scalar(w: u32) -> Res<SimdOp> {
 
 fn crypto_sha_three_reg(w: u32) -> Res<SimdOp> {
     // 0101 1110 size 0 Rm 0 opcode 00 Rn Rd
-    if bits(w, 31, 24) == 0x5E && bits(w, 23, 22) == 0 && bits(w, 14, 12) != 0b111 {
-        Err(CRYPTO)
-    } else {
-        Err(UNALLOC)
+    if bits(w, 31, 24) != 0x5E || bits(w, 23, 22) != 0 {
+        return Err(UNALLOC);
     }
+    let op = match bits(w, 14, 12) {
+        0b000 => Sha::Sha1c,
+        0b001 => Sha::Sha1p,
+        0b010 => Sha::Sha1m,
+        0b011 => Sha::Sha1su0,
+        0b100 => Sha::Sha256h,
+        0b101 => Sha::Sha256h2,
+        0b110 => Sha::Sha256su1,
+        _ => return Err(UNALLOC),
+    };
+    Ok(SimdOp::Sha {
+        op,
+        rd: rd(w),
+        rn: rn(w),
+        rm: rm(w),
+    })
 }
 
 fn crypto_sha_two_reg(w: u32) -> Res<SimdOp> {
-    if bits(w, 31, 24) == 0x5E && bits(w, 23, 22) == 0 && bits(w, 16, 12) <= 0b00010 {
-        Err(CRYPTO)
-    } else {
-        Err(UNALLOC)
+    // 0101 1110 size 10100 opcode 10 Rn Rd
+    if bits(w, 31, 24) != 0x5E || bits(w, 23, 22) != 0 {
+        return Err(UNALLOC);
     }
+    let op = match bits(w, 16, 12) {
+        0b00000 => Sha::Sha1h,
+        0b00001 => Sha::Sha1su1,
+        0b00010 => Sha::Sha256su0,
+        _ => return Err(UNALLOC),
+    };
+    Ok(SimdOp::Sha {
+        op,
+        rd: rd(w),
+        rn: rn(w),
+        rm: 0,
+    })
 }
 
 fn scalar_copy(w: u32) -> Res<SimdOp> {

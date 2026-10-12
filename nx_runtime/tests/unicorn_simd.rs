@@ -180,6 +180,32 @@ fn scalar_groups() {
     group("scalar copy", 0xD7, 0xDFE0_8400, 0x5E00_0400, 10_000);
 }
 
+/// The cryptographic extension: AES, SHA-1 and SHA-256 (64-bit `PMULL` is in the "three
+/// different" group). The groups include their reserved neighbours, which both sides must reject.
+#[test]
+fn cryptographic_extension() {
+    group("aes", 0xE1, 0xFF3E_0C00, 0x4E28_0800, 40_000);
+    group("sha three-register", 0xE2, 0xFF20_8C00, 0x5E00_0000, 60_000);
+    group("sha two-register", 0xE3, 0xFF3E_0C00, 0x5E28_0800, 40_000);
+    // The same with the size and the high opcode bits fixed, so nearly every word is a valid
+    // instruction.
+    group("aes (valid forms)", 0xE4, 0xFFFF_CC00, 0x4E28_4800, 60_000);
+    group(
+        "sha three-register (size 0)",
+        0xE5,
+        0xFFE0_8C00,
+        0x5E00_0000,
+        120_000,
+    );
+    group(
+        "sha two-register (low opcodes)",
+        0xE6,
+        0xFFFF_CC00,
+        0x5E28_0800,
+        60_000,
+    );
+}
+
 /// A case whose base register points into the data region and whose index register, if the word
 /// post-indexes by one, holds a small offset.
 fn memory_case(g: &mut Gen, w: u32) -> Case {

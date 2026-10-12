@@ -70,6 +70,9 @@ pub struct RunResult {
 pub fn bus_for(base: u64, words: &[u32], data: &[u8]) -> FlatBus {
     let mut bus = FlatBus::new(base, REGION);
     bus.load_words(base, words);
+    // The code does not change itself: a store into it faults on both sides instead of making the
+    // interpreter run a different instruction than the lifter decoded.
+    bus.protect(base, base + 4 * words.len() as u64);
     bus.mem[0x1_0000..0x1_0000 + data.len()].copy_from_slice(data);
     bus
 }
@@ -398,6 +401,9 @@ pub const TEMPLATES: &[(&str, u32, u32)] = &[
     ("simd scalar shift", 0xDF80_0400, 0x5F00_0400),
     ("simd scalar x indexed element", 0xDF00_0400, 0x5F00_0000),
     ("simd scalar copy", 0xDFE0_8400, 0x5E00_0400),
+    ("crypto aes", 0xFFFF_CC00, 0x4E28_4800),
+    ("crypto sha three-register", 0xFFE0_8C00, 0x5E00_0000),
+    ("crypto sha two-register", 0xFFFF_CC00, 0x5E28_0800),
 ];
 
 fn per_template() -> usize {
@@ -491,7 +497,8 @@ fn encodings_that_trap_stop_the_same_way() {
         asm::sysreg(false, 3, 3, 13, 0, 3, 3), // msr tpidrro_el0, x3 (read only)
         asm::sys(false, 3, 7, 5, 0, 3),        // ic iallu is EL1
         asm::sys(true, 0, 1, 2, 3, 3),         // sysl
-        0x4E28_4820, // aese: the cryptographic extension is not implemented
+        0xC8A0_7C41, // cas x0, x1, [x2]: Armv8.1 atomics are not implemented
+        0x4E28_4820, // aese v0.16b, v1.16b (implemented)
         0x4EA0_8400, // add v0.4s, v0.4s, v0.4s (implemented)
     ];
     for w in words {

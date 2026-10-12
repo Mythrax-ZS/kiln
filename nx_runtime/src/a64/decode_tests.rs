@@ -931,8 +931,7 @@ fn reserved_and_unallocated_encodings() {
 fn valid_but_unimplemented_encodings_are_unsupported_not_ignored() {
     // Valid in the architecture, outside this project's scope: must stop the run, never vanish.
     for w in [
-        0x4E28_4820u32, // aese v0.16b, v1.16b (crypto extension, not implemented)
-        0xC8A0_7C41,    // cas x0, x1, [x2]
+        0xC8A0_7C41u32, // cas x0, x1, [x2]
         0xD4A0_0001,    // dcps1
         0xD400_0002,    // hvc #0
         0xD440_0000,    // hlt #0

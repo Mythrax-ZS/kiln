@@ -6,6 +6,8 @@ pub struct FlatBus {
     pub base: u64,
     pub mem: Vec<u8>,
     pub counter: u64,
+    /// Addresses that reads may use and stores may not (the code of a program under test).
+    pub readonly: Option<std::ops::Range<u64>>,
 }
 
 impl FlatBus {
@@ -14,7 +16,13 @@ impl FlatBus {
             base,
             mem: vec![0; size],
             counter: 0,
+            readonly: None,
         }
+    }
+
+    /// Make `[start, end)` refuse stores, as the code of a real program does.
+    pub fn protect(&mut self, start: u64, end: u64) {
+        self.readonly = Some(start..end);
     }
 
     fn range(&self, addr: u64, size: u8, write: bool) -> Result<std::ops::Range<usize>, Fault> {
@@ -64,6 +72,15 @@ impl Bus for FlatBus {
 
     fn write(&mut self, addr: u64, size: u8, value: u128) -> Result<(), Fault> {
         let r = self.range(addr, size, true)?;
+        if let Some(ro) = &self.readonly {
+            if addr < ro.end && addr + u64::from(size) > ro.start {
+                return Err(Fault {
+                    addr,
+                    write: true,
+                    kind: FaultKind::Permission,
+                });
+            }
+        }
         self.mem[r].copy_from_slice(&value.to_le_bytes()[..size as usize]);
         Ok(())
     }

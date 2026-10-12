@@ -12,6 +12,7 @@
 //!   compare instructions, the new `NZCV` nibble;
 //! - `nzcv`: the current flags, for the instructions that test a condition (`FCSEL`, `FCCMP`).
 
+pub mod crypto;
 pub mod decode;
 mod decode_simd;
 mod decode_simd_imm;

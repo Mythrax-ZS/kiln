@@ -1259,7 +1259,7 @@ fn register_loads_and_stores() {
 }
 
 #[test]
-fn encodings_the_core_lacks_are_unallocated_and_the_crypto_extension_is_unsupported() {
+fn encodings_the_core_lacks_are_unallocated_and_the_crypto_extension_decodes() {
     use crate::a64::{decode, Inst};
     // fadd h0, h1, h2 (half-precision arithmetic needs FEAT_FP16)
     assert!(matches!(decode(0x1EE2_2820), Inst::Unallocated(_)));
@@ -1267,8 +1267,16 @@ fn encodings_the_core_lacks_are_unallocated_and_the_crypto_extension_is_unsuppor
     assert!(matches!(decode(0x6E82_8420), Inst::Unallocated(_)));
     // sdot v0.4s, v1.16b, v2.16b (FEAT_DotProd)
     assert!(matches!(decode(0x4E82_9420), Inst::Unallocated(_)));
-    // aese v0.16b, v1.16b is valid on the core and not implemented
-    assert!(matches!(decode(0x4E28_4820), Inst::Unsupported { .. }));
+    // The cryptographic extension is part of the core: aese v0.16b, v1.16b and sha256h q0, q1,
+    // v2.4s decode; the reserved neighbours (size != 0, the unused opcodes) do not.
+    assert!(matches!(decode(0x4E28_4820), Inst::Vec { .. }));
+    assert!(matches!(decode(0x5E02_4020), Inst::Vec { .. }));
+    assert!(matches!(decode(0x4E68_4820), Inst::Unallocated(_)));
+    assert!(matches!(
+        decode(0x4E28_4820 | 0x1F000),
+        Inst::Unallocated(_)
+    ));
+    assert!(matches!(decode(0x5E02_7020), Inst::Unallocated(_)));
     // fcmp d0, #0.0 with a non-zero Rm field
     assert!(matches!(decode(0x1E62_2018), Inst::Unallocated(_)));
 }

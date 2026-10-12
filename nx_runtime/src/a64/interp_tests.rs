@@ -1166,9 +1166,10 @@ fn undefined_and_unsupported_instructions_stop_the_run() {
     let mut m = Machine::new(&[0x0000_0000]);
     assert_eq!(m.run(1), Err(Trap::Undefined(0)));
     assert_eq!(m.cpu.pc, CODE);
-    let aese = 0x4E28_4820;
-    let mut m = Machine::new(&[aese]);
-    assert!(matches!(m.run(1), Err(Trap::Unsupported { word, .. }) if word == aese));
+    // cas x0, x1, [x2]: an Armv8.1 atomic, valid but not on the modelled core and not implemented.
+    let cas = 0xC8A0_7C41;
+    let mut m = Machine::new(&[cas]);
+    assert!(matches!(m.run(1), Err(Trap::Unsupported { word, .. }) if word == cas));
     assert_eq!(m.cpu.pc, CODE);
 }
 

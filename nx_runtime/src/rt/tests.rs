@@ -287,11 +287,11 @@ fn stops_are_recorded_with_their_details() {
     );
     assert_eq!(c.state.pc, STOP_PC);
 
-    // brk, an undefined word, an unsupported (crypto) word, an EL1-only system register.
+    // brk, an undefined word, an unsupported word (an Armv8.1 atomic), an EL1-only register.
     for (word, kind, aux) in [
         (asm::brk(0x123), trap::BRK, 0x123u64),
         (0x0000_0000, trap::UNDEFINED, 0),
-        (0x4E28_4820, trap::UNSUPPORTED, 0x4E28_4820),
+        (0xC8A0_7C41, trap::UNSUPPORTED, 0xC8A0_7C41),
         (asm::sysreg(true, 3, 0, 0, 0, 0, 3), trap::SYSREG, 3 << 14),
     ] {
         put_words(0x2300_0100, &[word]);

@@ -6,6 +6,7 @@
 //! `i128`, wide enough for every intermediate value (the widest is a 64-bit product shifted by a
 //! 64-bit amount).
 
+use super::crypto;
 use super::decode_simd::min_max_of;
 use super::simd::*;
 use crate::a64::fp::{self, Env, Fmt, Rounding};
@@ -291,6 +292,34 @@ pub fn exec(cpu: &mut CpuState, env: &mut Env, op: &SimdOp, src: u64) -> u64 {
 
 fn run(cpu: &mut CpuState, cx: &mut Ctx, op: &SimdOp, src: u64) -> u64 {
     match *op {
+        SimdOp::Aes { op, rd, rn } => {
+            let (d, n) = (cpu.vreg(rd), cpu.vreg(rn));
+            let r = match op {
+                Aes::Aese => crypto::aese(d, n),
+                Aes::Aesd => crypto::aesd(d, n),
+                Aes::Aesmc => crypto::aesmc(n),
+                Aes::Aesimc => crypto::aesimc(n),
+            };
+            cpu.set_vreg(rd, r);
+        }
+        SimdOp::Sha { op, rd, rn, rm } => {
+            let (d, n, m) = (cpu.vreg(rd), cpu.vreg(rn), cpu.vreg(rm));
+            // `Sn` is the low word of `Vn`.
+            let e = n as u32;
+            let r = match op {
+                Sha::Sha1c => crypto::sha1_rounds(crypto::Sha1Round::Choose, d, e, m),
+                Sha::Sha1p => crypto::sha1_rounds(crypto::Sha1Round::Parity, d, e, m),
+                Sha::Sha1m => crypto::sha1_rounds(crypto::Sha1Round::Majority, d, e, m),
+                Sha::Sha1su0 => crypto::sha1su0(d, n, m),
+                Sha::Sha256h => crypto::sha256h(d, n, m),
+                Sha::Sha256h2 => crypto::sha256h2(d, n, m),
+                Sha::Sha256su1 => crypto::sha256su1(d, n, m),
+                Sha::Sha1h => u128::from(crypto::sha1h(e)),
+                Sha::Sha1su1 => crypto::sha1su1(d, n),
+                Sha::Sha256su0 => crypto::sha256su0(d, n),
+            };
+            cpu.set_vreg(rd, r);
+        }
         SimdOp::Logic { op, q, rd, rn, rm } => {
             let (a, b, d) = (cpu.vreg(rn), cpu.vreg(rm), cpu.vreg(rd));
             let r = match op {
