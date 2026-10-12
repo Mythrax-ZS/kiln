@@ -61,5 +61,9 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
 - Unicorn differential test sizes: `RECOMP_DIFF_CASES` replaces the default number of cases of every
   group in `unicorn_diff`, `unicorn_fp` and `unicorn_simd` (the random-words test draws that many
   words).
+- Kernel layer: `nx_runtime/src/horizon/tests.rs` drives the SVC interface with real host threads
+  and needs no external tool. The homebrew tests in `src/build/e2e_tests.rs` build small NROs
+  from assembled words and run them (clang needed). `NX_TRACE_SVC=1` logs every SVC of a produced
+  program; `NX_RANDOM_SEED=<n>` makes the kernel's entropy reproducible.
 - Unicorn (AArch64 oracle): `UNICORN_DLL`, else `.venv` (`py -m venv .venv`, then
   `.venv\Scripts\pip install unicorn`). The shared library is loaded with `libloading`.

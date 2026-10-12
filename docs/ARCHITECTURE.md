@@ -20,6 +20,7 @@ ExeFS / NRO ──loader──▶ Module ──discover──▶ per-function CF
 | Emit | `src/codegen` | LLVM IR text, one unit per batch of functions, plus the support unit and the module descriptor. |
 | Build | `src/build` | clang discovery, parallel compile, link against `nx_runtime`. |
 | Run | `nx_runtime/src/rt` | Guest memory, exclusive monitor, function table, slow path, process start-up. |
+| Horizon | `nx_runtime/src/horizon` | The kernel a produced NSO or NRO runs on: SVCs, threads, synchronization, IPC, `sm:`. |
 
 ## Calling protocol (generated code)
 
@@ -53,6 +54,34 @@ store is `VecMem { word, pc, addr }`, lowered to `nx_vecmem` followed by the usu
 base register's address computation and writeback are ordinary integer IR. Nothing is inlined, so
 the flags and rounding come out of the exact soft-float whatever the host FPU does.
 
+## The Horizon layer
+
+A module descriptor carries a kind (`rt::host::kind`). A plain module (hosts and tests) is started
+as a function; an NSO or an NRO goes to `horizon::process::run_module`, which builds one `Kernel`
+for the process, maps the main thread's stack and thread-local region, and runs every guest thread
+on its own host thread (`Kernel::run_process`). Generated code reaches the kernel only through
+`nx_svc(cpu, imm)`: it spills the registers, `svc_entry` finds the thread's `Kernel` through
+`cpu.ctl.user` and calls `Kernel::svc`, which takes its arguments from `X0..X7` and leaves its
+results there as the Switchbrew SVC pages lay them out, and the generated code reloads the state.
+
+- **State**: one `Mutex` and one `Condvar` guard everything the kernel knows (handles, memory
+  blocks, threads, events, waiter lists). A blocking call sleeps in `wait_until`, which re-checks
+  its predicate whenever anything changed.
+- **Memory**: `memory.rs` is a block map over the guest address space (type, permission, attribute),
+  which `QueryMemory` reads and `MapMemory`, `SetMemoryPermission` and `SetHeapSize` change; the data
+  itself stays in `rt::mem`. Where the regions sit is in `layout.rs` (docs/ASSUMPTIONS.md A-034).
+- **Synchronization**: mutex words with the wait bit, condition variables and the address arbiter
+  work on the guest's own memory words (`Runtime::compare_exchange`), so a guest lock and a guest
+  atomic see the same bytes.
+- **IPC**: `ipc.rs` parses and builds HIPC messages and the CMIF headers, handles domains and the
+  control commands; a `Service` (`service.rs`) answers a request with a `Response`, whose objects
+  become move handles or domain object ids. `sm:` (`sm.rs`) is the only named port; it hands out a
+  service only if the program's NPDM service access list allows the name. `services.rs` registers
+  the services; none besides `sm:` exists yet.
+- **Stops**: an SVC, a named port, a service or a command nobody implemented does not get an
+  answer. The kernel records a report with the guest address and the number, ends the process and
+  the produced program exits with status 101.
+
 ## Guest memory
 
 One checked interface (`nx_runtime/src/rt/mem.rs`): a 39-bit address space of 4 KiB pages through a
@@ -70,3 +99,5 @@ runtime functions the emitter calls against the runtime's exports.
 | FP and SIMD | hand-computed results | `nx_runtime/src/a64/vec/{tests,scalar_tests}.rs` |
 | IR evaluator | the interpreter | `src/lift/tests.rs`, `flow_tests.rs` |
 | Native code | the interpreter | `src/native_tests.rs` (synthetic), `tests/real_code.rs` (a real title, opt-in) |
+| Kernel layer | the Switchbrew contract of each call, with real host threads | `nx_runtime/src/horizon/tests.rs` and the unit tests next to each file |
+| Homebrew NRO and NSO | expected output and exit status of built programs | `src/build/e2e_tests.rs` (`mod homebrew`) |

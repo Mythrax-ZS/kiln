@@ -19,8 +19,10 @@ explains how the pieces fit together.
 
 Done: M1 (input layer), M2 (loader), M3 (decoder and interpreter, integer ISA), M4 (lifter and
 LLVM code generation, integer ISA), M5 (floating point and Advanced SIMD in all four layers; the
-cryptographic extension is the one thing left out). Nothing renders: GPU work is out of scope until
-M7 passes.
+cryptographic extension is the one thing left out), M6 (the Horizon kernel layer: a homebrew NRO
+built by `recomp build` runs natively, prints through `svcOutputDebugString`, starts threads and
+talks to `sm:`; `sm:` is the only service). Nothing renders: GPU work is out of scope until M7
+passes.
 
 ## Using it
 
@@ -37,6 +39,14 @@ no jump table explains, interpreter fallbacks by address range, and instructions
 run. A produced program that stops says why on stderr and exits with status 101. Addresses it
 reached that no function covers can be logged with `NX_UNKNOWN_LOG=<file>` and fed back with
 `--hints`.
+
+A produced NSO or NRO runs on the project's own Horizon kernel layer. What the guest sends to
+`svcOutputDebugString` goes to the program's standard output. An SVC, a service or a service
+command nobody implemented stops the run: the report on standard error names the guest address and
+the number, and the exit status is 101. Two environment variables help while debugging:
+`NX_TRACE_SVC=1` logs every supervisor call with its arguments and result on standard error, and
+`NX_RANDOM_SEED=<decimal number>` makes the kernel's pseudo-random values (loader configuration, `GetInfo`
+entropy) reproducible.
 
 ## What "accuracy" means here
 
