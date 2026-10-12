@@ -110,6 +110,9 @@ pub struct RelocReport {
     pub unsupported: Vec<UnsupportedReloc>,
     /// Addends of the RELATIVE relocations: module offsets that pointers in memory refer to.
     pub relative_targets: Vec<u64>,
+    /// Module offset and previous contents of every slot a relocation wrote, in the order they
+    /// were written: what the kernel's loader leaves in memory for the runtime linker.
+    pub originals: Vec<(u64, [u8; 8])>,
 }
 
 impl RelocReport {
@@ -426,6 +429,7 @@ fn apply_table(
                             });
                         }
                         // Leave the slot zero.
+                        report.originals.push((r_offset, slot_at(image, r_offset)));
                         image[r_offset as usize..r_offset as usize + 8].fill(0);
                         continue;
                     }
@@ -441,9 +445,16 @@ fn apply_table(
                 continue;
             }
         };
+        report.originals.push((r_offset, slot_at(image, r_offset)));
         image[r_offset as usize..r_offset as usize + 8].copy_from_slice(&value.to_le_bytes());
     }
     Ok(())
+}
+
+fn slot_at(image: &[u8], at: u64) -> [u8; 8] {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&image[at as usize..at as usize + 8]);
+    b
 }
 
 fn read_pointer_array(image: &[u8], at: Option<u64>, size: u64) -> Result<Vec<u64>> {
@@ -548,6 +559,18 @@ impl Module {
     /// Guest address of the module start, where execution begins.
     pub fn entry(&self) -> u64 {
         self.base
+    }
+
+    /// The mapped bytes as the file holds them, before this loader applied any relocation. That
+    /// is what the kernel's loader leaves in memory: the title's own runtime linker (`rtld`)
+    /// relocates the modules when the program runs, so a produced program starts from this image.
+    /// The relocated `image` is for the analysis, which reads jump tables and pointers.
+    pub fn unrelocated_image(&self) -> Vec<u8> {
+        let mut image = self.image.clone();
+        for &(off, bytes) in self.relocs.originals.iter().rev() {
+            image[off as usize..off as usize + 8].copy_from_slice(&bytes);
+        }
+        image
     }
 
     pub fn addr(&self, offset: u64) -> u64 {

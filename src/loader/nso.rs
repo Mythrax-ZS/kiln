@@ -373,6 +373,39 @@ mod tests {
     }
 
     #[test]
+    fn the_unrelocated_image_is_what_the_file_holds() {
+        let spec = Spec {
+            relatives: vec![(SLOTS_OFF as u64, 0x1234)],
+            symbol_relocs: vec![(SLOTS_OFF as u64 + 8, "foo", R_AARCH64_ABS64, 8)],
+            jmprel: vec![(SLOTS_OFF as u64 + 16, "foo")],
+            imports: vec![("memcpy", false)],
+            exports: vec![("foo", 0x400)],
+            ..simple_spec()
+        };
+        let mut parts = build_parts(&spec);
+        // Slots hold junk in the file; one more relocation (an unresolved import) zeroes its slot.
+        let junk = SLOTS_OFF - DATA_OFF;
+        parts.data[junk..junk + 32].fill(0xEE);
+        let l = load_ok(&build_nso(&parts, NsoFlags::default()));
+        let m = &l.module;
+        assert_ne!(slot(&m.image, SLOTS_OFF), 0xEEEE_EEEE_EEEE_EEEE);
+        let raw = m.unrelocated_image();
+        assert_eq!(raw.len(), m.image.len());
+        for i in 0..3 {
+            assert_eq!(slot(&raw, SLOTS_OFF + 8 * i), 0xEEEE_EEEE_EEEE_EEEE, "{i}");
+        }
+        // Everywhere else the two images agree.
+        let relocated = [SLOTS_OFF, SLOTS_OFF + 8, SLOTS_OFF + 16];
+        for (at, (a, b)) in m.image.iter().zip(&raw).enumerate() {
+            if !relocated.iter().any(|&s| (s..s + 8).contains(&at)) {
+                assert_eq!(a, b, "byte {at:#x}");
+            }
+        }
+        // The text the analysis reads is the same in both.
+        assert_eq!(&m.image[..0x1000], &raw[..0x1000]);
+    }
+
+    #[test]
     fn init_fini_arrays_exports_and_known_entries() {
         let spec = Spec {
             exports: vec![("nnMain", 0x200), ("helper", 0x240)],
