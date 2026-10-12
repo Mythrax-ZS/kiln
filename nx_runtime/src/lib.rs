@@ -8,6 +8,7 @@ pub mod a64;
 pub mod error;
 pub mod npdm;
 pub mod romfs;
+pub mod rt;
 pub mod slow;
 pub mod storage;
 pub mod util;

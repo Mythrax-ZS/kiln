@@ -505,20 +505,10 @@ pub enum TrapKind {
 impl TrapKind {
     /// The `(op0, op1, CRn, CRm, op2)` encoding of a system register.
     pub fn sysreg(reg: SysReg, write: bool) -> TrapKind {
-        let enc = match reg {
-            SysReg::Nzcv => [3, 3, 4, 2, 0],
-            SysReg::Fpcr => [3, 3, 4, 4, 0],
-            SysReg::Fpsr => [3, 3, 4, 4, 1],
-            SysReg::TpidrEl0 => [3, 3, 13, 0, 2],
-            SysReg::TpidrroEl0 => [3, 3, 13, 0, 3],
-            SysReg::CntfrqEl0 => [3, 3, 14, 0, 0],
-            SysReg::CntpctEl0 => [3, 3, 14, 0, 1],
-            SysReg::CntvctEl0 => [3, 3, 14, 0, 2],
-            SysReg::CtrEl0 => [3, 3, 0, 0, 1],
-            SysReg::DczidEl0 => [3, 3, 0, 0, 7],
-            SysReg::Other(a, b, c, d, e) => [a, b, c, d, e],
-        };
-        TrapKind::SysReg { write, enc }
+        TrapKind::SysReg {
+            write,
+            enc: reg.encoding(),
+        }
     }
 }
 
