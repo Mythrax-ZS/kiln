@@ -26,6 +26,14 @@ fn register<S: Service + 'static>(
     kernel.register_service(name, Box::new(move || Box::new(make(weak.clone()))));
 }
 
+/// The names of the services `register_defaults` registers, sorted.
+pub fn implemented_names() -> Vec<String> {
+    use super::kernel::{ProcessInfo, ProcessKind};
+    let kernel = Kernel::new(ProcessInfo::new("names", ProcessKind::Nso, None));
+    register_defaults(&kernel);
+    kernel.implemented_services()
+}
+
 /// Register every implemented service with a kernel. `sm:` is not here: it is the named port the
 /// kernel itself answers.
 pub fn register_defaults(kernel: &Arc<Kernel>) {

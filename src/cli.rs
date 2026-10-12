@@ -264,6 +264,28 @@ fn describe_npdm(out: &mut String, bytes: &[u8]) -> Result<()> {
     );
     let ids: Vec<String> = k.svcs.ids().iter().map(|i| format!("{i:#x}")).collect();
     let _ = writeln!(out, "  enabled SVCs: {}", ids.join(" "));
+    // What this runtime lacks of what the program is allowed to use.
+    let implemented = nx_runtime::horizon::svc::IMPLEMENTED;
+    let missing: Vec<String> = k
+        .svcs
+        .ids()
+        .iter()
+        .filter(|i| !implemented.contains(i))
+        .map(|&i| match nx_runtime::horizon::svc::svc_name(i) {
+            Some(name) => format!("{i:#x} {name}"),
+            None => format!("{i:#x}"),
+        })
+        .collect();
+    let _ = writeln!(
+        out,
+        "  the runtime implements {} of them; not implemented: {}",
+        k.svcs.count() as usize - missing.len(),
+        if missing.is_empty() {
+            "none".to_string()
+        } else {
+            missing.join(", ")
+        }
+    );
     let (client, server): (Vec<_>, Vec<_>) = n.services.iter().partition(|s| !s.is_server);
     let names = |v: &[&nx_runtime::npdm::ServiceAccess]| {
         v.iter()
@@ -276,6 +298,22 @@ fn describe_npdm(out: &mut String, bytes: &[u8]) -> Result<()> {
         "  service access list ({} connect): {}",
         client.len(),
         names(&client)
+    );
+    let have = nx_runtime::horizon::services::implemented_names();
+    let (done, todo): (Vec<_>, Vec<_>) = client
+        .iter()
+        .map(|s| s.name.as_str())
+        .partition(|n| have.iter().any(|h| h == n));
+    let _ = writeln!(
+        out,
+        "  the runtime implements {} of them ({}); not implemented: {}",
+        done.len(),
+        done.join(", "),
+        if todo.is_empty() {
+            "none".to_string()
+        } else {
+            todo.join(", ")
+        }
     );
     if !server.is_empty() {
         let _ = writeln!(
@@ -540,6 +578,17 @@ mod tests {
         assert!(text.contains("3 SVCs enabled"), "{text}");
         assert!(text.contains("enabled SVCs: 0x1 0x2 0x7"), "{text}");
         assert!(text.contains("(3 connect): fsp-srv, sm:, nvdrv*"), "{text}");
+        // SVCs 1, 2 and 7 are implemented; of the services only `fsp-srv` is.
+        assert!(
+            text.contains("the runtime implements 3 of them; not implemented: none"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "the runtime implements 1 of them (fsp-srv); not implemented: sm:, nvdrv*"
+            ),
+            "{text}"
+        );
         assert!(
             text.contains("2 files, 1 directories, 100 bytes of file data"),
             "{text}"

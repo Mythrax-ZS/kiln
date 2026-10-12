@@ -71,7 +71,7 @@ A call the program's NPDM does not enable stops the run as if it were unimplemen
 NPDM enables 47 SVCs; **the ones among them that are not implemented** are 0x13 and 0x14 (shared
 memory), 0x20, 0x22 and 0x23 (the light and user-buffer IPC calls), 0x28 (`ReturnFromException`),
 0x2C and 0x2D (physical memory), 0x2F, 0x32, 0x33 (thread activity and context) and 0x5F (cache
-flush). Also not implemented: the server side of IPC (`CreateSession`, `AcceptSession`,
+flush). `recomp inspect` prints this list, and the services not implemented, for any title. Also not implemented: the server side of IPC (`CreateSession`, `AcceptSession`,
 `ReplyAndReceive*`: 0x40-0x44), `SignalToAddress` type 2, and `GetInfo` types 9, 19, 20, 24 to 28.
 
 ## Services

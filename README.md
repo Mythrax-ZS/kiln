@@ -36,6 +36,8 @@ recomp build   (--exefs <dir|pfs0> | --nro <file>) --out <dir> [--name <name>] [
 recomp relink  --out <dir> --name <name>
 ```
 
+`inspect` also says which of the SVCs and services a program may use this runtime does not implement.
+
 `build` writes `<name>.exe` (or `<name>`), optionally `<name>.dll` with `--shared`, the embedded
 image, and `<name>.report.txt` listing everything the analysis could not settle: indirect branches
 no jump table explains, interpreter fallbacks by address range, and instructions that stop the
