@@ -170,7 +170,7 @@ fn addresses(list: &[u64], limit: usize) -> String {
 }
 
 /// Group instruction addresses into ranges of consecutive instructions with the same reason.
-fn ranges_of(map: &BTreeMap<u64, &'static str>) -> Vec<(u64, u64, &'static str)> {
+pub(crate) fn ranges_of(map: &BTreeMap<u64, &'static str>) -> Vec<(u64, u64, &'static str)> {
     let mut out: Vec<(u64, u64, &'static str)> = Vec::new();
     for (&pc, &why) in map {
         match out.last_mut() {

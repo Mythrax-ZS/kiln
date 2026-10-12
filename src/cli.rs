@@ -356,6 +356,17 @@ fn describe_analysis(out: &mut String, a: &discover::Report) {
     );
 }
 
+/// The instructions that run in the interpreter and the ones that stop the run, with addresses.
+fn describe_stops(out: &mut String, a: &discover::Report) {
+    const LIMIT: usize = 100;
+    for (lo, hi, why) in pipeline::ranges_of(&a.fallbacks).iter().take(LIMIT) {
+        let _ = writeln!(out, "  interpreter fallback {lo:#x}..{hi:#x}: {why}");
+    }
+    for (pc, kind) in a.traps.iter().take(LIMIT) {
+        let _ = writeln!(out, "  stops the run at {pc:#x}: {kind:?}");
+    }
+}
+
 /// Discover and lift a program, report the sizes, compile nothing.
 fn analyze(args: &Args) -> Result<String> {
     let program = load_program(args)?;
@@ -368,6 +379,7 @@ lifted to {} IR instructions, {} bytes of LLVM IR text",
         program.name, r.functions, r.blocks, r.guest_instructions, r.ir_instructions, r.llvm_bytes
     );
     describe_analysis(&mut out, &r.analysis);
+    describe_stops(&mut out, &r.analysis);
     let _ = writeln!(
         out,
         "discovery {:.1}s, lifting and emitting {:.1}s",
