@@ -73,6 +73,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nx_gpu"
+version = "0.1.0"
+
+[[package]]
 name = "nx_runtime"
 version = "0.1.0"
 dependencies = [

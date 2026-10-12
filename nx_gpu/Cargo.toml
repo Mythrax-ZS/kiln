@@ -1,0 +1,10 @@
+[package]
+name = "nx_gpu"
+version = "0.1.0"
+edition = "2021"
+description = "GPU side of the Horizon emulation: nvdrv devices, display buffer queue, command processor"
+publish = false
+
+[lib]
+name = "nx_gpu"
+path = "src/lib.rs"
