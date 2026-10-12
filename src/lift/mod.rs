@@ -44,6 +44,29 @@ impl CodeSource for ModuleCode<'_> {
     }
 }
 
+/// The modules of a program as the analysis sees them: one address space, the modules in
+/// ascending order of their bases.
+pub struct ProcessCode<'a>(pub &'a [Module]);
+
+impl ProcessCode<'_> {
+    fn module_at(&self, addr: u64) -> Option<&Module> {
+        let i = self.0.partition_point(|m| m.base <= addr).checked_sub(1)?;
+        let m = &self.0[i];
+        m.offset_of(addr).map(|_| m)
+    }
+}
+
+impl CodeSource for ProcessCode<'_> {
+    fn is_code(&self, addr: u64) -> bool {
+        self.module_at(addr)
+            .is_some_and(|m| ModuleCode(m).is_code(addr))
+    }
+
+    fn read(&self, addr: u64, size: usize) -> Option<u64> {
+        ModuleCode(self.module_at(addr)?).read(addr, size)
+    }
+}
+
 /// Lift every discovered function.
 pub fn lift_all(d: &discover::Discovery) -> BTreeMap<u64, ir::Func> {
     let is_function = |a: u64| d.funcs.contains_key(&a);

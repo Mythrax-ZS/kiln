@@ -6,7 +6,7 @@ use super::Toolchain;
 use crate::lift::flow_tests::{fib_program, jump_table_words};
 use crate::loader::module::GUEST_BASE;
 use crate::loader::nso;
-use crate::loader::testing::{build_nso, build_parts, NsoFlags, Spec, CODE_OFF};
+use crate::loader::testing::{build_nso, build_parts, NsoFlags, Spec, CODE_OFF, SLOTS_OFF};
 use crate::program::Program;
 use libloading::Library;
 use nx_runtime::rt::host::ModuleDesc;
@@ -32,7 +32,7 @@ fn program_from(spec: &Spec) -> Program {
     let loaded = nso::load(&bytes, "main", GUEST_BASE, &nso::LoadOptions::default()).unwrap();
     Program {
         name: "main".into(),
-        module: loaded.module,
+        modules: vec![loaded.module],
         npdm: None,
     }
 }
@@ -167,6 +167,81 @@ fn a_program_that_stops_says_why_and_exits_nonzero() {
         err.contains("read of 0xdead (unmapped) by the instruction at 0x8000184"),
         "{err}"
     );
+}
+
+/// Two NSOs mapped back to back, the way the kernel's loader maps `rtld` and `main`. The first
+/// calls a function in the second (across the module boundary), then looks at a data slot that a
+/// RELATIVE relocation covers and returns 42 if the slot is still zero (nobody relocated the
+/// image) or 41 if it holds a pointer.
+fn two_module_program() -> Program {
+    let mov = |rd: u8, rm: u8| asm::logical_shifted(true, 1, 0, false, rm, 0, 31, rd);
+    let a = Spec {
+        code: vec![
+            mov(19, 30),
+            asm::b_imm(true, 0x5000 / 4 - 1), // main's function, one module further (the call is the second word)
+            asm::movz(true, 2, SLOTS_OFF as u32, 0),
+            asm::movk(true, 2, 0x0800, 1),
+            asm::ldr_x(1, 2, 0),
+            asm::cbz(true, false, 4, 1), // zero: skip to the "unrelocated" case
+            asm::add_imm(true, 0, 0, 1),
+            mov(30, 19),
+            asm::ret(30),
+            asm::add_imm(true, 0, 0, 2),
+            mov(30, 19),
+            asm::ret(30),
+        ],
+        with_mod0: true,
+        relatives: vec![(SLOTS_OFF as u64, CODE_OFF as i64)],
+        ..Spec::default()
+    };
+    let b = Spec {
+        code: vec![asm::movz(true, 0, 40, 0), asm::ret(30)],
+        ..Spec::default()
+    };
+    let load = |spec: &Spec, name: &str, base: u64| {
+        let bytes = build_nso(&build_parts(spec), NsoFlags::default());
+        nso::load(&bytes, name, base, &nso::LoadOptions::default())
+            .unwrap()
+            .module
+    };
+    let first = load(&a, "rtld", GUEST_BASE);
+    assert_eq!(first.image.len(), 0x5000, "the test's call distance");
+    let second = load(&b, "main", GUEST_BASE + first.image.len() as u64);
+    Program {
+        name: "main".into(),
+        modules: vec![first, second],
+        npdm: None,
+    }
+}
+
+#[test]
+fn modules_are_mapped_back_to_back_and_start_as_the_file_left_them() {
+    let Some(tc) = toolchain_or_skip() else {
+        return;
+    };
+    let program = two_module_program();
+    let dir = TempDir::new("e2e-modules");
+    let report = build(&program, &tc, &BuildOptions::new(dir.path(), "two")).unwrap();
+    // Each module's start (`b CODE_OFF`) and its function.
+    assert_eq!(report.functions, 4, "{report:?}");
+    assert_eq!(
+        std::fs::metadata(&report.image).unwrap().len(),
+        0xA000,
+        "both modules are in the image"
+    );
+    let out = run(&report.exe);
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "an unrelocated image leaves the slot zero; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Asking for the relocations this tool applies puts a pointer in the slot instead.
+    let mut opts = BuildOptions::new(dir.path(), "two_relocated");
+    opts.pre_relocated = true;
+    let report = build(&program, &tc, &opts).unwrap();
+    assert_eq!(run(&report.exe).status.code(), Some(41));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -381,7 +456,7 @@ mod homebrew {
         let loaded = nro::load(&bytes, "hello", GUEST_BASE).unwrap();
         Program {
             name: "hello".into(),
-            module: loaded.module,
+            modules: vec![loaded.module],
             npdm: None,
         }
     }

@@ -172,10 +172,12 @@ fn real_functions_run_the_same_natively_and_interpreted() {
             return;
         }
     };
-    let program = Program::from_exefs(&dir).expect("the title's main loads");
+    let program = Program::from_exefs_main(&dir).expect("the title's main loads");
     let work = TempDir::new("real-code");
     let mut opts = BuildOptions::new(work.path(), "title");
     opts.shared = true;
+    // The functions are called directly, with no runtime linker to relocate the image.
+    opts.pre_relocated = true;
     opts.opt_level = env_count("RECOMP_REAL_OPT", 1) as u8;
     let report = build(&program, &tc, &opts).expect("the title recompiles");
     eprintln!(
@@ -186,8 +188,8 @@ fn real_functions_run_the_same_natively_and_interpreted() {
     );
 
     // Sample function entries.
-    let m = &program.module;
-    let (roots, aopts) = analysis_inputs(m, &[]).unwrap();
+    let m = program.entry_module();
+    let (roots, aopts) = analysis_inputs(&program.modules, &[]).unwrap();
     let d = discover(&ModuleCode(m), &roots, &aopts);
     let entries: Vec<u64> = d.funcs.keys().copied().collect();
     let mut rng = Rng::new(0x5EED_C0DE);

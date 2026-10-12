@@ -10,7 +10,7 @@ use crate::codegen::{self, Descriptor, SegmentInfo};
 use crate::lift::cfg::FuncCfg;
 use crate::lift::discover::{discover, Options, Report};
 use crate::lift::func::lift_function;
-use crate::lift::ModuleCode;
+use crate::lift::ProcessCode;
 use crate::loader::module::{Module, ModuleKind};
 use crate::program::Program;
 use crate::{Error, Result};
@@ -37,6 +37,10 @@ pub struct BuildOptions {
     pub shared: bool,
     /// Guest instructions per translation unit.
     pub unit_size: usize,
+    /// Embed the image with the relocations this tool applied. By default the image is what the
+    /// kernel's loader leaves in memory and the program's own runtime linker relocates it; tests
+    /// that call guest functions directly, with no runtime linker, ask for this.
+    pub pre_relocated: bool,
 }
 
 impl BuildOptions {
@@ -49,6 +53,7 @@ impl BuildOptions {
             keep_ir: false,
             shared: false,
             unit_size: 6000,
+            pre_relocated: false,
         }
     }
 }
@@ -96,15 +101,19 @@ pub fn parse_hints(text: &str) -> Result<Vec<u64>> {
     Ok(out)
 }
 
-/// The analysis roots and function extents a module offers.
-pub fn analysis_inputs(m: &Module, hints: &[u64]) -> Result<(Vec<u64>, Options)> {
-    let mut roots = m.known_entries();
-    roots.extend(m.code_pointers().into_iter().map(|o| m.base + o));
-    let ranges: Vec<(u64, u64)> = m
-        .eh_functions()?
-        .iter()
-        .map(|r| (m.base + r.start, m.base + r.start + r.len))
-        .collect();
+/// The analysis roots and function extents the modules of a program offer.
+pub fn analysis_inputs(modules: &[Module], hints: &[u64]) -> Result<(Vec<u64>, Options)> {
+    let mut roots = Vec::new();
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for m in modules {
+        roots.extend(m.known_entries());
+        roots.extend(m.code_pointers().into_iter().map(|o| m.base + o));
+        ranges.extend(
+            m.eh_functions()?
+                .iter()
+                .map(|r| (m.base + r.start, m.base + r.start + r.len)),
+        );
+    }
     roots.extend(ranges.iter().map(|r| r.0));
     roots.extend_from_slice(hints);
     roots.sort_unstable();
@@ -112,7 +121,9 @@ pub fn analysis_inputs(m: &Module, hints: &[u64]) -> Result<(Vec<u64>, Options)>
     Ok((roots, Options { ranges }))
 }
 
-fn segment_infos(m: &Module) -> Vec<SegmentInfo> {
+/// The segments of module `m` for the descriptor; file offsets are relative to `origin`, the
+/// address the embedded image starts at.
+fn segment_infos(m: &Module, origin: u64) -> Vec<SegmentInfo> {
     m.segments
         .iter()
         .map(|s| {
@@ -131,12 +142,29 @@ fn segment_infos(m: &Module) -> Vec<SegmentInfo> {
                 addr: m.base + s.offset,
                 size: s.size,
                 perm: p,
-                file_off: s.offset,
+                file_off: m.base - origin + s.offset,
                 // Zero-filled memory is not stored.
                 file_size: if s.name == "bss" { 0 } else { stored },
             }
         })
         .collect()
+}
+
+/// The image the produced program embeds: every module as the kernel's loader would leave it in
+/// memory (unrelocated, unless `pre_relocated`), from the first module's base to the end of the
+/// last.
+fn process_image(program: &Program, pre_relocated: bool) -> Vec<u8> {
+    let (start, end) = program.span();
+    let mut image = vec![0u8; (end - start) as usize];
+    for m in &program.modules {
+        let at = (m.base - start) as usize;
+        if pre_relocated {
+            image[at..at + m.image.len()].copy_from_slice(&m.image);
+        } else {
+            image[at..at + m.image.len()].copy_from_slice(&m.unrelocated_image());
+        }
+    }
+    image
 }
 
 /// Split the functions into batches of about `unit_size` guest instructions.
@@ -185,14 +213,16 @@ fn write_report(r: &BuildReport, program: &Program, path: &Path) -> Result<()> {
     let a = &r.analysis;
     let mut s = String::new();
     let _ = writeln!(s, "recomp build report: {}", program.name);
-    let m = &program.module;
-    let _ = writeln!(
-        s,
-        "module at {:#x}, {} bytes mapped, entry {:#x}",
-        m.base,
-        m.image.len(),
-        m.entry()
-    );
+    for m in &program.modules {
+        let _ = writeln!(
+            s,
+            "module {} at {:#x}, {} bytes mapped",
+            m.name,
+            m.base,
+            m.image.len()
+        );
+    }
+    let _ = writeln!(s, "entry {:#x}", program.entry_module().entry());
     let _ = writeln!(
         s,
         "functions {}, guest blocks {}, guest instructions {}, translation units {}",
@@ -255,12 +285,12 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
     std::fs::create_dir_all(&opts.out_dir)?;
     let work = opts.out_dir.join("work");
     std::fs::create_dir_all(&work)?;
-    let m = &program.module;
+    let entry_module = program.entry_module();
 
     // Discovery.
     let t0 = Instant::now();
-    let (roots, aopts) = analysis_inputs(m, &opts.hints)?;
-    let d = discover(&ModuleCode(m), &roots, &aopts);
+    let (roots, aopts) = analysis_inputs(&program.modules, &opts.hints)?;
+    let d = discover(&ProcessCode(&program.modules), &roots, &aopts);
     let discover_s = t0.elapsed().as_secs_f32();
     if d.funcs.is_empty() {
         return Err(Error::format(
@@ -323,22 +353,32 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
     tc.compile(&support_ll, &support_obj, opts.opt_level)?;
 
     let image = opts.out_dir.join(format!("{}.image", opts.name));
-    std::fs::write(&image, &m.image)?;
-    let segments = segment_infos(m);
-    let exports: Vec<(String, u64)> = m
-        .exports
+    let image_bytes = process_image(program, opts.pre_relocated);
+    std::fs::write(&image, &image_bytes)?;
+    let (origin, _) = program.span();
+    let segments: Vec<SegmentInfo> = program
+        .modules
         .iter()
-        .map(|e| (e.name.clone(), m.base + e.offset))
+        .flat_map(|m| segment_infos(m, origin))
+        .collect();
+    let exports: Vec<(String, u64)> = program
+        .modules
+        .iter()
+        .flat_map(|m| {
+            m.exports
+                .iter()
+                .map(|e| (e.name.clone(), m.base + e.offset))
+        })
         .collect();
     let desc = Descriptor {
-        kind: match m.kind {
+        kind: match entry_module.kind {
             ModuleKind::Nso => nx_runtime::rt::host::kind::NSO,
             ModuleKind::Nro => nx_runtime::rt::host::kind::NRO,
         },
-        entry: m.entry(),
+        entry: entry_module.entry(),
         segments: &segments,
         image_path: &image,
-        image_len: m.image.len() as u64,
+        image_len: image_bytes.len() as u64,
         npdm: program.npdm.as_deref().unwrap_or(&[]),
         exports: &exports,
     };
@@ -434,10 +474,9 @@ pub struct AnalyzeReport {
 /// a real build would be, and exercises the lifter and the emitter on the whole program.
 pub fn analyze(program: &Program, hints: &[u64], unit_size: usize) -> Result<AnalyzeReport> {
     let triple = codegen::host_triple();
-    let m = &program.module;
     let t0 = Instant::now();
-    let (roots, aopts) = analysis_inputs(m, hints)?;
-    let d = discover(&ModuleCode(m), &roots, &aopts);
+    let (roots, aopts) = analysis_inputs(&program.modules, hints)?;
+    let d = discover(&ProcessCode(&program.modules), &roots, &aopts);
     let discover_s = t0.elapsed().as_secs_f32();
     let t1 = Instant::now();
     let groups = batches(&d.funcs, unit_size);

@@ -20,12 +20,13 @@ recomp: static recompiler from Horizon OS AArch64 programs to native x86_64
 
 usage:
   recomp inspect --exefs <dir|pfs0> [--romfs <dir|image>]
-  recomp analyze (--exefs <dir|pfs0> | --nro <file>) [--hints <file>]
+  recomp analyze (--exefs <dir|pfs0> | --nro <file>) [--hints <file>] [--main-only]
   recomp build   (--exefs <dir|pfs0> | --nro <file>) --out <dir> [--name <name>] [--opt <0-3>]
-                 [--hints <file>] [--shared] [--keep-ir]
+                 [--hints <file>] [--shared] [--keep-ir] [--main-only]
   recomp --version
 
-Inputs are the already extracted ExeFS and RomFS of a game. No keys are read.
+Inputs are the already extracted ExeFS and RomFS of a game. No keys are read. From an ExeFS
+every NSO is loaded (rtld, main, subsdk0-9, sdk) unless --main-only asks for `main` alone.
 ";
 
 /// Parsed command line: a subcommand, `--name value` options and bare switches.
@@ -38,7 +39,14 @@ pub struct Args {
 }
 
 /// Options that take no value.
-const SWITCHES: &[&str] = &["help", "version", "shared", "interpret", "keep-ir"];
+const SWITCHES: &[&str] = &[
+    "help",
+    "version",
+    "shared",
+    "interpret",
+    "keep-ir",
+    "main-only",
+];
 
 pub fn parse_args(argv: &[String]) -> Result<Args> {
     let mut args = Args::default();
@@ -97,28 +105,18 @@ pub fn inspect(exefs: &std::path::Path, romfs_path: Option<&std::path::Path>) ->
         "NSO files in load order: {}",
         fs.nso_names().join(", ")
     );
-    let loaded = "main";
-    let skipped: Vec<String> = fs.nso_names().into_iter().filter(|n| n != loaded).collect();
-    if !skipped.is_empty() {
-        let _ = writeln!(
-            out,
-            "Phase one loads `{loaded}` only; present but not loaded: {}",
-            skipped.join(", ")
-        );
-    }
     if !fs.contains("main.npdm") {
         let _ = writeln!(
             out,
             "warning: ExeFS has no main.npdm; no service access list is available"
         );
     }
-    if fs.contains("main") {
-        describe_main(&mut out, &fs)?;
-    }
+    // The NSOs are mapped one after the other from the guest base, as the kernel's loader does.
+    let mut base = GUEST_BASE;
     for name in fs.nso_names() {
-        if name != "main" {
-            describe_other_nso(&mut out, &name, &fs.read(&name)?)?;
-        }
+        let loaded = nso::load(&fs.read(&name)?, &name, base, &nso::LoadOptions::default())?;
+        base += loaded.module.image.len() as u64;
+        describe_nso(&mut out, &name, &loaded);
     }
     if let Some(bytes) = fs.npdm()? {
         describe_npdm(&mut out, &bytes)?;
@@ -220,11 +218,9 @@ fn describe_module(out: &mut String, m: &Module) {
     }
 }
 
-fn describe_main(out: &mut String, fs: &ExeFs) -> Result<()> {
-    let bytes = fs.main()?;
-    let loaded = nso::load(&bytes, "main", GUEST_BASE, &nso::LoadOptions::default())?;
+fn describe_nso(out: &mut String, name: &str, loaded: &nso::Loaded) {
     let h = &loaded.header;
-    let _ = writeln!(out, "main: NSO0, loaded as the phase-one module");
+    let _ = writeln!(out, "{name}: NSO0");
     describe_module(out, &loaded.module);
     let _ = writeln!(
         out,
@@ -236,17 +232,6 @@ fn describe_main(out: &mut String, fs: &ExeFs) -> Result<()> {
         yes_no(loaded.hash_verified[1]),
         yes_no(loaded.hash_verified[2])
     );
-    Ok(())
-}
-
-fn describe_other_nso(out: &mut String, name: &str, bytes: &[u8]) -> Result<()> {
-    let h = nso::NsoHeader::parse(bytes)?;
-    let _ = writeln!(
-        out,
-        "{name}: NSO0, not loaded in phase one; text {:#x}, rodata {:#x}, data {:#x}, bss {:#x} bytes",
-        h.segs[0].size, h.segs[1].size, h.segs[2].size, h.bss_size
-    );
-    Ok(())
 }
 
 fn describe_npdm(out: &mut String, bytes: &[u8]) -> Result<()> {
@@ -327,6 +312,7 @@ pub fn run(argv: &[String]) -> Result<String> {
 
 fn load_program(args: &Args) -> Result<Program> {
     match (args.path("exefs"), args.path("nro")) {
+        (Some(p), None) if args.has("main-only") => Program::from_exefs_main(&p),
         (Some(p), None) => Program::from_exefs(&p),
         (None, Some(p)) => Program::from_nro(&p),
         _ => Err(Error::format(
@@ -507,9 +493,17 @@ mod tests {
             text.contains(&format!("{:>12} bytes", main.len())),
             "{text}"
         );
-        assert!(text.contains("present but not loaded: subsdk0"), "{text}");
+        // The NSOs are mapped one after the other from the guest base, in load order.
         assert!(
-            text.contains("main: NSO0, loaded as the phase-one module"),
+            text.contains("NSO files in load order: main, subsdk0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("main: NSO0\n  mapped at 0x8000000, 0x5000 bytes"),
+            "{text}"
+        );
+        assert!(
+            text.contains("subsdk0: NSO0\n  mapped at 0x8005000, 0x5000 bytes"),
             "{text}"
         );
         assert!(text.contains("text    0x00000000 +0x1000 r-x"), "{text}");
@@ -525,10 +519,6 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("matching: yes, yes, yes"), "{text}");
-        assert!(
-            text.contains("subsdk0: NSO0, not loaded in phase one"),
-            "{text}"
-        );
         assert!(text.contains("name `Application`"), "{text}");
         assert!(text.contains("3 SVCs enabled"), "{text}");
         assert!(text.contains("enabled SVCs: 0x1 0x2 0x7"), "{text}");
