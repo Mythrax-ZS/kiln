@@ -398,9 +398,9 @@ fn an_svc_nothing_implements_stops_the_run_and_says_which() {
     }
     // A named one reports its name.
     let mut e = Env::new();
-    assert_eq!(e.svc(0x13, &[]), Flow::Stop);
+    assert_eq!(e.svc(0x20, &[]), Flow::Stop);
     match e.kernel.exit_state() {
-        Some(Exit::Fatal(m)) => assert!(m.contains("MapSharedMemory"), "{m}"),
+        Some(Exit::Fatal(m)) => assert!(m.contains("SendSyncRequestLight"), "{m}"),
         other => panic!("{other:?}"),
     }
 }
@@ -2354,4 +2354,249 @@ fn a_save_file_system_is_a_directory_with_files_and_listings() {
     assert_eq!(e.call(fs, &del).result, ResultCode::new(2, 1).0);
     // Commit has nothing to do.
     assert_eq!(e.call(fs, &Message::new(10)).result, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shared memory, hid, time, nifm, nfp, friend, bsd
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn shared_memory_is_mapped_where_the_program_asks_and_shows_what_the_service_wrote() {
+    let mut e = Env::new();
+    let (object, service_side) = e.kernel.create_shared_memory(0x4000).unwrap();
+    rt().mem
+        .write_bytes(service_side, b"input!", false)
+        .unwrap();
+    let handle = u64::from(e.kernel.lock().handles.insert(object.clone()).unwrap());
+    assert_eq!(
+        e.kernel.shared_memory_range(&object),
+        Some((service_side, 0x4000))
+    );
+    // The arguments are checked: handle, alignment, size, permission, and where it may go.
+    e.svc(0x13, &[0x1234, 0x5000_0000, 0x4000, 3]);
+    assert_eq!(e.r(), err::INVALID_HANDLE.0);
+    e.svc(0x13, &[handle, 0x5000_0001, 0x4000, 3]);
+    assert_eq!(e.r(), err::INVALID_ADDRESS.0);
+    e.svc(0x13, &[handle, 0x5000_0000, 0x1000, 3]);
+    assert_eq!(e.r(), err::INVALID_SIZE.0);
+    e.svc(0x13, &[handle, 0x5000_0000, 0x4000, 5]);
+    assert_eq!(e.r(), err::INVALID_NEW_MEMORY_PERMISSION.0);
+    e.svc(0x13, &[handle, 0x1000, 0x4000, 3]);
+    assert_eq!(
+        e.r(),
+        err::INVALID_MEMORY_REGION.0,
+        "below the region modules may use"
+    );
+    e.svc(0x13, &[handle, SCRATCH, 0x4000, 3]);
+    assert_eq!(
+        e.r(),
+        err::INVALID_CURRENT_MEMORY.0,
+        "over memory that is in use"
+    );
+    // Mapped read-write at a free address: the service's bytes are there, and a write by the
+    // program reaches the service.
+    e.svc(0x13, &[handle, 0x5000_0000, 0x4000, 3]);
+    assert_eq!(e.r(), 0);
+    assert_eq!(e.read(0x5000_0000, 6), b"input!");
+    e.write(0x5000_0100, b"back");
+    let mut seen = [0u8; 4];
+    rt().mem
+        .read_bytes(service_side + 0x100, &mut seen, false)
+        .unwrap();
+    assert_eq!(&seen, b"back");
+    // QueryMemory reports a shared block of that size.
+    e.svc(0x06, &[SCRATCH + 0x800, 0, 0x5000_0000]);
+    assert_eq!(e.r(), 0);
+    let info = e.read(SCRATCH + 0x800, 0x28);
+    assert_eq!(info[16], mem_type::SHARED);
+    assert_eq!(u64::from_le_bytes(info[8..16].try_into().unwrap()), 0x4000);
+    // It cannot be mapped twice at once at the same place, and unmapping needs the same range.
+    e.svc(0x13, &[handle, 0x5000_0000, 0x4000, 3]);
+    assert_eq!(e.r(), err::INVALID_CURRENT_MEMORY.0);
+    e.svc(0x14, &[handle, 0x5000_0000, 0x1000]);
+    assert_eq!(e.r(), err::INVALID_SIZE.0);
+    e.svc(0x14, &[handle, 0x5001_0000, 0x4000]);
+    assert_eq!(e.r(), err::INVALID_CURRENT_MEMORY.0);
+    e.svc(0x14, &[handle, 0x5000_0000, 0x4000]);
+    assert_eq!(e.r(), 0);
+    assert!(
+        rt().mem.read(0x5000_0000, 4, Relaxed).is_err(),
+        "gone from the program"
+    );
+    // The service still has its pages, and can have the object mapped again, read-only.
+    rt().mem.read_bytes(service_side, &mut seen, false).unwrap();
+    e.svc(0x13, &[handle, 0x5000_0000, 0x4000, 1]);
+    assert_eq!(e.r(), 0);
+    assert!(
+        rt().mem.write(0x5000_0000, 4, 1, Relaxed).is_err(),
+        "read-only for the program"
+    );
+    e.svc(0x14, &[handle, 0x5000_0000, 0x4000]);
+}
+
+#[test]
+fn hid_publishes_input_in_a_shared_memory_the_program_maps() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let hid = e.service("hid");
+    // CreateAppletResource(u64 aruid, pid) -> IAppletResource, then its shared memory.
+    let mut create = Message::new(0);
+    create.pid = true;
+    create.payload = 7u64.to_le_bytes().to_vec();
+    let resource = u64::from(e.call(hid, &create).moved[0]);
+    let memory = e.call(resource, &Message::new(0)).copied[0];
+    // Asking again gives the same object: mapping it shows 0x40000 bytes of zeros (no input).
+    let again = e.call(resource, &Message::new(0)).copied[0];
+    assert_ne!(memory, 0);
+    e.svc(0x13, &[u64::from(memory), 0x6000_0000, 0x4_0000, 1]);
+    assert_eq!(e.r(), 0);
+    assert!(e.read(0x6000_0000, 0x1000).iter().all(|&b| b == 0));
+    e.svc(0x14, &[u64::from(memory), 0x6000_0000, 0x4_0000]);
+    e.svc(0x13, &[u64::from(again), 0x6000_0000, 0x4_0000, 1]);
+    assert_eq!(e.r(), 0, "the second handle names the same object");
+    // The activation commands succeed and remember what they are told.
+    let mut style = Message::new(100);
+    style.pid = true;
+    style.payload = [
+        0x1F_u32.to_le_bytes().to_vec(),
+        vec![0; 4],
+        7u64.to_le_bytes().to_vec(),
+    ]
+    .concat();
+    assert_eq!(e.call(hid, &style).result, 0);
+    let mut get = Message::new(101);
+    get.pid = true;
+    get.payload = 7u64.to_le_bytes().to_vec();
+    assert_eq!(e.call(hid, &get).data, 0x1Fu32.to_le_bytes());
+    for command in [1, 11, 21, 31, 103] {
+        let mut m = Message::new(command);
+        m.pid = true;
+        m.payload = 7u64.to_le_bytes().to_vec();
+        assert_eq!(e.call(hid, &m).result, 0, "command {command}");
+    }
+    // A command nobody implemented names itself.
+    assert!(e.send(hid, &Message::new(4000).bytes(), false).is_none());
+    match e.kernel.exit_state() {
+        Some(Exit::Fatal(m)) => assert!(m.contains("command 4000"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_clocks_read_the_host_and_the_time_zone_is_utc() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let time = e.service("time:u");
+    let user = u64::from(e.call(time, &Message::new(0)).moved[0]);
+    let now = i64::from_le_bytes(e.call(user, &Message::new(0)).data[..8].try_into().unwrap());
+    assert!(now > 1_700_000_000, "{now}");
+    // The context pairs a steady time point with the offset to POSIX time.
+    let ctx = e.call(user, &Message::new(2)).data;
+    assert_eq!(ctx.len(), 0x20);
+    assert_eq!(&ctx[16..32], b"recomp-steady-01");
+    let steady = u64::from(e.call(time, &Message::new(2)).moved[0]);
+    let point = e.call(steady, &Message::new(0)).data;
+    assert_eq!(&point[8..24], b"recomp-steady-01");
+    // The zone: UTC, a rule of 0x4000 bytes, and calendar times computed from a POSIX time.
+    let zone = u64::from(e.call(time, &Message::new(3)).moved[0]);
+    assert_eq!(&e.call(zone, &Message::new(0)).data[..3], b"UTC");
+    assert_eq!(e.call(zone, &Message::new(2)).data, [1, 0, 0, 0]);
+    let mut load = Message::new(4);
+    load.payload = vec![0; 0x24];
+    load.receive = vec![(SCRATCH + 0x2000, 0x4000)];
+    assert_eq!(e.call(zone, &load).result, 0);
+    assert_eq!(&e.read(SCRATCH + 0x2000, 3), b"UTC");
+    let mut cal = Message::new(101);
+    cal.payload = 1_709_210_096i64.to_le_bytes().to_vec(); // 2024-02-29 12:34:56 UTC
+    let c = e.call(zone, &cal).data;
+    assert_eq!(i16::from_le_bytes([c[0], c[1]]), 2024);
+    assert_eq!(&c[2..7], &[2, 29, 12, 34, 56]);
+    assert_eq!(
+        u32::from_le_bytes(c[8..12].try_into().unwrap()),
+        4,
+        "a Thursday"
+    );
+    assert_eq!(u32::from_le_bytes(c[12..16].try_into().unwrap()), 59);
+}
+
+#[test]
+fn the_network_is_not_there_and_says_so() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let nifm = e.service("nifm:u");
+    let mut create = Message::new(5);
+    create.pid = true;
+    create.payload = vec![0; 8];
+    let general = u64::from(e.call(nifm, &create).moved[0]);
+    // No interface, no signal, disconnected; the radio is on; nothing is accepted.
+    assert_eq!(e.call(general, &Message::new(18)).data[..3], [0, 0, 0]);
+    assert_eq!(e.call(general, &Message::new(17)).data[0], 1);
+    // GetClientId returns 4 bytes through a pointer buffer.
+    let mut id = Message::new(1);
+    id.recv_list = vec![(SCRATCH + 0x600, 0x10)];
+    let r = e.call(general, &id);
+    assert_eq!(r.pointers, vec![(0, SCRATCH + 0x600, 4)]);
+    // A request: free, and submitting it signals the state change event.
+    let mut req = Message::new(4);
+    req.payload = 2i32.to_le_bytes().to_vec();
+    let request = u64::from(e.call(general, &req).moved[0]);
+    assert_eq!(e.call(request, &Message::new(0)).data, [1, 0, 0, 0]);
+    let events = e.call(request, &Message::new(2)).copied;
+    assert_eq!(events.len(), 2);
+    e.write(SCRATCH + 0x700, &events[0].to_le_bytes());
+    e.svc(0x18, &[0, SCRATCH + 0x700, 1, 0]);
+    assert_eq!(e.r(), err::TIMED_OUT.0, "nothing has happened yet");
+    assert_eq!(e.call(request, &Message::new(4)).result, 0);
+    e.svc(0x18, &[0, SCRATCH + 0x700, 1, 0]);
+    assert_eq!(e.r(), 0);
+    assert_eq!(
+        e.call(request, &Message::new(0)).data,
+        [1, 0, 0, 0],
+        "still not granted"
+    );
+    // A socket service is registered but opens no sockets.
+    let bsd = e.service("bsd:u");
+    let mut reg = Message::new(0);
+    reg.pid = true;
+    reg.payload = vec![0; 0x30];
+    assert_eq!(e.call(bsd, &reg).data.len(), 8);
+    assert!(e.send(bsd, &Message::new(2).bytes(), false).is_none());
+    match e.kernel.exit_state() {
+        Some(Exit::Fatal(m)) => assert!(m.contains("bsd:u") && m.contains("command 2"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn no_nfc_device_is_attached_and_the_friends_service_has_no_account_to_serve() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let nfp = e.service("nfp:user");
+    let user = u64::from(e.call(nfp, &Message::new(0)).moved[0]);
+    assert_eq!(
+        e.call(user, &Message::new(19)).data,
+        [0, 0, 0, 0],
+        "not initialized"
+    );
+    let mut init = Message::new(0);
+    init.pid = true;
+    init.payload = vec![0; 16];
+    assert_eq!(e.call(user, &init).result, 0);
+    assert_eq!(e.call(user, &Message::new(19)).data, [1, 0, 0, 0]);
+    let mut list = Message::new(2);
+    list.recv_list = vec![(SCRATCH + 0x600, 0x50)];
+    let r = e.call(user, &list);
+    assert_eq!(r.data, [0, 0, 0, 0], "no devices");
+    assert_eq!(r.pointers, vec![(0, SCRATCH + 0x600, 0)]);
+    assert_eq!(e.call(user, &Message::new(17)).copied.len(), 1);
+
+    let friends = e.service("friend:u");
+    let service = u64::from(e.call(friends, &Message::new(0)).moved[0]);
+    assert!(e
+        .send(service, &Message::new(10100).bytes(), false)
+        .is_none());
+    match e.kernel.exit_state() {
+        Some(Exit::Fatal(m)) => assert!(m.contains("IFriendService") && m.contains("10100"), "{m}"),
+        other => panic!("{other:?}"),
+    }
 }

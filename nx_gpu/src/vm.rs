@@ -276,6 +276,12 @@ impl AddressSpace {
 
     /// `MAP_BUFFER_EX`: map a handle. Returns the GPU address.
     pub fn map_buffer(&mut self, req: &MapRequest) -> NvResult<u64> {
+        // A title maps whole big pages of a handle that is smaller: the mapping may run past the
+        // handle up to the next big page (the console accepted a 64 KiB mapping of an 8 KiB
+        // handle; docs/ASSUMPTIONS.md A-069).
+        let reach = req
+            .handle_size
+            .next_multiple_of(u64::from(self.big_page_size));
         if req.buffer_offset > req.handle_size {
             return Err(NvError::BAD_VALUE);
         }
@@ -284,7 +290,7 @@ impl AddressSpace {
         } else {
             req.mapping_size
         };
-        if len == 0 || req.buffer_offset + len > req.handle_size {
+        if len == 0 || req.buffer_offset + len > reach {
             return Err(NvError::BAD_VALUE);
         }
         let len = len.next_multiple_of(u64::from(SMALL_PAGE));
@@ -581,7 +587,11 @@ mod tests {
         r.buffer_offset = 0x3000;
         assert_eq!(a.map_buffer(&r), Err(NvError::BAD_VALUE));
         r.buffer_offset = 0x1000;
-        r.mapping_size = 0x2000;
+        // Up to the next big page past the handle is accepted (the title maps 64 KiB of an
+        // 8 KiB handle); beyond that is not.
+        r.mapping_size = 0xF000;
+        assert!(a.map_buffer(&r).is_ok());
+        r.mapping_size = 0x10000;
         assert_eq!(a.map_buffer(&r), Err(NvError::BAD_VALUE));
         r.mapping_size = 0;
         r.page_size = 0x3000;

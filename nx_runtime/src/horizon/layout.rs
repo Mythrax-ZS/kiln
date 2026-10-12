@@ -63,3 +63,8 @@ pub mod attr {
     pub const DEVICE_SHARED: u32 = 4;
     pub const UNCACHED: u32 = 8;
 }
+
+/// Pages the kernel layer keeps for objects the program cannot see (the backing of shared memory
+/// a service fills): the last 4 GiB below the end of the address space.
+pub const KERNEL_SCRATCH_BASE: u64 = ADDRESS_SPACE_END - KERNEL_SCRATCH_SIZE;
+pub const KERNEL_SCRATCH_SIZE: u64 = 0x1_0000_0000;

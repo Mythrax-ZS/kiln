@@ -128,6 +128,9 @@ pub(super) struct State {
     pub mapped: Vec<(u64, u64)>,
     /// Ranges lent to services with `CreateTransferMemory`, by object index.
     pub transfer_memories: Vec<super::memobj::TransferMemory>,
+    pub(super) shared: Vec<super::shmem::SharedBlock>,
+    /// The next free address of the kernel's own pages (`KERNEL_SCRATCH_BASE` and up).
+    pub(super) kernel_cursor: u64,
 }
 
 /// What each guest thread's `ctl.user` points at, so an SVC finds its kernel.
@@ -260,6 +263,8 @@ impl Kernel {
             main_handle: 0,
             mapped: Vec::new(),
             transfer_memories: Vec::new(),
+            shared: Vec::new(),
+            kernel_cursor: 0,
         };
         Arc::new(Kernel {
             process,

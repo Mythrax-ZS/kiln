@@ -527,18 +527,18 @@ mod homebrew {
         let mut p = Prog::new(GUEST_BASE + CODE_OFF as u64);
         connect_sm(&mut p);
         sm_request(&mut p, 0, true, &[0; 8]);
-        sm_request(&mut p, 1, false, b"hid\0\0\0\0\0");
+        sm_request(&mut p, 1, false, b"ldr:ro\0\0");
         p.emit(mov_imm(X0, 0));
         p.emit(asm::ret(30));
         data_string(&mut p, "sm_name", "sm:");
         let program = nro_program(p.finish());
         let dir = TempDir::new("e2e-nro-stop");
-        let report = build(&program, &tc, &BuildOptions::new(dir.path(), "askhid")).unwrap();
+        let report = build(&program, &tc, &BuildOptions::new(dir.path(), "askldr")).unwrap();
         let out = run(&report.exe);
         assert_eq!(out.status.code(), Some(101));
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
-            err.contains("`hid`") && err.contains("not implement"),
+            err.contains("`ldr:ro`") && err.contains("not implement"),
             "{err}"
         );
         assert!(

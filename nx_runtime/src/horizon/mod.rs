@@ -19,6 +19,7 @@ pub mod process;
 pub mod result;
 pub mod service;
 pub mod services;
+pub mod shmem;
 pub mod sm;
 pub mod svc;
 #[cfg(test)]

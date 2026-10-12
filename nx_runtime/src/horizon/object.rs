@@ -32,8 +32,10 @@ pub enum KObject {
     /// The waitable end of an event.
     ReadableEvent(usize),
     Session(SessionRef),
-    /// A shared-memory or transfer-memory object (an index into the kernel's table).
+    /// A transfer-memory object (an index into the kernel's table).
     Memory(usize),
+    /// A shared-memory object (an index into the kernel's table).
+    Shared(usize),
 }
 
 impl KObject {
@@ -49,6 +51,7 @@ impl KObject {
             KObject::ReadableEvent(_) => "readable event",
             KObject::Session(_) => "client session",
             KObject::Memory(_) => "memory object",
+            KObject::Shared(_) => "shared memory object",
         }
     }
 }

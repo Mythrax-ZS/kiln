@@ -9,6 +9,7 @@ use super::super::kernel::Kernel;
 use super::super::object::KObject;
 use super::super::result::ResultCode;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
+use super::Bare;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -146,21 +147,6 @@ impl Service for ApplicationProxy {
             other => return Err(Stop::unknown_command("IApplicationProxy", other)),
         };
         Ok(Response::ok().with_object(object))
-    }
-}
-
-/// An interface object with no command implemented: handing it out is right, using it stops the
-/// run with the command named.
-#[derive(Debug)]
-struct Bare(&'static str);
-
-impl Service for Bare {
-    fn name(&self) -> &str {
-        self.0
-    }
-
-    fn request(&mut self, req: &Request) -> ServiceResult {
-        Err(Stop::unknown_command(self.0, req.command))
     }
 }
 

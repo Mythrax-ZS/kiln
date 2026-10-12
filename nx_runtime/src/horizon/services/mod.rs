@@ -8,12 +8,18 @@ pub(super) mod acc;
 mod aoc;
 mod apm;
 mod applet;
+mod bsd;
+mod friend;
 mod fsp;
+mod hid;
 mod lm;
+mod nfp;
+mod nifm;
 mod nvdrv;
 mod pctl;
 pub(super) mod savefs;
 mod set;
+mod time;
 mod vi;
 
 use super::kernel::Kernel;
@@ -53,16 +59,40 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     });
     register(kernel, "acc:u0", acc::AccountService::new);
     register(kernel, "aoc:u", aoc::AddOnContent::new);
+    register(kernel, "bsd:u", bsd::Client::new);
     register(kernel, "apm", apm::Apm::new);
     let fs = std::sync::Arc::new(fsp::Shared::default());
+    register(kernel, "friend:u", |_| friend::ServiceCreator);
     register(kernel, "fsp-srv", move |k| {
         fsp::FileSystemProxy::new(k, fs.clone())
     });
+    let input = Arc::new(hid::Shared::default());
+    register(kernel, "hid", move |k| {
+        hid::HidServer::new(k, input.clone())
+    });
     register(kernel, "lm", lm::LogService::new);
+    register(kernel, "nfp:user", nfp::UserManager::new);
+    register(kernel, "nifm:u", nifm::StaticService::new);
     let gpu = Arc::new(nvdrv::Shared::new());
     let report = gpu.clone();
     kernel.on_finish(Box::new(move || report.report()));
     register(kernel, "nvdrv", move |k| nvdrv::NvDrv::new(k, gpu.clone()));
     register(kernel, "pctl", pctl::Factory::new);
     register(kernel, "set", set::SettingsServer::new);
+    register(kernel, "time:u", time::StaticService::new);
+}
+
+/// An interface object with no command implemented: handing it out is right, using it stops the
+/// run with the command named.
+#[derive(Debug)]
+struct Bare(&'static str);
+
+impl Service for Bare {
+    fn name(&self) -> &str {
+        self.0
+    }
+
+    fn request(&mut self, req: &super::service::Request) -> super::service::ServiceResult {
+        Err(super::service::Stop::unknown_command(self.0, req.command))
+    }
 }
