@@ -18,7 +18,9 @@ what was implemented, what was tested and how, and what was not verified. `docs/
 explains how the pieces fit together.
 
 Done: M1 (input layer), M2 (loader), M3 (decoder and interpreter, integer ISA), M4 (lifter and
-LLVM code generation, integer ISA). Nothing renders: GPU work is out of scope until M7 passes.
+LLVM code generation, integer ISA), M5 (floating point and Advanced SIMD in all four layers; the
+cryptographic extension is the one thing left out). Nothing renders: GPU work is out of scope until
+M7 passes.
 
 ## Using it
 

@@ -58,5 +58,8 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   the loader; `tests/real_code.rs` recompiles `main` and compares native with interpreted runs of
   sampled functions (`RECOMP_REAL_FUNCTIONS`, `RECOMP_REAL_STATES`, `RECOMP_REAL_ALL=1` for every
   function). Only aggregate numbers are printed; nothing from the title is stored.
+- Unicorn differential test sizes: `RECOMP_DIFF_CASES` replaces the default number of cases of every
+  group in `unicorn_diff`, `unicorn_fp` and `unicorn_simd` (the random-words test draws that many
+  words).
 - Unicorn (AArch64 oracle): `UNICORN_DLL`, else `.venv` (`py -m venv .venv`, then
   `.venv\Scripts\pip install unicorn`). The shared library is loaded with `libloading`.

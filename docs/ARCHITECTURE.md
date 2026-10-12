@@ -13,6 +13,7 @@ ExeFS / NRO ──loader──▶ Module ──discover──▶ per-function CF
 | Input | `src/container`, `nx_runtime/src/{storage,romfs,npdm}.rs` | ExeFS directory or PFS0, RomFS directory or image, NPDM. No keys. |
 | Load | `src/loader` | NSO0 / NRO0: LZ4, SHA-256, MOD0 relocations, exports, `.eh_frame_hdr` function extents. Fixed guest base `0x0800_0000`. |
 | Decode | `nx_runtime/src/a64/decode.rs` | 32-bit word to `Inst`; strict (unallocated is distinct from unsupported). |
+| Floating point and SIMD | `nx_runtime/src/a64/{fp.rs,vec/}` | Exact soft-float (`fp.rs`), the decoder for the scalar FP and Advanced SIMD space and the executor (`vec/`). One implementation, used by the interpreter and by generated code. |
 | Interpret | `nx_runtime/src/a64/interp.rs` | The oracle, and the fallback for anything not translated. |
 | Discover | `src/lift/discover.rs`, `jumptable.rs` | Recursive descent from roots; functions, blocks, jump tables. |
 | Lift | `src/lift/{builder,inst,func}.rs`, IR in `ir.rs` | SSA (Braun et al.), explicit `N Z C V`, one IR instruction per pseudocode operation. |
@@ -40,6 +41,18 @@ SSA values inside a function and in `cpu->state` between functions.
   an unhandled `SVC` records its details in `cpu->ctl` and sets `pc` to `STOP_PC`, which no call
   site expects, so the whole stack unwinds to the run loop.
 
+## Floating point and SIMD
+
+The vector registers, `FPCR` and `FPSR` live in the CPU structure, not in SSA values (docs/ASSUMPTIONS.md
+A-026). An FP or SIMD instruction becomes one IR operation, `Vec { word, src, nzcv }`, that lowers
+to a call of `nx_vec(cpu, word, src, nzcv)`: the runtime decodes the word, runs the same `vec::exec`
+the interpreter runs, and returns the integer result or the new flags. Only what crosses the
+integer register file travels as an SSA value: the source of `SCVTF`/`DUP`/`FMOV Dn, Xn`, the result
+of `FCVTZS`/`UMOV`/`FMOV Xd, Dn`, and the `NZCV` nibble of `FCMP`/`FCCMP`/`FCSEL`. A vector load or
+store is `VecMem { word, pc, addr }`, lowered to `nx_vecmem` followed by the usual fault check; the
+base register's address computation and writeback are ordinary integer IR. Nothing is inlined, so
+the flags and rounding come out of the exact soft-float whatever the host FPU does.
+
 ## Guest memory
 
 One checked interface (`nx_runtime/src/rt/mem.rs`): a 39-bit address space of 4 KiB pages through a
@@ -52,6 +65,8 @@ runtime functions the emitter calls against the runtime's exports.
 | Layer | Against | Where |
 |-------|---------|-------|
 | Decoder | LLVM's assembler (217 encodings) | `nx_runtime/src/a64/decode_tests.rs` |
-| Interpreter | Unicorn (Cortex-A57 model), pseudocode wins | `nx_runtime/tests/unicorn_diff.rs` |
+| Soft-float | the host FPU (x86 SSE, by inline assembly) | `nx_runtime/src/a64/fp_tests.rs` |
+| Interpreter | Unicorn (Cortex-A57 model), pseudocode wins | `nx_runtime/tests/unicorn_diff.rs` (integer, random words), `unicorn_fp.rs`, `unicorn_simd.rs` |
+| FP and SIMD | hand-computed results | `nx_runtime/src/a64/vec/{tests,scalar_tests}.rs` |
 | IR evaluator | the interpreter | `src/lift/tests.rs`, `flow_tests.rs` |
 | Native code | the interpreter | `src/native_tests.rs` (synthetic), `tests/real_code.rs` (a real title, opt-in) |
