@@ -147,6 +147,8 @@ pub struct Kernel {
     pub(super) trace: bool,
     /// Print what the program logs through `lm` (`NX_TRACE_LOG`).
     trace_log: bool,
+    /// Things to do once the process has ended (services print their summaries).
+    finish_hooks: Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl Drop for Kernel {
@@ -268,6 +270,7 @@ impl Kernel {
             random: Mutex::new(random_seed()),
             trace: std::env::var_os("NX_TRACE_SVC").is_some(),
             trace_log: std::env::var_os("NX_TRACE_LOG").is_some(),
+            finish_hooks: Mutex::new(Vec::new()),
         })
     }
 
@@ -1296,12 +1299,30 @@ impl Kernel {
 
     /// Run the process to its end.
     pub fn run_process(self: &Arc<Kernel>, cfg: &super::process::StartConfig) -> Exit {
-        match self.start(cfg) {
+        let exit = match self.start(cfg) {
             Ok(()) => self.wait_for_exit(),
             Err(e) => Exit::Fatal(format!(
                 "the process could not be started (result {:#x})",
                 e.0
             )),
+        };
+        self.run_finish_hooks();
+        exit
+    }
+
+    /// Call `f` when the process has ended, after its last instruction.
+    pub fn on_finish(&self, f: Box<dyn Fn() + Send + Sync>) {
+        self.finish_hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(f);
+    }
+
+    fn run_finish_hooks(&self) {
+        let hooks =
+            std::mem::take(&mut *self.finish_hooks.lock().unwrap_or_else(|e| e.into_inner()));
+        for h in hooks {
+            h();
         }
     }
 }

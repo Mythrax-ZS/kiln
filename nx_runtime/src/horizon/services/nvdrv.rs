@@ -50,6 +50,14 @@ impl Shared {
             .clone()
     }
 
+    /// Print what the command processor counted (`NX_TRACE_GPU`), once the process has ended.
+    pub fn report(&self) {
+        let core = self.core.lock().unwrap_or_else(|e| e.into_inner());
+        if core.gpu.level >= 1 && core.gpu.stats.submits > 0 {
+            eprint!("{}", core.gpu.stats.report(25));
+        }
+    }
+
     /// Apply what the driver asked for since the last call to the kernel's events.
     fn deliver_signals(&self, kernel: &Kernel) {
         let signals = self

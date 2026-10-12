@@ -56,6 +56,8 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     });
     register(kernel, "lm", lm::LogService::new);
     let gpu = Arc::new(nvdrv::Shared::new());
+    let report = gpu.clone();
+    kernel.on_finish(Box::new(move || report.report()));
     register(kernel, "nvdrv", move |k| nvdrv::NvDrv::new(k, gpu.clone()));
     register(kernel, "pctl", pctl::Factory::new);
 }
