@@ -9,27 +9,37 @@ use super::eval::{outcome_of_trap, Outcome, ProgramEval};
 use super::lift_all;
 use nx_runtime::a64::bits::decode_bit_masks;
 use nx_runtime::a64::inst::{BranchReg, Inst, LogicOp};
-use nx_runtime::a64::{decode, step, CpuState};
+use nx_runtime::a64::{decode, step, CpuState, Trap};
 use nx_runtime::testing::{asm, FlatBus, Rng};
 
 pub const CODE: u64 = 0x0800_0000;
-pub const DATA: u64 = CODE + 0x1_0000;
 pub const DATA_SIZE: usize = 0x4000;
 pub const REGION: usize = 0x1_0000 + DATA_SIZE;
 pub const EXIT: u64 = 0xFFFF_0000;
 
-/// A code image for the analysis: words at `CODE`.
+/// A code image for the analysis: words at `base`.
 pub struct Image {
+    pub base: u64,
     pub words: Vec<u32>,
+}
+
+impl Image {
+    pub fn new(words: Vec<u32>) -> Image {
+        Image { base: CODE, words }
+    }
+
+    pub fn at(base: u64, words: Vec<u32>) -> Image {
+        Image { base, words }
+    }
 }
 
 impl CodeSource for Image {
     fn is_code(&self, addr: u64) -> bool {
-        addr >= CODE && addr < CODE + 4 * self.words.len() as u64
+        addr >= self.base && addr < self.base + 4 * self.words.len() as u64
     }
 
     fn read(&self, addr: u64, size: usize) -> Option<u64> {
-        let off = addr.checked_sub(CODE)? as usize;
+        let off = addr.checked_sub(self.base)? as usize;
         let mut bytes = [0u8; 8];
         for (i, b) in bytes.iter_mut().enumerate().take(size) {
             let at = off + i;
@@ -40,15 +50,26 @@ impl CodeSource for Image {
     }
 }
 
+/// The supervisor-call handler the tests share: `SVC #1` adds 100 to X0 and continues, every other
+/// number stops the run.
+pub fn test_svc(cpu: &mut CpuState, imm: u16) -> bool {
+    if imm == 1 {
+        cpu.x[0] = cpu.x[0].wrapping_add(100);
+        true
+    } else {
+        false
+    }
+}
+
 pub struct RunResult {
     pub outcome: Outcome,
     pub cpu: CpuState,
     pub mem: Vec<u8>,
 }
 
-fn bus_for(words: &[u32], data: &[u8]) -> FlatBus {
-    let mut bus = FlatBus::new(CODE, REGION);
-    bus.load_words(CODE, words);
+pub fn bus_for(base: u64, words: &[u32], data: &[u8]) -> FlatBus {
+    let mut bus = FlatBus::new(base, REGION);
+    bus.load_words(base, words);
     bus.mem[0x1_0000..0x1_0000 + data.len()].copy_from_slice(data);
     bus
 }
@@ -60,9 +81,19 @@ pub fn run_interpreter_bounded(
     data: &[u8],
     max_steps: usize,
 ) -> RunResult {
-    let mut bus = bus_for(words, data);
+    run_interpreter_at(CODE, words, cpu0, data, max_steps)
+}
+
+pub fn run_interpreter_at(
+    base: u64,
+    words: &[u32],
+    cpu0: &CpuState,
+    data: &[u8],
+    max_steps: usize,
+) -> RunResult {
+    let mut bus = bus_for(base, words, data);
     let mut cpu = cpu0.clone();
-    cpu.pc = CODE;
+    cpu.pc = base;
     cpu.x[30] = EXIT;
     let mut outcome = Outcome::Halted;
     for _ in 0..max_steps {
@@ -70,9 +101,13 @@ pub fn run_interpreter_bounded(
             outcome = Outcome::Exited;
             break;
         }
-        if let Err(t) = step(&mut cpu, &mut bus) {
-            outcome = outcome_of_trap(t, cpu.pc);
-            break;
+        match step(&mut cpu, &mut bus) {
+            Ok(()) => {}
+            Err(Trap::Svc(imm)) if test_svc(&mut cpu, imm) => {}
+            Err(t) => {
+                outcome = outcome_of_trap(t, cpu.pc);
+                break;
+            }
         }
     }
     RunResult {
@@ -84,15 +119,27 @@ pub fn run_interpreter_bounded(
 
 /// Discover, lift and evaluate the program at `CODE`.
 pub fn run_lifted(words: &[u32], cpu0: &CpuState, data: &[u8]) -> (RunResult, Vec<u64>) {
-    let image = Image {
-        words: words.to_vec(),
-    };
-    let d = discover(&image, &[CODE], &Options::default());
+    run_lifted_at(CODE, &[], words, cpu0, data)
+}
+
+/// As [`run_lifted`] for a program at `base`, with `hints` as extra roots for the analysis.
+pub fn run_lifted_at(
+    base: u64,
+    hints: &[u64],
+    words: &[u32],
+    cpu0: &CpuState,
+    data: &[u8],
+) -> (RunResult, Vec<u64>) {
+    let image = Image::at(base, words.to_vec());
+    let mut roots = vec![base];
+    roots.extend_from_slice(hints);
+    let d = discover(&image, &roots, &Options::default());
     let funcs = lift_all(&d);
-    let mut bus = bus_for(words, data);
+    let mut bus = bus_for(base, words, data);
     let mut cpu = cpu0.clone();
     let mut ev = ProgramEval::new(&funcs, EXIT);
-    let outcome = ev.run(CODE, &mut cpu, &mut bus);
+    ev.svc = Box::new(test_svc);
+    let outcome = ev.run(base, &mut cpu, &mut bus);
     let unknown = ev.unknown.clone();
     (
         RunResult {
@@ -115,10 +162,8 @@ pub fn compare(a: &RunResult, b: &RunResult) -> Option<String> {
     if a.mem != b.mem {
         let at = a.mem.iter().zip(&b.mem).position(|(x, y)| x != y).unwrap();
         return Some(format!(
-            "memory differs at {:#x}: interpreter {:#04x}, lifted {:#04x}",
-            CODE + at as u64,
-            a.mem[at],
-            b.mem[at]
+            "memory differs at region offset {:#x}: interpreter {:#04x}, lifted {:#04x}",
+            at, a.mem[at], b.mem[at]
         ));
     }
     if matches!(a.outcome, Outcome::Fault { .. }) {
@@ -206,20 +251,26 @@ impl Gen {
     }
 
     /// An address inside the data region with room on both sides.
-    pub fn pointer(&mut self) -> u64 {
-        DATA + 0x1000 + self.below(DATA_SIZE as u64 - 0x2000)
+    pub fn pointer_at(&mut self, base: u64) -> u64 {
+        base + 0x1_0000 + 0x1000 + self.below(DATA_SIZE as u64 - 0x2000)
     }
 
     pub fn state(&mut self) -> CpuState {
+        self.state_at(CODE)
+    }
+
+    /// A random state for a program at `base`: registers hold boundary values or pointers into the
+    /// program's data region, and the stack pointer is inside it.
+    pub fn state_at(&mut self, base: u64) -> CpuState {
         let mut s = CpuState::default();
         for r in s.x.iter_mut() {
             *r = if self.below(3) == 0 {
-                self.pointer()
+                self.pointer_at(base)
             } else {
                 self.value()
             };
         }
-        s.sp = DATA + 0x2000 + 16 * self.below(64);
+        s.sp = base + 0x1_0000 + 0x2000 + 16 * self.below(64);
         s.nzcv = (self.below(16) as u32) << 28;
         s.fpcr = 0;
         s.tpidr_el0 = self.rng.next_u64();

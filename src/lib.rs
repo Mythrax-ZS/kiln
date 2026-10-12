@@ -4,7 +4,9 @@
 //! model and Horizon emulation layer live in the `nx_runtime` crate, which every produced binary
 //! links against. Inputs are an already extracted ExeFS and RomFS; no keys are involved.
 
+pub mod build;
 pub mod cli;
+pub mod codegen;
 pub mod container;
 pub mod lift;
 pub mod loader;
