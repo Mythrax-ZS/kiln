@@ -53,12 +53,35 @@ impl Env {
     }
 
     fn with(kind: ProcessKind, npdm: Option<Npdm>, segments: Vec<Segment>) -> Env {
+        Env::build(kind, npdm, segments, None)
+    }
+
+    /// A process whose RomFS is the directory `romfs`, with the default services registered.
+    fn with_romfs(romfs: &std::path::Path) -> Env {
+        let e = Env::build(
+            ProcessKind::Nso,
+            None,
+            Vec::new(),
+            Some(romfs.to_path_buf()),
+        );
+        super::services::register_defaults(&e.kernel);
+        e
+    }
+
+    fn build(
+        kind: ProcessKind,
+        npdm: Option<Npdm>,
+        segments: Vec<Segment>,
+        romfs: Option<std::path::PathBuf>,
+    ) -> Env {
         let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _ = rt().mem.unmap(SCRATCH, SCRATCH_SIZE);
         rt().mem
             .map(SCRATCH, SCRATCH_SIZE, perm::R | perm::W)
             .unwrap();
-        let kernel = Kernel::new(ProcessInfo::new("test", kind, npdm));
+        let mut info = ProcessInfo::new("test", kind, npdm);
+        info.romfs = romfs;
+        let kernel = Kernel::new(info);
         let out = Arc::new(Mutex::new(Vec::new()));
         kernel.set_output(Box::new(Capture(Arc::clone(&out))));
         let tid = kernel
@@ -960,6 +983,7 @@ struct Reply {
     result: u32,
     data: Vec<u8>,
     moved: Vec<u32>,
+    copied: Vec<u32>,
     object_ids: Vec<u32>,
 }
 
@@ -982,11 +1006,14 @@ impl Env {
         let h1 = u32::from_le_bytes(out[4..8].try_into().unwrap());
         let mut off = 8;
         let mut moved = Vec::new();
+        let mut copied = Vec::new();
         if h1 >> 31 != 0 {
             let tag = u32::from_le_bytes(out[8..12].try_into().unwrap());
             off = 12;
-            // The replies here carry no copied handles; skip them.
-            off += 4 * ((tag >> 1) & 0xF) as usize;
+            for _ in 0..(tag >> 1) & 0xF {
+                copied.push(u32::from_le_bytes(out[off..off + 4].try_into().unwrap()));
+                off += 4;
+            }
             for _ in 0..(tag >> 5) & 0xF {
                 moved.push(u32::from_le_bytes(out[off..off + 4].try_into().unwrap()));
                 off += 4;
@@ -1017,6 +1044,7 @@ impl Env {
             result,
             data,
             moved,
+            copied,
             object_ids,
         })
     }
@@ -1370,4 +1398,217 @@ fn the_main_thread_can_start_another_and_wait_for_it() {
     assert_eq!(exit, Exit::Code(0x1000));
     drop(kernel);
     drop(guard);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The services themselves, through the kernel
+// ---------------------------------------------------------------------------------------------
+
+/// A request with handles and buffer descriptors, laid out the way the Nintendo SDK does.
+struct Message {
+    pid: bool,
+    copy_handles: Vec<u32>,
+    /// Receive (B) descriptors: where the service may write.
+    receive: Vec<(u64, u64)>,
+    command: u32,
+    payload: Vec<u8>,
+}
+
+impl Message {
+    fn new(command: u32) -> Message {
+        Message {
+            pid: false,
+            copy_handles: Vec::new(),
+            receive: Vec::new(),
+            command,
+            payload: Vec::new(),
+        }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        let mut m = vec![0u8; 8];
+        let special = self.pid || !self.copy_handles.is_empty();
+        if special {
+            let tag = u32::from(self.pid) | ((self.copy_handles.len() as u32) << 1);
+            m.extend_from_slice(&tag.to_le_bytes());
+            if self.pid {
+                m.extend_from_slice(&0u64.to_le_bytes());
+            }
+            for h in &self.copy_handles {
+                m.extend_from_slice(&h.to_le_bytes());
+            }
+        }
+        for &(addr, size) in &self.receive {
+            // size[31:0], address[31:0], then address[38:36] in bits 2-4, size[35:32] in 24-27
+            // and address[35:32] in 28-31 of the last word.
+            m.extend_from_slice(&(size as u32).to_le_bytes());
+            m.extend_from_slice(&(addr as u32).to_le_bytes());
+            let d2 = (((addr >> 32) & 0xF) << 28) as u32
+                | (((size >> 32) & 0xF) << 24) as u32
+                | (((addr >> 36) & 0x7) << 2) as u32;
+            m.extend_from_slice(&d2.to_le_bytes());
+        }
+        let after_descriptors = m.len();
+        m.resize(after_descriptors.next_multiple_of(16), 0);
+        m.extend_from_slice(&SFCI.to_le_bytes());
+        m.extend_from_slice(&0u32.to_le_bytes());
+        m.extend_from_slice(&self.command.to_le_bytes());
+        m.extend_from_slice(&0u32.to_le_bytes());
+        m.extend_from_slice(&self.payload);
+        let words = (m.len() - after_descriptors).div_ceil(4);
+        let h0 = 4u32 | ((self.receive.len() as u32) << 24);
+        m[0..4].copy_from_slice(&h0.to_le_bytes());
+        m[4..8].copy_from_slice(&(words as u32 | (u32::from(special) << 31)).to_le_bytes());
+        m
+    }
+}
+
+impl Env {
+    /// Connect to `sm:`, register, and get the named service's session handle.
+    fn service(&mut self, name: &str) -> u64 {
+        let sm = self.connect_sm();
+        let r = self
+            .send(sm, &request_bytes(0, &[0; 8], true, 4), false)
+            .unwrap();
+        assert_eq!(r.result, 0);
+        let r = self.get_service(sm, name).unwrap();
+        assert_eq!(r.result, 0, "{name}");
+        u64::from(r.moved[0])
+    }
+
+    fn call(&mut self, session: u64, m: &Message) -> Reply {
+        self.send(session, &m.bytes(), false).unwrap()
+    }
+}
+
+#[test]
+fn a_transfer_memory_locks_its_range_until_the_handle_is_closed() {
+    let mut e = Env::new();
+    e.svc(0x01, &[0, 0x20_0000]);
+    let range = HEAP_BASE + 0x10_0000;
+    // Arguments are checked: alignment, size, permission, and the memory has to be plain heap.
+    e.svc(0x15, &[0, range + 1, 0x2000, 0]);
+    assert_eq!(e.r(), err::INVALID_ADDRESS.0);
+    e.svc(0x15, &[0, range, 0, 0]);
+    assert_eq!(e.r(), err::INVALID_SIZE.0);
+    e.svc(0x15, &[0, range, 0x2000, 5]);
+    assert_eq!(e.r(), err::INVALID_NEW_MEMORY_PERMISSION.0);
+    e.svc(0x15, &[0, HEAP_BASE + 0x40_0000, 0x1000, 0]);
+    assert_eq!(e.r(), err::INVALID_CURRENT_MEMORY.0);
+
+    rt().mem.write(range, 8, 0xFEED, Relaxed).unwrap();
+    e.svc(0x15, &[0, range, 0x2000, 0]);
+    assert_eq!(e.r(), 0);
+    let handle = e.x(1);
+    // The program has no access meanwhile, and the block reads as locked with no permission.
+    assert!(rt().mem.read(range, 8, Relaxed).is_err());
+    e.svc(0x06, &[SCRATCH, 0, range]);
+    let info = e.read(SCRATCH, 0x28);
+    assert_eq!((info[16], info[20], info[24]), (mem_type::NORMAL, 1, 0));
+    // A range that is lent cannot be lent again.
+    e.svc(0x15, &[0, range, 0x1000, 0]);
+    assert_eq!(e.r(), err::INVALID_CURRENT_MEMORY.0);
+    // The service side sees the range through the object.
+    let object = e.kernel.object(handle as u32, e.tid).unwrap();
+    assert_eq!(e.kernel.transfer_memory(&object), Some((range, 0x2000)));
+    // Closing the handle gives the memory back with its contents.
+    e.svc(0x16, &[handle]);
+    assert_eq!(e.r(), 0);
+    assert_eq!(rt().mem.read(range, 8, Relaxed), Ok(0xFEED));
+    e.svc(0x06, &[SCRATCH, 0, range]);
+    let info = e.read(SCRATCH, 0x28);
+    assert_eq!((info[16], info[20], info[24]), (mem_type::NORMAL, 0, 3));
+    assert_eq!(e.kernel.transfer_memory(&object), None);
+}
+
+#[test]
+fn the_applet_manager_announces_focus_once_and_then_has_nothing_to_say() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let applet = e.service("appletOE");
+    // OpenApplicationProxy(u64 reserved, pid, the process handle) -> IApplicationProxy
+    let mut open = Message::new(0);
+    open.pid = true;
+    open.copy_handles = vec![CURRENT_PROCESS];
+    open.payload = vec![0; 8];
+    let proxy = u64::from(e.call(applet, &open).moved[0]);
+    // GetCommonStateGetter, then its event.
+    let state = u64::from(e.call(proxy, &Message::new(0)).moved[0]);
+    let event = u64::from(e.call(state, &Message::new(0)).copied[0]);
+    // The focus message is waiting, so the event is signalled.
+    e.write(SCRATCH + 0x400, &(event as u32).to_le_bytes());
+    e.svc(0x18, &[0, SCRATCH + 0x400, 1, 0]);
+    assert_eq!((e.r(), e.x(1)), (0, 0));
+    let r = e.call(state, &Message::new(1));
+    assert_eq!(r.result, 0);
+    assert_eq!(u32::from_le_bytes(r.data[..4].try_into().unwrap()), 15);
+    // Nothing else is queued: the event clears and the next ReceiveMessage reports no message.
+    e.svc(0x18, &[0, SCRATCH + 0x400, 1, 0]);
+    assert_eq!(e.r(), err::TIMED_OUT.0);
+    assert_eq!(e.call(state, &Message::new(1)).result, 0x680);
+    // The state it reports: in focus, handheld.
+    let r = e.call(state, &Message::new(9));
+    assert_eq!(r.data[0], 1);
+    let r = e.call(state, &Message::new(5));
+    assert_eq!(r.data[0], 0);
+}
+
+#[test]
+fn the_romfs_is_read_through_the_file_system_proxy() {
+    use crate::testing::TempDir;
+    let dir = TempDir::new("romfs-ipc");
+    let pattern: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    dir.write("data/pattern.bin", &pattern);
+    dir.write("readme.txt", b"hello");
+    let image = crate::romfs::open_path(dir.path()).unwrap();
+    let mut e = Env::with_romfs(dir.path());
+    let fs = e.service("fsp-srv");
+    // SetCurrentProcess(u64 reserved, pid)
+    let mut set = Message::new(1);
+    set.pid = true;
+    set.payload = vec![0; 8];
+    assert_eq!(e.call(fs, &set).result, 0);
+    assert_eq!(e.call(fs, &Message::new(1005)).data, [0, 0, 0, 0]);
+    // OpenDataStorageByCurrentProcess() -> IStorage
+    let storage = u64::from(e.call(fs, &Message::new(200)).moved[0]);
+    let size = u64::from_le_bytes(
+        e.call(storage, &Message::new(4)).data[..8]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(size, image.size());
+    // Read(s64 offset, u64 size) into a buffer the caller gave; compare with the image itself.
+    for (offset, len) in [(0u64, 0x50u64), (0x10, 0x200), (size - 100, 100), (0, size)] {
+        let mut read = Message::new(0);
+        read.payload.extend_from_slice(&offset.to_le_bytes());
+        read.payload.extend_from_slice(&len.to_le_bytes());
+        read.receive = vec![(SCRATCH + 0x1000, len)];
+        let r = e.call(storage, &read);
+        assert_eq!(r.result, 0, "{offset:#x} {len:#x}");
+        let mut want = vec![0u8; len as usize];
+        image.read_at(offset, &mut want).unwrap();
+        assert_eq!(e.read(SCRATCH + 0x1000, len as usize), want, "{offset:#x}");
+    }
+    // The file data is in the image where the tables say.
+    let rom = crate::romfs::RomFs::open(image.clone()).unwrap();
+    assert_eq!(rom.read_file("/data/pattern.bin").unwrap(), pattern);
+    // A read past the end stops the run: the result the service gives is not documented.
+    let mut read = Message::new(0);
+    read.payload.extend_from_slice(&(size - 4).to_le_bytes());
+    read.payload.extend_from_slice(&16u64.to_le_bytes());
+    read.receive = vec![(SCRATCH + 0x1000, 16)];
+    assert!(e.send(storage, &read.bytes(), false).is_none());
+    assert!(matches!(e.kernel.exit_state(), Some(Exit::Fatal(m)) if m.contains("IStorage::Read")));
+}
+
+#[test]
+fn asking_for_a_romfs_the_process_does_not_have_stops_the_run() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let fs = e.service("fsp-srv");
+    assert!(e.send(fs, &Message::new(200).bytes(), false).is_none());
+    match e.kernel.exit_state() {
+        Some(Exit::Fatal(m)) => assert!(m.contains("--romfs") && m.contains("NX_ROMFS"), "{m}"),
+        other => panic!("{other:?}"),
+    }
 }

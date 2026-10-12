@@ -25,15 +25,16 @@ pub enum Flow {
     Stop,
 }
 
-/// What `GetInfo` reports as the memory the process may use in total (a retail console gives an
-/// application a pool of about 3.2 GiB; this is smaller to keep the host's commit modest).
-pub const TOTAL_MEMORY_SIZE: u64 = 0x8000_0000;
+/// What `GetInfo` reports as the memory the process may use in total: the size of the application
+/// pool of a 4 GiB console as I remember it from Atmosphere (docs/ASSUMPTIONS.md A-036). A title
+/// sets a heap of about 3.1 GiB, so this must be at least that.
+pub const TOTAL_MEMORY_SIZE: u64 = 0xCD50_0000;
 
 /// The SVCs this kernel implements.
 pub const IMPLEMENTED: &[u32] = &[
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-    0x11, 0x12, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x21, 0x24, 0x25, 0x26,
-    0x27, 0x29, 0x34, 0x35, 0x36, 0x45,
+    0x11, 0x12, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x21, 0x24, 0x25,
+    0x26, 0x27, 0x29, 0x34, 0x35, 0x36, 0x45,
 ];
 
 /// The names of the SVCs, for reports.
@@ -149,8 +150,15 @@ impl Kernel {
             cpu.state.x[3],
         ];
         let pc = cpu.state.pc.wrapping_sub(4);
-        let flow = self.svc_dispatch(cpu, thread, imm);
         let name = svc_name(imm).unwrap_or("?");
+        // A call that can block is logged when it starts as well, so a hang shows where it is.
+        if matches!(imm, 0x0B | 0x18 | 0x1A | 0x1C | 0x34) {
+            eprintln!(
+                "[svc] thread {thread} at {pc:#x}: {name} ({imm:#x}) x0..x3 = {:#x} {:#x} {:#x} {:#x} (may block)",
+                args[0], args[1], args[2], args[3]
+            );
+        }
+        let flow = self.svc_dispatch(cpu, thread, imm);
         eprintln!(
             "[svc] thread {thread} at {pc:#x}: {name} ({imm:#x}) x0..x3 = {:#x} {:#x} {:#x} {:#x} -> x0 = {:#x} x1 = {:#x}{}",
             args[0],
@@ -336,6 +344,16 @@ impl Kernel {
                 let r = self.clear_event(w(x[0]));
                 result(cpu, r);
             }
+            0x15 => match self.create_transfer_memory(x[1], x[2], w(x[3])) {
+                Ok(h) => {
+                    result(cpu, ResultCode::SUCCESS);
+                    cpu.state.x[1] = u64::from(h);
+                }
+                Err(e) => {
+                    result(cpu, e);
+                    cpu.state.x[1] = 0;
+                }
+            },
             0x16 => {
                 let r = self.close_handle(w(x[0]));
                 result(cpu, r);

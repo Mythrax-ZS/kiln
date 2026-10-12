@@ -22,7 +22,8 @@ usage:
   recomp inspect --exefs <dir|pfs0> [--romfs <dir|image>]
   recomp analyze (--exefs <dir|pfs0> | --nro <file>) [--hints <file>] [--main-only]
   recomp build   (--exefs <dir|pfs0> | --nro <file>) --out <dir> [--name <name>] [--opt <0-3>]
-                 [--hints <file>] [--shared] [--keep-ir] [--main-only]
+                 [--hints <file>] [--shared] [--keep-ir] [--main-only] [--romfs <dir|image>] [--reuse-objects]
+  recomp relink  --out <dir> --name <name>
   recomp --version
 
 Inputs are the already extracted ExeFS and RomFS of a game. No keys are read. From an ExeFS
@@ -46,6 +47,7 @@ const SWITCHES: &[&str] = &[
     "interpret",
     "keep-ir",
     "main-only",
+    "reuse-objects",
 ];
 
 pub fn parse_args(argv: &[String]) -> Result<Args> {
@@ -303,6 +305,7 @@ pub fn run(argv: &[String]) -> Result<String> {
         }
         "analyze" => analyze(&args),
         "build" => build_command(&args),
+        "relink" => relink_command(&args),
         other => Err(Error::format(
             "command line",
             format!("unknown command `{other}`"),
@@ -374,6 +377,18 @@ lifted to {} IR instructions, {} bytes of LLVM IR text",
     Ok(out)
 }
 
+/// Link the objects of an earlier build again with the current runtime (for development).
+fn relink_command(args: &Args) -> Result<String> {
+    let out_dir = args.require_path("out")?;
+    let name = args
+        .options
+        .get("name")
+        .ok_or_else(|| Error::format("command line", "--name is required"))?;
+    let tc = Toolchain::discover()?;
+    let exe = pipeline::relink(&tc, &out_dir, name)?;
+    Ok(format!("executable: {}\n", exe.display()))
+}
+
 /// Recompile a program into a native executable (and optionally a shared library).
 fn build_command(args: &Args) -> Result<String> {
     let program = load_program(args)?;
@@ -387,6 +402,8 @@ fn build_command(args: &Args) -> Result<String> {
     opts.hints = load_hints(args)?;
     opts.shared = args.has("shared");
     opts.keep_ir = args.has("keep-ir");
+    opts.reuse_objects = args.has("reuse-objects");
+    opts.romfs = args.path("romfs");
     if let Some(o) = args.options.get("opt") {
         opts.opt_level = o
             .parse::<u8>()

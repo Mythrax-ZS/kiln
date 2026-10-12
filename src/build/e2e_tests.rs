@@ -169,6 +169,23 @@ fn a_program_that_stops_says_why_and_exits_nonzero() {
     );
 }
 
+#[test]
+fn the_objects_of_a_build_can_be_linked_again() {
+    let Some(tc) = toolchain_or_skip() else {
+        return;
+    };
+    let program = program_from(&Spec {
+        code: fib_main(),
+        ..Spec::default()
+    });
+    let dir = TempDir::new("e2e-relink");
+    let report = build(&program, &tc, &BuildOptions::new(dir.path(), "again")).unwrap();
+    std::fs::remove_file(&report.exe).unwrap();
+    let exe = super::pipeline::relink(&tc, dir.path(), "again").unwrap();
+    assert_eq!(run(&exe).status.code(), Some(55));
+    assert!(super::pipeline::relink(&tc, &dir.join("nothing"), "again").is_err());
+}
+
 /// Two NSOs mapped back to back, the way the kernel's loader maps `rtld` and `main`. The first
 /// calls a function in the second (across the module boundary), then looks at a data slot that a
 /// RELATIVE relocation covers and returns 42 if the slot is still zero (nobody relocated the

@@ -12,6 +12,7 @@ pub mod handle;
 pub mod ipc;
 pub mod kernel;
 pub mod layout;
+pub mod memobj;
 pub mod memory;
 pub mod object;
 pub mod process;

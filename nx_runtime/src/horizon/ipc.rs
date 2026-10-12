@@ -187,6 +187,35 @@ pub fn build_reply(r: &Reply) -> Option<[u8; MESSAGE_BYTES]> {
     Some(out)
 }
 
+/// One line on standard error for a request a service answered (`NX_TRACE_SVC`).
+fn trace_request(service: &str, req: &Request, answer: &Result<Response, Stop>) {
+    let shape = format!(
+        "{} data bytes, buffers A{} B{} X{} W{}, handles {} copied {} moved{}",
+        req.data.len(),
+        req.send_buffers.len(),
+        req.receive_buffers.len(),
+        req.pointer_buffers.len(),
+        req.exchange_buffers.len(),
+        req.copy_handles.len(),
+        req.move_handles.len(),
+        if req.pid.is_some() { ", pid" } else { "" }
+    );
+    match answer {
+        Ok(r) => eprintln!(
+            "[ipc] {service} command {}: {shape} -> result {:#x}, {} data bytes, {} objects, {} handles",
+            req.command,
+            r.result.0,
+            r.data.len(),
+            r.objects.len(),
+            r.copy_handles.len() + r.move_handles.len()
+        ),
+        Err(s) => eprintln!(
+            "[ipc] {service} command {}: {shape} -> stops the run: {}",
+            req.command, s.0
+        ),
+    }
+}
+
 impl Kernel {
     /// Take the handles of a request out of the table (copy) or off the caller (move).
     fn resolve_handles(&self, current: u64, m: &Message) -> Option<(Vec<KObject>, Vec<KObject>)> {
@@ -342,7 +371,11 @@ impl Kernel {
                         None => return Routed::Reply(Response::error(err::INVALID_HANDLE), domain),
                     }
                 };
-                match service.request(&req) {
+                let answer = service.request(&req);
+                if self.trace {
+                    trace_request(service.name(), &req, &answer);
+                }
+                match answer {
                     Ok(r) => Routed::Reply(r, domain),
                     Err(s) => Routed::Stop(s),
                 }

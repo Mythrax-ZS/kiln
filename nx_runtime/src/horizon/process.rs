@@ -244,7 +244,16 @@ pub unsafe fn run_module(m: &crate::rt::host::ModuleDesc) -> i32 {
     let name = npdm
         .as_ref()
         .map_or_else(|| "main".to_string(), |n| n.meta.name.clone());
-    let kernel = Kernel::new(ProcessInfo::new(&name, process_kind, npdm));
+    let mut info = ProcessInfo::new(&name, process_kind, npdm);
+    // The RomFS: `NX_ROMFS` wins over the path the program was built with.
+    let built_with = std::str::from_utf8(c_slice(m.romfs, m.romfs_len as usize))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    info.romfs = std::env::var_os("NX_ROMFS")
+        .map(std::path::PathBuf::from)
+        .or(built_with);
+    let kernel = Kernel::new(info);
     super::services::register_defaults(&kernel);
     let segments = c_slice(m.segs, m.nsegs as usize)
         .iter()

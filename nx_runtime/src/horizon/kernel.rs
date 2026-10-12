@@ -48,6 +48,8 @@ pub struct ProcessInfo {
     pub process_id: u64,
     pub program_id: u64,
     pub npdm: Option<Npdm>,
+    /// The RomFS the program reads: a directory or an image (`NX_ROMFS` or the build's `--romfs`).
+    pub romfs: Option<std::path::PathBuf>,
 }
 
 impl ProcessInfo {
@@ -58,6 +60,7 @@ impl ProcessInfo {
             process_id: 0x80,
             program_id: npdm.as_ref().map_or(0, |n| n.program_id),
             npdm,
+            romfs: None,
         }
     }
 }
@@ -123,6 +126,8 @@ pub(super) struct State {
     pub main_handle: Handle,
     /// Regions this kernel mapped into guest memory, unmapped again when it is dropped.
     pub mapped: Vec<(u64, u64)>,
+    /// Ranges lent to services with `CreateTransferMemory`, by object index.
+    pub transfer_memories: Vec<super::memobj::TransferMemory>,
 }
 
 /// What each guest thread's `ctl.user` points at, so an SVC finds its kernel.
@@ -140,6 +145,8 @@ pub struct Kernel {
     pub(super) random: Mutex<u64>,
     /// Log every supervisor call (`NX_TRACE_SVC`).
     pub(super) trace: bool,
+    /// Print what the program logs through `lm` (`NX_TRACE_LOG`).
+    trace_log: bool,
 }
 
 impl Drop for Kernel {
@@ -250,6 +257,7 @@ impl Kernel {
             seq: 0,
             main_handle: 0,
             mapped: Vec::new(),
+            transfer_memories: Vec::new(),
         };
         Arc::new(Kernel {
             process,
@@ -259,7 +267,17 @@ impl Kernel {
             output: Mutex::new(Box::new(std::io::stdout())),
             random: Mutex::new(random_seed()),
             trace: std::env::var_os("NX_TRACE_SVC").is_some(),
+            trace_log: std::env::var_os("NX_TRACE_LOG").is_some(),
         })
+    }
+
+    pub fn trace_log(&self) -> bool {
+        self.trace_log
+    }
+
+    /// Is `NX_TRACE_SVC` on?
+    pub fn tracing(&self) -> bool {
+        self.trace
     }
 
     pub(super) fn lock(&self) -> MutexGuard<'_, State> {
@@ -360,6 +378,12 @@ impl Kernel {
         rt().mem.write_bytes(addr, data, true).is_ok()
     }
 
+    /// The contents of an IPC buffer, at most `limit` bytes of it; `None` when it is not readable.
+    pub fn read_buffer(&self, buf: super::service::Buffer, limit: u64) -> Option<Vec<u8>> {
+        let mut out = vec![0u8; buf.size.min(limit) as usize];
+        self.read_memory(buf.addr, &mut out).then_some(out)
+    }
+
     /// Map fresh zeroed pages the kernel owns (unmapped when the kernel is dropped).
     pub(super) fn map_owned(
         &self,
@@ -431,7 +455,10 @@ impl Kernel {
     pub fn close_handle(&self, h: Handle) -> ResultCode {
         let removed = self.lock().handles.close(h);
         match removed {
-            Ok(_) => ResultCode::SUCCESS,
+            Ok(object) => {
+                self.release_memory_object(&object);
+                ResultCode::SUCCESS
+            }
             Err(e) => e,
         }
     }
@@ -601,6 +628,30 @@ impl Kernel {
                 let _ = st.handles.close(writable);
                 Err(e)
             }
+        }
+    }
+
+    /// A new event as two kernel objects without handles: the writable end for whoever signals it
+    /// (a service) and the readable end to hand the program in a reply.
+    pub fn new_event(&self) -> (KObject, KObject) {
+        let mut st = self.lock();
+        let index = st.events.len();
+        st.events.push(Event { signaled: false });
+        (KObject::WritableEvent(index), KObject::ReadableEvent(index))
+    }
+
+    /// Signal (`true`) or clear (`false`) the event one of whose ends is `end`.
+    pub fn set_event(&self, end: &KObject, signaled: bool) {
+        let (KObject::WritableEvent(i) | KObject::ReadableEvent(i)) = end else {
+            return;
+        };
+        let mut st = self.lock();
+        if let Some(e) = st.events.get_mut(*i) {
+            e.signaled = signaled;
+        }
+        drop(st);
+        if signaled {
+            self.notify();
         }
     }
 

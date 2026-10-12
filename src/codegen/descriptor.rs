@@ -24,6 +24,8 @@ pub struct Descriptor<'a> {
     pub image_len: u64,
     pub npdm: &'a [u8],
     pub exports: &'a [(String, u64)],
+    /// Path of the RomFS the program was built with (UTF-8), or empty.
+    pub romfs: &'a str,
 }
 
 /// An LLVM IR string constant body: printable ASCII as is, everything else as `\XX`.
@@ -78,6 +80,13 @@ pub fn descriptor_unit(triple: &str, d: &Descriptor, shared: bool) -> String {
         llvm_bytes(d.npdm)
     );
 
+    let _ = writeln!(
+        s,
+        "@nx_romfs = internal constant [{} x i8] c\"{}\"\n",
+        d.romfs.len(),
+        llvm_bytes(d.romfs.as_bytes())
+    );
+
     for (i, (name, _)) in d.exports.iter().enumerate() {
         let mut bytes = name.as_bytes().to_vec();
         bytes.push(0);
@@ -106,16 +115,17 @@ pub fn descriptor_unit(triple: &str, d: &Descriptor, shared: bool) -> String {
     let export = if shared { "dllexport " } else { "" };
     let _ = writeln!(
         s,
-        "@nx_module = {export}constant {{ i32, i32, i32, i32, i64, ptr, ptr, i64, ptr, i64, ptr, i64 }} {{\n  \
+        "@nx_module = {export}constant {{ i32, i32, i32, i32, i64, ptr, ptr, i64, ptr, i64, ptr, i64, ptr, i64 }} {{\n  \
          i32 {}, i32 {}, i32 {}, i32 0, i64 {}, ptr @nx_segments, ptr @nx_image, i64 {}, ptr @nx_npdm,\n  \
-         i64 {}, ptr @nx_exports, i64 {}\n}}\n",
+         i64 {}, ptr @nx_exports, i64 {}, ptr @nx_romfs, i64 {}\n}}\n",
         nx_runtime::rt::host::MODULE_ABI_VERSION,
         d.segments.len(),
         d.kind,
         d.entry as i64,
         d.image_len as i64,
         d.npdm.len(),
-        d.exports.len()
+        d.exports.len(),
+        d.romfs.len()
     );
     let main = if shared {
         "dllexport i32 @recomp_main"
@@ -155,20 +165,26 @@ mod tests {
             image_len: 0x1000,
             npdm: &[1, 2, 3],
             exports: &[("nnMain".to_string(), 0x0800_0040)],
+            romfs: "C:\\data\\romfs",
         };
         let ll = descriptor_unit("x86_64-pc-windows-msvc", &d, false);
         assert!(ll.contains(".incbin \\22C:/out/game.image\\22"), "{ll}");
         assert!(ll.contains("define i32 @main("), "{ll}");
+        let version = nx_runtime::rt::host::MODULE_ABI_VERSION;
         assert!(
-            ll.contains("i32 2, i32 1, i32 1, i32 0, i64 134217728"),
+            ll.contains(&format!(
+                "i32 {version}, i32 1, i32 1, i32 0, i64 134217728"
+            )),
             "{ll}"
         );
         assert!(ll.contains("c\"nnMain\\00\""), "{ll}");
+        assert!(ll.contains("c\"C:\\5Cdata\\5Cromfs\""), "{ll}");
+        assert!(ll.contains("ptr @nx_romfs, i64 13"), "{ll}");
         let lib = descriptor_unit("x86_64-pc-windows-msvc", &d, true);
         assert!(lib.contains("dllexport i32 @recomp_main"));
         assert!(lib.contains("@nx_module = dllexport constant"));
         // The layout the runtime reads.
         assert_eq!(std::mem::size_of::<nx_runtime::rt::host::SegmentDesc>(), 40);
-        assert_eq!(std::mem::size_of::<nx_runtime::rt::host::ModuleDesc>(), 80);
+        assert_eq!(std::mem::size_of::<nx_runtime::rt::host::ModuleDesc>(), 96);
     }
 }

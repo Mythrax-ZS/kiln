@@ -41,6 +41,13 @@ pub struct BuildOptions {
     /// kernel's loader leaves in memory and the program's own runtime linker relocates it; tests
     /// that call guest functions directly, with no runtime linker, ask for this.
     pub pre_relocated: bool,
+    /// The RomFS the program reads at run time, a directory or an image. Its absolute path is
+    /// stored in the produced program, which looks there unless `NX_ROMFS` says otherwise.
+    pub romfs: Option<PathBuf>,
+    /// For development: trust the unit object files an earlier build left in `work/` and compile
+    /// only what is missing. The descriptor, the image and the link are always redone. Use it
+    /// only when the program, the hints and the options are the same as in that build.
+    pub reuse_objects: bool,
 }
 
 impl BuildOptions {
@@ -54,6 +61,8 @@ impl BuildOptions {
             shared: false,
             unit_size: 6000,
             pre_relocated: false,
+            romfs: None,
+            reuse_objects: false,
         }
     }
 }
@@ -316,6 +325,10 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
                 .spawn_scoped(scope, || loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(group) = groups.get(i) else { break };
+                    let obj = work.join(format!("unit{i}.{obj_ext}"));
+                    if opts.reuse_objects && obj.is_file() {
+                        continue;
+                    }
                     let funcs: Vec<_> = group
                         .iter()
                         .map(|a| lift_function(&d.funcs[a], &is_function))
@@ -326,7 +339,6 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
                     );
                     let refs: Vec<_> = funcs.iter().collect();
                     let ll = work.join(format!("unit{i}.ll"));
-                    let obj = work.join(format!("unit{i}.{obj_ext}"));
                     let result = std::fs::write(&ll, codegen::function_unit(triple, &refs))
                         .map_err(Error::from)
                         .and_then(|()| tc.compile(&ll, &obj, opts.opt_level));
@@ -355,6 +367,10 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
     let image = opts.out_dir.join(format!("{}.image", opts.name));
     let image_bytes = process_image(program, opts.pre_relocated);
     std::fs::write(&image, &image_bytes)?;
+    let romfs_path = match &opts.romfs {
+        Some(p) => std::path::absolute(p)?.to_string_lossy().into_owned(),
+        None => String::new(),
+    };
     let (origin, _) = program.span();
     let segments: Vec<SegmentInfo> = program
         .modules
@@ -381,6 +397,7 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
         image_len: image_bytes.len() as u64,
         npdm: program.npdm.as_deref().unwrap_or(&[]),
         exports: &exports,
+        romfs: &romfs_path,
     };
     let lift_s = t1.elapsed().as_secs_f32();
 
@@ -456,6 +473,38 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
     };
     write_report(&report, program, &report_file)?;
     Ok(report)
+}
+
+/// Link the object files of an earlier `build` again, against the runtime library as it is now.
+/// The services and the kernel layer change much more often than the generated code, and linking
+/// takes seconds where compiling a whole title takes much longer. Returns the executable.
+pub fn relink(tc: &Toolchain, out_dir: &Path, name: &str) -> Result<PathBuf> {
+    let work = out_dir.join("work");
+    let obj_ext = if cfg!(windows) { "obj" } else { "o" };
+    let mut objs: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(&work)? {
+        let path = entry?.path();
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let is_object = path.extension().and_then(|e| e.to_str()) == Some(obj_ext);
+        if is_object && (stem.starts_with("unit") || stem == "support" || stem == "descriptor") {
+            objs.push(path);
+        }
+    }
+    if objs.is_empty() {
+        return Err(Error::NotFound(format!(
+            "object files of an earlier build in {}",
+            work.display()
+        )));
+    }
+    objs.sort();
+    let exe_name = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    let exe = out_dir.join(exe_name);
+    tc.link(&objs, &runtime_lib()?, &exe, false, &[])?;
+    Ok(exe)
 }
 
 /// What lifting a program produces, without compiling it.

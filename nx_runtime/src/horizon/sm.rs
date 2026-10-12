@@ -75,14 +75,20 @@ impl Service for Sm {
                 };
                 if let Some(npdm) = &kernel.process.npdm {
                     if !npdm.allows_service(&name) {
+                        if kernel.tracing() {
+                            eprintln!("[sm] `{name}` is not in the program's service access list");
+                        }
                         return Ok(Response::error(sm_err::NOT_ALLOWED));
                     }
+                }
+                if kernel.tracing() {
+                    eprintln!("[sm] GetServiceHandle `{name}`");
                 }
                 match kernel.service_object(&name) {
                     Some(object) => Ok(Response::ok().with_move_handle(KObject::session(object))),
                     None => Err(Stop(format!(
-                        "the program asked the service manager for `{name}`, which it may use and \
-                         which this runtime does not implement"
+                        "the program asked the service manager (sm: command 1, GetServiceHandle) \
+                         for `{name}`, which it may use and which this runtime does not implement"
                     ))),
                 }
             }

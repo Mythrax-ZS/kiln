@@ -24,7 +24,7 @@ pub(crate) unsafe fn c_slice<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
 }
 
 /// Bump when [`ModuleDesc`] or [`SegmentDesc`] change.
-pub const MODULE_ABI_VERSION: u32 = 2;
+pub const MODULE_ABI_VERSION: u32 = 3;
 
 /// How [`nx_rt_main`] starts the module: as a plain function (hosts and tests), as the `main` NSO
 /// of a title, or as a homebrew NRO. The last two run on the Horizon kernel layer.
@@ -77,6 +77,9 @@ pub struct ModuleDesc {
     pub npdm_len: u64,
     pub exports: *const ExportDesc,
     pub nexports: u64,
+    /// The RomFS the program was built with: a path (UTF-8, not terminated), possibly empty.
+    pub romfs: *const u8,
+    pub romfs_len: u64,
 }
 
 // SAFETY: descriptors are immutable constants emitted by the code generator.
@@ -349,6 +352,8 @@ mod tests {
             npdm_len: 0,
             exports: exports.as_ptr(),
             nexports: 2,
+            romfs: std::ptr::null(),
+            romfs_len: 0,
         };
         // SAFETY: the descriptor points at live arrays.
         unsafe {
@@ -411,6 +416,8 @@ mod tests {
             npdm_len: 0,
             exports: std::ptr::null(),
             nexports: 0,
+            romfs: std::ptr::null(),
+            romfs_len: 0,
         };
         // SAFETY: nothing is dereferenced before the version check fails.
         let e = unsafe { load_module(&m) }.unwrap_err();

@@ -60,6 +60,22 @@ impl Request {
         }
         u64::from_le_bytes(b)
     }
+
+    /// The `index`th buffer the caller gave for the service to read: a send (A) descriptor, or
+    /// when the caller used its pointer buffer instead, a pointer (X) descriptor. Callers pick one
+    /// of the two for each buffer, so a command with one input buffer finds it at index 0.
+    pub fn input_buffer(&self, index: usize) -> Option<Buffer> {
+        self.send_buffers
+            .iter()
+            .chain(&self.pointer_buffers)
+            .nth(index)
+            .copied()
+    }
+
+    /// The `index`th buffer the caller gave for the service to fill (a receive (B) descriptor).
+    pub fn output_buffer(&self, index: usize) -> Option<Buffer> {
+        self.receive_buffers.get(index).copied()
+    }
 }
 
 /// What a service answers.
