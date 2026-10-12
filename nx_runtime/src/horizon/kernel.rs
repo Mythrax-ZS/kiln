@@ -138,6 +138,8 @@ pub struct Kernel {
     registry: Mutex<BTreeMap<String, ServiceFactory>>,
     pub(super) output: Mutex<Box<dyn Write + Send>>,
     pub(super) random: Mutex<u64>,
+    /// Log every supervisor call (`NX_TRACE_SVC`).
+    pub(super) trace: bool,
 }
 
 impl Drop for Kernel {
@@ -256,6 +258,7 @@ impl Kernel {
             registry: Mutex::new(BTreeMap::new()),
             output: Mutex::new(Box::new(std::io::stdout())),
             random: Mutex::new(random_seed()),
+            trace: std::env::var_os("NX_TRACE_SVC").is_some(),
         })
     }
 

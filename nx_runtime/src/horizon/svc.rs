@@ -137,7 +137,34 @@ impl Kernel {
     }
 
     /// Execute `SVC #imm` for `thread`. On entry `cpu.state.pc` is the instruction after it.
+    /// `NX_TRACE_SVC` in the environment logs every call and its result on standard error.
     pub fn svc(self: &Arc<Kernel>, cpu: &mut NativeCpu, thread: u64, imm: u32) -> Flow {
+        if !self.trace {
+            return self.svc_dispatch(cpu, thread, imm);
+        }
+        let args = [
+            cpu.state.x[0],
+            cpu.state.x[1],
+            cpu.state.x[2],
+            cpu.state.x[3],
+        ];
+        let pc = cpu.state.pc.wrapping_sub(4);
+        let flow = self.svc_dispatch(cpu, thread, imm);
+        let name = svc_name(imm).unwrap_or("?");
+        eprintln!(
+            "[svc] thread {thread} at {pc:#x}: {name} ({imm:#x}) x0..x3 = {:#x} {:#x} {:#x} {:#x} -> x0 = {:#x} x1 = {:#x}{}",
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            cpu.state.x[0],
+            cpu.state.x[1],
+            if flow == Flow::Stop { " (stop)" } else { "" }
+        );
+        flow
+    }
+
+    fn svc_dispatch(self: &Arc<Kernel>, cpu: &mut NativeCpu, thread: u64, imm: u32) -> Flow {
         if let Some(npdm) = &self.process.npdm {
             if !npdm.allows_svc(imm) {
                 return self.stop_run(
