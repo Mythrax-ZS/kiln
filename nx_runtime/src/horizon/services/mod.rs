@@ -8,6 +8,7 @@ pub(super) mod acc;
 mod aoc;
 mod apm;
 mod applet;
+mod audren;
 mod bsd;
 mod friend;
 mod fsp;
@@ -17,8 +18,11 @@ mod nfp;
 mod nifm;
 mod nvdrv;
 mod pctl;
+mod pl;
+mod prepo;
 pub(super) mod savefs;
 mod set;
+mod ssl;
 mod time;
 mod vi;
 
@@ -59,7 +63,8 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     });
     register(kernel, "acc:u0", acc::AccountService::new);
     register(kernel, "aoc:u", aoc::AddOnContent::new);
-    register(kernel, "bsd:u", bsd::Client::new);
+    register(kernel, "audren:u", audren::Manager::new);
+    register(kernel, "bsd:u", |_| bsd::Client::new());
     register(kernel, "apm", apm::Apm::new);
     let fs = std::sync::Arc::new(fsp::Shared::default());
     register(kernel, "friend:u", |_| friend::ServiceCreator);
@@ -78,7 +83,13 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     kernel.on_finish(Box::new(move || report.report()));
     register(kernel, "nvdrv", move |k| nvdrv::NvDrv::new(k, gpu.clone()));
     register(kernel, "pctl", pctl::Factory::new);
+    register(kernel, "prepo:u", |_| prepo::Prepo::new());
+    let fonts = Arc::new(pl::Shared::default());
+    register(kernel, "pl:u", move |k| {
+        pl::SharedResourceManager::new(k, fonts.clone())
+    });
     register(kernel, "set", set::SettingsServer::new);
+    register(kernel, "ssl", |_| ssl::SslService::new());
     register(kernel, "time:u", time::StaticService::new);
 }
 

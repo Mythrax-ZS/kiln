@@ -31,7 +31,7 @@ impl Service for Apm {
     fn request(&mut self, req: &Request) -> ServiceResult {
         match req.command {
             // OpenSession() -> ISession
-            0 => Ok(Response::ok().with_object(Box::new(Session::default()))),
+            0 => Ok(Response::ok().with_object(Box::new(Session::new()))),
             // GetPerformanceMode() -> u32 (docs/ASSUMPTIONS.md A-042: the console is handheld).
             1 => Ok(Response::ok().with_u32(MODE_HANDHELD)),
             // IsCpuOverclockEnabled() -> u8 [7.0.0+]
@@ -41,11 +41,25 @@ impl Service for Apm {
     }
 }
 
+/// The configuration `GetCurrentPerformanceConfiguration` of `apm:sys` starts with (Switchbrew),
+/// which is what a session reports for the normal mode until the program sets another
+/// (docs/ASSUMPTIONS.md A-042).
+const DEFAULT_NORMAL_CONFIGURATION: u32 = 0x0002_0003;
+
 /// `nn::apm::ISession`: the configuration the program asked for in each mode.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Session {
     configuration: [Option<u32>; 2],
     overclock: bool,
+}
+
+impl Session {
+    fn new() -> Session {
+        Session {
+            configuration: [Some(DEFAULT_NORMAL_CONFIGURATION), None],
+            overclock: false,
+        }
+    }
 }
 
 impl Service for Session {
@@ -107,17 +121,30 @@ mod tests {
 
     #[test]
     fn a_configuration_is_read_back_per_mode() {
-        let mut s = Session::default();
+        let mut s = Session::new();
+        // The normal mode starts with the default; the boost mode with nothing.
+        let got = s.request(&req(1, &0u32.to_le_bytes())).unwrap();
+        assert_eq!(got.data, DEFAULT_NORMAL_CONFIGURATION.to_le_bytes());
         let mut set = 1u32.to_le_bytes().to_vec();
-        set.extend_from_slice(&0x0002_0001u32.to_le_bytes());
+        set.extend_from_slice(&0x0001_0001u32.to_le_bytes());
         assert!(s.request(&req(0, &set)).unwrap().result.is_success());
         let got = s.request(&req(1, &1u32.to_le_bytes())).unwrap();
+        assert_eq!(got.data, 0x0001_0001u32.to_le_bytes());
+        // Setting the normal mode replaces its default; mode 2 does not exist.
+        let mut set = 0u32.to_le_bytes().to_vec();
+        set.extend_from_slice(&0x0002_0001u32.to_le_bytes());
+        assert!(s.request(&req(0, &set)).unwrap().result.is_success());
+        let got = s.request(&req(1, &0u32.to_le_bytes())).unwrap();
         assert_eq!(got.data, 0x0002_0001u32.to_le_bytes());
-        // Nothing was set for mode 0, and mode 2 does not exist.
-        assert!(s.request(&req(1, &0u32.to_le_bytes())).is_err());
         let bad = s.request(&req(1, &2u32.to_le_bytes())).unwrap();
         assert!(!bad.result.is_success());
         assert!(s.request(&req(9, &[])).is_err());
+    }
+
+    #[test]
+    fn asking_for_the_boost_mode_before_setting_it_stops_the_run() {
+        let mut s = Session::new();
+        assert!(s.request(&req(1, &1u32.to_le_bytes())).is_err());
     }
 
     #[test]

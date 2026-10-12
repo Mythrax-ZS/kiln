@@ -5,19 +5,15 @@
 //! offline (docs/ASSUMPTIONS.md A-072), and no socket call is implemented: the first one a
 //! program makes stops the run and names itself.
 
-use super::super::kernel::Kernel;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
-use std::sync::Weak;
 
 /// `nn::socket::sf::IClient`.
-#[derive(Debug)]
-pub struct Client {
-    kernel: Weak<Kernel>,
-}
+#[derive(Debug, Default)]
+pub struct Client;
 
 impl Client {
-    pub fn new(kernel: Weak<Kernel>) -> Client {
-        Client { kernel }
+    pub fn new() -> Client {
+        Client
     }
 }
 
@@ -29,15 +25,10 @@ impl Service for Client {
     fn request(&mut self, req: &Request) -> ServiceResult {
         match req.command {
             // RegisterClient(BsdServiceConfig, u64 reserved, u64 transfer memory size, pid,
-            // transfer memory handle) -> u64: the process id the client is known by
-            0 => {
-                let kernel = self
-                    .kernel
-                    .upgrade()
-                    .ok_or_else(|| Stop("the process is gone".to_string()))?;
-                Ok(Response::ok().with_u64(kernel.process.process_id))
-            }
-            // StartMonitoring(u64 pid, pid)
+            // transfer memory handle) -> u64: the id the client is known by, which is 0 (the
+            // SDK's `nn::socket::Initialize` treats any other value as a failure)
+            0 => Ok(Response::ok().with_u64(0)),
+            // StartMonitoring(u64 client id, pid)
             1 => Ok(Response::ok()),
             other => Err(Stop::unknown_command("bsd:u", other)),
         }

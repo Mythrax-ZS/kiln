@@ -6,8 +6,13 @@
 
 use super::super::kernel::Kernel;
 use super::super::object::KObject;
+use super::super::result::ResultCode;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
 use std::sync::{Arc, Mutex, Weak};
+
+/// The result of a request on a console with no network: "no internet connection" (module 110,
+/// description 300; docs/ASSUMPTIONS.md A-072).
+const NO_INTERNET_CONNECTION: ResultCode = ResultCode::new(110, 300);
 
 fn gone() -> Stop {
     Stop("the process is gone".to_string())
@@ -116,6 +121,9 @@ impl Service for NetRequest {
         match req.command {
             // GetRequestState() -> RequestState: 1 is Free, a request that was not accepted
             0 => Ok(Response::ok().with_u32(1)),
+            // GetResult(): what became of the request, which with no network is a failure; it is
+            // the result the command itself returns
+            1 => Ok(Response::error(NO_INTERNET_CONNECTION)),
             // GetSystemEventReadableHandles() -> (event, event)
             2 => {
                 let events = self.events.lock().unwrap_or_else(|e| e.into_inner());

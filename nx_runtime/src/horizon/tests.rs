@@ -2067,6 +2067,30 @@ fn a_managed_layer_from_the_applet_manager_can_be_opened_with_its_id() {
     assert!(e.send(display, &open_layer.bytes(), false).is_none());
 }
 
+#[test]
+fn library_applets_are_launchable_at_once_and_the_other_events_stay_quiet() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let applet = e.service("appletOE");
+    let mut open = Message::new(0);
+    open.pid = true;
+    open.copy_handles = vec![CURRENT_PROCESS];
+    open.payload = vec![0; 8];
+    let proxy = u64::from(e.call(applet, &open).moved[0]);
+    let self_controller = u64::from(e.call(proxy, &Message::new(1)).moved[0]);
+    // GetLibraryAppletLaunchableEvent: set when handed out, and again if it is asked for again.
+    for _ in 0..2 {
+        let event = e.call(self_controller, &Message::new(9)).copied[0];
+        e.write(SCRATCH + 0x700, &event.to_le_bytes());
+        e.svc(0x18, &[0, SCRATCH + 0x700, 1, 0]);
+        assert_eq!(e.r(), 0, "signaled");
+        e.svc(0x17, &[u64::from(event)]);
+        assert_eq!(e.r(), 0);
+        e.svc(0x18, &[0, SCRATCH + 0x700, 1, 0]);
+        assert_eq!(e.r(), err::TIMED_OUT.0, "and cleared by the program");
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // acc:u0, set, and save data
 // ---------------------------------------------------------------------------------------------
@@ -2554,17 +2578,214 @@ fn the_network_is_not_there_and_says_so() {
         [1, 0, 0, 0],
         "still not granted"
     );
+    // What became of it: no internet connection, 2110-0300, as the command's own result.
+    assert_eq!(e.call(request, &Message::new(1)).result, 110 | (300 << 9));
     // A socket service is registered but opens no sockets.
     let bsd = e.service("bsd:u");
     let mut reg = Message::new(0);
     reg.pid = true;
     reg.payload = vec![0; 0x30];
-    assert_eq!(e.call(bsd, &reg).data.len(), 8);
+    assert_eq!(
+        e.call(bsd, &reg).data,
+        [0; 8],
+        "the client id is 0: the SDK aborts on any other"
+    );
     assert!(e.send(bsd, &Message::new(2).bytes(), false).is_none());
     match e.kernel.exit_state() {
         Some(Exit::Fatal(m)) => assert!(m.contains("bsd:u") && m.contains("command 2"), "{m}"),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn play_reports_are_accepted_and_discarded_and_nothing_else_is_offered() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let prepo = e.service("prepo:u");
+    for command in [10100, 10101, 10102, 10103] {
+        let mut save = Message::new(command);
+        save.pid = true;
+        save.send = vec![(SCRATCH + 0x100, 8), (SCRATCH + 0x200, 0x10)];
+        assert_eq!(e.call(prepo, &save).result, 0, "command {command}");
+    }
+    assert!(e.send(prepo, &Message::new(10200).bytes(), false).is_none());
+    match e.kernel.exit_state() {
+        Some(Exit::Fatal(m)) => assert!(m.contains("prepo:u") && m.contains("10200"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_tls_library_starts_with_no_contexts_and_makes_none() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let ssl = e.service("ssl");
+    let mut version = Message::new(5);
+    version.payload = 0x1_0000u32.to_le_bytes().to_vec();
+    assert_eq!(e.call(ssl, &version).result, 0);
+    assert_eq!(
+        e.call(ssl, &Message::new(1)).data,
+        [0, 0, 0, 0],
+        "no contexts"
+    );
+    // Making one needs a network: the run stops and names the command.
+    assert!(e.send(ssl, &Message::new(0).bytes(), false).is_none());
+    match e.kernel.exit_state() {
+        Some(Exit::Fatal(m)) => assert!(m.contains("ssl") && m.contains("command 0"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The parameter block `audren:u` takes: 48 kHz, 240 samples a frame, 2 voices, 1 effect, REV3.
+fn audio_parameters() -> Vec<u8> {
+    let mut p = vec![0u8; 0x34];
+    for (offset, value) in [
+        (0x00, 48_000u32),
+        (0x04, 240),
+        (0x08, 6),
+        (0x0C, 0),
+        (0x10, 2),
+        (0x14, 1),
+        (0x18, 1),
+        (0x30, 0x3356_4552),
+    ] {
+        p[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    p
+}
+
+#[test]
+fn the_audio_renderer_answers_updates_and_sets_its_event_every_frame() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let audren = e.service("audren:u");
+    let mut size = Message::new(1);
+    size.payload = audio_parameters();
+    let work = e.call(audren, &size).data;
+    let work = u64::from_le_bytes(work[..8].try_into().unwrap());
+    assert!(work >= 0x1000 && work % 0x1000 == 0, "{work:#x}");
+    // Opening it: the parameters, a work buffer size, an aruid, the process id and two handles.
+    let (transfer, _) = e.kernel.create_event().unwrap();
+    let (process, _) = e.kernel.create_event().unwrap();
+    let mut open = Message::new(0);
+    open.pid = true;
+    open.copy_handles = vec![transfer, process];
+    open.payload = [
+        audio_parameters(),
+        vec![0; 4],
+        work.to_le_bytes().to_vec(),
+        vec![0; 8],
+    ]
+    .concat();
+    let renderer = u64::from(e.call(audren, &open).moved[0]);
+    for (command, expected) in [(0, 48_000u32), (1, 240), (2, 6), (3, 1)] {
+        let value = e.call(renderer, &Message::new(command)).data;
+        assert_eq!(value, expected.to_le_bytes(), "command {command}");
+    }
+    assert_eq!(e.call(renderer, &Message::new(5)).result, 0);
+    assert_eq!(
+        e.call(renderer, &Message::new(3)).data,
+        [0, 0, 0, 0],
+        "started"
+    );
+
+    // One update: no memory pool is asked for anything; the answer holds every section.
+    let input = SCRATCH + 0x2000;
+    let output = SCRATCH + 0x6000;
+    let voices = 2;
+    let in_size = 0x40 + 0x10 + 3 * 0x20 + voices * (0x70 + 0x170) + 0x100;
+    let mut data = vec![0u8; in_size];
+    let put = |b: &mut Vec<u8>, o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    put(&mut data, 0, 0x3356_4552);
+    put(&mut data, 0x04, 0x10);
+    put(&mut data, 0x08, 3 * 0x20);
+    put(&mut data, 0x0C, voices as u32 * 0x170);
+    put(&mut data, 0x10, voices as u32 * 0x70);
+    put(&mut data, 0x3C, in_size as u32);
+    // The first memory pool asks to be attached.
+    put(&mut data, 0x40 + 0x10 + 0x10, 4);
+    e.write(input, &data);
+    let mut update = Message::new(10);
+    update.send = vec![(input, in_size as u64)];
+    update.receive = vec![(output, 0x1000), (output + 0x1000, 0)];
+    assert_eq!(e.call(renderer, &update).result, 0);
+    let out = e.read(output, 0x40 + 3 * 0x10);
+    assert_eq!(
+        u32::from_le_bytes(out[0..4].try_into().unwrap()),
+        0x3356_4552
+    );
+    assert_eq!(
+        u32::from_le_bytes(out[0x08..0x0C].try_into().unwrap()),
+        3 * 0x10
+    );
+    assert_eq!(
+        u32::from_le_bytes(out[0x40..0x44].try_into().unwrap()),
+        5,
+        "attached"
+    );
+    // An update the renderer cannot read stops the run and says why.
+    let mut bad = Message::new(10);
+    bad.send = vec![(input, 0x20)];
+    bad.receive = vec![(output, 0x1000), (output + 0x1000, 0)];
+    assert!(e.send(renderer, &bad.bytes(), false).is_none());
+    match e.kernel.exit_state() {
+        Some(Exit::Fatal(m)) => assert!(m.contains("no header"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_audio_renderer_event_is_set_by_the_frame_clock() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let audren = e.service("audren:u");
+    let (transfer, _) = e.kernel.create_event().unwrap();
+    let (process, _) = e.kernel.create_event().unwrap();
+    let mut open = Message::new(0);
+    open.pid = true;
+    open.copy_handles = vec![transfer, process];
+    open.payload = [audio_parameters(), vec![0; 20]].concat();
+    let renderer = u64::from(e.call(audren, &open).moved[0]);
+    let event = e.call(renderer, &Message::new(7)).copied[0];
+    e.write(SCRATCH + 0x700, &event.to_le_bytes());
+    // Within a second the clock has gone off, and it goes off again once the program resets it.
+    for _ in 0..2 {
+        e.svc(0x18, &[0, SCRATCH + 0x700, 1, 1_000_000_000]);
+        assert_eq!(e.r(), 0);
+        e.svc(0x17, &[u64::from(event)]);
+        assert_eq!(e.r(), 0);
+    }
+}
+
+#[test]
+fn the_audio_device_names_itself_and_is_stereo() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let audren = e.service("audren:u");
+    let mut get = Message::new(2);
+    get.payload = 7u64.to_le_bytes().to_vec();
+    let device = u64::from(e.call(audren, &get).moved[0]);
+    let mut list = Message::new(0);
+    list.receive = vec![(SCRATCH + 0x1000, 0x400)];
+    assert_eq!(e.call(device, &list).data, [4, 0, 0, 0]);
+    let names = e.read(SCRATCH + 0x1000, 0x400);
+    assert_eq!(&names[0x100..0x100 + 25], b"AudioBuiltInSpeakerOutput");
+    assert_eq!(names[0x100 + 25], 0, "null terminated");
+    let mut active = Message::new(3);
+    active.receive = vec![(SCRATCH + 0x2000, 0x100)];
+    assert_eq!(e.call(device, &active).result, 0);
+    assert_eq!(&e.read(SCRATCH + 0x2000, 25), b"AudioBuiltInSpeakerOutput");
+    assert_eq!(
+        e.call(device, &Message::new(5)).data,
+        [2, 0, 0, 0],
+        "two channels"
+    );
+    assert_eq!(e.call(device, &Message::new(2)).data, 1.0f32.to_le_bytes());
+    assert_eq!(
+        e.call(device, &Message::new(4)).copied.len(),
+        1,
+        "the device event"
+    );
 }
 
 #[test]

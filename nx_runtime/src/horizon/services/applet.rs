@@ -72,11 +72,16 @@ fn push_message(kernel: &Kernel, shared: &Shared, m: u32) {
 
 /// A readable event that nothing signals, shared by every getter of the same kind.
 fn idle_event(kernel: &Kernel, shared: &Shared, slot: usize) -> KObject {
+    event_ends(kernel, shared, slot).1
+}
+
+/// The (writable, readable) ends of the event in `slot`, made on first use.
+fn event_ends(kernel: &Kernel, shared: &Shared, slot: usize) -> (KObject, KObject) {
     let mut s = lock(shared);
     while s.idle_events.len() <= slot {
         s.idle_events.push(kernel.new_event());
     }
-    s.idle_events[slot].1.clone()
+    s.idle_events[slot].clone()
 }
 
 /// `nn::am::service::IApplicationProxyService` (`appletOE`).
@@ -220,10 +225,13 @@ impl Service for SelfController {
         match req.command {
             // LockExit(), UnlockExit(): nothing asks the program to exit.
             1 | 2 => Ok(Response::ok()),
-            // GetLibraryAppletLaunchableEvent() -> event
+            // GetLibraryAppletLaunchableEvent() -> event: library applets can be launched, so the
+            // event is set whenever the program asks for it (docs/ASSUMPTIONS.md A-043)
             9 => {
                 let kernel = self.kernel.upgrade().ok_or_else(gone)?;
-                Ok(Response::ok().with_copy_handle(idle_event(&kernel, &self.shared, 1)))
+                let (writable, readable) = event_ends(&kernel, &self.shared, 1);
+                kernel.set_event(&writable, true);
+                Ok(Response::ok().with_copy_handle(readable))
             }
             // SetScreenShotPermission(s32), SetOperationModeChangedNotification(bool),
             // SetPerformanceModeChangedNotification(bool), SetFocusHandlingMode(3 x bool),
@@ -443,6 +451,13 @@ impl Service for LibraryAppletCreator {
                     kernel: self.kernel.clone(),
                 })))
             }
+            // CreateLibraryApplet(u32 applet id, u32 mode) -> ILibraryAppletAccessor
+            0 => Err(Stop(format!(
+                "the program asked to launch the library applet {:#x} (mode {}); library applets \
+                 are part of the console's firmware, which this runtime does not have",
+                req.u32_at(0),
+                req.u32_at(4)
+            ))),
             other => Err(Stop::unknown_command("ILibraryAppletCreator", other)),
         }
     }
