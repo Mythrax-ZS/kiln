@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod container;
+pub mod loader;
 
 pub use nx_runtime::{error, romfs, storage, util};
 pub use nx_runtime::{Error, Result};
