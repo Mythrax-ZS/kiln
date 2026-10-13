@@ -123,6 +123,10 @@ pub struct Info {
     /// covers, then from word 4 six words per entry: the first GPU address (low, high), one past
     /// the last (low, high) and the device address of the first byte (low, high).
     pub global_memory: bool,
+    /// Vertex stage: the program reads the instance id. The counter of the draw (the hardware runs
+    /// the instances of a draw one after another, each counting up from 0) is then the 32-bit
+    /// push constant at offset 0 of the vertex stage, which the caller sets before the draw.
+    pub instance_counter: bool,
     /// Vertex stage: which components (bit `c` of entry `i`) of attribute location `i` are read.
     pub attributes_read: [u8; 32],
     /// Output attribute locations written (bit `c` of entry `i` for component `c`).

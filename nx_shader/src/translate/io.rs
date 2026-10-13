@@ -23,6 +23,8 @@ pub(super) struct Io {
     frag_inputs: BTreeMap<(u32, u32), Id>,
     vertex_index: Option<Id>,
     instance_index: Option<Id>,
+    /// The push constant block holding the instance counter of the draw.
+    instance_counter: Option<Id>,
     base_vertex: Option<Id>,
     base_instance: Option<Id>,
     frag_coord: Option<Id>,
@@ -408,10 +410,14 @@ fn attribute_in(tx: &mut Tx<'_>, addr: u32) -> R<Id> {
             })
         }
         0x2f8 => {
-            // The instance id, without the base instance.
+            // The instance id: the counter of the draw (the hardware runs the instances of a draw
+            // as a series of draws that count up) plus, for a draw that really is instanced, the
+            // instance within it without the base instance.
+            let counter = instance_counter(tx);
             let idx = builtin_input(tx, builtin::INSTANCE_INDEX, true, 0);
             let base = builtin_input(tx, builtin::BASE_INSTANCE, true, 1);
-            Ok(tx.isub(idx, base))
+            let within = tx.isub(idx, base);
+            Ok(tx.iadd(counter, within))
         }
         0x2fc => {
             let idx = builtin_input(tx, builtin::VERTEX_INDEX, true, 2);
@@ -420,6 +426,31 @@ fn attribute_in(tx: &mut Tx<'_>, addr: u32) -> R<Id> {
         }
         _ => tx.fail(format!("ALD of attribute address {addr:#x}")),
     }
+}
+
+/// The instance counter of the draw: the 32-bit push constant at offset 0 (see
+/// `Info::instance_counter`).
+fn instance_counter(tx: &mut Tx<'_>) -> Id {
+    let u = tx.t.u32;
+    let var = match tx.io.instance_counter {
+        Some(v) => v,
+        None => {
+            let block = tx.m.ty_struct(&[u]);
+            tx.m.decorate(block, deco::BLOCK, &[]);
+            tx.m.member_decorate(block, 0, deco::OFFSET, &[0]);
+            let ptr = tx.m.ty_pointer(storage::PUSH_CONSTANT, block);
+            let v = tx.m.global_variable(ptr, storage::PUSH_CONSTANT);
+            tx.interface.push(v);
+            tx.io.instance_counter = Some(v);
+            v
+        }
+    };
+    tx.info.instance_counter = true;
+    let zero = tx.c32(0);
+    let ptr_ty = tx.m.ty_pointer(storage::PUSH_CONSTANT, u);
+    let ptr =
+        tx.f.emit_result(&mut tx.m, op::ACCESS_CHAIN, ptr_ty, &[var, zero]);
+    tx.f.load(&mut tx.m, u, ptr)
 }
 
 /// Load a scalar `int` built-in input (`which` picks the cache slot of the variable).
