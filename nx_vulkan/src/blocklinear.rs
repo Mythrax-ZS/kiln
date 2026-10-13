@@ -71,7 +71,7 @@ impl Geometry {
 }
 
 /// Where byte `x` (0..64) of row `y` (0..8) is inside a GOB.
-pub fn gob_offset(x: u32, y: u32) -> u32 {
+pub const fn gob_offset(x: u32, y: u32) -> u32 {
     (x / 32) * 256 + (y / 2) * 64 + ((x % 32) / 16) * 32 + (y % 2) * 16 + x % 16
 }
 
@@ -102,22 +102,60 @@ pub fn swizzle(g: &Geometry, linear: &[u8], tiled: &mut [u8]) {
     });
 }
 
+/// Where each 16-byte chunk of a row of a GOB lies inside it: the chunk across (0..4) in each of
+/// the 8 rows.
+const CHUNK: [[u16; 4]; 8] = {
+    let mut table = [[0u16; 4]; 8];
+    let mut y = 0;
+    while y < 8 {
+        let mut c = 0;
+        while c < 4 {
+            table[y][c] = gob_offset(16 * c as u32, y as u32) as u16;
+            c += 1;
+        }
+        y += 1;
+    }
+    table
+};
+
 /// Visit the surface in runs of up to 16 bytes that are contiguous in both layouts, calling
-/// `f(tiled offset, linear offset, length)`.
+/// `f(tiled offset, linear offset, length)`: GOB by GOB, so that the position of a GOB is worked
+/// out once for its 32 chunks.
 fn walk(g: &Geometry, mut f: impl FnMut(usize, usize, usize)) {
-    let row = g.row_bytes();
-    for z in 0..g.depth {
-        for y in 0..g.height {
-            let linear_row = (u64::from(z) * u64::from(g.height) + u64::from(y)) * row;
-            let mut x = 0u64;
-            while x < row {
-                let n = (row - x).min(16 - x % 16);
-                f(
-                    g.offset(x, y, z) as usize,
-                    (linear_row + x) as usize,
-                    n as usize,
-                );
-                x += n;
+    let row = g.row_bytes() as usize;
+    let (blocks_x, blocks_y) = (g.blocks_x() as usize, g.blocks_y() as usize);
+    let block_height = 1usize << g.block_height_log2;
+    let block_depth = 1usize << g.block_depth_log2;
+    let block_bytes = g.block_bytes() as usize;
+    let height = g.height as usize;
+    for z in 0..g.depth as usize {
+        let (block_z, z_in_block) = (z / block_depth, z % block_depth);
+        for gob_row in 0..height.div_ceil(8) {
+            let (block_y, gob_y) = (gob_row / block_height, gob_row % block_height);
+            let gob_in_block = z_in_block * block_height + gob_y;
+            let first_block = (block_z * blocks_y + block_y) * blocks_x;
+            for gob_x in 0..blocks_x {
+                let gob = (first_block + gob_x) * block_bytes + gob_in_block * 512;
+                let x0 = gob_x * 64;
+                let width = (row - x0).min(64);
+                for (y_in_gob, chunks) in CHUNK.iter().enumerate() {
+                    let y = gob_row * 8 + y_in_gob;
+                    if y >= height {
+                        break;
+                    }
+                    let linear = (z * height + y) * row + x0;
+                    for (c, chunk) in chunks.iter().enumerate() {
+                        let skipped = 16 * c;
+                        if skipped >= width {
+                            break;
+                        }
+                        f(
+                            gob + usize::from(*chunk),
+                            linear + skipped,
+                            (width - skipped).min(16),
+                        );
+                    }
+                }
             }
         }
     }
@@ -129,6 +167,61 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    /// The surface walked the way the formula of [`Geometry::offset`] says, a run at a time.
+    fn walk_by_the_formula(g: &Geometry) -> Vec<(usize, usize, usize)> {
+        let row = g.row_bytes();
+        let mut runs = Vec::new();
+        for z in 0..g.depth {
+            for y in 0..g.height {
+                let linear_row = (u64::from(z) * u64::from(g.height) + u64::from(y)) * row;
+                let mut x = 0u64;
+                while x < row {
+                    let n = (row - x).min(16 - x % 16);
+                    runs.push((
+                        g.offset(x, y, z) as usize,
+                        (linear_row + x) as usize,
+                        n as usize,
+                    ));
+                    x += n;
+                }
+            }
+        }
+        runs
+    }
+
+    #[test]
+    fn the_walk_by_gobs_makes_the_runs_the_formula_gives() {
+        for (w, h, d, bpe, bh, bd) in [
+            (64, 8, 1, 1, 0, 0),
+            (16, 16, 1, 4, 1, 0),
+            (100, 70, 1, 4, 2, 0),
+            (320, 360, 1, 4, 4, 0),
+            (33, 17, 1, 2, 3, 0),
+            (7, 5, 1, 16, 0, 0),
+            (40, 46, 1, 4, 3, 0),
+            (13, 9, 1, 1, 5, 0),
+            (40, 40, 3, 4, 1, 1),
+            (8, 8, 9, 8, 0, 3),
+            (1, 1, 1, 4, 0, 0),
+        ] {
+            let g = Geometry {
+                width: w,
+                height: h,
+                depth: d,
+                bytes_per_element: bpe,
+                block_height_log2: bh,
+                block_depth_log2: bd,
+            };
+            let mut seen = Vec::new();
+            walk(&g, |t, l, n| seen.push((t, l, n)));
+            // The same runs, in whatever order: GOB by GOB is not row by row.
+            let mut want = walk_by_the_formula(&g);
+            seen.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(seen, want, "{g:?}");
+        }
     }
 
     #[test]
