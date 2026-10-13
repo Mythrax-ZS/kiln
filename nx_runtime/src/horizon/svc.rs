@@ -148,7 +148,7 @@ impl Kernel {
     /// pointer chain (`x29` points at a saved `x29` and `x30`, as the compilers of Horizon
     /// programs lay out their frames). The walk stops at the first pointer that does not look like
     /// a frame.
-    fn guest_call_stack(&self, cpu: &NativeCpu) -> Vec<u64> {
+    pub(super) fn guest_call_stack(&self, cpu: &NativeCpu) -> Vec<u64> {
         let mut out = Vec::new();
         // A value that is not an address of the 39-bit space is a marker (the return address of
         // a thread entry point, say), not a place in the program.

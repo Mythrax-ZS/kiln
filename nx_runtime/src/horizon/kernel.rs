@@ -607,7 +607,21 @@ impl Kernel {
                 }
             }
             stop::EXIT_THREAD | stop::EXIT_PROCESS => {}
-            _ => self.fatal(describe_stop(cpu)),
+            _ => {
+                // Generated code keeps the registers in variables and stores them in the CPU
+                // structure at calls, so after a fault the structure holds them as of the last
+                // call: the chain of callers is right, the faulting function itself is `pc`.
+                let stack = self.guest_call_stack(cpu);
+                let mut report = describe_stop(cpu);
+                if !stack.is_empty() {
+                    let frames: Vec<String> = stack.iter().map(|a| format!("{a:#x}")).collect();
+                    report.push_str(&format!(
+                        " (thread {thread}); return addresses as of its last call: {}",
+                        frames.join(" ")
+                    ));
+                }
+                self.fatal(report);
+            }
         }
         let mut st = self.lock();
         if let Some(t) = st.threads.get_mut(&thread) {
