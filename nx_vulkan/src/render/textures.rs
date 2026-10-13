@@ -1476,4 +1476,20 @@ mod tests {
         let t = target(base, format, (64, 48), 0);
         assert!(overlay_of(&tic, &plain_2d(), base, &t, 3).is_none());
     }
+
+    #[test]
+    fn a_strip_of_a_tall_texture_in_the_same_layout_is_found() {
+        // The title's: a texture of 320 x 360 texels in blocks of 4 GOBs (20 columns of GOBs, 12
+        // blocks of rows) and a target of its first 40 rows made the same way.
+        let (tic, format) = header_of(1, (320, 360), 1, 1, 2);
+        let base = 0x8000_0000u64;
+        let t = target(base, format, (320, 40), 2);
+        let o = overlay_of(&tic, &plain_2d(), base, &t, 1).expect("a strip at the top");
+        assert_eq!((o.level, o.y, o.width, o.height), (0, 0, 320, 40));
+        // A strip a block of rows down is a part of it too: a block is 4 GOBs of 8 rows, and a
+        // row of blocks is 20 columns of 2048 bytes.
+        let t = target(base + 20 * 2048, format, (320, 32), 2);
+        let o = overlay_of(&tic, &plain_2d(), base, &t, 1).expect("a block of rows down");
+        assert_eq!((o.y, o.width, o.height), (32, 320, 32));
+    }
 }

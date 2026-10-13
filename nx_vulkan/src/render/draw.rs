@@ -647,18 +647,20 @@ impl Core {
         cause.1 = keys.len();
         if cause.2.is_empty() {
             cause.2 = format!(
-                "the header says {}x{}, type {}, {} levels, components {:#x}, array {}; the first target is {}x{} with format {:?}, {} layers, tiling {:?}",
+                "the header says {}x{}, type {}, {} levels, components {:#x}, array {}, block heights (log2 of GOBs, width, height, depth) {:?}; the first target is {}x{} with format {:?}, {} layers, tiling {:?}, {:#x} bytes after the texture starts",
                 tic.width(),
                 tic.height(),
                 tic.texture_type(),
                 tic.levels(),
                 tic.components(),
                 used.arrayed,
+                tic.block_log2(),
                 keys[0].width,
                 keys[0].height,
                 keys[0].format,
                 keys[0].layers,
-                keys[0].tiling
+                keys[0].tiling,
+                keys[0].address.wrapping_sub(cpu)
             );
         }
         // The rendering in progress ends, and what was recorded runs, so that the pixels are
