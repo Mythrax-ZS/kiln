@@ -57,6 +57,9 @@ pub struct Debug {
     /// `NX_DEBUG_SYNC_FROM=<frame>`: the same from that presented frame on (a loss of the device
     /// that comes at a known frame, after a run that is too long to wait for at every draw).
     pub sync_from: Option<u64>,
+    /// `NX_DEBUG_WAIT_FINISH`: wait for the device at the end of every submission of the guest, as
+    /// the renderer did before it overlapped the device's work with recording (A-123).
+    pub wait_at_finish: bool,
     /// `NX_DEBUG_SKIP_PROGRAMS=<hex address>[,...]`: a draw whose vertex or pixel program is at one
     /// of these addresses is not drawn (does the loss of a device come from those draws?).
     pub skip_programs: Vec<u64>,
@@ -93,6 +96,7 @@ impl Debug {
             sync_draws: set("NX_DEBUG_SYNC_DRAWS")
                 .then(|| number("NX_DEBUG_SYNC_DRAWS").unwrap_or(1)),
             sync_from: number("NX_DEBUG_SYNC_FROM"),
+            wait_at_finish: set("NX_DEBUG_WAIT_FINISH"),
             skip_programs: addresses("NX_DEBUG_SKIP_PROGRAMS"),
             discard_programs: addresses("NX_DEBUG_DISCARD_PROGRAMS"),
         }

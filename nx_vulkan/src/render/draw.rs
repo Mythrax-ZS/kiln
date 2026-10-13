@@ -335,6 +335,7 @@ impl Core {
                 ));
             }
             if p.info.global_memory {
+                self.global_pending = true;
                 let (buffer, size) = self.global.table(&self.vk, &mut self.frame, scene)?;
                 buffer_infos.push((
                     base + 20,

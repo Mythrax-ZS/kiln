@@ -106,6 +106,12 @@ struct Core {
     phases: Phases,
     /// Draws wait for the device (`NX_DEBUG_SYNC_DRAWS`).
     sync_on: bool,
+    /// A program that reads or writes guest memory in place was recorded since the device was
+    /// last waited for: the guest may take a submission as over when its fence is reached, so
+    /// the end of the submission waits (A-123).
+    global_pending: bool,
+    /// Draws recorded since the last batch was sent to the device.
+    batch_draws: u32,
     /// What the textures of the draw being recorded are, kept while draws wait for the device so
     /// that the one that loses it can say.
     last_textures: Vec<String>,
@@ -116,6 +122,9 @@ struct Core {
     #[cfg(feature = "window")]
     display: Option<display::Display>,
 }
+
+/// How many draws a batch has at least when the end of a pass sends it to the device.
+const BATCH_DRAWS: u32 = 24;
 
 /// The time the draws spent in each of their steps (reported with `NX_TRACE_GPU`).
 #[derive(Clone, Copy, Debug, Default)]
@@ -249,6 +258,8 @@ impl Renderer {
                     pass_target: None,
                     phases: Phases::default(),
                     sync_on: false,
+                    global_pending: false,
+                    batch_draws: 0,
                     last_textures: Vec::new(),
                     write_back_causes: std::collections::HashMap::new(),
                     #[cfg(feature = "window")]
@@ -431,6 +442,11 @@ impl Core {
             return Ok(());
         }
         self.end_pass();
+        // A pass that ends is a good place to give the device what was recorded: it works on that
+        // while the next pass is recorded (A-123).
+        if self.batch_draws >= BATCH_DRAWS && !self.sync_on {
+            self.send_batch()?;
+        }
         let cmd = self.frame.cmd(&self.vk)?;
         let mut color_infos = Vec::new();
         for key in &wanted.colors {
@@ -690,10 +706,18 @@ impl Core {
         Ok(())
     }
 
-    /// Run what was recorded and wait for it.
+    /// Run what was recorded and wait for it, and for what the device was given before.
     fn flush(&mut self) -> Result<(), String> {
         self.end_pass();
+        self.global_pending = false;
+        self.batch_draws = 0;
         self.frame.submit(&self.vk)?;
+        self.submission_over();
+        Ok(())
+    }
+
+    /// Count a submission and let go of the targets nothing draws to any more.
+    fn submission_over(&mut self) {
         self.targets.submissions += 1;
         let retired = self.targets.retire(&mut self.frame);
         if self.debug.trace_textures {
@@ -701,6 +725,24 @@ impl Core {
                 eprintln!("[vulkan] the render target {key:?} was let go (nothing drew to it for a long time)");
             }
         }
+    }
+
+    /// Send what was recorded to the device and go on recording while it runs (A-123).
+    fn send_batch(&mut self) -> Result<(), String> {
+        self.end_pass();
+        self.batch_draws = 0;
+        self.frame.kick(&self.vk)
+    }
+
+    /// The commands of a submission of the guest are all recorded. They are sent to the device
+    /// and not waited for, unless one of them touches guest memory in place (the guest may use
+    /// that memory again as soon as its fence is reached) or `NX_DEBUG_WAIT_FINISH` says to.
+    fn end_submission(&mut self) -> Result<(), String> {
+        if self.global_pending || self.debug.wait_at_finish || self.sync_on {
+            return self.flush();
+        }
+        self.send_batch()?;
+        self.submission_over();
         Ok(())
     }
 }
@@ -709,6 +751,7 @@ impl Renderer {
     fn draw_command(&mut self, scene: &Scene<'_>, draw: &Draw) -> Result<(), String> {
         let core = self.core()?;
         let mut result = core.draw(scene, draw);
+        core.batch_draws += 1;
         if core.sync_on && result.is_ok() {
             if let Err(e) = core.flush() {
                 // What was submitted up to this draw failed, and this was the last to join it.
@@ -791,7 +834,7 @@ impl Renderer {
 
     fn finish_command(&mut self) -> Result<(), String> {
         match self.core.as_mut() {
-            Some(Ok(core)) => core.flush(),
+            Some(Ok(core)) => core.end_submission(),
             _ => Ok(()),
         }
     }
@@ -880,7 +923,7 @@ impl Renderer {
         }
         let draws = self.frame_draws;
         let core = self.core()?;
-        core.flush()?;
+        core.end_submission()?;
         if core.debug.sync_draws.is_some_and(|n| draws >= n.max(1))
             || core.debug.sync_from.is_some_and(|f| p.frame >= f)
         {

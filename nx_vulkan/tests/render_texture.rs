@@ -642,3 +642,42 @@ fn a_target_that_a_texture_is_not_wholly_made_of_is_still_written_under_it() {
         "the later target was not written"
     );
 }
+
+#[test]
+fn work_sent_to_the_device_in_batches_sees_what_the_batches_before_it_made() {
+    if vulkan().is_none() {
+        return;
+    }
+    // A target is cleared in one batch and read as a texture in the next, many times over, with
+    // the host never waiting for the device in between: every picture must be the colour the
+    // batch before it made.
+    let source = GPU_BASE + 0x50_0000;
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = textured(
+        16,
+        target,
+        header(0x08, 2, 16, 16, source),
+        nearest_sampler(),
+    );
+    let mut r = Renderer::new(RenderConfig::default());
+    let colors = [
+        [1.0, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+        [1.0, 1.0, 0.0, 1.0],
+    ];
+    for round in 0..40usize {
+        let color = colors[round % colors.len()];
+        w.color_target(0, source, 16, 16, 0xD5);
+        clear_to(&mut r, &mut w, color, None);
+        r.finish().unwrap();
+        w.color_target(0, target, 16, 16, 0xD5);
+        r.draw(&w.scene(), &DRAW).unwrap();
+        r.finish().unwrap();
+        let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+        let want = color.map(|c| (c * 255.0) as u8);
+        for px in rgba.as_chunks::<4>().0 {
+            assert_eq!(px, &want, "round {round}");
+        }
+    }
+}
