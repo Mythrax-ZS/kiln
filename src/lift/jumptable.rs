@@ -24,7 +24,7 @@
 
 use super::discover::CodeSource;
 use nx_runtime::a64::bus::{Bus, Fault, FaultKind};
-use nx_runtime::a64::inst::{BranchReg, Inst, MemKind};
+use nx_runtime::a64::inst::{BranchReg, Inst, MemKind, MovOp};
 use nx_runtime::a64::interp::execute;
 use nx_runtime::a64::state::CpuState;
 use std::collections::BTreeMap;
@@ -87,6 +87,7 @@ pub fn resolve(
     br_pc: u64,
     rn: u8,
     inside: &dyn Fn(u64) -> bool,
+    known: &[(usize, u64)],
 ) -> Option<Vec<u64>> {
     // The straight-line code in front of the branch.
     let mut window: Vec<(u64, Inst)> = Vec::new();
@@ -168,6 +169,9 @@ pub fn resolve(
             ..CpuState::default()
         };
         cpu.x = [fill; 31];
+        for &(r, value) in known {
+            cpu.x[r] = value;
+        }
         cpu
     };
     let observed = usize::from(idx);
@@ -260,6 +264,114 @@ pub fn resolve(
     out.sort_unstable();
     out.dedup();
     Some(out)
+}
+
+/// The callee-saved registers (x19 to x28) that the code decoded so far gives one constant value
+/// and nothing else, as `(register, value)`: a compiler that switches inside a loop often puts the
+/// address of the jump table in such a register once, before the loop, where the straight-line
+/// window in front of the `BR` does not reach. Only the instructions that compute the constant
+/// (`ADRP` and `ADD`, `ADR`, `MOVZ`) may write the register; loads from the stack, which restore
+/// it at the end of the function, are not counted. A value guessed wrong costs speed only: the
+/// candidate targets are checked against the function table when the branch runs.
+pub fn constant_registers(code: &dyn CodeSource, insts: &BTreeMap<u64, Inst>) -> Vec<(usize, u64)> {
+    let mut bus = ImageBus { code };
+    let mut distinct = CpuState::default();
+    for (r, x) in distinct.x.iter_mut().enumerate() {
+        *x = 0x0101_0101_0101_0101u64.wrapping_mul(r as u64 + 1);
+    }
+    // Who writes each register, in address order.
+    let mut writers: [Vec<(u64, Inst)>; 31] = std::array::from_fn(|_| Vec::new());
+    for (&pc, &inst) in insts {
+        if inst.is_branch() {
+            continue;
+        }
+        let restores = match inst {
+            Inst::LdSt { rn, .. } | Inst::LdStPair { rn, .. } => rn == 31 || rn == 29,
+            _ => false,
+        };
+        let mut cpu = distinct.clone();
+        cpu.pc = pc;
+        let _ = execute(&mut cpu, &mut bus, inst);
+        let mut written: Vec<usize> = (19..=28).filter(|&r| cpu.x[r] != distinct.x[r]).collect();
+        match inst {
+            Inst::LdSt {
+                kind: MemKind::Load | MemKind::LoadSigned32 | MemKind::LoadSigned64,
+                rt,
+                ..
+            } if (19..=28).contains(&rt) => written.push(usize::from(rt)),
+            Inst::LdStPair {
+                load: true,
+                rt,
+                rt2,
+                ..
+            } => written.extend(
+                [usize::from(rt), usize::from(rt2)]
+                    .into_iter()
+                    .filter(|r| (19..=28).contains(r)),
+            ),
+            _ => {}
+        }
+        written.sort_unstable();
+        written.dedup();
+        if restores {
+            continue;
+        }
+        for r in written {
+            writers[r].push((pc, inst));
+        }
+    }
+    let mut out = Vec::new();
+    for (r, list) in writers.iter().enumerate().take(29).skip(19) {
+        let value = match list[..] {
+            [(
+                pc,
+                Inst::Adr {
+                    page: false, imm, ..
+                },
+            )] => Some(pc.wrapping_add(imm as u64)),
+            [(
+                pc,
+                Inst::Adr {
+                    page: true, imm, ..
+                },
+            ), (
+                _,
+                Inst::AddSubImm {
+                    sub: false,
+                    set_flags: false,
+                    rn,
+                    imm: add,
+                    sf: true,
+                    ..
+                },
+            )] if usize::from(rn) == r => Some(
+                (pc & !0xFFF)
+                    .wrapping_add(imm as u64)
+                    .wrapping_add(u64::from(add)),
+            ),
+            [(
+                pc,
+                Inst::Adr {
+                    page: true, imm, ..
+                },
+            )] => Some((pc & !0xFFF).wrapping_add(imm as u64)),
+            [(
+                _,
+                Inst::MovWide {
+                    op: MovOp::Movz,
+                    imm16,
+                    shift,
+                    sf: true,
+                    ..
+                },
+            )] => Some(u64::from(imm16) << shift),
+            _ => None,
+        };
+        if let Some(v) = value {
+            out.push((r, v));
+        }
+    }
+    out
 }
 
 /// Is this instruction the `BR` this module resolves?

@@ -198,6 +198,8 @@ impl Build<'_> {
     /// code became reachable.
     fn resolve_tables(&mut self) -> bool {
         let mut progress = false;
+        // What the code decoded so far says about registers a loop keeps (worked out when needed).
+        let mut known: Option<Vec<(usize, u64)>> = None;
         for i in 0..self.brs.len() {
             let (pc, rn, tried_at) = self.brs[i];
             if self.tables.contains_key(&pc) || tried_at == self.insts.len() {
@@ -208,7 +210,12 @@ impl Build<'_> {
             let code = self.code;
             let inside =
                 move |t: u64| code.is_code(t) && bounds.is_none_or(|(lo, hi)| lo <= t && t < hi);
-            if let Some(targets) = jumptable::resolve(self.code, &self.insts, pc, rn, &inside) {
+            let known = known
+                .get_or_insert_with(|| jumptable::constant_registers(code, &self.insts))
+                .clone();
+            if let Some(targets) =
+                jumptable::resolve(self.code, &self.insts, pc, rn, &inside, &known)
+            {
                 for &t in &targets {
                     self.add_block(t);
                 }

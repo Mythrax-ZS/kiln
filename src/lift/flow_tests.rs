@@ -234,6 +234,33 @@ pub fn jump_table_copied_index(base: u64) -> Vec<u32> {
     p.finish()
 }
 
+/// A switch in a loop: the address of the table is computed once, before the loop, in a register
+/// the loop keeps, so the straight-line code in front of the `BR` does not set it.
+pub fn jump_table_hoisted_base(base: u64) -> Vec<u32> {
+    let mut p = Prog::new(base);
+    p.adr(23, "table");
+    p.b("again");
+    p.label("again");
+    p.emit(asm::logical_imm(false, 0, false, 0, 3, 0, 0)); // and w0, w0, #15
+    p.emit(asm::cmp_imm(false, 0, 5));
+    p.b_cond(8, "default"); // b.hi
+    p.emit(asm::ldst_reg(2, 2, 0, 3, true, 23, 10)); // ldrsw x10, [x23, x0, lsl #2]
+    p.emit(asm::add_sub_shifted(true, false, false, 0, 10, 0, 23, 9)); // add x9, x23, x10
+    p.emit(asm::br(9));
+    for i in 0..6u32 {
+        p.label(&format!("case{i}"))
+            .emit(asm::movz(true, 0, 400 + i, 0));
+        p.emit(asm::ret(30));
+    }
+    p.label("default").emit(asm::movz(true, 0, 996, 0));
+    p.emit(asm::ret(30));
+    p.label("table");
+    for i in 0..6 {
+        p.rel32(&format!("case{i}"), "table");
+    }
+    p.finish()
+}
+
 /// A switch whose first case is 1: the index is adjusted before the compare.
 pub fn jump_table_offset_index(base: u64) -> Vec<u32> {
     let mut p = Prog::new(base);
@@ -421,6 +448,10 @@ pub fn catalogue(base: u64) -> Vec<Entry> {
         entry("jump table of bytes", jump_table_bytes(base)),
         entry("jump table, index copied", jump_table_copied_index(base)),
         entry("jump table, index adjusted", jump_table_offset_index(base)),
+        entry(
+            "jump table, base set before a loop",
+            jump_table_hoisted_base(base),
+        ),
         entry("supervisor calls", supervisor_calls(base)),
         entry("unsupported instruction", unsupported_instruction(base)),
     ];
@@ -531,6 +562,11 @@ fn discovery_finds_the_functions_and_tables() {
     let d = discovery(&jump_table_offset_index(CODE));
     assert_eq!(d.report.jump_tables.len(), 1, "{:?}", d.report);
     assert_eq!(d.report.jump_tables[0].targets.len(), 4);
+
+    let d = discovery(&jump_table_hoisted_base(CODE));
+    assert_eq!(d.report.jump_tables.len(), 1, "{:?}", d.report);
+    assert_eq!(d.report.jump_tables[0].targets.len(), 6);
+    assert!(d.report.unresolved_branches.is_empty());
 
     let d = discovery(&unexplained_branch(CODE));
     assert_eq!(d.report.unresolved_branches.len(), 1);
