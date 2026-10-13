@@ -356,6 +356,10 @@ impl Service for ApplicationFunctions {
             }
             // GetDesiredLanguage() -> LanguageCode
             21 => Ok(Response::ok().with_u64(LANGUAGE_CODE)),
+            // GetDisplayVersion() -> DisplayVersion (16 bytes, a NUL-padded string). The version
+            // is a field of the program's control data, which is not among the inputs
+            // (docs/ASSUMPTIONS.md A-117).
+            23 => Ok(Response::ok().with_bytes(&DISPLAY_VERSION)),
             // SetTerminateResult(Result): nothing reads the result the program ends with
             22 => {
                 if let Some(kernel) = self.kernel.upgrade() {
@@ -420,6 +424,9 @@ impl Service for ApplicationFunctions {
         }
     }
 }
+
+/// The version string `GetDisplayVersion` returns, "1.0.0" in 16 bytes (docs/ASSUMPTIONS.md A-117).
+const DISPLAY_VERSION: [u8; 16] = *b"1.0.0\0\0\0\0\0\0\0\0\0\0\0";
 
 /// The 16-byte id `GetPseudoDeviceId` returns: fixed, because the real one is derived from the
 /// console (docs/ASSUMPTIONS.md A-043).
@@ -572,6 +579,22 @@ mod tests {
     #[test]
     fn the_language_code_spells_the_locale() {
         assert_eq!(&LANGUAGE_CODE.to_le_bytes(), b"en-US\0\0\0");
+    }
+
+    #[test]
+    fn the_display_version_is_a_nul_padded_string_of_sixteen_bytes() {
+        let mut f = ApplicationFunctions {
+            kernel: Weak::new(),
+            shared: Arc::default(),
+        };
+        let r = f.request(&req(23, &[])).unwrap();
+        assert!(r.result.is_success());
+        assert_eq!(r.data.len(), 16);
+        assert_eq!(&r.data[..5], b"1.0.0");
+        assert!(r.data[5..].iter().all(|&b| b == 0));
+        // The neighbouring commands that are not implemented still stop the run.
+        let stop = f.request(&req(24, &[])).unwrap_err();
+        assert!(stop.0.contains("IApplicationFunctions") && stop.0.contains("24"));
     }
 
     #[test]
