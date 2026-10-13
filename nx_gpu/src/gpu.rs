@@ -244,6 +244,7 @@ impl Gpu {
                 syncpt,
                 level: self.level,
             };
+            let _phase = crate::progress::enter(crate::progress::METHODS_RUNNING);
             for chunk in bytes.as_chunks::<4>().0 {
                 let word = u32::from_le_bytes(*chunk);
                 cx.stats.words += 1;

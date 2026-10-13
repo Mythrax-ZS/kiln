@@ -11,6 +11,7 @@ use super::memory::{Info, MemoryMap};
 use super::object::KObject;
 use super::result::{kernel as err, KResult, ResultCode};
 use super::service::ServiceFactory;
+use super::watchdog::ThreadMonitor;
 use crate::npdm::Npdm;
 use crate::rt::abi::{perm, stop, NativeCpu, EXIT_PC};
 use crate::rt::host::describe_stop;
@@ -137,6 +138,8 @@ pub(super) struct State {
 pub struct ThreadCtx {
     pub kernel: Arc<Kernel>,
     pub thread: u64,
+    /// What the thread is doing, as the watchdog sees it.
+    pub monitor: Arc<ThreadMonitor>,
 }
 
 pub struct Kernel {
@@ -152,6 +155,10 @@ pub struct Kernel {
     trace_log: bool,
     /// Things to do once the process has ended (services print their summaries).
     finish_hooks: Mutex<Vec<Box<dyn Fn() + Send + Sync>>>,
+    /// What each running guest thread is doing, for the watchdog (`NX_WATCHDOG`).
+    monitors: Mutex<BTreeMap<u64, Arc<ThreadMonitor>>>,
+    /// A watchdog is running (`NX_WATCHDOG`): calls say what they are about.
+    watched: bool,
 }
 
 impl Drop for Kernel {
@@ -276,7 +283,29 @@ impl Kernel {
             trace: std::env::var_os("NX_TRACE_SVC").is_some(),
             trace_log: std::env::var_os("NX_TRACE_LOG").is_some(),
             finish_hooks: Mutex::new(Vec::new()),
+            monitors: Mutex::new(BTreeMap::new()),
+            watched: super::watchdog::requested().is_some(),
         })
+    }
+
+    /// The monitors of the running guest threads, by thread.
+    pub(super) fn monitors(&self) -> MutexGuard<'_, BTreeMap<u64, Arc<ThreadMonitor>>> {
+        self.monitors.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Tell the watchdog what the supervisor call `thread` is in is about (built only when a
+    /// watchdog is running).
+    pub(super) fn note(&self, thread: u64, text: impl FnOnce() -> String) {
+        if self.watched {
+            if let Some(m) = self.monitors().get(&thread) {
+                m.set_detail(text());
+            }
+        }
+    }
+
+    /// The entry point and argument a thread was created with.
+    pub(super) fn thread_entry(&self, thread: u64) -> Option<(u64, u64)> {
+        self.lock().threads.get(&thread).map(|t| (t.entry, t.arg))
     }
 
     pub fn trace_log(&self) -> bool {
@@ -584,14 +613,19 @@ impl Kernel {
 
     /// Run `cpu` from `entry` until its thread ends, then account for how it ended.
     pub fn run_on(self: &Arc<Kernel>, cpu: &mut NativeCpu, thread: u64, entry: u64) {
+        let monitor = Arc::new(ThreadMonitor::new(cpu));
+        self.monitors().insert(thread, Arc::clone(&monitor));
         let ctx = Box::into_raw(Box::new(ThreadCtx {
             kernel: Arc::clone(self),
             thread,
+            monitor: Arc::clone(&monitor),
         }));
         cpu.ctl.user = ctx.cast::<c_void>();
         // SAFETY: the CPU belongs to this thread alone and generated code is registered.
         let reason = unsafe { run(cpu, entry) };
         cpu.ctl.user = std::ptr::null_mut();
+        self.monitors().remove(&thread);
+        monitor.retire();
         // SAFETY: created above and no longer referenced.
         drop(unsafe { Box::from_raw(ctx) });
         self.thread_ended(thread, reason, cpu);
@@ -1310,6 +1344,9 @@ impl Kernel {
     /// main thread.
     pub fn start(self: &Arc<Kernel>, cfg: &super::process::StartConfig) -> KResult<()> {
         rt().set_svc_handler(Some(super::svc::svc_entry));
+        if let Some(limit) = super::watchdog::requested() {
+            super::watchdog::spawn(Arc::clone(self), limit);
+        }
         let main = self.prepare(cfg)?;
         let r = self.start_thread(main);
         if r.is_success() {

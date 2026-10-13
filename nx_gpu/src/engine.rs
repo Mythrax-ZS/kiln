@@ -476,6 +476,7 @@ impl Engine {
             .get_mut(method as usize)
             .ok_or_else(|| format!("method {method:#x} is outside the engine"))?;
         *slot = data;
+        crate::progress::method();
         if traced_register(self.class, method) {
             eprintln!(
                 "[gpu] {} {} = {data:#x} (draw {} so far{})",
@@ -549,6 +550,7 @@ impl Engine {
             mem: cx.mem,
             space: cx.space,
         };
+        let _phase = crate::progress::enter(crate::progress::DISPATCHING);
         match backend.dispatch(&scene, &dispatch) {
             Ok(()) => Ok(()),
             Err(why) => cx.renderer_failed("a compute launch", why),
@@ -776,6 +778,8 @@ impl Engine {
             mem: cx.mem,
             space: cx.space,
         };
+        crate::progress::command();
+        let _phase = crate::progress::enter(crate::progress::DRAWING);
         match backend.draw(&scene, &draw) {
             Ok(()) => Ok(()),
             Err(why) => cx.renderer_failed("a draw", why),
@@ -794,6 +798,8 @@ impl Engine {
             mem: cx.mem,
             space: cx.space,
         };
+        crate::progress::command();
+        let _phase = crate::progress::enter(crate::progress::CLEARING);
         match backend.clear(&scene, &Clear::from_word(word)) {
             Ok(()) => Ok(()),
             Err(why) => cx.renderer_failed("a clear", why),

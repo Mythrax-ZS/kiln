@@ -483,6 +483,11 @@ pub fn frames_presented(total: u64) {
     FRAMES.store(total, Ordering::Relaxed);
 }
 
+/// The number of frames the display has presented so far (what the watchdog looks at).
+pub fn frames() -> u64 {
+    FRAMES.load(Ordering::Relaxed)
+}
+
 /// `NX_INPUT_SCRIPT`: the script it holds (the contents of the file, if it names one), read once.
 /// One that cannot be understood is said so and left out.
 fn script() -> &'static Script {

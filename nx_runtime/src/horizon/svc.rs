@@ -116,8 +116,17 @@ pub extern "C" fn svc_entry(cpu: *mut NativeCpu, imm: u32) -> i32 {
         return 1;
     }
     // SAFETY: set by `Kernel::run_on` and alive for the whole run.
-    let (kernel, thread) = unsafe { (Arc::clone(&(*ctx).kernel), (*ctx).thread) };
-    i32::from(kernel.svc(cpu, thread, imm) == Flow::Stop)
+    let (kernel, thread, monitor) = unsafe {
+        (
+            Arc::clone(&(*ctx).kernel),
+            (*ctx).thread,
+            Arc::clone(&(*ctx).monitor),
+        )
+    };
+    monitor.enter(imm, &cpu.state.x);
+    let flow = kernel.svc(cpu, thread, imm);
+    monitor.leave();
+    i32::from(flow == Flow::Stop)
 }
 
 fn w(x: u64) -> u32 {

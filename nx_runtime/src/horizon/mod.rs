@@ -26,6 +26,7 @@ pub mod sm;
 pub mod svc;
 #[cfg(test)]
 mod tests;
+pub mod watchdog;
 
 pub use kernel::{Exit, Kernel, ProcessInfo, ProcessKind};
 pub use process::{Segment, StartConfig};

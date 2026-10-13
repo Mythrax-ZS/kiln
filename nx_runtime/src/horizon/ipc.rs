@@ -306,7 +306,7 @@ impl Kernel {
             return Ok(err::INVALID_HANDLE);
         };
         let receive_list = msg.receive_list.clone();
-        let routed = self.route(&session, msg, copies, moves);
+        let routed = self.route(current, &session, msg, copies, moves);
         let (response, domain, object_ids) = match routed {
             Routed::Stop(s) => return Err(s),
             Routed::Reply(r, domain) => {
@@ -362,6 +362,7 @@ impl Kernel {
     /// Dispatch a parsed message to the object it names.
     fn route(
         &self,
+        current: u64,
         session: &SessionRef,
         msg: Message,
         copies: Vec<KObject>,
@@ -442,6 +443,9 @@ impl Kernel {
                         None => return Routed::Reply(Response::error(err::INVALID_HANDLE), domain),
                     }
                 };
+                self.note(current, || {
+                    format!("`{}` command {}", service.name(), req.command)
+                });
                 let answer = service.request(&req);
                 if self.trace {
                     trace_request(service.name(), &req, &answer);
