@@ -7,10 +7,10 @@
 
 use super::shaders::{bindings_of, Binding, Program};
 use super::Core;
+use crate::fast::FastMap;
 use ash::vk;
 use nx_gpu::compute::Dispatch;
 use nx_gpu::render::Scene;
-use std::collections::HashMap;
 
 /// The constant buffer slot that holds the handles of the textures a compute program names (the
 /// title puts them there for a launch as it does for a draw).
@@ -19,7 +19,7 @@ const TEXTURE_TABLE: u32 = 2;
 /// Compute pipelines by the program and the layout they were made for.
 #[derive(Default)]
 pub struct ComputePipelines {
-    map: HashMap<(u64, Vec<Binding>), vk::Pipeline>,
+    map: FastMap<(u64, Vec<Binding>), vk::Pipeline>,
 }
 
 impl ComputePipelines {

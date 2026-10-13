@@ -2,13 +2,13 @@
 //! layouts they need.
 
 use crate::device::Vk;
+use crate::fast::FastMap;
 use ash::vk;
 use nx_gpu::render::Scene;
 use nx_gpu::state::{StageKind, StageSlot};
 use nx_shader::cfg::{Cfg, Code};
 use nx_shader::sph::{Sph, SPH_BYTES};
 use nx_shader::translate::{translate, Class, Config, Info, Stage};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// How much of GPU memory after a program's start is read to find its end.
@@ -54,7 +54,7 @@ struct Entry {
     hash: u64,
     sph: Sph,
     code: Vec<u8>,
-    variations: HashMap<Variation, Arc<Program>>,
+    variations: FastMap<Variation, Arc<Program>>,
 }
 
 /// A compute program found in GPU memory (it has no header), translated for a workgroup size.
@@ -66,9 +66,9 @@ struct KernelEntry {
 }
 
 pub struct Shaders {
-    entries: HashMap<u64, Entry>,
+    entries: FastMap<u64, Entry>,
     /// Compute programs by (address, workgroup size).
-    kernels: HashMap<(u64, [u32; 3]), KernelEntry>,
+    kernels: FastMap<(u64, [u32; 3]), KernelEntry>,
     next_id: u64,
     /// `NX_SPIRV_CHECK`: validate each translation.
     spirv_check: bool,
@@ -107,8 +107,8 @@ const TRIVIAL_VERTEX: &[u32] = &[
 impl Shaders {
     pub fn new(debug: &super::Debug) -> Shaders {
         Shaders {
-            entries: HashMap::new(),
-            kernels: HashMap::new(),
+            entries: FastMap::default(),
+            kernels: FastMap::default(),
             next_id: 0,
             spirv_check: debug.spirv_check,
             solid_pixel: debug.solid_pixel,
@@ -213,7 +213,7 @@ impl Shaders {
                     hash: scene.hash(slot.address, size as u64).0,
                     sph,
                     code,
-                    variations: HashMap::new(),
+                    variations: FastMap::default(),
                 })
             }
         };
@@ -392,7 +392,7 @@ pub fn bindings_of(programs: &[&Program]) -> Vec<Binding> {
 /// A descriptor set layout and the pipeline layout around it, by the bindings they hold.
 #[derive(Default)]
 pub struct Layouts {
-    map: HashMap<Vec<Binding>, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
+    map: FastMap<Vec<Binding>, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
 }
 
 impl Layouts {

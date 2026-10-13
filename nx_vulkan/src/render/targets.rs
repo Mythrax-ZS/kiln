@@ -4,10 +4,10 @@
 use super::frame::{Frame, Garbage};
 use crate::blocklinear::{swizzle, Geometry};
 use crate::device::Vk;
+use crate::fast::FastMap;
 use crate::image::{aspect_of, Image, ImageInfo};
 use ash::vk;
 use nx_gpu::mem::GuestMemory;
-use std::collections::HashMap;
 
 /// How the memory a target stands for is laid out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -147,10 +147,10 @@ impl Target {
 /// All the targets made so far.
 #[derive(Default)]
 pub struct Targets {
-    map: HashMap<Key, Target>,
+    map: FastMap<Key, Target>,
     /// The target at each guest address (one at a time: a new shape retires the old one), so that
     /// a texture's memory finds its targets without looking at all of them.
-    by_address: std::collections::BTreeMap<u64, Key>,
+    by_address: std::collections::BTreeMap<u64, Placed>,
     /// The most memory any target stands for: no target that overlaps an address starts further
     /// below it than this.
     largest: u64,
@@ -160,6 +160,16 @@ pub struct Targets {
     next_serial: u64,
     /// What writing targets back to memory cost since the last report.
     pub write_backs: WriteBacks,
+}
+
+/// What the address index keeps of a target, so that finding the targets of some memory looks at
+/// numbers and not at the map of targets.
+#[derive(Clone, Copy, Debug)]
+struct Placed {
+    key: Key,
+    /// The memory the target stands for (0 when its format's texel size is not known).
+    bytes: u64,
+    color: bool,
 }
 
 /// A color target that overlaps some memory.
@@ -244,8 +254,16 @@ impl Targets {
                 }
             }
             self.map.insert(key, target);
-            self.by_address.insert(key.address, key);
-            self.largest = self.largest.max(key.memory_bytes().unwrap_or(0));
+            let bytes = key.memory_bytes().unwrap_or(0);
+            self.by_address.insert(
+                key.address,
+                Placed {
+                    key,
+                    bytes,
+                    color: aspect_of(key.format) == vk::ImageAspectFlags::COLOR,
+                },
+            );
+            self.largest = self.largest.max(bytes);
         }
         let submissions = self.submissions;
         self.next_serial += 1;
@@ -259,15 +277,15 @@ impl Targets {
 
     /// The color target standing for the guest memory at `address`, if one was drawn to.
     pub fn at_address(&mut self, address: u64) -> Option<&mut Target> {
-        let key = self.by_address.get(&address)?;
-        let t = self.map.get_mut(key)?;
+        let placed = self.by_address.get(&address)?;
+        let t = self.map.get_mut(&placed.key)?;
         (aspect_of(t.key.format) == vk::ImageAspectFlags::COLOR).then_some(t)
     }
 
     /// The depth target standing for the guest memory at `address`, if one was drawn to.
     pub fn depth_at_address(&mut self, address: u64) -> Option<&mut Target> {
-        let key = self.by_address.get(&address)?;
-        let t = self.map.get_mut(key)?;
+        let placed = self.by_address.get(&address)?;
+        let t = self.map.get_mut(&placed.key)?;
         (aspect_of(t.key.format) != vk::ImageAspectFlags::COLOR).then_some(t)
     }
 
@@ -275,20 +293,20 @@ impl Targets {
     /// in the order they were drawn to.
     pub fn covering(&self, start: u64, end: u64) -> Vec<Covering> {
         let from = start.saturating_sub(self.largest);
-        let mut found: Vec<Covering> = self
-            .by_address
-            .range(from..end)
-            .filter_map(|(_, key)| self.map.get(key))
-            .filter(|t| aspect_of(t.key.format) == vk::ImageAspectFlags::COLOR)
-            .filter_map(|t| {
-                let bytes = t.key.memory_bytes()?;
-                (t.key.address < end && t.key.address + bytes > start).then_some(Covering {
+        let mut found: Vec<Covering> = Vec::new();
+        for (&address, placed) in self.by_address.range(from..end) {
+            // Most of the targets in the range are further away than the texture reaches.
+            if !placed.color || placed.bytes == 0 || address + placed.bytes <= start {
+                continue;
+            }
+            if let Some(t) = self.map.get(&placed.key) {
+                found.push(Covering {
                     key: t.key,
                     serial: t.serial,
                     dirty: t.dirty,
-                })
-            })
-            .collect();
+                });
+            }
+        }
         found.sort_by_key(|c| c.serial);
         found
     }

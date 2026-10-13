@@ -10,11 +10,11 @@ use super::frame::{Frame, Garbage};
 use super::targets::{Key, Tiling};
 use crate::blocklinear::{deswizzle, Geometry};
 use crate::device::Vk;
+use crate::fast::FastMap;
 use crate::image::{aspect_of, Image, ImageInfo};
 use ash::vk;
 use nx_gpu::render::Scene;
 use nx_shader::translate::{Dim, TextureUse};
-use std::collections::HashMap;
 
 /// A texture header: eight words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -612,11 +612,12 @@ struct Texture {
     checked: u64,
     hash: u64,
     bytes: u64,
-    /// The value of [`Textures::generation`] when it was compared with memory.
-    generation: u64,
+    /// Where the memory it was made of is in the guest process (0 when that is not known), to
+    /// tell which textures a write of the renderer into memory touches.
+    cpu: u64,
     /// The render targets that stand for parts of the image, by how many times each was drawn to
     /// when its pixels were last copied into it.
-    overlays: HashMap<Key, u64>,
+    overlays: FastMap<Key, u64>,
     levels: u32,
     layers: u32,
 }
@@ -758,19 +759,19 @@ fn plan(tic: &Tic, shape: Shape, format: TexFormat) -> Result<Plan, String> {
 
 #[derive(Default)]
 pub struct Textures {
-    map: HashMap<(Tic, Shape), Texture>,
+    map: FastMap<(Tic, Shape), Texture>,
     /// Samplers by header and by whether the shader compares against a depth.
-    samplers: HashMap<(Tsc, bool), vk::Sampler>,
+    samplers: FastMap<(Tsc, bool), vk::Sampler>,
     /// The number of buffers shown so far: a texture is compared with memory once per frame.
     pub frame: u64,
     /// Say what each new image is made of (`NX_TRACE_TEXTURES`).
     pub trace: bool,
-    /// Counts the times memory was written by the renderer itself (a render target put into it): a
-    /// texture compared with memory before that is compared again.
-    pub generation: u64,
     /// How many bytes of memory a texture takes (see [`Textures::span`]), by header and shape.
-    spans: HashMap<(Tic, Shape), Option<u64>>,
+    spans: FastMap<(Tic, Shape), Option<u64>>,
 }
+
+/// A texture's `checked` that matches no frame: it is compared with memory again.
+const UNCHECKED: u64 = u64::MAX;
 
 /// Everything a draw needs of a texture.
 pub struct Bound {
@@ -901,7 +902,7 @@ impl Textures {
         let current = self.frame;
         let key = (tic, shape);
         if let Some(t) = self.map.get(&key) {
-            if t.checked == current && t.generation == self.generation {
+            if t.checked == current {
                 return Ok(t.image.view);
             }
         }
@@ -944,7 +945,6 @@ impl Textures {
         if let Some(t) = self.map.get_mut(&key) {
             if t.hash == hash {
                 t.checked = current;
-                t.generation = self.generation;
                 return Ok(t.image.view);
             }
             // The contents changed: the old image goes once the submission is over.
@@ -1109,13 +1109,24 @@ impl Textures {
                 checked: current,
                 hash,
                 bytes: total,
-                generation: self.generation,
-                overlays: HashMap::new(),
+                cpu: scene.host_address(tic.address()).map_or(0, |(cpu, _)| cpu),
+                overlays: FastMap::default(),
                 levels,
                 layers,
             },
         );
         Ok(view)
+    }
+
+    /// The renderer wrote `[start, end)` of the guest process's memory (a render target put into
+    /// it): the textures made of memory there are compared with it again when next used, the
+    /// others keep what they were found to be this frame.
+    pub fn memory_written(&mut self, start: u64, end: u64) {
+        for t in self.map.values_mut() {
+            if t.cpu == 0 || (t.cpu < end && t.cpu + t.bytes > start) {
+                t.checked = UNCHECKED;
+            }
+        }
     }
 
     pub fn destroy(&mut self, vk: &Vk) {

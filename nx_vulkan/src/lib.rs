@@ -7,6 +7,7 @@ pub mod astc;
 pub mod blocklinear;
 pub mod compute;
 pub mod device;
+pub mod fast;
 pub mod formats;
 pub mod image;
 pub mod input;

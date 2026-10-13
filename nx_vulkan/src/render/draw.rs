@@ -5,12 +5,12 @@ use super::convert::Topology;
 use super::shaders::{bindings_of, Program, Variation};
 use super::textures::{texture_format, Copy, Overlay, Tic, Tsc};
 use super::Core;
+use crate::fast::FastMap;
 use ash::vk;
 use nx_gpu::draw_state::{Blend, DepthStencil, Raster, StencilFace};
 use nx_gpu::render::{Draw, Scene, Source};
 use nx_gpu::state::{StageKind, StageSlot};
 use nx_shader::translate::{Class, Dim, Stage, TextureUse};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -52,7 +52,7 @@ struct BlendKey {
 
 #[derive(Default)]
 pub struct Pipelines {
-    map: HashMap<PipelineKey, vk::Pipeline>,
+    map: FastMap<PipelineKey, vk::Pipeline>,
 }
 
 impl Pipelines {
@@ -668,7 +668,11 @@ impl Core {
         self.end_pass();
         self.targets
             .write_back(&self.vk, &mut self.frame, scene.mem, &keys)?;
-        self.textures.generation += 1;
+        for key in &keys {
+            let start = key.address;
+            self.textures
+                .memory_written(start, start + key.memory_bytes().unwrap_or(u64::MAX / 2));
+        }
         if self.debug.trace_textures {
             eprintln!(
                 "[vulkan] {} render targets written to the memory of the texture at {:#x} ({bytes} bytes)",
