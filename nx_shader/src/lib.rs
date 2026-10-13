@@ -15,3 +15,5 @@ pub mod inst;
 pub mod ops;
 pub mod sph;
 pub mod spirv;
+pub mod translate;
+pub mod validate;

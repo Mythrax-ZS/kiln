@@ -518,10 +518,15 @@ impl Module {
         })
     }
 
-    pub fn ty_runtime_array(&mut self, elem: Id) -> Id {
-        self.cached_type(TypeKey::RuntimeArray(elem), op::TYPE_RUNTIME_ARRAY, |id| {
-            vec![id, elem]
-        })
+    /// A runtime array of `elem`, with its `ArrayStride` decoration (made once).
+    pub fn ty_runtime_array(&mut self, elem: Id, stride: u32) -> Id {
+        let key = TypeKey::RuntimeArray(elem);
+        if let Some(id) = self.types.get(&key) {
+            return *id;
+        }
+        let id = self.cached_type(key, op::TYPE_RUNTIME_ARRAY, |id| vec![id, elem]);
+        self.decorate(id, deco::ARRAY_STRIDE, &[stride]);
+        id
     }
 
     pub fn ty_function(&mut self, ret: Id, params: &[Id]) -> Id {
@@ -710,6 +715,16 @@ impl Function {
             &[ptr, id, storage::FUNCTION],
         );
         id
+    }
+
+    /// A local variable with an initializer (a constant), hoisted to the start of the entry block.
+    /// `pointer_type` must be a pointer to the variable's type in the `Function` storage class.
+    pub fn local_with_init(&mut self, pointer_type: Id, id: Id, init: Id) {
+        encode(
+            &mut self.variables,
+            op::VARIABLE,
+            &[pointer_type, id, storage::FUNCTION, init],
+        );
     }
 
     /// An instruction without a result.
