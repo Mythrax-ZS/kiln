@@ -23,6 +23,7 @@ pub(crate) mod alu;
 mod emit;
 mod flow;
 mod global;
+mod int;
 mod io;
 mod tex;
 

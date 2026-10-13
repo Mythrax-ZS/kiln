@@ -2,110 +2,12 @@
 //! results are compared with what plain Rust arithmetic gives. Skipped (loudly) without Vulkan or
 //! without `spirv-val`.
 
-use nx_shader::asm::{assemble, bra, exit, Enc, P0};
-use nx_shader::cfg::Code;
+mod common;
+
+use common::{random_states, run, vulkan, Rng, State};
+use nx_shader::asm::{bra, exit, Enc, P0};
 use nx_shader::inst::Guard;
 use nx_shader::ops::Op;
-use nx_shader::translate::{test_bindings as tb, translate, Config, Stage};
-use nx_vulkan::Vk;
-
-fn vulkan() -> Option<Vk> {
-    match Vk::new() {
-        Ok(v) => Some(v),
-        Err(e) => {
-            if std::env::var("RECOMP_REQUIRE_EXTERNAL").is_ok_and(|v| v == "1") {
-                panic!("no Vulkan device and RECOMP_REQUIRE_EXTERNAL=1: {e}");
-            }
-            eprintln!("SKIPPED: no Vulkan device: {e}");
-            None
-        }
-    }
-}
-
-/// A small deterministic generator for test inputs.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u32 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 >> 16) as u32
-    }
-}
-
-/// The registers (and predicates) of one invocation.
-#[derive(Clone, Copy, Default)]
-struct State {
-    regs: [u32; 15],
-    preds: u32,
-}
-
-/// Run `program` once per element of `inputs` and return the final states. `cbuf0` is bound as
-/// constant buffer 0.
-fn run(vk: &Vk, program: &[u64], inputs: &[State], cbuf0: &[u32]) -> Vec<State> {
-    let bytes = assemble(program);
-    let t = translate(Code(&bytes), None, &Config::new(Stage::Compute))
-        .unwrap_or_else(|e| panic!("translation failed: {e}"));
-    nx_shader::validate::assert_valid(&t.spirv);
-    let n = inputs.len();
-    let mut regs_in = Vec::with_capacity(n * 16 * 4);
-    for s in inputs {
-        for r in s.regs {
-            regs_in.extend_from_slice(&r.to_le_bytes());
-        }
-        regs_in.extend_from_slice(&s.preds.to_le_bytes());
-    }
-    let mut regs_out = vec![0u8; n * 16 * 4];
-    let mut attr_in = vec![0u8; n * tb::ATTRS as usize * 4];
-    let mut attr_out = vec![0u8; n * tb::ATTRS as usize * 4];
-    let mut c0: Vec<u8> = cbuf0.iter().flat_map(|w| w.to_le_bytes()).collect();
-    c0.resize(c0.len().max(4096), 0);
-    let cbuf_binding = 64 * Stage::Compute.index();
-    vk.run_compute(
-        &t.spirv,
-        &mut [
-            (tb::REGS_IN, &mut regs_in),
-            (tb::REGS_OUT, &mut regs_out),
-            (tb::ATTR_IN, &mut attr_in),
-            (tb::ATTR_OUT, &mut attr_out),
-            (cbuf_binding, &mut c0),
-        ],
-        [n as u32, 1, 1],
-    )
-    .unwrap();
-    (0..n)
-        .map(|i| {
-            let word = |j: usize| {
-                u32::from_le_bytes(
-                    regs_out[(i * 16 + j) * 4..(i * 16 + j) * 4 + 4]
-                        .try_into()
-                        .unwrap(),
-                )
-            };
-            let mut s = State::default();
-            for (j, r) in s.regs.iter_mut().enumerate() {
-                *r = word(j);
-            }
-            s.preds = word(15);
-            s
-        })
-        .collect()
-}
-
-fn random_states(n: usize, seed: u64) -> Vec<State> {
-    let mut rng = Rng(seed | 1);
-    (0..n)
-        .map(|_| {
-            let mut s = State::default();
-            for r in s.regs.iter_mut() {
-                *r = rng.next();
-            }
-            s.preds = rng.next() & 0x7F;
-            s
-        })
-        .collect()
-}
 
 #[test]
 fn integer_arithmetic_matches_rust() {
@@ -338,5 +240,785 @@ fn float_to_integer_conversions_saturate() {
         // hardware does too.
         assert_eq!(got.regs[7], r as u32, "u32 of {v}");
         assert_eq!(got.regs[8], r as i32 as u32, "s32 of {v}");
+    }
+}
+
+// ---- comparisons, selection and minimum / maximum --------------------------------------------
+
+/// Values with the awkward cases in: zeros, infinities, NaN, equal and near values.
+fn float_pool() -> Vec<f32> {
+    vec![
+        0.0,
+        1.0,
+        -1.0,
+        0.5,
+        -2.5,
+        3.0,
+        100.25,
+        -100.25,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        1.000_000_1,
+    ]
+}
+
+fn pair_states(values: &[f32]) -> Vec<State> {
+    let mut out = Vec::new();
+    for a in values {
+        for b in values {
+            let mut s = State::default();
+            s.regs[1] = a.to_bits();
+            s.regs[2] = b.to_bits();
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// The 4-bit comparison of `FSETP`/`FSET`.
+fn fcmp(code: u32, a: f32, b: f32) -> bool {
+    let unordered = a.is_nan() || b.is_nan();
+    match code {
+        0 => false,
+        1 => a < b,
+        2 => a == b,
+        3 => a <= b,
+        4 => a > b,
+        5 => !unordered && a != b,
+        6 => a >= b,
+        7 => !unordered,
+        8 => unordered,
+        9 => unordered || a < b,
+        10 => unordered || a == b,
+        11 => unordered || a <= b,
+        12 => unordered || a > b,
+        13 => unordered || a != b,
+        14 => unordered || a >= b,
+        _ => true,
+    }
+}
+
+fn bool_op(code: u32, a: bool, b: bool) -> bool {
+    match code {
+        0 => a && b,
+        1 => a || b,
+        _ => a != b,
+    }
+}
+
+#[test]
+fn float_comparisons_set_predicates_and_registers() {
+    let Some(vk) = vulkan() else { return };
+    let inputs = pair_states(&float_pool());
+    for code in 0..16u32 {
+        for bop in 0..3u32 {
+            // FSETP.cmp.bop P0, P1, R1, R2, P2 and FSET.cmp.bop R3, R1, R2, P2 (bf: 1.0 for true).
+            let program = [
+                Enc::op(Op::FsetpReg)
+                    .ra(1)
+                    .rb(2)
+                    .field(0, 3, 1)
+                    .field(3, 3, 0)
+                    .field(48, 4, u64::from(code))
+                    .field(45, 2, u64::from(bop))
+                    .pred(39, 2, false)
+                    .build(),
+                Enc::op(Op::FsetReg)
+                    .rd(3)
+                    .ra(1)
+                    .rb(2)
+                    .field(48, 4, u64::from(code))
+                    .field(45, 2, u64::from(bop))
+                    .bit(52, true)
+                    .pred(39, 2, false)
+                    .build(),
+                Enc::op(Op::FsetReg)
+                    .rd(4)
+                    .ra(1)
+                    .rb(2)
+                    .field(48, 4, u64::from(code))
+                    .field(45, 2, u64::from(bop))
+                    .pred(39, 2, false)
+                    .build(),
+                exit(Guard::ALWAYS),
+            ];
+            for pc in [false, true] {
+                let mut states = inputs.clone();
+                for s in &mut states {
+                    s.preds = if pc { 4 } else { 0 };
+                }
+                let out = run(&vk, &program, &states, &[]);
+                for (inp, got) in states.iter().zip(&out) {
+                    let (a, b) = (f32::from_bits(inp.regs[1]), f32::from_bits(inp.regs[2]));
+                    let c = fcmp(code, a, b);
+                    let msg = format!("cmp {code} bop {bop} pc {pc} on {a} and {b}");
+                    assert_eq!(got.preds & 1 != 0, bool_op(bop, c, pc), "P0, {msg}");
+                    assert_eq!(got.preds & 2 != 0, bool_op(bop, !c, pc), "P1, {msg}");
+                    let t = bool_op(bop, c, pc);
+                    assert_eq!(
+                        got.regs[3],
+                        if t { 1.0f32.to_bits() } else { 0 },
+                        "FSET.BF, {msg}"
+                    );
+                    assert_eq!(got.regs[4], if t { u32::MAX } else { 0 }, "FSET, {msg}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn float_modifiers_apply_to_comparisons_and_extremes() {
+    let Some(vk) = vulkan() else { return };
+    let inputs = pair_states(&float_pool());
+    // FSETP.LT with |Ra| and -Rb; FMNMX min and max with -Ra and |Rb|.
+    let program = [
+        Enc::op(Op::FsetpReg)
+            .ra(1)
+            .rb(2)
+            .field(0, 3, 1)
+            .field(3, 3, 0)
+            .field(48, 4, 1)
+            .pred(39, 7, false)
+            .bit(7, true)
+            .bit(6, true)
+            .build(),
+        Enc::op(Op::FmnmxReg)
+            .rd(3)
+            .ra(1)
+            .rb(2)
+            .pred(39, 7, false)
+            .bit(48, true)
+            .bit(49, true)
+            .build(),
+        Enc::op(Op::FmnmxReg)
+            .rd(4)
+            .ra(1)
+            .rb(2)
+            .pred(39, 7, true)
+            .bit(48, true)
+            .bit(49, true)
+            .build(),
+        exit(Guard::ALWAYS),
+    ];
+    let out = run(&vk, &program, &inputs, &[]);
+    for (inp, got) in inputs.iter().zip(&out) {
+        let (a, b) = (f32::from_bits(inp.regs[1]), f32::from_bits(inp.regs[2]));
+        let msg = format!("on {a} and {b}");
+        assert_eq!(got.preds & 1 != 0, a.abs() < -b, "FSETP.LT |a|, -b, {msg}");
+        // A NaN operand yields the other one; two NaNs give NaN.
+        let (x, y) = (-a, b.abs());
+        let lo = x.min(y);
+        let hi = x.max(y);
+        let (glo, ghi) = (f32::from_bits(got.regs[3]), f32::from_bits(got.regs[4]));
+        if lo.is_nan() {
+            assert!(glo.is_nan() && ghi.is_nan(), "FMNMX of two NaNs, {msg}");
+        } else {
+            assert_eq!(glo, lo, "FMNMX min, {msg}");
+            assert_eq!(ghi, hi, "FMNMX max, {msg}");
+        }
+    }
+}
+
+#[test]
+fn integer_comparisons_selection_and_extremes() {
+    let Some(vk) = vulkan() else { return };
+    let mut inputs = random_states(300, 21);
+    // Equal and adjacent values, and the signed extremes.
+    for (a, b) in [
+        (5u32, 5u32),
+        (0, 0),
+        (u32::MAX, 0),
+        (0, u32::MAX),
+        (0x8000_0000, 0x7FFF_FFFF),
+        (1, 2),
+    ] {
+        let mut s = State::default();
+        s.regs[1] = a;
+        s.regs[2] = b;
+        inputs.push(s);
+    }
+    for signed in [false, true] {
+        for code in 0..8u32 {
+            for bop in 0..3u32 {
+                let program = [
+                    Enc::op(Op::IsetpReg)
+                        .ra(1)
+                        .rb(2)
+                        .field(0, 3, 1)
+                        .field(3, 3, 0)
+                        .field(49, 3, u64::from(code))
+                        .field(45, 2, u64::from(bop))
+                        .bit(48, signed)
+                        .pred(39, 2, false)
+                        .build(),
+                    Enc::op(Op::IsetReg)
+                        .rd(3)
+                        .ra(1)
+                        .rb(2)
+                        .field(49, 3, u64::from(code))
+                        .field(45, 2, u64::from(bop))
+                        .bit(48, signed)
+                        .bit(44, true)
+                        .pred(39, 2, false)
+                        .build(),
+                    exit(Guard::ALWAYS),
+                ];
+                let out = run(&vk, &program, &inputs, &[]);
+                for (inp, got) in inputs.iter().zip(&out) {
+                    let (a, b) = (inp.regs[1], inp.regs[2]);
+                    let ord = if signed {
+                        (a as i32).cmp(&(b as i32))
+                    } else {
+                        a.cmp(&b)
+                    };
+                    let c = match code {
+                        0 => false,
+                        1 => ord.is_lt(),
+                        2 => ord.is_eq(),
+                        3 => ord.is_le(),
+                        4 => ord.is_gt(),
+                        5 => ord.is_ne(),
+                        6 => ord.is_ge(),
+                        _ => true,
+                    };
+                    let pc = inp.preds & 4 != 0;
+                    let msg = format!("signed {signed} cmp {code} bop {bop} on {a:#x} and {b:#x}");
+                    assert_eq!(got.preds & 1 != 0, bool_op(bop, c, pc), "P0, {msg}");
+                    assert_eq!(got.preds & 2 != 0, bool_op(bop, !c, pc), "P1, {msg}");
+                    let t = bool_op(bop, c, pc);
+                    assert_eq!(
+                        got.regs[3],
+                        if t { 1.0f32.to_bits() } else { 0 },
+                        "ISET.BF, {msg}"
+                    );
+                }
+            }
+        }
+    }
+    // SEL and IMNMX.
+    for signed in [false, true] {
+        let program = [
+            Enc::op(Op::SelReg)
+                .rd(3)
+                .ra(1)
+                .rb(2)
+                .pred(39, 2, false)
+                .build(),
+            Enc::op(Op::SelReg)
+                .rd(4)
+                .ra(1)
+                .rb(2)
+                .pred(39, 2, true)
+                .build(),
+            Enc::op(Op::ImnmxReg)
+                .rd(5)
+                .ra(1)
+                .rb(2)
+                .pred(39, 7, false)
+                .bit(48, signed)
+                .build(),
+            Enc::op(Op::ImnmxReg)
+                .rd(6)
+                .ra(1)
+                .rb(2)
+                .pred(39, 7, true)
+                .bit(48, signed)
+                .build(),
+            exit(Guard::ALWAYS),
+        ];
+        let out = run(&vk, &program, &inputs, &[]);
+        for (inp, got) in inputs.iter().zip(&out) {
+            let (a, b) = (inp.regs[1], inp.regs[2]);
+            let p2 = inp.preds & 4 != 0;
+            assert_eq!(got.regs[3], if p2 { a } else { b }, "SEL");
+            assert_eq!(
+                got.regs[4],
+                if p2 { b } else { a },
+                "SEL with the predicate negated"
+            );
+            let (lo, hi) = if signed {
+                (
+                    (a as i32).min(b as i32) as u32,
+                    (a as i32).max(b as i32) as u32,
+                )
+            } else {
+                (a.min(b), a.max(b))
+            };
+            assert_eq!(got.regs[5], lo, "IMNMX min, signed {signed}");
+            assert_eq!(got.regs[6], hi, "IMNMX max, signed {signed}");
+        }
+    }
+}
+
+#[test]
+fn predicate_logic_matches_rust() {
+    let Some(vk) = vulkan() else { return };
+    let inputs: Vec<State> = (0..128u32)
+        .map(|bits| State {
+            preds: bits,
+            ..State::default()
+        })
+        .collect();
+    for op1 in 0..3u32 {
+        for op2 in 0..3u32 {
+            // PSETP.op1.op2 P3, P4, P0, !P1, P2 and PSET.op1.op2.BF R3, P0, P1, !P2.
+            let program = [
+                Enc::op(Op::Psetp)
+                    .field(0, 3, 4)
+                    .field(3, 3, 3)
+                    .pred(12, 0, false)
+                    .pred(29, 1, true)
+                    .pred(39, 2, false)
+                    .field(24, 2, u64::from(op1))
+                    .field(45, 2, u64::from(op2))
+                    .build(),
+                Enc::op(Op::Pset)
+                    .rd(3)
+                    .pred(12, 0, false)
+                    .pred(29, 1, false)
+                    .pred(39, 2, true)
+                    .field(24, 2, u64::from(op1))
+                    .field(45, 2, u64::from(op2))
+                    .bit(44, true)
+                    .build(),
+                exit(Guard::ALWAYS),
+            ];
+            let out = run(&vk, &program, &inputs, &[]);
+            for (inp, got) in inputs.iter().zip(&out) {
+                let p = |i: u32| inp.preds >> i & 1 != 0;
+                let r3 = bool_op(op2, bool_op(op1, p(0), !p(1)), p(2));
+                let r4 = bool_op(op2, bool_op(op1, !p(0), !p(1)), p(2));
+                let msg = format!("ops {op1} {op2}, predicates {:#b}", inp.preds);
+                assert_eq!(got.preds >> 3 & 1 != 0, r3, "P3, {msg}");
+                assert_eq!(got.preds >> 4 & 1 != 0, r4, "P4, {msg}");
+                let s = bool_op(op2, bool_op(op1, p(0), p(1)), !p(2));
+                assert_eq!(
+                    got.regs[3],
+                    if s { 1.0f32.to_bits() } else { 0 },
+                    "PSET, {msg}"
+                );
+            }
+        }
+    }
+}
+
+// ---- shifts, bit fields and multiplication ---------------------------------------------------
+
+/// Random operands with the counts and bit-field descriptors that matter in R2.
+fn bit_states(seed: u64) -> Vec<State> {
+    let mut inputs = random_states(400, seed);
+    let mut rng = Rng(seed ^ 0x55);
+    for s in &mut inputs {
+        // Shift counts around the interesting range; field starts and lengths.
+        s.regs[3] = rng.next() % 40;
+        s.regs[4] = (rng.next() % 40) | (rng.next() % 40) << 8 | (rng.next() & 0xFFFF) << 16;
+    }
+    for v in [0u32, 1, u32::MAX, 0x8000_0000, 0x7FFF_FFFF, 0xFFFF_0000] {
+        for count in [0u32, 1, 31, 32, 33] {
+            let mut s = State::default();
+            s.regs[1] = v;
+            s.regs[3] = count;
+            s.regs[4] = count | 8 << 8;
+            inputs.push(s);
+        }
+    }
+    inputs
+}
+
+#[test]
+fn shifts_wrap_or_saturate_as_flagged() {
+    let Some(vk) = vulkan() else { return };
+    let inputs = bit_states(31);
+    let program = [
+        // SHL R5 = R1 << R3 (no wrap: counts of 32 and more give 0); SHL.W wraps the count.
+        Enc::op(Op::ShlReg).rd(5).ra(1).rb(3).build(),
+        Enc::op(Op::ShlReg).rd(6).ra(1).rb(3).bit(39, true).build(),
+        // SHR.U32 and SHR.S32 and their wrapping forms (bit 48 set means signed).
+        Enc::op(Op::ShrReg).rd(7).ra(1).rb(3).build(),
+        Enc::op(Op::ShrReg).rd(8).ra(1).rb(3).bit(48, true).build(),
+        Enc::op(Op::ShrReg).rd(9).ra(1).rb(3).bit(39, true).build(),
+        Enc::op(Op::ShrReg)
+            .rd(10)
+            .ra(1)
+            .rb(3)
+            .bit(39, true)
+            .bit(48, true)
+            .build(),
+        // SHR with the bits of the source reversed first.
+        Enc::op(Op::ShrReg).rd(11).ra(1).rb(3).bit(40, true).build(),
+        exit(Guard::ALWAYS),
+    ];
+    let out = run(&vk, &program, &inputs, &[]);
+    for (inp, got) in inputs.iter().zip(&out) {
+        let (a, n) = (inp.regs[1], inp.regs[3]);
+        let msg = format!("{a:#x} by {n}");
+        let wrap = n & 31;
+        assert_eq!(got.regs[5], if n >= 32 { 0 } else { a << n }, "SHL, {msg}");
+        assert_eq!(got.regs[6], a << wrap, "SHL.W, {msg}");
+        assert_eq!(
+            got.regs[7],
+            if n >= 32 { 0 } else { a >> n },
+            "SHR.U32, {msg}"
+        );
+        assert_eq!(
+            got.regs[8],
+            ((a as i32) >> n.min(31)) as u32,
+            "SHR.S32, {msg}"
+        );
+        assert_eq!(got.regs[9], a >> wrap, "SHR.U32.W, {msg}");
+        assert_eq!(
+            got.regs[10],
+            ((a as i32) >> wrap) as u32,
+            "SHR.S32.W, {msg}"
+        );
+        let rev = a.reverse_bits();
+        assert_eq!(
+            got.regs[11],
+            if n >= 32 { 0 } else { rev >> n },
+            "SHR.BREV, {msg}"
+        );
+    }
+}
+
+/// `BFE` as the PTX `bfe` instruction defines it, for a start below 32.
+fn bfe_model(a: u32, start: u32, len: u32, signed: bool) -> u32 {
+    // Bits past the end of the word, and past the length, take the sign bit of the field.
+    let sbit = signed && len > 0 && a >> (start + len - 1).min(31) & 1 != 0;
+    (0..32).fold(0u32, |d, i| {
+        let bit = if i < len && start + i <= 31 {
+            a >> (start + i) & 1 != 0
+        } else {
+            sbit
+        };
+        d | u32::from(bit) << i
+    })
+}
+
+#[test]
+fn bit_fields_population_and_leading_bits() {
+    let Some(vk) = vulkan() else { return };
+    let mut inputs = bit_states(32);
+    // Descriptors with a start below 32 (the model's domain).
+    for s in &mut inputs {
+        s.regs[4] = (s.regs[4] & 0x1F) | (s.regs[4] >> 8 & 0x3F) << 8;
+    }
+    let program = [
+        Enc::op(Op::BfeReg).rd(5).ra(1).rb(4).build(),
+        Enc::op(Op::BfeReg).rd(6).ra(1).rb(4).bit(48, true).build(),
+        Enc::op(Op::PopcReg).rd(7).rb(1).build(),
+        Enc::op(Op::PopcReg).rd(8).rb(1).bit(40, true).build(),
+        Enc::op(Op::FloReg).rd(9).rb(1).build(),
+        Enc::op(Op::FloReg).rd(10).rb(1).bit(48, true).build(),
+        Enc::op(Op::FloReg).rd(11).rb(1).bit(41, true).build(),
+        Enc::op(Op::FloReg)
+            .rd(12)
+            .rb(1)
+            .bit(48, true)
+            .bit(41, true)
+            .build(),
+        exit(Guard::ALWAYS),
+    ];
+    let out = run(&vk, &program, &inputs, &[]);
+    for (inp, got) in inputs.iter().zip(&out) {
+        let a = inp.regs[1];
+        let (start, len) = (inp.regs[4] & 0xFF, inp.regs[4] >> 8 & 0xFF);
+        let msg = format!("{a:#x}, field {start}+{len}");
+        // Bit 48 set is the signed form: R5 is BFE.U32 and R6 BFE.S32.
+        assert_eq!(
+            got.regs[5],
+            bfe_model(a, start, len, false),
+            "BFE.U32, {msg}"
+        );
+        assert_eq!(
+            got.regs[6],
+            bfe_model(a, start, len, true),
+            "BFE.S32, {msg}"
+        );
+        assert_eq!(got.regs[7], a.count_ones(), "POPC, {msg}");
+        assert_eq!(got.regs[8], (!a).count_ones(), "POPC.INV, {msg}");
+        // FLO: the position of the highest set bit; for the signed form, of the highest bit that
+        // differs from the sign; all ones when there is none.
+        let unsigned_pos = if a == 0 {
+            u32::MAX
+        } else {
+            31 - a.leading_zeros()
+        };
+        let signed_pos = if a == 0 || a == u32::MAX {
+            u32::MAX
+        } else {
+            let x = if (a as i32) < 0 { !a } else { a };
+            31 - x.leading_zeros()
+        };
+        assert_eq!(got.regs[9], unsigned_pos, "FLO.U32, {msg}");
+        assert_eq!(got.regs[10], signed_pos, "FLO.S32, {msg}");
+        let shift = |p: u32| if p == u32::MAX { u32::MAX } else { 31 - p };
+        assert_eq!(got.regs[11], shift(unsigned_pos), "FLO.U32.SH, {msg}");
+        assert_eq!(got.regs[12], shift(signed_pos), "FLO.S32.SH, {msg}");
+    }
+}
+
+#[test]
+fn integer_multiplication_low_and_high() {
+    let Some(vk) = vulkan() else { return };
+    let mut inputs = random_states(300, 41);
+    for (a, b) in [
+        (u32::MAX, u32::MAX),
+        (0x8000_0000, 0x8000_0000),
+        (0x8000_0000, u32::MAX),
+        (0, u32::MAX),
+        (0xFFFF, 0xFFFF),
+    ] {
+        let mut s = State::default();
+        s.regs[1] = a;
+        s.regs[2] = b;
+        inputs.push(s);
+    }
+    let program = [
+        Enc::op(Op::ImulReg).rd(3).ra(1).rb(2).build(),
+        Enc::op(Op::ImulReg).rd(4).ra(1).rb(2).bit(39, true).build(),
+        Enc::op(Op::ImulReg)
+            .rd(5)
+            .ra(1)
+            .rb(2)
+            .bit(39, true)
+            .bit(40, true)
+            .bit(41, true)
+            .build(),
+        exit(Guard::ALWAYS),
+    ];
+    let out = run(&vk, &program, &inputs, &[]);
+    for (inp, got) in inputs.iter().zip(&out) {
+        let (a, b) = (inp.regs[1], inp.regs[2]);
+        let msg = format!("{a:#x} * {b:#x}");
+        assert_eq!(got.regs[3], a.wrapping_mul(b), "IMUL, {msg}");
+        assert_eq!(
+            got.regs[4],
+            ((u64::from(a) * u64::from(b)) >> 32) as u32,
+            "IMUL.U32.U32.HI, {msg}"
+        );
+        assert_eq!(
+            got.regs[5],
+            ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32,
+            "IMUL.S32.S32.HI, {msg}"
+        );
+    }
+}
+
+// ---- conversions and special functions -------------------------------------------------------
+
+#[test]
+fn integer_to_float_and_back_between_sizes() {
+    let Some(vk) = vulkan() else { return };
+    let mut inputs = random_states(300, 51);
+    for v in [
+        0u32,
+        1,
+        0xFF,
+        0x80,
+        0x7F,
+        0xFFFF,
+        0x8000,
+        0x7FFF,
+        u32::MAX,
+        0x8000_0000,
+    ] {
+        let mut s = State::default();
+        s.regs[1] = v;
+        inputs.push(s);
+    }
+    // I2F with the source taken as: u32, s32, u8 (byte 0), s8 (byte 1), u16 (half 1), s16, and
+    // s32 with the absolute value and with the negation.
+    let i2f = |rd: u8, size: u64, signed: bool, sel: u64| {
+        Enc::op(Op::I2fReg)
+            .rd(rd)
+            .rb(1)
+            .field(8, 2, 2)
+            .field(10, 2, size)
+            .bit(13, signed)
+            .field(41, 2, sel)
+    };
+    // I2I: the destination size and signedness, saturating or not, from a 32-bit source.
+    let i2i = |rd: u8, dsize: u64, dsigned: bool, sat: bool| {
+        Enc::op(Op::I2iReg)
+            .rd(rd)
+            .rb(1)
+            .field(8, 2, dsize)
+            .bit(12, dsigned)
+            .field(10, 2, 2)
+            .bit(13, true)
+            .bit(50, sat)
+    };
+    let program = [
+        i2f(3, 2, false, 0).build(),
+        i2f(4, 2, true, 0).build(),
+        i2f(5, 0, false, 0).build(),
+        i2f(6, 0, true, 1).build(),
+        i2f(7, 1, false, 2).build(),
+        i2f(8, 1, true, 0).build(),
+        i2f(9, 2, true, 0).bit(49, true).build(),
+        i2f(10, 2, true, 0).bit(45, true).build(),
+        i2i(11, 0, false, true).build(),
+        i2i(12, 0, true, true).build(),
+        i2i(13, 1, false, true).build(),
+        i2i(14, 1, true, true).build(),
+        exit(Guard::ALWAYS),
+    ];
+    let out = run(&vk, &program, &inputs, &[]);
+    for (inp, got) in inputs.iter().zip(&out) {
+        let a = inp.regs[1];
+        let msg = format!("{a:#x}");
+        let f = |r: usize| f32::from_bits(got.regs[r]);
+        assert_eq!(f(3), a as f32, "I2F.U32, {msg}");
+        assert_eq!(f(4), a as i32 as f32, "I2F.S32, {msg}");
+        assert_eq!(f(5), (a & 0xFF) as f32, "I2F.U8, {msg}");
+        assert_eq!(
+            f(6),
+            ((a >> 8) as u8 as i8) as f32,
+            "I2F.S8 of byte 1, {msg}"
+        );
+        assert_eq!(f(7), (a >> 16) as f32, "I2F.U16 of the high half, {msg}");
+        assert_eq!(f(8), (a as u16 as i16) as f32, "I2F.S16, {msg}");
+        assert_eq!(
+            f(9),
+            (a as i32).wrapping_abs() as u32 as i32 as f32,
+            "I2F.S32.ABS, {msg}"
+        );
+        assert_eq!(
+            f(10),
+            (a as i32).wrapping_neg() as f32,
+            "I2F.S32.NEG, {msg}"
+        );
+        // The saturating narrowing conversions read the source as signed 32-bit.
+        let s = a as i32;
+        assert_eq!(got.regs[11], s.clamp(0, 255) as u32, "I2I.U8.SAT, {msg}");
+        assert_eq!(got.regs[12], s.clamp(-128, 127) as u32, "I2I.S8.SAT, {msg}");
+        assert_eq!(got.regs[13], s.clamp(0, 65535) as u32, "I2I.U16.SAT, {msg}");
+        assert_eq!(
+            got.regs[14],
+            s.clamp(-32768, 32767) as u32,
+            "I2I.S16.SAT, {msg}"
+        );
+    }
+}
+
+#[test]
+fn float_to_float_rounding_modes() {
+    let Some(vk) = vulkan() else { return };
+    let mut values: Vec<f32> = vec![
+        0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 2.4, 2.6, -2.4, -2.6, 7.0, -7.0,
+    ];
+    let mut rng = Rng(61);
+    for _ in 0..100 {
+        values.push((rng.next() as f32 / u32::MAX as f32 - 0.5) * 2000.0);
+    }
+    let inputs: Vec<State> = values
+        .iter()
+        .map(|v| {
+            let mut s = State::default();
+            s.regs[1] = v.to_bits();
+            s
+        })
+        .collect();
+    // F2F with each rounding (bits 39..40 and 42: round 0b100, floor 0b101, ceil 0b110, trunc
+    // 0b111, pass 0b011), with the negation and the absolute value, and saturating.
+    let f2f = |rd: u8, mode: u64| {
+        Enc::op(Op::F2fReg)
+            .rd(rd)
+            .rb(1)
+            .field(8, 2, 2)
+            .field(10, 2, 2)
+            .field(39, 2, mode & 3)
+            .bit(42, mode & 4 != 0)
+    };
+    let program = [
+        f2f(3, 0b011).build(),
+        f2f(4, 0b100).build(),
+        f2f(5, 0b101).build(),
+        f2f(6, 0b110).build(),
+        f2f(7, 0b111).build(),
+        f2f(8, 0b100).bit(45, true).build(),
+        f2f(9, 0b111).bit(49, true).build(),
+        f2f(10, 0b011).bit(50, true).build(),
+        exit(Guard::ALWAYS),
+    ];
+    let out = run(&vk, &program, &inputs, &[]);
+    for (v, got) in values.iter().zip(&out) {
+        let f = |r: usize| f32::from_bits(got.regs[r]);
+        assert_eq!(f(3), *v, "pass, {v}");
+        assert_eq!(f(4), v.round_ties_even(), "round, {v}");
+        assert_eq!(f(5), v.floor(), "floor, {v}");
+        assert_eq!(f(6), v.ceil(), "ceil, {v}");
+        assert_eq!(f(7), v.trunc(), "trunc, {v}");
+        assert_eq!(f(8), (-v).round_ties_even(), "round of the negation, {v}");
+        assert_eq!(f(9), v.abs().trunc(), "trunc of the absolute value, {v}");
+        assert_eq!(f(10), v.clamp(0.0, 1.0), "saturate, {v}");
+    }
+}
+
+#[test]
+fn special_functions_are_close_to_the_exact_ones() {
+    let Some(vk) = vulkan() else { return };
+    let mut rng = Rng(71);
+    let mut values: Vec<f32> = vec![0.25, 0.5, 1.0, 2.0, 3.0, 10.0, 100.0, 1.5e-3, 12345.0];
+    for _ in 0..200 {
+        values.push(rng.next() as f32 / u32::MAX as f32 * 50.0 + 1e-3);
+    }
+    let inputs: Vec<State> = values
+        .iter()
+        .map(|v| {
+            let mut s = State::default();
+            s.regs[1] = v.to_bits();
+            s
+        })
+        .collect();
+    let mufu = |rd: u8, function: u64| Enc::op(Op::Mufu).rd(rd).ra(1).field(20, 4, function);
+    let program = [
+        mufu(3, 4).build(),                             // rcp
+        mufu(4, 5).build(),                             // rsq
+        mufu(5, 8).build(),                             // sqrt
+        mufu(6, 3).build(),                             // lg2
+        mufu(7, 4).bit(46, true).bit(48, true).build(), // rcp of -|x|
+        exit(Guard::ALWAYS),
+    ];
+    let out = run(&vk, &program, &inputs, &[]);
+    let close = |got: f32, want: f32, what: &str, x: f32| {
+        let tolerance = want.abs() * 1e-5 + 1e-6;
+        assert!(
+            (got - want).abs() <= tolerance,
+            "{what}({x}) = {got}, expected {want}"
+        );
+    };
+    for (x, got) in values.iter().zip(&out) {
+        let f = |r: usize| f32::from_bits(got.regs[r]);
+        close(f(3), 1.0 / x, "rcp", *x);
+        close(f(4), 1.0 / x.sqrt(), "rsq", *x);
+        close(f(5), x.sqrt(), "sqrt", *x);
+        close(f(6), x.log2(), "lg2", *x);
+        close(f(7), -1.0 / x, "rcp(-|x|)", *x);
+    }
+    // Sine, cosine and the base-2 exponential over their usual ranges.
+    let angles: Vec<f32> = (0..64).map(|i| -3.1 + 6.2 * i as f32 / 63.0).collect();
+    let inputs: Vec<State> = angles
+        .iter()
+        .map(|v| {
+            let mut s = State::default();
+            s.regs[1] = v.to_bits();
+            s
+        })
+        .collect();
+    let program = [
+        mufu(3, 1).build(), // sin
+        mufu(4, 0).build(), // cos
+        mufu(5, 2).build(), // ex2
+        exit(Guard::ALWAYS),
+    ];
+    let out = run(&vk, &program, &inputs, &[]);
+    for (x, got) in angles.iter().zip(&out) {
+        let f = |r: usize| f32::from_bits(got.regs[r]);
+        assert!((f(3) - x.sin()).abs() < 1e-3, "sin({x}) = {}", f(3));
+        assert!((f(4) - x.cos()).abs() < 1e-3, "cos({x}) = {}", f(4));
+        close(f(5), x.exp2(), "ex2", *x);
     }
 }

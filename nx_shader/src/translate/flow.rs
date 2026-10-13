@@ -1,7 +1,7 @@
 //! Blocks and control flow: the straight-line case, and the dispatch loop for the rest.
 
 use super::emit::{Tx, R};
-use super::{alu, io};
+use super::{alu, int, io};
 use crate::cfg::{Block, Cfg, Code, Term};
 use crate::inst::Inst;
 use crate::ops::Op;
@@ -165,6 +165,9 @@ fn instruction(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
         Op::Nop | Op::Ssy | Op::Pbk | Op::Pcnt | Op::Depbar | Op::Membar => Ok(()),
         _ => {
             if alu::translate(tx, inst, row.op)? {
+                return Ok(());
+            }
+            if int::translate(tx, inst, row.op)? {
                 return Ok(());
             }
             if io::translate(tx, inst, row.op)? {

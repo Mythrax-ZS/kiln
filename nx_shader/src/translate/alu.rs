@@ -55,7 +55,7 @@ pub(super) fn translate(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<bool> {
 
 /// The second source as 32 raw bits, from a register, a constant buffer or an immediate (the
 /// 20-bit form is sign-extended).
-fn src_b(tx: &mut Tx<'_>, inst: Inst) -> R<Id> {
+pub(super) fn src_b(tx: &mut Tx<'_>, inst: Inst) -> R<Id> {
     match inst.form() {
         Form::Reg => Ok(tx.read(inst.rb())),
         Form::Cbuf => tx.cbuf_word(inst.cbuf_index(), inst.cbuf_offset()),
@@ -97,7 +97,7 @@ fn fsat(tx: &mut Tx<'_>, v: Id) -> Id {
 }
 
 /// Refuse an instruction that writes the condition code (other than integer adds' carry).
-fn no_cc(tx: &Tx<'_>, inst: Inst, bit: u32) -> R<()> {
+pub(super) fn no_cc(tx: &Tx<'_>, inst: Inst, bit: u32) -> R<()> {
     if inst.bit(bit) {
         return tx.fail("an instruction that writes the condition code flags");
     }
@@ -339,7 +339,8 @@ fn fset(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
 
 /// `MUFU.op Rd, ±|Ra|`: the special functions.
 fn mufu(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
-    let a = tx.read_f(inst.rb());
+    // The operand is `Ra`; bits 20..23 hold the function, not a register.
+    let a = tx.read_f(inst.ra());
     let a = fmods(tx, a, inst.bit(48), inst.bit(46));
     let f = tx.t.f32;
     let mut r = match inst.bits(20, 4) {
@@ -619,7 +620,7 @@ fn i2i(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
 // ---- integer ------------------------------------------------------------------------------
 
 /// `a + b + carry_in`, with the carry out of the 32-bit addition.
-fn add_carry(tx: &mut Tx<'_>, a: Id, b: Id, carry_in: Option<Id>) -> (Id, Id) {
+pub(super) fn add_carry(tx: &mut Tx<'_>, a: Id, b: Id, carry_in: Option<Id>) -> (Id, Id) {
     let u = tx.t.u32;
     let pair = tx.m.ty_struct(&[u, u]);
     let one = tx.c32(1);
@@ -879,13 +880,14 @@ fn lop(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
     };
     tx.write(inst, inst.rd(), r);
     if !is32 {
-        // Bits 44..45: 1 sets the predicate (bits 48..50) true, 2 to "the result is zero", 3 to
-        // "the result is not zero".
+        // Bits 44..45: the predicate (bits 48..50, `PT` for none) becomes 0 false, 1 true, 2 "the
+        // result is zero" or 3 "the result is not zero".
         let mode = inst.bits(44, 2);
-        if mode != 0 {
-            let p = inst.bits(48, 3) as u8;
+        let p = inst.bits(48, 3) as u8;
+        if p != PT {
             let zero = tx.c32(0);
             let value = match mode {
+                0 => tx.cfalse(),
                 1 => tx.ctrue(),
                 2 => tx.cmp(op::I_EQUAL, r, zero),
                 _ => tx.cmp(op::I_NOT_EQUAL, r, zero),
