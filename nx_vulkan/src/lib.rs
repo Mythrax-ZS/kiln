@@ -5,5 +5,7 @@
 
 pub mod compute;
 pub mod device;
+pub mod image;
 
+pub use compute::{AddressPatch, SampledImage};
 pub use device::{Capabilities, Options, Vk};
