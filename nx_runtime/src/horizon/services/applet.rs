@@ -237,6 +237,9 @@ impl Service for SelfController {
             // SetPerformanceModeChangedNotification(bool), SetFocusHandlingMode(3 x bool),
             // SetRestartMessageEnabled(bool), SetOutOfFocusSuspendingEnabled(bool)
             10..=14 | 16 => Ok(Response::ok()),
+            // SetAlbumImageOrientation(u32): which way up the pictures of the capture button are
+            // taken; nothing takes them (docs/ASSUMPTIONS.md A-116)
+            19 => Ok(Response::ok()),
             // CreateManagedDisplayLayer() -> u64 layer id, for `vi`'s OpenLayer
             40 => {
                 let display = lock(&self.shared).display.clone();
@@ -578,6 +581,26 @@ mod tests {
         assert_eq!(r.data, APPLET_RESOURCE_USER_ID.to_le_bytes());
         assert!(w.request(&req(10, &[])).unwrap().result.is_success());
         assert!(w.request(&req(77, &[])).is_err());
+    }
+
+    #[test]
+    fn the_self_controller_accepts_its_settings_and_stops_on_the_rest() {
+        let mut s = SelfController {
+            kernel: Weak::new(),
+            shared: Arc::default(),
+        };
+        // Settings the program makes and nothing reads back, among them the orientation of the
+        // pictures of the capture button (command 19, A-116).
+        for command in [1, 2, 10, 11, 12, 13, 14, 16, 19] {
+            assert!(s
+                .request(&req(command, &[0; 4]))
+                .unwrap()
+                .result
+                .is_success());
+        }
+        // A command nobody implemented stops the run and says which it was.
+        let stop = s.request(&req(77, &[])).unwrap_err();
+        assert!(stop.0.contains("ISelfController") && stop.0.contains("77"));
     }
 
     #[test]

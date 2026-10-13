@@ -290,4 +290,4 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
 `nx_vulkan/src/{window,input}.rs`, `nx_vulkan/tests/render_*.rs`, `translate_*.rs` and
 `astc_reference.rs`, `nx_gpu/src/{render,draw_state,compute,i2m,vm,lib}.rs` (`lib` has the progress counters),
 `nx_shader/src/translate/` and `tests/{tmml,control_flow}.rs`, `nx_runtime/src/horizon/{input,gamepad,watchdog,cores}.rs`
-and `services/hid.rs`, `docs/ASSUMPTIONS.md` A-092 to A-115.
+and `services/hid.rs`, `docs/ASSUMPTIONS.md` A-092 to A-116.
