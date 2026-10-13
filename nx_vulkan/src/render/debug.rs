@@ -11,6 +11,8 @@ pub struct Debug {
     pub trace_gpu: bool,
     /// `NX_TRACE_TEXTURES`: the texture handles, headers and samplers of every draw.
     pub trace_textures: bool,
+    /// `NX_TRACE_COMPUTE`: how long the device took over each compute launch (by timestamps).
+    pub trace_compute: bool,
     /// `NX_TRACE_CBUFS`: the first words of every constant buffer a draw reads.
     pub trace_cbufs: bool,
     /// `NX_TRACE_STATE`: with `NX_TRACE_DRAWS`, the state, indices and vertices of each draw.
@@ -77,6 +79,7 @@ impl Debug {
             trace_gpu: set("NX_TRACE_GPU") || set("NX_TRACE_PERF"),
             trace_textures: set("NX_TRACE_TEXTURES"),
             trace_cbufs: set("NX_TRACE_CBUFS"),
+            trace_compute: set("NX_TRACE_COMPUTE"),
             trace_state: set("NX_TRACE_STATE"),
             trace_frame: number("NX_TRACE_DRAWS"),
             dump_draws: std::env::var_os("NX_DUMP_DRAWS").map(PathBuf::from),

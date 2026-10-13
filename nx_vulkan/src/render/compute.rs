@@ -11,6 +11,7 @@ use crate::fast::FastMap;
 use ash::vk;
 use nx_gpu::compute::Dispatch;
 use nx_gpu::render::Scene;
+use std::time::Instant;
 
 /// The constant buffer slot that holds the handles of the textures a compute program names (the
 /// title puts them there for a launch as it does for a draw).
@@ -33,11 +34,18 @@ impl ComputePipelines {
 
 impl Core {
     pub(super) fn dispatch(&mut self, scene: &Scene<'_>, d: &Dispatch) -> Result<(), String> {
+        let mut mark = Instant::now();
+        let mut lap = |into: &mut std::time::Duration| {
+            let now = Instant::now();
+            *into += now - mark;
+            mark = now;
+        };
         let program = self.shaders.kernel(&self.vk, scene, d.program, d.block)?;
         let bindings = bindings_of(&[&program]);
         let (set_layout, pipeline_layout) = self.layouts.get(&self.vk, &bindings)?;
         let set = self.frame.descriptor_set(&self.vk, set_layout)?;
         let base = 64 * program.stage.index();
+        lap(&mut self.phases.compute[0]);
 
         // The constant buffers the program reads, from the descriptor.
         let mut buffer_infos: Vec<(u32, vk::DescriptorBufferInfo)> = Vec::new();
@@ -101,6 +109,7 @@ impl Core {
             ));
         }
 
+        lap(&mut self.phases.compute[1]);
         // The textures: their handles are words of constant buffers of the descriptor.
         let pools = scene.regs.texture_pools();
         let mut handles = Vec::new();
@@ -130,6 +139,7 @@ impl Core {
             ));
         }
         let images = self.bind_textures(scene, &program, "compute", &pools, &handles)?;
+        lap(&mut self.phases.compute[2]);
 
         let infos: Vec<[vk::DescriptorBufferInfo; 1]> =
             buffer_infos.iter().map(|(_, i)| [*i]).collect();
@@ -162,12 +172,23 @@ impl Core {
         unsafe { self.vk.device.update_descriptor_sets(&writes, &[]) };
 
         let pipeline = self.compute_pipeline(&program, pipeline_layout, &bindings)?;
+        lap(&mut self.phases.compute[3]);
 
         // Leave the rendering that is begun; what was recorded runs first, then the launch, and
         // the wait that follows is what puts its writes in memory.
         self.end_pass();
         let cmd = self.frame.cmd(&self.vk)?;
         let device = &self.vk.device;
+        // With `NX_TRACE_COMPUTE`, the device times the launch.
+        let timestamps = if self.debug.trace_compute {
+            let info = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(2);
+            // SAFETY: valid create info; destroyed below, after the launch has run.
+            unsafe { device.create_query_pool(&info, None) }.ok()
+        } else {
+            None
+        };
         let everything = [vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
             .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)];
@@ -192,7 +213,14 @@ impl Core {
                 &[set],
                 &[],
             );
+            if let Some(pool) = timestamps {
+                device.cmd_reset_query_pool(cmd, pool, 0, 2);
+                device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, pool, 0);
+            }
             device.cmd_dispatch(cmd, d.grid[0], d.grid[1], d.grid[2]);
+            if let Some(pool) = timestamps {
+                device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 1);
+            }
             self.frame.mark(&self.vk, cmd, || {
                 format!(
                     "compute launch of the program at {:#x}, grid {:?}",
@@ -209,7 +237,33 @@ impl Core {
                 &[],
             );
         }
-        self.flush()
+        lap(&mut self.phases.compute[4]);
+        let flushed = self.flush();
+        if let Some(pool) = timestamps {
+            let mut ticks = [0u64; 2];
+            // SAFETY: the pool has two queries written by the launch that has run.
+            let read = unsafe {
+                self.vk.device.get_query_pool_results(
+                    pool,
+                    0,
+                    &mut ticks,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                )
+            };
+            if read.is_ok() {
+                let us = ticks[1].saturating_sub(ticks[0]) as f64
+                    * f64::from(self.vk.caps.timestamp_period)
+                    / 1000.0;
+                eprintln!(
+                    "[vulkan] compute launch of the program at {:#x}, grid {:?}, block {:?}: {us:.0} us on the device",
+                    d.program, d.grid, d.block
+                );
+            }
+            // SAFETY: nothing uses the pool any more.
+            unsafe { self.vk.device.destroy_query_pool(pool, None) };
+        }
+        lap(&mut self.phases.compute[5]);
+        flushed
     }
 
     /// The compute pipeline of `program` in `layout`, made on first use.

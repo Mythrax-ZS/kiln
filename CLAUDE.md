@@ -119,7 +119,8 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   to what is shown; `NX_DUMP_EVERY=<n>`, `NX_DUMP_COUNT=<n>`, `NX_DUMP_TARGETS=1` for every render
   target too: a PNG is uncompressed, so dump every n-th frame); `NX_TRACE_DRAWS=<frame>` lists the
   draws and clears of one frame (with `NX_TRACE_STATE=1` their state and vertices, `NX_DUMP_DRAWS=<dir>`
-  and `NX_DUMP_FROM=<n>` a picture after each); `NX_TRACE_TEXTURES=1`, `NX_TRACE_CBUFS=1`,
+  and `NX_DUMP_FROM=<n>` a picture after each); `NX_TRACE_COMPUTE=1` says how long the device took over
+  each compute launch (timestamps); `NX_TRACE_TEXTURES=1`, `NX_TRACE_CBUFS=1`,
   `NX_DEBUG_NO_CULL=1`, `NX_DEBUG_FULL_VIEWPORT=1`, `NX_DEBUG_SOLID_PIXEL=1` (every pixel program writes
   magenta; `NX_DEBUG_SOLID_KEEP=<hex address>[,...]` spares the programs at those addresses,
   `NX_DEBUG_SOLID_ONLY=<hex address>[,...]` does it to those programs alone,

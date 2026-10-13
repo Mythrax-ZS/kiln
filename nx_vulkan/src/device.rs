@@ -42,6 +42,8 @@ pub struct Capabilities {
     pub min_uniform_buffer_offset_alignment: u64,
     pub non_coherent_atom_size: u64,
     pub max_push_descriptors: u32,
+    /// How many nanoseconds a tick of the device's timestamps is.
+    pub timestamp_period: f32,
 }
 
 /// How to create the device.
@@ -241,6 +243,7 @@ impl Vk {
             min_storage_buffer_offset_alignment: props.limits.min_storage_buffer_offset_alignment,
             min_uniform_buffer_offset_alignment: props.limits.min_uniform_buffer_offset_alignment,
             non_coherent_atom_size: props.limits.non_coherent_atom_size,
+            timestamp_period: props.limits.timestamp_period,
             ..Capabilities::default()
         };
         if vk::api_version_major(props.api_version) < 1

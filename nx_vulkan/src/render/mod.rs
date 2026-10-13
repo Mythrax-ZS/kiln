@@ -149,6 +149,9 @@ struct Phases {
     texture_bind: std::time::Duration,
     /// The dynamic state and the draw command.
     record: std::time::Duration,
+    /// The steps of compute launches: the program, the constant buffers, the textures, the
+    /// pipeline, the recording and sending the work and waiting for it.
+    compute: [std::time::Duration; 6],
 }
 
 /// Calls of one kind and the time they took.
@@ -888,6 +891,18 @@ impl Renderer {
                             "[vulkan]   the texture at GPU address {address:#x}: {times} times, \n                             {targets} targets at the last; {what}"
                         );
                     }
+                }
+                if ph.compute.iter().any(|d| !d.is_zero()) {
+                    let ms: Vec<String> = ph
+                        .compute
+                        .iter()
+                        .map(|d| format!("{:.0}", d.as_secs_f64() * 1000.0))
+                        .collect();
+                    eprintln!(
+                        "[vulkan] frame {}: the compute launches spent {} ms (program, constant buffers, textures, pipeline, recording, sending and waiting)",
+                        p.frame,
+                        ms.join(", ")
+                    );
                 }
                 let s = std::mem::take(&mut self.spent);
                 let renderer =
