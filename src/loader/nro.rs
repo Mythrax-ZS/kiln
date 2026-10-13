@@ -129,8 +129,8 @@ pub fn load(bytes: &[u8], name: &str, base: u64) -> Result<Loaded> {
         return Err(Error::format("NRO", "mapped size is implausibly large"));
     }
     let mut image = vec![0u8; mapped as usize];
-    for i in 0..3 {
-        let (off, size) = (h.segs[i].0 as usize, h.segs[i].1 as usize);
+    for &(off, size) in h.segs.iter().take(3) {
+        let (off, size) = (off as usize, size as usize);
         image[off..off + size].copy_from_slice(&bytes[off..off + size]);
     }
     let perms = [Perm::RX, Perm::R, Perm::RW];

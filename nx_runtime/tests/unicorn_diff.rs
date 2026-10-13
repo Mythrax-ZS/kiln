@@ -779,9 +779,9 @@ fn random_words_decode_and_execute_like_unicorn() {
         // Registers: a mix of data pointers and boundary values so that memory forms hit mapped memory.
         // Vector registers and the floating-point control registers are random too, and compared.
         let mut case = g.simd_case(vec![word]);
-        for r in 0..31 {
+        for slot in case.state.x.iter_mut().take(31) {
             if g.below(3) == 0 {
-                case.state.x[r] = g.data_pointer(0x1000, 0x1000);
+                *slot = g.data_pointer(0x1000, 0x1000);
             }
         }
         case.state.pc = h.slot();

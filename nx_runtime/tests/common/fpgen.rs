@@ -32,9 +32,9 @@ impl Gen {
             let v = self.fp_register();
             s.set_vreg(n, v);
         }
-        for r in 0..31 {
+        for slot in s.x.iter_mut().take(31) {
             if self.below(3) == 0 {
-                s.x[r] = self.data_pointer(0x1000, 0x1000);
+                *slot = self.data_pointer(0x1000, 0x1000);
             }
         }
         s.fpcr = self.fpcr();
