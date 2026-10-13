@@ -163,9 +163,6 @@ impl Core {
             None => None,
         };
         for p in std::iter::once(&vs).chain(ps.iter()) {
-            if !p.info.textures.is_empty() {
-                return Err("a program that samples a texture".to_string());
-            }
             if p.info.global_memory {
                 return Err("a program that reads or writes global memory".to_string());
             }
@@ -274,6 +271,49 @@ impl Core {
                 ));
             }
         }
+        // The textures the programs sample: handle, headers, image and sampler.
+        let pools = regs.texture_pools();
+        let mut image_infos: Vec<(u32, vk::DescriptorImageInfo)> = Vec::new();
+        for (p, slot) in std::iter::once((&vs, vs_slot)).chain(ps.iter().zip(ps_slot)) {
+            let base = 64 * p.stage.index();
+            for used in &p.info.textures {
+                let handle =
+                    self.texture_handle(scene, slot.group, pools.bindless_slot, used.index)?;
+                let (tic_id, tsc_id) = (handle & 0xF_FFFF, handle >> 20);
+                if tic_id >= pools.header_count || tsc_id >= pools.sampler_count {
+                    return Err(format!(
+                        "the texture handle {handle:#x} (header {tic_id} of {}, sampler {tsc_id} of {})",
+                        pools.header_count, pools.sampler_count
+                    ));
+                }
+                let tic =
+                    self.read_gpu(scene, pools.header_address + 32 * u64::from(tic_id), 32)?;
+                let tsc =
+                    self.read_gpu(scene, pools.sampler_address + 32 * u64::from(tsc_id), 32)?;
+                let words = |b: &[u8]| -> [u32; 8] {
+                    std::array::from_fn(|i| {
+                        u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap())
+                    })
+                };
+                let bound = self.textures.bind(
+                    &self.vk,
+                    &mut self.frame,
+                    scene,
+                    super::textures::Tic(words(&tic)),
+                    super::textures::Tsc(words(&tsc)),
+                    used,
+                )?;
+                image_infos.push((
+                    base + 24 + used.index,
+                    vk::DescriptorImageInfo::default()
+                        .sampler(bound.sampler)
+                        .image_view(bound.view)
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                ));
+            }
+        }
+        let image_arrays: Vec<[vk::DescriptorImageInfo; 1]> =
+            image_infos.iter().map(|(_, i)| [*i]).collect();
         let infos: Vec<[vk::DescriptorBufferInfo; 1]> =
             buffer_infos.iter().map(|(_, i)| [*i]).collect();
         let writes: Vec<vk::WriteDescriptorSet> = buffer_infos
@@ -287,6 +327,19 @@ impl Core {
                     .buffer_info(info)
             })
             .collect();
+        let mut writes = writes;
+        writes.extend(
+            image_infos
+                .iter()
+                .zip(&image_arrays)
+                .map(|((binding, _), info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(*binding)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(info)
+                }),
+        );
         // SAFETY: the set and the buffers are valid.
         unsafe { self.vk.device.update_descriptor_sets(&writes, &[]) };
 
@@ -351,6 +404,31 @@ impl Core {
         scene
             .read_vec(va, len)
             .ok_or_else(|| format!("{len} bytes of GPU memory at {va:#x}, which is not all mapped"))
+    }
+
+    /// The texture handle a program names with `index`: word `index` of the constant buffer that
+    /// holds the handles (`slot` of the stage's binding group).
+    fn texture_handle(
+        &self,
+        scene: &Scene<'_>,
+        group: u32,
+        slot: u32,
+        index: u32,
+    ) -> Result<u32, String> {
+        let Some(b) = scene.cbufs.get(group, slot) else {
+            return Err(format!(
+                "texture {index} is named by a handle in constant buffer slot {slot} of group {group}, which is not bound"
+            ));
+        };
+        let offset = 4 * u64::from(index);
+        if offset + 4 > u64::from(b.size) {
+            return Err(format!(
+                "texture {index} is named at byte {offset} of a constant buffer of {} bytes",
+                b.size
+            ));
+        }
+        let word = self.read_gpu(scene, b.address + offset, 4)?;
+        Ok(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
     }
 
     /// The bytes of the constant buffer bound to `slot` of binding group `group` (at most `want`

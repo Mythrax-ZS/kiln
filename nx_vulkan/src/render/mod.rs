@@ -10,6 +10,7 @@ mod draw;
 mod frame;
 mod shaders;
 mod targets;
+mod textures;
 
 use crate::device::Vk;
 use crate::formats::{color_format, depth_format};
@@ -55,6 +56,7 @@ struct Core {
     frame: Frame,
     targets: Targets,
     shaders: shaders::Shaders,
+    textures: textures::Textures,
     layouts: shaders::Layouts,
     pipelines: draw::Pipelines,
     /// The attachments of the rendering that is begun in the command buffer, if any.
@@ -89,6 +91,7 @@ impl Renderer {
                     frame,
                     targets: Targets::default(),
                     shaders: shaders::Shaders::default(),
+                    textures: textures::Textures::default(),
                     layouts: shaders::Layouts::default(),
                     pipelines: draw::Pipelines::default(),
                     pass: None,
@@ -404,6 +407,8 @@ impl Backend for Renderer {
         let config = self.config.clone();
         let core = self.core()?;
         core.flush()?;
+        // A displayed buffer ends a frame: textures are compared with memory again in the next.
+        core.textures.frame += 1;
         let Some(dir) = config.dump_dir.as_ref() else {
             return Ok(());
         };
@@ -438,9 +443,17 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         if let Some(Ok(mut core)) = self.core.take() {
             let _ = core.flush();
+            if std::env::var("NX_TRACE_GPU").is_ok() {
+                eprintln!(
+                    "[vulkan] {} bytes of textures in the cache, {} pictures written",
+                    core.textures.bytes(),
+                    core.dumped
+                );
+            }
             core.pipelines.destroy(&core.vk);
             core.layouts.destroy(&core.vk);
             core.shaders.destroy(&core.vk);
+            core.textures.destroy(&core.vk);
             core.targets.destroy(&core.vk);
             core.frame.destroy(&core.vk);
         }

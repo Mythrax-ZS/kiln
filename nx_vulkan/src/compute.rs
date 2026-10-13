@@ -199,6 +199,8 @@ impl Vk {
                     } else {
                         vk::ImageViewType::TYPE_2D
                     },
+                    components: vk::ComponentMapping::default(),
+                    levels: 1,
                 })?;
                 let uploaded = self.upload_image(&image, i.texels);
                 gpu_images.push(image);

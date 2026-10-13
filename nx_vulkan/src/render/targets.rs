@@ -117,6 +117,8 @@ impl Targets {
                 } else {
                     vk::ImageViewType::TYPE_2D
                 },
+                components: vk::ComponentMapping::default(),
+                levels: 1,
             })?;
             self.map.insert(
                 key,

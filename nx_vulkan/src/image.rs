@@ -11,9 +11,13 @@ pub struct ImageInfo {
     pub width: u32,
     pub height: u32,
     pub layers: u32,
+    /// Mip levels (the base level alone is 1).
+    pub levels: u32,
     pub usage: vk::ImageUsageFlags,
     /// The view type: `TYPE_2D` or `TYPE_2D_ARRAY` for now.
     pub view_type: vk::ImageViewType,
+    /// What the view makes of the components (identity unless a texture says otherwise).
+    pub components: vk::ComponentMapping,
 }
 
 /// An image with its memory and a view of all of it.
@@ -102,7 +106,7 @@ impl Vk {
                 height: info.height,
                 depth: 1,
             })
-            .mip_levels(1)
+            .mip_levels(info.levels.max(1))
             .array_layers(info.layers)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
@@ -142,11 +146,12 @@ impl Vk {
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
                     .view_type(info.view_type)
+                    .components(info.components)
                     .format(info.format)
                     .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: aspect_of(info.format),
                         base_mip_level: 0,
-                        level_count: 1,
+                        level_count: info.levels.max(1),
                         base_array_layer: 0,
                         layer_count: info.layers,
                     }),

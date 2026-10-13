@@ -463,6 +463,16 @@ impl Vk {
         })
     }
 
+    /// Can images of `format` (optimal tiling) do all of `features`?
+    pub fn format_supports(&self, format: vk::Format, features: vk::FormatFeatureFlags) -> bool {
+        // SAFETY: plain query on a valid physical device.
+        let props = unsafe {
+            self.instance
+                .get_physical_device_format_properties(self.physical, format)
+        };
+        props.optimal_tiling_features.contains(features)
+    }
+
     /// The index of a memory type that is allowed by `type_bits` and has all of `flags`.
     pub fn find_memory_type(&self, type_bits: u32, flags: vk::MemoryPropertyFlags) -> Option<u32> {
         (0..self.memory_properties.memory_type_count).find(|&i| {

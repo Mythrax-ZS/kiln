@@ -21,6 +21,10 @@ struct Chunk {
 pub struct Frame {
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
+    /// Commands that must run before the main ones: texture uploads, which cannot be recorded
+    /// inside a rendering.
+    staging: vk::CommandBuffer,
+    staging_recording: bool,
     fence: vk::Fence,
     recording: bool,
     chunks: Vec<Chunk>,
@@ -50,22 +54,24 @@ impl Frame {
                     None,
                 )
                 .map_err(|e| format!("creating the command pool: {e}"))?;
-            let cmd = vk
+            let buffers = vk
                 .device
                 .allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
                         .command_pool(pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
+                        .command_buffer_count(2),
                 )
-                .map_err(|e| format!("allocating the command buffer: {e}"))?[0];
+                .map_err(|e| format!("allocating the command buffers: {e}"))?;
             let fence = vk
                 .device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(|e| format!("creating the fence: {e}"))?;
             Ok(Frame {
                 pool,
-                cmd,
+                cmd: buffers[0],
+                staging: buffers[1],
+                staging_recording: false,
                 fence,
                 recording: false,
                 chunks: Vec::new(),
@@ -93,6 +99,24 @@ impl Frame {
             self.recording = true;
         }
         Ok(self.cmd)
+    }
+
+    /// The command buffer for uploads, run before the main one; started if it was not.
+    pub fn upload_cmd(&mut self, vk: &Vk) -> Result<vk::CommandBuffer, String> {
+        if !self.staging_recording {
+            // SAFETY: the buffer is not in use (the last submission was waited for).
+            unsafe {
+                vk.device
+                    .begin_command_buffer(
+                        self.staging,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .map_err(|e| format!("beginning the upload command buffer: {e}"))?;
+            }
+            self.staging_recording = true;
+        }
+        Ok(self.staging)
     }
 
     /// Copy `data` into upload memory aligned to `align` and give the buffer and offset.
@@ -195,17 +219,27 @@ impl Frame {
     /// End the recording, run it and wait for it. Afterwards the upload memory and the
     /// descriptor pools are free again and the garbage is gone.
     pub fn submit(&mut self, vk: &Vk) -> Result<(), String> {
-        if !self.recording {
+        if !self.recording && !self.staging_recording {
             return Ok(());
         }
-        // SAFETY: the command buffer is recording; the fence is unsignaled; the wait makes
+        // SAFETY: the command buffers are recording; the fence is unsignaled; the wait makes
         // everything the commands used safe to release.
         let result = unsafe {
             (|| -> Result<(), String> {
-                vk.device
-                    .end_command_buffer(self.cmd)
-                    .map_err(|e| format!("ending the command buffer: {e}"))?;
-                let cmds = [self.cmd];
+                // Uploads first, then the commands that use what they upload.
+                let mut cmds = Vec::new();
+                if self.staging_recording {
+                    vk.device
+                        .end_command_buffer(self.staging)
+                        .map_err(|e| format!("ending the upload command buffer: {e}"))?;
+                    cmds.push(self.staging);
+                }
+                if self.recording {
+                    vk.device
+                        .end_command_buffer(self.cmd)
+                        .map_err(|e| format!("ending the command buffer: {e}"))?;
+                    cmds.push(self.cmd);
+                }
                 let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
                 vk.device
                     .queue_submit(vk.queue, &submit, self.fence)
@@ -220,11 +254,14 @@ impl Frame {
             })()
         };
         self.recording = false;
+        self.staging_recording = false;
         // SAFETY: nothing is using the pools now.
         unsafe {
-            vk.device
-                .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
-                .map_err(|e| format!("resetting the command buffer: {e}"))?;
+            for cmd in [self.cmd, self.staging] {
+                vk.device
+                    .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                    .map_err(|e| format!("resetting a command buffer: {e}"))?;
+            }
             for pool in &self.descriptor_pools {
                 let _ = vk
                     .device
