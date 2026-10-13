@@ -169,9 +169,48 @@ pub fn stand_in_font(name: &str) -> Vec<u8> {
         t.extend([0u8; 20]); // fixed pitch and memory hints
         t
     };
+    // The OS/2 table, version 4 (96 bytes). A text engine takes the ascent and the height of a
+    // line from its Windows metrics (and the typographic ones), not only from `hhea`: with this
+    // table missing it computes a height of zero.
+    let os2 = {
+        let mut t = Vec::new();
+        t.extend(be16(4)); // version
+        t.extend(be16(ADVANCE)); // average character width
+        t.extend(be16(400)); // weight class: regular
+        t.extend(be16(5)); // width class: medium
+        t.extend(be16(0)); // type flags: embedding allowed
+                           // subscript and superscript: size x, size y, offset x, offset y
+        for v in [650i16, 600, 0, 75, 650, 600, 0, 350] {
+            t.extend(be16(v as u16));
+        }
+        t.extend(be16(50)); // strikeout size
+        t.extend(be16(300)); // strikeout position
+        t.extend(be16(0)); // family class
+        t.extend([0u8; 10]); // panose
+        t.extend(be32(1)); // unicode ranges: Basic Latin
+        t.extend([0u8; 12]);
+        t.extend(*b"NONE"); // vendor
+        t.extend(be16(0x00C0)); // selection: regular, use the typographic metrics
+        t.extend(be16(FIRST_CHAR));
+        t.extend(be16(LAST_CHAR));
+        t.extend(be16(ASCENT as u16)); // typographic ascender
+        t.extend(be16(DESCENT as u16)); // typographic descender
+        t.extend(be16(0)); // typographic line gap
+        t.extend(be16(ASCENT as u16)); // Windows ascent
+        t.extend(be16(DESCENT.unsigned_abs())); // Windows descent, a positive number
+        t.extend(be32(1)); // code pages: Latin 1
+        t.extend(be32(0));
+        t.extend(be16(500)); // x height
+        t.extend(be16(700)); // cap height
+        t.extend(be16(0)); // default character: .notdef
+        t.extend(be16(0x0020)); // break character: the space
+        t.extend(be16(1)); // maximum context
+        t
+    };
 
     // Tables in tag order, each padded to four bytes.
-    let tables: [(&[u8; 4], &Vec<u8>); 9] = [
+    let tables: [(&[u8; 4], &Vec<u8>); 10] = [
+        (b"OS/2", &os2),
         (b"cmap", &cmap),
         (b"glyf", &glyf),
         (b"head", &head),
@@ -187,7 +226,7 @@ pub fn stand_in_font(name: &str) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend(be32(0x0001_0000));
     out.extend(be16(count as u16));
-    out.extend(be16(128)); // search range: 16 times the largest power of two <= count
+    out.extend(be16(128)); // search range: 16 times the largest power of two <= count (8)
     out.extend(be16(3)); // entry selector: log2 of that power
     out.extend(be16((count * 16 - 128) as u16)); // range shift
     let mut offset = header;
@@ -345,7 +384,7 @@ mod tests {
         let f = stand_in_font("recomp standard");
         assert_eq!(u32_at(&f, 0), 0x0001_0000);
         let n = u16_at(&f, 4) as usize;
-        assert_eq!(n, 9);
+        assert_eq!(n, 10);
         let mut previous = [0u8; 4];
         let mut head = None;
         for i in 0..n {
@@ -394,6 +433,29 @@ mod tests {
         assert_eq!(table(&f, b"hmtx").1, 4 + 2 * (GLYPHS - 1));
         let (head, _) = table(&f, b"head");
         assert_eq!(u16_at(&f, head + 50), 0, "short offsets in loca");
+    }
+
+    #[test]
+    fn the_os2_table_gives_the_same_metrics_as_the_horizontal_header() {
+        let f = stand_in_font("x");
+        let (os2, len) = table(&f, b"OS/2");
+        assert_eq!((u16_at(&f, os2), len), (4, 96), "version 4 is 96 bytes");
+        let (hhea, _) = table(&f, b"hhea");
+        let (hhea_ascent, hhea_descent) =
+            (u16_at(&f, hhea + 4) as i16, u16_at(&f, hhea + 6) as i16);
+        // Typographic ascender, descender and line gap, then the Windows ascent and descent.
+        assert_eq!(u16_at(&f, os2 + 68) as i16, hhea_ascent);
+        assert_eq!(u16_at(&f, os2 + 70) as i16, hhea_descent);
+        assert_eq!(u16_at(&f, os2 + 72), 0);
+        assert_eq!(u16_at(&f, os2 + 74) as i16, hhea_ascent);
+        assert_eq!(u16_at(&f, os2 + 76) as i16, -hhea_descent);
+        // The first and last characters it says it covers are the ones the cmap maps.
+        assert_eq!(
+            (u16_at(&f, os2 + 64), u16_at(&f, os2 + 66)),
+            (FIRST_CHAR, LAST_CHAR)
+        );
+        // The metrics are not zero: a text engine divides by the height they give.
+        assert!(hhea_ascent > 0 && hhea_descent < 0);
     }
 
     #[test]
