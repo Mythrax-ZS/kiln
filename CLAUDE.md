@@ -52,9 +52,12 @@ Small chunks. Title at most 50 characters. No body. No attribution lines of any 
   (`nvdrv` and its device nodes, the display and buffer-queue path, a tracing command processor
   with a macro engine). The owner approved shader translation (Maxwell SASS to SPIR-V, crate
   `nx_shader`, M9) and the Vulkan backend (`ash`, crate `nx_vulkan`, M10) on 2026-10-13; M9
-  passed the same day, and M10 draws the title's first screens (frames dumped and looked at) and is
-  open at the window. Never describe the output as playable before frames are measured; saying
-  what a frame shows needs the frame itself (a dumped image looked at), not a count.
+  passed the same day, and M10 draws the title's first screens and its opening cutscene (frames
+  dumped and looked at), shows them in a window and takes keyboard input; it runs at about 15
+  frames a second there, and nothing past the cutscene has been seen (open, see
+  `docs/reports/M10-vulkan-backend.md`). Never describe the output as playable before frames are
+  measured; saying what a frame shows needs the frame itself (a dumped image looked at), not a
+  count.
 - Out of scope: online services, account checks, licensing checks, AArch32 (detect and error).
 
 ## External tools used by tests
@@ -81,12 +84,23 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   from assembled words and run them (clang needed). `NX_TRACE_SVC=1` logs every SVC and IPC
   request of a produced program; `NX_TRACE_LOG=1` prints what it logs through `lm`;
   `NX_RANDOM_SEED=<n>` makes the kernel's entropy reproducible; `NX_ROMFS=<dir|image>` names the
-  RomFS it reads at run time.
+  RomFS it reads at run time; `NX_WATCHDOG=<seconds>` says, when no frame has been presented for
+  that long (and again every that many seconds), what every guest thread is doing (the supervisor
+  call, the service and command of a request, the return addresses as of its last call) and
+  where the command processor and the renderer are (`recomp symbols` names the addresses). A run
+  that stops reports every thread (priority, core, what it is doing), then the registers of the
+  thread that stopped and 256 bytes at each register that holds an address (and at what those
+  point at in the heap), for reading a crash. `NX_CORES=per-core` (or `one`) makes a guest thread
+  hold a core to run guest code and give it up at a supervisor call that can block or reschedule,
+  threads waiting for a core being served in order (a model of the console's cores, off by
+  default; priorities are not modelled).
 - GPU front: `nx_gpu`'s unit tests need no external tool. `NX_TRACE_GPU=1` prints every submission
   of a produced program and, when it ends, what the command processor counted (`NX_GPU_TOP=<n>` is
   how many of the busiest methods it lists, 0 for all); `NX_TRACE_GPU=2` prints every method write
-  and macro call; `NX_MAX_FRAMES=<n>` ends the run after `n` presented frames; `NX_SAVE_DIR=<dir>`
-  is where save data goes (default `./nx_save`). `recomp symbols --exefs <dir> [--match <text>]
+  and macro call; `NX_TRACE_REGISTER=<hex byte offset>[,...]` prints every write to those 3D registers
+  (with the draw count and the macro it came from) and `NX_TRACE_MACRO=<id>` every call of that macro
+  with the writes it makes and its code, once; `NX_MAX_FRAMES=<n>` ends the run after `n` presented
+  frames; `NX_SAVE_DIR=<dir>` is where save data goes (default `./nx_save`). `recomp symbols --exefs <dir> [--match <text>]
   [<address>...]` names the function around an address, for reading the return addresses a stop
   report ends with.
 - Renderer: `nx_vulkan`'s tests need a Vulkan device (`NX_VULKAN_DEVICE` picks one; they print
@@ -96,10 +110,35 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   target too: a PNG is uncompressed, so dump every n-th frame); `NX_TRACE_DRAWS=<frame>` lists the
   draws and clears of one frame (with `NX_TRACE_STATE=1` their state and vertices, `NX_DUMP_DRAWS=<dir>`
   and `NX_DUMP_FROM=<n>` a picture after each); `NX_TRACE_TEXTURES=1`, `NX_TRACE_CBUFS=1`,
-  `NX_DEBUG_NO_CULL=1`, `NX_DEBUG_FULL_VIEWPORT=1`, `NX_DEBUG_SOLID_PIXEL=1` and
-  `NX_SPIRV_CHECK=1` look at one thing each; `NX_VULKAN_VALIDATE=1` turns the validation layer on;
-  `NX_SHADER_DUMP=<dir>` writes the programs draws use (read them with `cargo run --release -p
-  nx_shader --example sass -- <file>`). Never `NX_DUMP_FRAMES` without `NX_DUMP_EVERY` for a long run.
+  `NX_DEBUG_NO_CULL=1`, `NX_DEBUG_FULL_VIEWPORT=1`, `NX_DEBUG_SOLID_PIXEL=1` (every pixel program writes
+  magenta; `NX_DEBUG_SOLID_KEEP=<hex address>[,...]` spares the programs at those addresses,
+  `NX_DEBUG_SOLID_ONLY=<hex address>[,...]` does it to those programs alone,
+  `NX_DEBUG_SKIP_PROGRAMS=<hex address>[,...]` draws nothing with those programs,
+  `NX_DEBUG_DISCARD_PROGRAMS=<hex address>[,...]` runs the vertex stage of the draws of those vertex
+  programs and rasterizes nothing, `NX_DEBUG_TRIVIAL_VERTEX=<hex address>[,...]` gives those vertex
+  programs a body that writes a constant position, `NX_DEBUG_DISPATCH_LOOP=1` translates every
+  program with the loop around a `switch` (A-114), `NX_SPIRV_OPT=<arguments>` passes every graphics
+  program through `spirv-opt` first),
+  `NX_DEBUG_EQUAL_AS_LEQUAL=1`, `NX_DEBUG_NO_DEPTH_TEST=1`, `NX_DEBUG_FLIP_FRONT=1`,
+  `NX_TRACE_TARGETS=1` (each render target configuration, the first time it is drawn to) and
+  `NX_SPIRV_CHECK=1` look at one thing each; `NX_DEBUG_SYNC_DRAWS=<n>` waits for the device after
+  every draw (slow), from the first frame with `n` draws on (`NX_DEBUG_SYNC_FROM=<frame>`: from
+  that presented frame on), so that the draw that loses the device is named with its state,
+  programs and textures, and how long after its submission the device was lost (a hang takes the
+  2 s of the operating system's watchdog, a fault does not); `NX_DEBUG_CHECKPOINTS=1` (an NVIDIA device) marks the
+  commands of a submission so that a lost device says which it was running;
+  `NX_VULKAN_VALIDATE=1` turns the validation layer on; `NX_SHADER_DUMP=<dir>` writes the programs
+  draws use and the compute programs launched, as `COMPUTE_<address>.bin` without a header (read
+  them with `cargo run --release -p nx_shader --example sass -- <file>`; the `audit` example lists
+  what the translator lacks). To find why a frame is wrong: `NX_DUMP_BUSY=<draws>` dumps the first
+  frame with that many draws and every target, `NX_TRACE_AFTER_BUSY=1` traces the frame after it
+  (what `NX_TRACE_DRAWS` does), `NX_DUMP_PASSES=<dir>` writes a picture of each pass of a traced
+  frame, `NX_DUMP_DRAWS=<dir>` with `NX_DUMP_FROM=<n>` and `NX_DUMP_UNTIL=<n>` one after each
+  command, `NX_TRACE_COMPUTE=1` prints every compute launch with its descriptor and
+  `NX_TRACE_CBUFS=1` the constant buffers a traced draw or launch reads. `NX_INPUT_SCRIPT="<frame>
+  <Action> [<frames>];..."` (or a file) presses actions of a keymap at presented frame numbers, for
+  runs without a person (the frame rate decides when a menu is ready: a run that is 15 times faster
+  needs the press 15 times later). Never `NX_DUMP_FRAMES` without `NX_DUMP_EVERY` for a long run.
 - Window and input: `NX_WINDOW=1` (with `NX_RENDERER=vulkan`) shows the frames in a window
   (`NX_WINDOW_SIZE=<w>x<h>`, `NX_WINDOW_TITLE`, `NX_PRESENT_MODE=fifo|mailbox|immediate`); no test
   opens one. The keyboard and an XInput gamepad are the handheld controls of `hid`: `NX_KEYMAP=<file>`

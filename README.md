@@ -36,9 +36,11 @@ show its first screens (an introduction screen with photographs, a logo and text
 artwork), in 23 s of wall clock on an RTX 5070 Ti (`docs/reports/M10-vulkan-backend.md`). With
 `NX_WINDOW=1` the same frames appear in a window, and the keyboard (or an XInput gamepad) reaches
 the title: the keys that stand for the directional pad and for the left stick moved the selection
-of its menu, and confirming it started the title's introduction. After that the picture stayed
-black for the 45 s that were watched, and why has not been looked into. There is no sound, and no
-screen past the menu has been drawn. Nothing here is a claim that a game is playable.
+of its menu, and confirming it started the title's introduction: a story card and then its opening
+cutscene (characters lit and in color, a flame effect, subtitles), which was looked at in dumped
+frames. The cutscene runs at about 15 frames a second on that card, with about 600 draws a frame.
+There is no sound, nothing past the cutscene has been seen, and the title sometimes stops early
+(about one run in 30; the report says what is known). Nothing here is a claim that a game is playable.
 
 ### Keys
 
@@ -63,6 +65,9 @@ the name of each key pressed, which is how to find the names. An Xbox-style (XIn
 without setup, with its face buttons by position (the bottom one is B, as on the console;
 `NX_GAMEPAD_LABELS=1` keeps the names instead), and `NX_GAMEPAD=0` leaves it out. Only the
 handheld controls exist, so a title that does not support the handheld mode sees no controller.
+For a run without a person, `NX_INPUT_SCRIPT="<frame> <Action> [<frames>];..."` (or the name of a file
+holding that) presses the actions named above (`A`, `DpadDown`, ...) at presented frame numbers, for
+that many frames (default 6): `NX_INPUT_SCRIPT="2500 A 6"` presses A at frame 2500.
 
 ## Using it
 
@@ -115,7 +120,8 @@ path) or with `NX_ROMFS=<dir|image>` when running. Environment variables that he
 debugging: `NX_TRACE_SVC=1` logs every supervisor call and every IPC request with its result on
 standard error, `NX_TRACE_LOG=1` prints what the program logs through the log manager, and
 `NX_RANDOM_SEED=<decimal number>` makes the kernel's pseudo-random values (loader configuration,
-`GetInfo` entropy) reproducible. `recomp relink` links the objects of an earlier build against the
+`GetInfo` entropy) reproducible, and `NX_WATCHDOG=<seconds>` says what every guest thread is doing
+when no frame has been presented for that long. `recomp relink` links the objects of an earlier build against the
 current runtime and `--reuse-objects` skips recompiling unchanged code, which keeps the loop of
 trying a title short.
 
