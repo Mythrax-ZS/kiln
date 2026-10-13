@@ -7,6 +7,7 @@
 //! which generated code tests after every access.
 
 use super::abi::{perm, stop, trap, FuncEntry, NativeCpu, STOP_PC};
+use super::census::{self, Kind};
 use super::mem::{fast_ptr, MapError, FAST_READ, FAST_WRITE};
 use super::monitor::nx_mem_armed;
 use super::runtime::{
@@ -204,6 +205,9 @@ pub extern "C" fn nx_crc32(acc: u32, data: u64, size: u32, castagnoli: u32) -> u
 /// `FPCR` and `FPSR` are read and written in the CPU structure.
 #[no_mangle]
 pub extern "C" fn nx_vec(p: *mut NativeCpu, word: u32, src: u64, nzcv: u64) -> u64 {
+    if census::enabled() {
+        census::note(Kind::Vec, u64::from(word));
+    }
     let c = cpu(p);
     match vec::decode::decode(word) {
         Ok(op) => vec::exec::exec(&mut c.state, &op, src, nzcv as u8),
@@ -220,6 +224,9 @@ pub extern "C" fn nx_vec(p: *mut NativeCpu, word: u32, src: u64, nzcv: u64) -> u
 /// A vector register load or store at `addr`; a failed access is recorded like any other.
 #[no_mangle]
 pub extern "C" fn nx_vecmem(p: *mut NativeCpu, word: u32, addr: u64, pc: u64) {
+    if census::enabled() {
+        census::note(Kind::VecMem, u64::from(word));
+    }
     let c = cpu(p);
     let Ok((mem, _)) = vec::decode::decode_mem(word) else {
         record_trap(c, trap::UNSUPPORTED, pc, u64::from(word), 0);

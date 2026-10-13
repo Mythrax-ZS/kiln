@@ -1,6 +1,7 @@
 //! Process-wide runtime state and the operations generated code and the slow path share.
 
 use super::abi::{self, stop, trap, FuncEntry, NativeCpu, EXIT_PC, STOP_PC};
+use super::census::{self, Kind};
 use super::mem::GuestMemory;
 use super::monitor::{Monitors, Reservation};
 use crate::a64::bus::{Bus, Fault, FaultKind, COUNTER_FREQUENCY};
@@ -103,6 +104,7 @@ pub fn rt() -> &'static Runtime {
     RT.get_or_init(|| {
         let runtime = Runtime::new();
         runtime.mem.publish();
+        super::census::start_from_env();
         runtime
     })
 }
@@ -513,7 +515,11 @@ struct Host {
 
 impl SlowHost for Host {
     fn has_native(&mut self, addr: u64) -> bool {
-        rt().lookup(addr).is_some()
+        let native = rt().lookup(addr).is_some();
+        if !native && census::enabled() {
+            census::note(Kind::Interpreted, addr);
+        }
+        native
     }
 
     fn call_native(&mut self, _state: &mut CpuState, _bus: &mut dyn Bus) -> bool {
@@ -541,6 +547,9 @@ impl SlowHost for Host {
 pub unsafe fn slow_path(cpu: *mut NativeCpu) {
     let thread = (*cpu).ctl.thread_id;
     rt().note_unknown((*cpu).state.pc);
+    if census::enabled() {
+        census::note(Kind::Interpreted, (*cpu).state.pc);
+    }
     let mut bus = NativeBus { thread };
     let mut host = Host { cpu };
     let state: *mut CpuState = &mut (*cpu).state;
@@ -573,6 +582,11 @@ pub unsafe fn slow_path(cpu: *mut NativeCpu) {
 pub unsafe fn interpret_one(cpu: *mut NativeCpu) {
     let thread = (*cpu).ctl.thread_id;
     let mut bus = NativeBus { thread };
+    if census::enabled() {
+        if let Ok(word) = bus.fetch((*cpu).state.pc) {
+            census::note(Kind::Fallback, u64::from(word));
+        }
+    }
     let state: *mut CpuState = &mut (*cpu).state;
     if let Err(t) = step(&mut *state, &mut bus) {
         handle_trap(&mut *cpu, t);
