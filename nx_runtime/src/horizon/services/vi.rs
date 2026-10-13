@@ -29,6 +29,8 @@ pub struct Shared {
     vsync_running: AtomicBool,
     /// Stop after this many presented frames (`NX_MAX_FRAMES`), for measuring.
     frame_limit: Option<u64>,
+    /// The driver, which tells the renderer which buffer is on screen.
+    gpu: Mutex<Option<Arc<super::nvdrv::Shared>>>,
 }
 
 impl Shared {
@@ -40,7 +42,17 @@ impl Shared {
             frame_limit: std::env::var("NX_MAX_FRAMES")
                 .ok()
                 .and_then(|v| v.parse().ok()),
+            gpu: Mutex::new(None),
         }
+    }
+
+    /// Connect the display to the driver, so displayed buffers reach the renderer.
+    pub fn set_gpu(&self, gpu: Arc<super::nvdrv::Shared>) {
+        *self.gpu.lock().unwrap_or_else(|e| e.into_inner()) = Some(gpu);
+    }
+
+    fn gpu(&self) -> Option<Arc<super::nvdrv::Shared>> {
+        self.gpu.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn comp(&self) -> std::sync::MutexGuard<'_, Compositor> {
@@ -321,6 +333,17 @@ impl BinderDriver {
                 reply.len(),
                 out.size
             )));
+        }
+        if code == nx_gpu::display::code::QUEUE_BUFFER {
+            let frame = self.shared.comp().last_frame_of(binder);
+            if let (Some(frame), Some(gpu)) = (frame, self.shared.gpu()) {
+                gpu.present(&frame).map_err(|why| {
+                    Stop(format!(
+                        "the renderer could not show frame {}: {why}",
+                        frame.number
+                    ))
+                })?;
+            }
         }
         if let Some(limit) = self.shared.frame_limit {
             let frames = self.shared.comp().frames_presented();

@@ -50,6 +50,12 @@ impl Shared {
             .clone()
     }
 
+    /// The title queued a buffer for display: tell the renderer (if there is one).
+    pub fn present(&self, frame: &nx_gpu::display::Frame) -> Result<(), String> {
+        let mut core = self.core.lock().unwrap_or_else(|e| e.into_inner());
+        core.gpu.present(frame)
+    }
+
     /// Print what the command processor counted (`NX_TRACE_GPU`), once the process has ended.
     pub fn report(&self) {
         let core = self.core.lock().unwrap_or_else(|e| e.into_inner());

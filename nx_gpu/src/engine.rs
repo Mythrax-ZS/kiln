@@ -10,6 +10,7 @@ use crate::gpu::class;
 use crate::mem::GuestMemory;
 use crate::mme;
 use crate::names;
+use crate::render::{Backend, Clear, Draw, Scene, Source};
 use crate::shaders::Inventory;
 use crate::state::{CbufBindings, Regs};
 use crate::syncpt::Syncpoints;
@@ -58,6 +59,8 @@ pub struct Stats {
     pub semaphore_releases: u64,
     /// The shader programs the draws used.
     pub shaders: Inventory,
+    /// What the renderer could not do (when the run goes on past that): the message and how often.
+    pub failed: BTreeMap<String, u64>,
 }
 
 impl Stats {
@@ -121,6 +124,18 @@ impl Stats {
         if self.shaders.draws > 0 {
             s.push_str(&self.shaders.report(top));
         }
+        if !self.failed.is_empty() {
+            let total: u64 = self.failed.values().sum();
+            s.push_str(&format!(
+                "  the renderer failed {total} times, for {} reasons:\n",
+                self.failed.len()
+            ));
+            let mut reasons: Vec<_> = self.failed.iter().collect();
+            reasons.sort_by_key(|(why, count)| (std::cmp::Reverse(**count), (*why).clone()));
+            for (why, count) in reasons.into_iter().take(top) {
+                s.push_str(&format!("  {count:>8} x {why}\n"));
+            }
+        }
         s
     }
 }
@@ -133,6 +148,10 @@ pub struct Cx<'a> {
     /// Tokens of the events the syncpoint increments of the commands have set.
     pub woken: &'a mut Vec<EventToken>,
     pub stats: &'a mut Stats,
+    /// Where draws, clears and the end of a submission are reported, if anywhere.
+    pub backend: Option<&'a mut (dyn Backend + 'static)>,
+    /// Go on after a failure of the backend (counting it) instead of stopping.
+    pub lenient: bool,
     pub channel: u32,
     /// The channel's syncpoint.
     pub syncpt: u32,
@@ -161,6 +180,20 @@ impl Cx<'_> {
                 data.len()
             ))
         }
+    }
+
+    /// The renderer could not do `what`: that stops the run, unless the processor was told to go
+    /// on, in which case it is counted by reason and the first of each is printed.
+    fn renderer_failed(&mut self, what: &str, why: String) -> Result<(), String> {
+        if !self.lenient {
+            return Err(format!("{what} could not be rendered: {why}"));
+        }
+        let count = self.stats.failed.entry(why.clone()).or_default();
+        *count += 1;
+        if *count == 1 && self.level >= 1 {
+            eprintln!("[gpu] {what} could not be rendered: {why}");
+        }
+        Ok(())
     }
 
     /// The GPU's timestamp counter, in nanoseconds since the first use (docs/ASSUMPTIONS.md).
@@ -206,6 +239,7 @@ mod m3d {
     pub const BEGIN: u32 = 0x1618 / 4;
     pub const DRAW_INLINE_VERTEX: u32 = 0x1640 / 4;
     pub const DRAW_INDEX_BUFFER: u32 = 0x17e0 / 4;
+    pub const SET_INDEX_BUFFER_F: u32 = 0x17dc / 4;
     /// `DRAW_INDEX_BUFFER32/16/8_BEGIN_END_INSTANCE_FIRST` then the same three `_SUBSEQUENT`.
     pub const DRAW_INDEX_BEGIN_END_FIRST: u32 = 0x17e4 / 4;
     pub const DRAW_INDEX_BEGIN_END_LAST: u32 = 0x17f8 / 4;
@@ -234,6 +268,8 @@ pub struct Engine {
     topology: u32,
     /// Vertices or indices sent inline since the last `BEGIN`.
     inline_elements: u32,
+    /// The number of the instance being drawn (0 for the first of a series, see `BEGIN`).
+    instance: u32,
     /// The constant buffers bound to each slot of each binding group.
     pub cbufs: CbufBindings,
 }
@@ -310,6 +346,7 @@ impl Engine {
             running: None,
             topology: 0,
             inline_elements: 0,
+            instance: 0,
             cbufs: CbufBindings::default(),
         }
     }
@@ -411,6 +448,12 @@ impl Engine {
             m3d::BEGIN => {
                 self.topology = data & 0xFFFF;
                 self.inline_elements = 0;
+                // Bits 26..27: the first instance of a series, the next one, or the same.
+                match data >> 26 & 3 {
+                    0 => self.instance = 0,
+                    1 => self.instance += 1,
+                    _ => {}
+                }
             }
             // Vertices and indices sent in the method stream are drawn when the primitive ends.
             m3d::DRAW_INLINE_VERTEX | m3d::DRAW_INLINE_INDEX => self.inline_elements += 1,
@@ -419,24 +462,49 @@ impl Engine {
             m3d::END => {
                 if self.inline_elements > 0 {
                     let count = std::mem::take(&mut self.inline_elements);
-                    self.note_draw(cx, "inline vertices or indices", 0, count, self.topology);
+                    let topology = self.topology;
+                    self.note_draw(
+                        cx,
+                        "inline vertices or indices",
+                        Source::Inline { count },
+                        topology,
+                    )?;
                 }
             }
             m3d::DRAW_VERTEX_ARRAY => {
                 let first = self.reg(m3d::SET_VERTEX_ARRAY_START);
-                self.note_draw(cx, "DRAW_VERTEX_ARRAY", first, data, self.topology);
+                let topology = self.topology;
+                self.note_draw(
+                    cx,
+                    "DRAW_VERTEX_ARRAY",
+                    Source::Arrays { first, count: data },
+                    topology,
+                )?;
             }
             m3d::DRAW_VERTEX_ARRAY_BEGIN_END_FIRST
             | m3d::DRAW_VERTEX_ARRAY_BEGIN_END_SUBSEQUENT => {
                 let kind = if method == m3d::DRAW_VERTEX_ARRAY_BEGIN_END_FIRST {
+                    self.instance = 0;
                     "DRAW_VERTEX_ARRAY_BEGIN_END_INSTANCE_FIRST"
                 } else {
+                    self.instance += 1;
                     "DRAW_VERTEX_ARRAY_BEGIN_END_INSTANCE_SUBSEQUENT"
                 };
-                self.note_draw(cx, kind, data & 0xFFFF, (data >> 16) & 0xFFF, data >> 28);
+                let source = Source::Arrays {
+                    first: data & 0xFFFF,
+                    count: (data >> 16) & 0xFFF,
+                };
+                self.note_draw(cx, kind, source, data >> 28)?;
             }
             m3d::DRAW_INDEX_BUFFER => {
-                self.note_draw(cx, "DRAW_INDEX_BUFFER", 0, data, self.topology);
+                let first = self.reg(m3d::SET_INDEX_BUFFER_F);
+                let topology = self.topology;
+                let source = Source::Indexed {
+                    first,
+                    count: data,
+                    size: None,
+                };
+                self.note_draw(cx, "DRAW_INDEX_BUFFER", source, topology)?;
             }
             m3d::DRAW_INDEX_BEGIN_END_FIRST..=m3d::DRAW_INDEX_BEGIN_END_LAST => {
                 const KINDS: [&str; 6] = [
@@ -447,26 +515,50 @@ impl Engine {
                     "DRAW_INDEX_BUFFER16_BEGIN_END_INSTANCE_SUBSEQUENT",
                     "DRAW_INDEX_BUFFER8_BEGIN_END_INSTANCE_SUBSEQUENT",
                 ];
-                let kind = KINDS[(method - m3d::DRAW_INDEX_BEGIN_END_FIRST) as usize];
-                self.note_draw(cx, kind, data & 0xFFFF, (data >> 16) & 0xFFF, data >> 28);
+                const SIZES: [u32; 6] = [4, 2, 1, 4, 2, 1];
+                let which = (method - m3d::DRAW_INDEX_BEGIN_END_FIRST) as usize;
+                if which < 3 {
+                    self.instance = 0;
+                } else {
+                    self.instance += 1;
+                }
+                let source = Source::Indexed {
+                    first: data & 0xFFFF,
+                    count: (data >> 16) & 0xFFF,
+                    size: Some(SIZES[which]),
+                };
+                self.note_draw(cx, KINDS[which], source, data >> 28)?;
             }
-            m3d::DRAW_AUTO => self.note_draw(cx, "DRAW_AUTO", 0, data, self.topology),
-            m3d::DRAW_ZERO_INDEX => self.note_draw(cx, "DRAW_ZERO_INDEX", 0, data, self.topology),
-            m3d::CLEAR_SURFACE => cx.stats.draws.clears += 1,
+            m3d::DRAW_AUTO => {
+                let topology = self.topology;
+                let source = Source::Unsupported { count: data };
+                self.note_draw(cx, "DRAW_AUTO", source, topology)?;
+            }
+            m3d::DRAW_ZERO_INDEX => {
+                let topology = self.topology;
+                let source = Source::Unsupported { count: data };
+                self.note_draw(cx, "DRAW_ZERO_INDEX", source, topology)?;
+            }
+            m3d::CLEAR_SURFACE => self.note_clear(cx, data)?,
             _ => {}
         }
         Ok(())
     }
 
-    /// A draw was asked for: count it, and describe the first few.
+    /// A draw was asked for: count it, describe the first few, and give it to the renderer.
     fn note_draw(
         &mut self,
         cx: &mut Cx<'_>,
         kind: &'static str,
-        first: u32,
-        count: u32,
+        source: Source,
         topology: u32,
-    ) {
+    ) -> Result<(), String> {
+        let (first, count) = match source {
+            Source::Arrays { first, count } | Source::Indexed { first, count, .. } => {
+                (first, count)
+            }
+            Source::Inline { count } | Source::Unsupported { count } => (0, count),
+        };
         let stages = self.regs().stages();
         let mut shaders = std::mem::take(&mut cx.stats.shaders);
         shaders.observe(cx, &stages);
@@ -493,6 +585,42 @@ impl Engine {
                 eprintln!("[gpu] draw {text}");
             }
             d.first.push(text);
+        }
+        let draw = Draw {
+            source,
+            topology,
+            instance: self.instance,
+        };
+        let Some(backend) = cx.backend.as_mut() else {
+            return Ok(());
+        };
+        let scene = Scene {
+            regs: Regs(&self.regs),
+            cbufs: &self.cbufs,
+            mem: cx.mem,
+            space: cx.space,
+        };
+        match backend.draw(&scene, &draw) {
+            Ok(()) => Ok(()),
+            Err(why) => cx.renderer_failed("a draw", why),
+        }
+    }
+
+    /// A `CLEAR_SURFACE` was asked for.
+    fn note_clear(&mut self, cx: &mut Cx<'_>, word: u32) -> Result<(), String> {
+        cx.stats.draws.clears += 1;
+        let Some(backend) = cx.backend.as_mut() else {
+            return Ok(());
+        };
+        let scene = Scene {
+            regs: Regs(&self.regs),
+            cbufs: &self.cbufs,
+            mem: cx.mem,
+            space: cx.space,
+        };
+        match backend.clear(&scene, &Clear::from_word(word)) {
+            Ok(()) => Ok(()),
+            Err(why) => cx.renderer_failed("a clear", why),
         }
     }
 
@@ -617,6 +745,14 @@ mod tests {
     }
 
     fn with_cx<R>(f: impl FnOnce(&mut Cx<'_>) -> R) -> (R, TestMemory, Stats) {
+        with_backend(None, false, f)
+    }
+
+    fn with_backend<R>(
+        backend: Option<&mut (dyn Backend + 'static)>,
+        lenient: bool,
+        f: impl FnOnce(&mut Cx<'_>) -> R,
+    ) -> (R, TestMemory, Stats) {
         let (mem, space, mut sp) = world();
         let mut woken = Vec::new();
         let mut stats = Stats::default();
@@ -627,6 +763,8 @@ mod tests {
                 syncpoints: &mut sp,
                 woken: &mut woken,
                 stats: &mut stats,
+                backend,
+                lenient,
                 channel: 1,
                 syncpt: 1,
                 level: 0,
@@ -994,5 +1132,128 @@ mod tests {
         assert!(r.contains("9 x 3D NO_OPERATION"), "{r}");
         assert!(r.contains("3 x 3D CALL_MME_MACRO[0]"), "{r}");
         assert!(r.contains("7 x macro 4 (20 parameters in all)"), "{r}");
+    }
+
+    #[test]
+    fn draws_and_clears_reach_the_backend_with_what_they_say() {
+        use crate::render::testing::{Event, Recorder};
+        let mut rec = Recorder::default();
+        let events = rec.events.clone();
+        with_backend(Some(&mut rec), false, |cx| {
+            let mut e = Engine::new(class::THREED);
+            // BEGIN triangles (the first instance), an indexed draw of 12 indices from the
+            // index 7, END.
+            e.write(cx, 0x1618 / 4, 4, false).unwrap();
+            e.write(cx, 0x17dc / 4, 7, false).unwrap();
+            e.write(cx, 0x17e0 / 4, 12, true).unwrap();
+            e.write(cx, 0x1614 / 4, 0, true).unwrap();
+            // The next instance (bits 26..27 = 1), 6 vertices from the vertex 30.
+            e.write(cx, 0x1618 / 4, 4 | 1 << 26, false).unwrap();
+            e.write(cx, 0xd74 / 4, 30, false).unwrap();
+            e.write(cx, 0xd78 / 4, 6, true).unwrap();
+            e.write(cx, 0x1614 / 4, 0, true).unwrap();
+            // A combined 16-bit indexed draw (first 3, count 9, triangle strip), which starts a
+            // series again, and a subsequent one.
+            e.write(cx, 0x17e8 / 4, 3 | 9 << 16 | 5 << 28, true)
+                .unwrap();
+            e.write(cx, 0x17f4 / 4, 1 | 2 << 16 | 4 << 28, true)
+                .unwrap();
+            // Clear red, green, blue and alpha of the target 2, layer 3.
+            e.write(cx, 0x19d0 / 4, 0b11_1100 | 2 << 6 | 3 << 10, true)
+                .unwrap();
+        });
+        let draw = |source, topology, instance| {
+            Event::Draw(Draw {
+                source,
+                topology,
+                instance,
+            })
+        };
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                draw(
+                    Source::Indexed {
+                        first: 7,
+                        count: 12,
+                        size: None
+                    },
+                    4,
+                    0
+                ),
+                draw(
+                    Source::Arrays {
+                        first: 30,
+                        count: 6
+                    },
+                    4,
+                    1
+                ),
+                draw(
+                    Source::Indexed {
+                        first: 3,
+                        count: 9,
+                        size: Some(2)
+                    },
+                    5,
+                    0
+                ),
+                draw(
+                    Source::Indexed {
+                        first: 1,
+                        count: 2,
+                        size: Some(2)
+                    },
+                    4,
+                    1
+                ),
+                Event::Clear(Clear {
+                    depth: false,
+                    stencil: false,
+                    red: true,
+                    green: true,
+                    blue: true,
+                    alpha: true,
+                    target: 2,
+                    layer: 3,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_draw_the_backend_fails_stops_the_run_unless_it_goes_on() {
+        use crate::render::testing::Recorder;
+        let mut rec = Recorder {
+            fail_draws: true,
+            ..Recorder::default()
+        };
+        with_backend(Some(&mut rec), false, |cx| {
+            let mut e = Engine::new(class::THREED);
+            let err = e.write(cx, 0xd78 / 4, 3, true).unwrap_err();
+            assert!(
+                err.contains("a draw could not be rendered: the recorder refuses draws"),
+                "{err}"
+            );
+        });
+        let mut rec = Recorder {
+            fail_draws: true,
+            ..Recorder::default()
+        };
+        let events = rec.events.clone();
+        let ((), _, stats) = with_backend(Some(&mut rec), true, |cx| {
+            let mut e = Engine::new(class::THREED);
+            e.write(cx, 0xd78 / 4, 3, true).unwrap();
+            e.write(cx, 0xd78 / 4, 4, true).unwrap();
+        });
+        assert_eq!(events.lock().unwrap().len(), 2, "both were still offered");
+        assert_eq!(stats.failed["the recorder refuses draws"], 2);
+        assert!(
+            stats
+                .report(5)
+                .contains("the renderer failed 2 times, for 1 reasons"),
+            "{}",
+            stats.report(5)
+        );
     }
 }

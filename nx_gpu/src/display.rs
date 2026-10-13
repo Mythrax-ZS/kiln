@@ -104,6 +104,35 @@ impl GraphicBuffer {
             raw: flat.to_vec(),
         })
     }
+
+    /// A word of the native handle after its header, for the fields of the surface description
+    /// `NvGraphicBuffer` carries (`libnx`'s `graphic_buffer.h`): the first plane starts at word
+    /// 13 with width, height, color format, layout, pitch, an unused word, offset, kind and
+    /// the block height.
+    fn plane_word(&self, index: usize) -> u32 {
+        self.ints.get(13 + index).copied().unwrap_or(0)
+    }
+
+    /// The layout of the first plane (`libnx`'s `NvLayout`: 1 pitch linear, 2 Tegra tiled, 3 block
+    /// linear).
+    pub fn layout(&self) -> u32 {
+        self.plane_word(3)
+    }
+
+    /// The distance between rows in bytes (of a pitch linear plane).
+    pub fn pitch(&self) -> u32 {
+        self.plane_word(4)
+    }
+
+    /// Where the plane starts in its `nvmap` memory.
+    pub fn offset(&self) -> u32 {
+        self.plane_word(6)
+    }
+
+    /// The height of a block of a block linear plane, as a power of two in GOBs.
+    pub fn block_height_log2(&self) -> u32 {
+        self.plane_word(8)
+    }
 }
 
 /// What `queueBuffer` says about the buffer (the Switch's `QueueBufferInput`).
@@ -635,6 +664,14 @@ impl Compositor {
             self.events.set(token, free);
         }
         Ok(reply.finish())
+    }
+
+    /// The last frame shown on the layer behind `binder`.
+    pub fn last_frame_of(&self, binder: i32) -> Option<Frame> {
+        self.layers
+            .values()
+            .find(|l| l.binder == binder)
+            .and_then(|l| l.queue.last_frame().cloned())
     }
 
     /// The frames presented on all layers.

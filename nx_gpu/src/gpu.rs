@@ -6,6 +6,7 @@ use crate::event::EventToken;
 use crate::mem::GuestMemory;
 use crate::nvmap::Nvmap;
 use crate::pushbuf::GpEntry;
+use crate::render::Backend;
 use crate::syncpt::{reached, Syncpoints};
 use crate::vm::AddressSpace;
 use std::collections::BTreeMap;
@@ -64,6 +65,11 @@ pub struct Gpu {
     pub channels: BTreeMap<u32, Channel>,
     pub syncpoints: Syncpoints,
     pub stats: Stats,
+    /// What draws, clears and displayed buffers are given to; without one nothing is drawn.
+    pub backend: Option<Box<dyn Backend>>,
+    /// A draw the backend fails is counted and the run goes on (`NX_GPU_LENIENT=1`), instead of
+    /// stopping at the first.
+    pub lenient: bool,
     /// The trace level from `NX_TRACE_GPU`: 0 none, 1 submissions, 2 every method.
     pub level: u8,
     next_space: u32,
@@ -87,10 +93,38 @@ impl Gpu {
             channels: BTreeMap::new(),
             syncpoints: Syncpoints::new(),
             stats: Stats::default(),
+            backend: None,
+            lenient: std::env::var("NX_GPU_LENIENT").is_ok_and(|v| v != "0"),
             level: trace_level(),
             next_space: 1,
             next_channel: 1,
         }
+    }
+
+    /// The title queued a buffer for display: tell the renderer where it is. The `nvmap` handle
+    /// is resolved to the address of its memory in the guest process, which is how a render
+    /// target is matched with the buffer that shows it.
+    pub fn present(&mut self, frame: &crate::display::Frame) -> Result<(), String> {
+        let Some(backend) = self.backend.as_deref_mut() else {
+            return Ok(());
+        };
+        let buffer = &frame.buffer;
+        let Some(base) = self.nvmap.get(buffer.nvmap_id).and_then(|h| h.addr) else {
+            return Err(format!(
+                "the displayed buffer is in nvmap handle {}, which has no memory",
+                buffer.nvmap_id
+            ));
+        };
+        backend.present(&crate::render::Present {
+            address: base + u64::from(buffer.offset()),
+            width: buffer.width,
+            height: buffer.height,
+            pitch: buffer.pitch(),
+            format: buffer.format,
+            layout: buffer.layout(),
+            block_height_log2: buffer.block_height_log2(),
+            frame: frame.number,
+        })
     }
 
     pub fn new_space(&mut self) -> u32 {
@@ -190,6 +224,8 @@ impl Gpu {
                 syncpoints: &mut self.syncpoints,
                 woken: &mut woken,
                 stats: &mut self.stats,
+                backend: self.backend.as_deref_mut(),
+                lenient: self.lenient,
                 channel,
                 syncpt,
                 level: self.level,
@@ -201,6 +237,18 @@ impl Gpu {
                     Ok(Some(w)) => ch.execute(&mut cx, w).map_err(unimplemented)?,
                     Ok(None) => {}
                     Err(e) => return Err(unimplemented(e.0)),
+                }
+            }
+        }
+        // What was recorded for the renderer is finished before any fence says it is.
+        if let Some(backend) = self.backend.as_deref_mut() {
+            if let Err(why) = backend.finish() {
+                if self.lenient {
+                    eprintln!("[gpu] the renderer could not finish a submission: {why}");
+                } else {
+                    return Err(unimplemented(format!(
+                        "the renderer could not finish a submission: {why}"
+                    )));
                 }
             }
         }

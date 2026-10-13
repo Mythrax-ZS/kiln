@@ -13,6 +13,7 @@
 
 pub mod channel;
 pub mod display;
+pub mod draw_state;
 pub mod engine;
 pub mod error;
 pub mod event;
@@ -25,6 +26,7 @@ pub mod nvdrv;
 pub mod nvmap;
 pub mod parcel;
 pub mod pushbuf;
+pub mod render;
 pub mod shaders;
 pub mod state;
 pub mod syncpt;

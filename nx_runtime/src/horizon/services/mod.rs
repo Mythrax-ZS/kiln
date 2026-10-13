@@ -53,7 +53,9 @@ pub fn implemented_names() -> Vec<String> {
 /// kernel itself answers.
 pub fn register_defaults(kernel: &Arc<Kernel>) {
     let applet = applet::Shared::default();
+    let gpu = Arc::new(nvdrv::Shared::new());
     let display = Arc::new(vi::Shared::new());
+    display.set_gpu(gpu.clone());
     applet.lock().unwrap_or_else(|e| e.into_inner()).display = Some(display.clone());
     register(kernel, "vi:u", move |k| {
         vi::RootService::new(k, display.clone())
@@ -78,7 +80,6 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     register(kernel, "lm", lm::LogService::new);
     register(kernel, "nfp:user", nfp::UserManager::new);
     register(kernel, "nifm:u", nifm::StaticService::new);
-    let gpu = Arc::new(nvdrv::Shared::new());
     let report = gpu.clone();
     kernel.on_finish(Box::new(move || report.report()));
     register(kernel, "nvdrv", move |k| nvdrv::NvDrv::new(k, gpu.clone()));

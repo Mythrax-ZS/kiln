@@ -261,6 +261,8 @@ mod tests {
                 syncpoints: &mut sp,
                 woken: &mut woken,
                 stats: &mut stats,
+                backend: None,
+                lenient: false,
                 channel: 1,
                 syncpt: 1,
                 level: 0,
