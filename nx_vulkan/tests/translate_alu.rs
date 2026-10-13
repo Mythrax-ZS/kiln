@@ -93,7 +93,19 @@ fn float_arithmetic_matches_rust() {
         let sum = a + b;
         assert_eq!(got.regs[3], sum.to_bits(), "fadd, input {i}");
         assert_eq!(got.regs[4], (a * b).to_bits(), "fmul, input {i}");
-        assert_eq!(got.regs[5], a.mul_add(b, sum).to_bits(), "ffma, input {i}");
+        // A fused multiply-add rounds once. A software device (a CPU implementation of Vulkan)
+        // may not fuse and then rounds twice, so it is allowed that result as well.
+        let fused = a.mul_add(b, sum).to_bits();
+        let unfused = (a * b + sum).to_bits();
+        if vk.caps.discrete {
+            assert_eq!(got.regs[5], fused, "ffma, input {i}");
+        } else {
+            assert!(
+                got.regs[5] == fused || got.regs[5] == unfused,
+                "ffma, input {i}: {:#x} is neither {fused:#x} nor {unfused:#x}",
+                got.regs[5]
+            );
+        }
         assert_eq!(
             got.regs[6],
             (a.abs() + -b).to_bits(),
