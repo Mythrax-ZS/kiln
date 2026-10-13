@@ -200,6 +200,9 @@ pub struct Raster {
     pub bias_line: bool,
     pub bias_point: bool,
     pub provoking_last: bool,
+    /// Depth outside the viewport's range is clamped to it, not clipped (both the "pixel min z"
+    /// and "pixel max z" fields of `SET_VIEWPORT_CLIP_CONTROL` say clamp).
+    pub depth_clamp: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -314,7 +317,7 @@ pub struct Window {
     pub offset: [u32; 2],
     /// The viewport transform of the registers applies (else clip space is the window).
     pub transform_enabled: bool,
-    /// Clip space z runs from 0 to 1 (else from -1 to 1).
+    /// Clip space z runs from 0 to 1 (else from -1 to 1): bit 0 of `SET_VIEWPORT_CLIP_CONTROL`.
     pub z_zero_to_one: bool,
     pub pixel_center_integer: bool,
 }
@@ -429,6 +432,7 @@ impl Regs<'_> {
 
     pub fn window(&self) -> Window {
         let origin = self.word(r::WINDOW_ORIGIN);
+        let clip = self.word(r::VIEWPORT_CLIP_CONTROL);
         Window {
             lower_left: origin & 1 != 0,
             flip_y: origin >> 4 & 1 != 0,
@@ -437,7 +441,7 @@ impl Regs<'_> {
                 self.word(r::WINDOW_OFFSET_X + 4),
             ],
             transform_enabled: self.flag(r::VIEWPORT_SCALE_OFFSET),
-            z_zero_to_one: self.flag(r::VIEWPORT_CLIP_CONTROL),
+            z_zero_to_one: clip & 1 != 0,
             pixel_center_integer: self.flag(0x1924),
         }
     }
@@ -464,6 +468,7 @@ impl Regs<'_> {
             bias_line: self.flag(r::POLY_OFFSET_LINE),
             bias_point: self.flag(r::POLY_OFFSET_POINT),
             provoking_last: self.flag(r::PROVOKING_VERTEX),
+            depth_clamp: self.word(r::VIEWPORT_CLIP_CONTROL) >> 3 & 3 == 3,
         }
     }
 
@@ -747,6 +752,24 @@ mod tests {
         f[0x192c / 4] = 1;
         let w = Regs(&f).window();
         assert!(w.lower_left && w.flip_y && w.transform_enabled && !w.z_zero_to_one);
+        assert!(!Regs(&f).raster().depth_clamp);
+    }
+
+    #[test]
+    fn the_clip_control_register_is_read_field_by_field() {
+        let mut f = file();
+        // Other fields set (a guardband and a clip mode) do not make the z range 0 to 1.
+        f[0x193c / 4] = 1 << 7 | 3 << 11;
+        let w = Regs(&f).window();
+        assert!(!w.z_zero_to_one && !Regs(&f).raster().depth_clamp);
+        f[0x193c / 4] = 1;
+        assert!(Regs(&f).window().z_zero_to_one);
+        // Depth is clamped when both ends say so, not for one.
+        f[0x193c / 4] = 1 << 3;
+        assert!(!Regs(&f).raster().depth_clamp);
+        f[0x193c / 4] = 1 << 3 | 1 << 4;
+        let w = Regs(&f).window();
+        assert!(Regs(&f).raster().depth_clamp && !w.z_zero_to_one);
     }
 
     #[test]
