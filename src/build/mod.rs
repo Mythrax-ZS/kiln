@@ -166,6 +166,11 @@ impl Toolchain {
             for e in exports {
                 args.push(format!("-Wl,/EXPORT:{e}"));
             }
+            // A map of the linked image (where each function is), for finding what a host thread
+            // is running from its instruction pointer: `RECOMP_LINK_MAP=<file>`.
+            if let Some(map) = std::env::var_os("RECOMP_LINK_MAP") {
+                args.push(format!("-Wl,/MAP:{}", path_arg(Path::new(&map))));
+            }
         } else {
             args.extend(["-pthread", "-ldl", "-lm"].map(String::from));
             for e in exports {

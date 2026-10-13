@@ -87,7 +87,11 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   RomFS it reads at run time; `NX_WATCHDOG=<seconds>` says, when no frame has been presented for
   that long (and again every that many seconds), what every guest thread is doing (the supervisor
   call, the service and command of a request, the return addresses as of its last call) and
-  where the command processor and the renderer are (`recomp symbols` names the addresses). A run
+  where the command processor and the renderer are (`recomp symbols` names the addresses;
+  `NX_WATCHDOG_ALWAYS=1` reports every that many seconds whether frames come or not, for a title
+  that presents the frames of a loading screen for ever). `NX_JITTER=<percent>[,<microseconds>]`
+  makes that share of the supervisor calls sleep for up to that long first (500 by default), to stir
+  the threads' timing when looking for a race. A run
   that stops reports every thread (priority, core, what it is doing), then the registers of the
   thread that stopped and 256 bytes at each register that holds an address (and at what those
   point at in the heap), for reading a crash. `NX_CORES=per-core` (or `one`) makes a guest thread
@@ -154,5 +158,9 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
 - A real title through the whole pipeline (opt-in, by hand; nothing from it is stored): build with
   `recomp build --exefs <exefs> --romfs <romfs> --out <dir>`, run `<dir>/<name>` with
   `NX_TRACE_SVC=1`, and use `recomp relink` / `--reuse-objects` to iterate on the runtime.
+  `RECOMP_LINK_MAP=<file>` makes the link write a map of the executable, and on Windows
+  `pwsh -File tools/sample_threads.ps1 -Map <file>` samples where every thread of the running
+  program is (a generated function `f_<guest address>`, a Rust function of the runtime, a module
+  of the process) to say what it is busy with.
 - Unicorn (AArch64 oracle): `UNICORN_DLL`, else `.venv` (`py -m venv .venv`, then
   `.venv\Scripts\pip install unicorn`). The shared library is loaded with `libloading`.

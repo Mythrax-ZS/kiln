@@ -1,0 +1,102 @@
+# What is a produced Windows program busy with? Samples the instruction pointer of every thread now and
+# then and names where it is: a function of the program (from the link map that `recomp build` or
+# `recomp relink` writes when RECOMP_LINK_MAP=<file> is set: generated code is `f_<guest address>`, the
+# runtime's functions have their Rust names) or a module of the process (a driver, ntdll).
+#
+# usage: pwsh -File tools/sample_threads.ps1 -Map <map file> [-Process title] [-Samples 40]
+#            [-IntervalMs 50] [-Top 25] [-OnlyRunning]
+#
+# -OnlyRunning leaves out the threads the system says are waiting. The first column is how many
+# samples found a thread at the place, then the thread's id, then the place.
+param(
+    [Parameter(Mandatory = $true)][string]$Map,
+    [string]$Process = "title",
+    [int]$Samples = 40,
+    [int]$IntervalMs = 50,
+    [int]$Top = 25,
+    [switch]$OnlyRunning
+)
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class ThreadIp {
+    [DllImport("kernel32.dll")] static extern IntPtr OpenThread(uint access, bool inherit, uint tid);
+    [DllImport("kernel32.dll")] static extern uint SuspendThread(IntPtr h);
+    [DllImport("kernel32.dll")] static extern int ResumeThread(IntPtr h);
+    [DllImport("kernel32.dll")] static extern bool GetThreadContext(IntPtr h, IntPtr ctx);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    // The instruction pointer of a thread of this (64-bit) process, or 0 when it cannot be read.
+    public static ulong Rip(uint tid) {
+        // THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION
+        IntPtr h = OpenThread(0x0002 | 0x0008 | 0x0040, false, tid);
+        if (h == IntPtr.Zero) return 0;
+        // A CONTEXT is 1232 bytes, aligned to 16; ContextFlags (at 0x30) asks for the control registers
+        // (CONTEXT_AMD64 | CONTEXT_CONTROL), and Rip is at 0xF8.
+        IntPtr raw = Marshal.AllocHGlobal(1232 + 16);
+        long aligned = ((long)raw + 15) & ~15L;
+        IntPtr ctx = (IntPtr)aligned;
+        for (int i = 0; i < 1232; i++) Marshal.WriteByte(ctx, i, 0);
+        Marshal.WriteInt32(ctx, 0x30, 0x100001);
+        ulong rip = 0;
+        if (SuspendThread(h) != 0xFFFFFFFF) {
+            if (GetThreadContext(h, ctx)) rip = (ulong)Marshal.ReadInt64(ctx, 0xF8);
+            ResumeThread(h);
+        }
+        Marshal.FreeHGlobal(raw);
+        CloseHandle(h);
+        return rip;
+    }
+}
+"@
+
+$p = Get-Process $Process -ErrorAction Stop | Select-Object -First 1
+$base = [uint64]$p.MainModule.BaseAddress.ToInt64()
+$preferred = [uint64]0x140000000   # the image base the map is written for
+
+# The map's symbols, by address.
+$addrs = New-Object System.Collections.Generic.List[uint64]
+$names = New-Object System.Collections.Generic.List[string]
+$rows = foreach ($line in [System.IO.File]::ReadLines($Map)) {
+    if ($line -match '^\s*[0-9a-f]{4}:[0-9a-f]{8}\s+(\S+)\s+([0-9a-f]{16})\s') {
+        [pscustomobject]@{ Va = [Convert]::ToUInt64($Matches[2], 16); Name = $Matches[1] }
+    }
+}
+foreach ($r in ($rows | Sort-Object Va)) { $addrs.Add($r.Va); $names.Add($r.Name) }
+
+$modules = $p.Modules | ForEach-Object {
+    [pscustomobject]@{
+        Name = $_.ModuleName
+        Lo = [uint64]$_.BaseAddress.ToInt64()
+        Hi = [uint64]$_.BaseAddress.ToInt64() + [uint64]$_.ModuleMemorySize
+    }
+}
+
+function Where-Is([uint64]$rip) {
+    if ($rip -eq 0) { return "(no context)" }
+    if ($rip -lt $base -or $rip -ge $base + 0x20000000) {
+        foreach ($m in $modules) {
+            if ($rip -ge $m.Lo -and $rip -lt $m.Hi) { return "{0}+{1:x}" -f $m.Name, ($rip - $m.Lo) }
+        }
+        return "(unknown module: {0:x})" -f $rip
+    }
+    $va = $rip - $base + $preferred
+    $i = $addrs.BinarySearch($va)
+    if ($i -lt 0) { $i = (-bnot $i) - 1 }
+    if ($i -lt 0) { return "(below the image: {0:x})" -f $rip }
+    $off = $va - $addrs[$i]
+    if ($off -gt 0x100000) { return "(not in a function: {0:x})" -f $rip }
+    return "{0}+{1:x}" -f $names[$i], $off
+}
+
+$counts = @{}
+for ($n = 0; $n -lt $Samples; $n++) {
+    $p.Refresh()
+    foreach ($t in $p.Threads) {
+        if ($OnlyRunning -and $t.ThreadState -ne "Running") { continue }
+        $key = "{0}  {1}" -f $t.Id, (Where-Is ([ThreadIp]::Rip([uint32]$t.Id)))
+        if ($counts.ContainsKey($key)) { $counts[$key]++ } else { $counts[$key] = 1 }
+    }
+    Start-Sleep -Milliseconds $IntervalMs
+}
+$counts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First $Top |
+    ForEach-Object { "{0,5}  {1}" -f $_.Value, $_.Key }
