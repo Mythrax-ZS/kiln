@@ -5,6 +5,8 @@
 //! return addresses as of its last call: generated code keeps its registers in variables and
 //! stores them in the CPU structure at calls) and how far the command processor has got, then
 //! again every `seconds` while the run stays stuck. `recomp symbols` names the addresses.
+//! `NX_WATCHDOG_ALWAYS=1` makes it report every `seconds` whether frames come or not, for a title
+//! that presents the frames of a loading screen for ever.
 
 use super::kernel::Kernel;
 use super::svc::svc_name;
@@ -93,6 +95,9 @@ pub fn spawn(kernel: Arc<Kernel>, limit: Duration) {
 }
 
 fn watch(kernel: &Kernel, limit: Duration) {
+    // `NX_WATCHDOG_ALWAYS`: report every `limit` whether frames come or not (a title that presents
+    // the frames of a loading screen for ever is not answering either).
+    let always = std::env::var_os("NX_WATCHDOG_ALWAYS").is_some();
     let mut frames = super::input::frames();
     let mut moved = Instant::now();
     let mut last_report: Option<Instant> = None;
@@ -106,11 +111,13 @@ fn watch(kernel: &Kernel, limit: Duration) {
         if now_frames != frames {
             frames = now_frames;
             moved = Instant::now();
-            last_report = None;
-            continue;
+            if !always {
+                last_report = None;
+                continue;
+            }
         }
         let quiet = moved.elapsed();
-        if quiet < limit || last_report.is_some_and(|t| t.elapsed() < limit) {
+        if (!always && quiet < limit) || last_report.is_some_and(|t| t.elapsed() < limit) {
             continue;
         }
         last_report = Some(Instant::now());
@@ -119,9 +126,13 @@ fn watch(kernel: &Kernel, limit: Duration) {
             nx_gpu::progress::COMMANDS.load(Ordering::Relaxed),
         );
         eprintln!(
-            "[watchdog] no frame was presented for {:.0} s (frame {frames}); the command processor \
+            "[watchdog] {} (frame {frames}); the command processor \
              has handled {m} methods (+{} since the last look) and {c} draws and clears (+{}); the GPU \n             side is {}",
-            quiet.as_secs_f64(),
+            if always {
+                "status".to_string()
+            } else {
+                format!("no frame was presented for {:.0} s", quiet.as_secs_f64())
+            },
             m - methods,
             c - commands,
             nx_gpu::progress::phase()
@@ -178,8 +189,19 @@ pub(super) fn report_threads(kernel: &Kernel, label: &str) {
                 .iter()
                 .map(|a| format!("{a:#x}"))
                 .collect();
+            // What a thread running guest code held at its last call says where it is going: the
+            // callee is in the register the call went through (x8 and x16 are the usual ones).
+            let regs = if svc == 0 {
+                let x = &cpu.state.x;
+                format!(
+                    ", x0 {:#x} x1 {:#x} x8 {:#x} x16 {:#x} x19 {:#x} x20 {:#x} x21 {:#x} x22 {:#x}",
+                    x[0], x[1], x[8], x[16], x[19], x[20], x[21], x[22]
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "pc {:#x} at its last call, return addresses {}",
+                "pc {:#x} at its last call{regs}, return addresses {}",
                 cpu.state.pc,
                 frames.join(" ")
             )
