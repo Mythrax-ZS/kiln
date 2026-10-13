@@ -33,6 +33,8 @@ pub struct PipelineKey {
     topology: i32,
     polygon_mode: i32,
     depth_clamp: bool,
+    /// Nothing is rasterized (`NX_DEBUG_DISCARD_PROGRAMS`).
+    discard: bool,
     color_formats: Vec<i32>,
     depth_format: i32,
     blend: Vec<BlendKey>,
@@ -96,6 +98,7 @@ fn logic_op(func: u32) -> vk::LogicOp {
 
 impl Core {
     pub(super) fn draw(&mut self, scene: &Scene<'_>, draw: &Draw) -> Result<(), String> {
+        self.last_textures.clear();
         let regs = scene.regs;
         let raster = regs.raster();
         if !raster.enabled {
@@ -126,6 +129,12 @@ impl Core {
             .find(|s| s.kind == StageKind::Vertex)
             .ok_or("a draw without a vertex program")?;
         let ps_slot = stages.iter().find(|s| s.kind == StageKind::Pixel);
+        if stages
+            .iter()
+            .any(|s| self.debug.skip_programs.contains(&s.address))
+        {
+            return Ok(());
+        }
 
         // What the shaders see of the state.
         let window = regs.window();
@@ -378,6 +387,7 @@ impl Core {
             &raster,
             &blend,
             layout_bindings.clone(),
+            self.debug.discard_programs.contains(&vs_slot.address),
         );
         let pipeline = self.pipeline(&key, &vs, ps.as_deref(), pipeline_layout, &blend)?;
         lap(&mut mark, &mut self.phases.pipeline);
@@ -413,6 +423,16 @@ impl Core {
         if !self.set_dynamic_state(scene, cmd, &pass, &raster, &regs.depth_stencil(), &blend) {
             return Ok(());
         }
+        self.frame.mark(&self.vk, cmd, || {
+            format!(
+                "draw {:?} topology {} instance {} with the programs at {:#x} and {:?}",
+                draw.source,
+                draw.topology,
+                draw.instance,
+                vs_slot.address,
+                ps_slot.map(|s| s.address)
+            )
+        });
         let d = &self.vk.device;
         // SAFETY: as above.
         unsafe {
@@ -534,6 +554,12 @@ impl Core {
                 std::array::from_fn(|i| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()))
             };
             let (tic, tsc) = (Tic(words(&tic_bytes)), Tsc(words(&tsc_bytes)));
+            if self.sync_on {
+                self.last_textures.push(format!(
+                    "texture {} of the {kind_name} program: handle {handle:#x} from {from}, header {tic_id} {:08x?} sampler {tsc_id} {:08x?}",
+                    used.index, tic.0, tsc.0
+                ));
+            }
             if self.debug.trace_textures && self.traced().is_some() {
                 eprintln!(
                     "[vulkan] texture {} of the {kind_name} program: header {tic_id} {:08x?} sampler {tsc_id} {:08x?}",
@@ -684,6 +710,12 @@ impl Core {
             target.transition(&self.vk, cmd, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
             let source = target.image.image;
             let o = c.overlay;
+            self.frame.mark(&self.vk, cmd, || {
+                format!(
+                    "copy of the target at {:#x} into layer {} level {} of a texture",
+                    o.key.address, o.layer, o.level
+                )
+            });
             let region = [vk::ImageCopy::default()
                 .src_subresource(vk::ImageSubresourceLayers {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -1030,6 +1062,7 @@ impl Core {
         raster: &Raster,
         blend: &Blend,
         layout: Vec<super::shaders::Binding>,
+        discard: bool,
     ) -> PipelineKey {
         let color_formats: Vec<i32> = pass.colors.iter().map(|k| k.format.as_raw()).collect();
         let blend_keys = (0..pass.colors.len())
@@ -1067,6 +1100,7 @@ impl Core {
             topology: topology.as_raw(),
             polygon_mode: convert::polygon_mode(raster.front_mode).as_raw(),
             depth_clamp: raster.depth_clamp && self.vk.caps.depth_clamp,
+            discard,
             color_formats,
             depth_format: pass.depth.map_or(0, |k| k.format.as_raw()),
             blend: blend_keys,
@@ -1125,6 +1159,7 @@ impl Core {
         let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::from_raw(key.polygon_mode))
             .depth_clamp_enable(key.depth_clamp)
+            .rasterizer_discard_enable(key.discard)
             .cull_mode(vk::CullModeFlags::NONE)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);

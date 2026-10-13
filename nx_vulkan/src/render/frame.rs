@@ -34,6 +34,11 @@ pub struct Frame {
     pools_in_use: usize,
     /// Resources to destroy once the submission has finished.
     pub garbage: Vec<Garbage>,
+    /// What each checkpoint of the submission in progress stands for (`NX_DEBUG_CHECKPOINTS`), by
+    /// its number less one.
+    marks: Vec<String>,
+    /// The device was lost: nothing more is asked of it.
+    lost: bool,
 }
 
 /// Something a submission needed that can be destroyed after it ran.
@@ -80,6 +85,8 @@ impl Frame {
                 descriptor_pools: Vec::new(),
                 pools_in_use: 0,
                 garbage: Vec::new(),
+                marks: Vec::new(),
+                lost: false,
             })
         }
     }
@@ -217,47 +224,116 @@ impl Frame {
         Err("no descriptor set could be allocated".to_string())
     }
 
+    /// The device was lost in an earlier submission.
+    pub fn lost(&self) -> bool {
+        self.lost
+    }
+
+    /// Say in `cmd` where the commands recorded so far end, as `what` (`NX_DEBUG_CHECKPOINTS`; a
+    /// device that is lost says which of these it reached).
+    pub fn mark(&mut self, vk: &Vk, cmd: vk::CommandBuffer, what: impl FnOnce() -> String) {
+        if vk.caps.checkpoints {
+            self.marks.push(what());
+            vk.checkpoint(cmd, self.marks.len() as u64);
+        }
+    }
+
+    /// Print the checkpoints a lost device reached.
+    fn say_where_it_stopped(&self, vk: &Vk, after: std::time::Duration) {
+        eprintln!(
+            "[vulkan] the device was lost {:.2} s after the commands were submitted",
+            after.as_secs_f64()
+        );
+        if !vk.caps.checkpoints {
+            eprintln!(
+                "[vulkan]   (NX_DEBUG_CHECKPOINTS=1 makes it say which command it was running)"
+            );
+            return;
+        }
+        let reached = vk.checkpoints_reached();
+        eprintln!(
+            "[vulkan]   {} commands were marked in the submission; the device reached {}:",
+            self.marks.len(),
+            reached.len()
+        );
+        let describe = |marker: u64| {
+            marker
+                .checked_sub(1)
+                .and_then(|i| self.marks.get(i as usize))
+                .map_or("unknown", String::as_str)
+        };
+        for &(stage, marker) in &reached {
+            eprintln!(
+                "[vulkan]   {stage:?} had finished the commands up to {marker}: {}",
+                describe(marker)
+            );
+        }
+        // The commands between the last one that is all done and the last one that was begun are
+        // the ones the device can have stopped in.
+        let first = reached.iter().map(|r| r.1).min().unwrap_or(0);
+        let last = reached.iter().map(|r| r.1).max().unwrap_or(0);
+        for marker in first + 1..=last.min(first + 40) {
+            eprintln!("[vulkan]   command {marker}: {}", describe(marker));
+        }
+    }
+
     /// End the recording, run it and wait for it. Afterwards the upload memory and the
     /// descriptor pools are free again and the garbage is gone.
     pub fn submit(&mut self, vk: &Vk) -> Result<(), String> {
+        if self.lost {
+            return Err("the Vulkan device was lost earlier".to_string());
+        }
         if !self.recording && !self.staging_recording {
             return Ok(());
         }
+        let began = std::time::Instant::now();
         // SAFETY: the command buffers are recording; the fence is unsignaled; the wait makes
         // everything the commands used safe to release.
         let result = unsafe {
-            (|| -> Result<(), String> {
+            (|| -> Result<(), (String, bool)> {
+                let lost = |e: vk::Result| e == vk::Result::ERROR_DEVICE_LOST;
                 // Uploads first, then the commands that use what they upload.
                 let mut cmds = Vec::new();
                 if self.staging_recording {
                     vk.device
                         .end_command_buffer(self.staging)
-                        .map_err(|e| format!("ending the upload command buffer: {e}"))?;
+                        .map_err(|e| (format!("ending the upload command buffer: {e}"), lost(e)))?;
                     cmds.push(self.staging);
                 }
                 if self.recording {
                     vk.device
                         .end_command_buffer(self.cmd)
-                        .map_err(|e| format!("ending the command buffer: {e}"))?;
+                        .map_err(|e| (format!("ending the command buffer: {e}"), lost(e)))?;
                     cmds.push(self.cmd);
                 }
                 let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
                 let _phase = nx_gpu::progress::enter(nx_gpu::progress::SUBMITTING);
                 vk.device
                     .queue_submit(vk.queue, &submit, self.fence)
-                    .map_err(|e| format!("submitting the commands: {e}"))?;
+                    .map_err(|e| (format!("submitting the commands: {e}"), lost(e)))?;
                 let _phase = nx_gpu::progress::enter(nx_gpu::progress::WAITING_FOR_DEVICE);
                 vk.device
                     .wait_for_fences(&[self.fence], true, 120_000_000_000)
-                    .map_err(|e| format!("waiting for the commands: {e}"))?;
+                    .map_err(|e| (format!("waiting for the commands: {e}"), lost(e)))?;
                 vk.device
                     .reset_fences(&[self.fence])
-                    .map_err(|e| format!("resetting the fence: {e}"))?;
+                    .map_err(|e| (format!("resetting the fence: {e}"), lost(e)))?;
                 Ok(())
             })()
         };
         self.recording = false;
         self.staging_recording = false;
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err((message, true)) => {
+                // Nothing more can be asked of a lost device (its calls may never return), but it can
+                // be asked where it was when it went.
+                self.lost = true;
+                self.say_where_it_stopped(vk, began.elapsed());
+                return Err(message);
+            }
+            Err((message, false)) => Err(message),
+        };
         // SAFETY: nothing is using the pools now.
         unsafe {
             for cmd in [self.cmd, self.staging] {
@@ -271,6 +347,7 @@ impl Frame {
                     .reset_descriptor_pool(*pool, vk::DescriptorPoolResetFlags::empty());
             }
         }
+        self.marks.clear();
         self.pools_in_use = 0;
         for chunk in &mut self.chunks {
             chunk.used = 0;

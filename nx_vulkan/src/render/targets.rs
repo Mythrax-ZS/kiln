@@ -312,6 +312,9 @@ impl Targets {
             };
             let size = u64::from(key.width) * u64::from(key.height) * u64::from(bpp);
             let staging = vk.create_host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
+            frame.mark(vk, cmd, || {
+                format!("copy of the target {key:?} out to memory")
+            });
             target.transition(vk, cmd, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
             let region = [vk::BufferImageCopy::default()
                 .image_subresource(vk::ImageSubresourceLayers {

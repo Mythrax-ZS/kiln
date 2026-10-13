@@ -34,6 +34,7 @@ impl Variation {
         c.attribute_classes = self.attribute_classes;
         c.target_classes = self.target_classes;
         c.depth_minus_one_to_one = self.depth_minus_one_to_one;
+        c.force_loop = std::env::var_os("NX_DEBUG_DISPATCH_LOOP").is_some();
         c
     }
 }
@@ -76,7 +77,32 @@ pub struct Shaders {
     /// `NX_DEBUG_SOLID_KEEP=<address>[,<address>...]`: pixel programs at these addresses keep
     /// their code in spite of `NX_DEBUG_SOLID_PIXEL` (hexadecimal).
     solid_keep: Vec<u64>,
+    /// `NX_DEBUG_SOLID_ONLY=<address>[,<address>...]`: pixel programs at these addresses (and no
+    /// others) write a constant color: does a draw lose the device because of its pixel program?
+    solid_only: Vec<u64>,
+    /// `NX_SPIRV_OPT=<spirv-opt arguments>`: every graphics program goes through `spirv-opt` with
+    /// these arguments before the device sees it (does a driver do better with another shape of
+    /// the same program?).
+    spirv_opt: Option<Vec<String>>,
+    /// `NX_DEBUG_TRIVIAL_VERTEX=<address>[,<address>...]`: the vertex programs at these addresses are
+    /// replaced by one that writes a constant position and reads nothing (the translation still
+    /// says what the pipeline feeds it): does a draw lose the device in the program or in what feeds it?
+    trivial_vertex: Vec<u64>,
 }
+
+/// A vertex program that writes the position (0, 0, 0, 1) and nothing else (SPIR-V 1.6, assembled
+/// from text and checked with `spirv-val`).
+const TRIVIAL_VERTEX: &[u32] = &[
+    0x07230203, 0x00010600, 0x00070000, 0x0000000c, 0x00000000, 0x00020011, 0x00000001, 0x0003000e,
+    0x00000000, 0x00000001, 0x0006000f, 0x00000000, 0x00000001, 0x6e69616d, 0x00000000, 0x00000002,
+    0x00040047, 0x00000002, 0x0000000b, 0x00000000, 0x00020013, 0x00000003, 0x00030021, 0x00000004,
+    0x00000003, 0x00030016, 0x00000005, 0x00000020, 0x00040017, 0x00000006, 0x00000005, 0x00000004,
+    0x00040020, 0x00000007, 0x00000003, 0x00000006, 0x0004003b, 0x00000007, 0x00000002, 0x00000003,
+    0x0004002b, 0x00000005, 0x00000008, 0x00000000, 0x0004002b, 0x00000005, 0x00000009, 0x3f800000,
+    0x0007002c, 0x00000006, 0x0000000a, 0x00000008, 0x00000008, 0x00000008, 0x00000009, 0x00050036,
+    0x00000003, 0x00000001, 0x00000000, 0x00000004, 0x000200f8, 0x0000000b, 0x0003003e, 0x00000002,
+    0x0000000a, 0x000100fd, 0x00010038,
+];
 
 impl Shaders {
     pub fn new(debug: &super::Debug) -> Shaders {
@@ -86,15 +112,31 @@ impl Shaders {
             next_id: 0,
             spirv_check: debug.spirv_check,
             solid_pixel: debug.solid_pixel,
-            solid_keep: std::env::var("NX_DEBUG_SOLID_KEEP")
-                .map(|v| {
-                    v.split(',')
-                        .filter_map(|a| {
-                            u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            solid_keep: super::debug::addresses("NX_DEBUG_SOLID_KEEP"),
+            solid_only: super::debug::addresses("NX_DEBUG_SOLID_ONLY"),
+            trivial_vertex: super::debug::addresses("NX_DEBUG_TRIVIAL_VERTEX"),
+            spirv_opt: std::env::var("NX_SPIRV_OPT")
+                .ok()
+                .map(|v| v.split_whitespace().map(str::to_string).collect()),
+        }
+    }
+
+    /// The module after the passes `NX_SPIRV_OPT` asks for, if it asks.
+    fn tuned(opt: &Option<Vec<String>>, spirv: &[u32], what: &str) -> Vec<u32> {
+        let Some(args) = opt else {
+            return spirv.to_vec();
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        match nx_shader::validate::optimize(spirv, &args) {
+            Ok(Some(better)) => better,
+            Ok(None) => {
+                eprintln!("[vulkan] NX_SPIRV_OPT is set and spirv-opt is not installed");
+                spirv.to_vec()
+            }
+            Err(e) => {
+                eprintln!("[vulkan] spirv-opt failed on {what}: {e}");
+                spirv.to_vec()
+            }
         }
     }
 }
@@ -152,9 +194,9 @@ impl Shaders {
                 }
                 let size = SPH_BYTES + cfg.extent as usize;
                 let mut code = code[..cfg.extent as usize].to_vec();
-                if self.solid_pixel
-                    && slot.kind == StageKind::Pixel
-                    && !self.solid_keep.contains(&slot.address)
+                if slot.kind == StageKind::Pixel
+                    && ((self.solid_pixel && !self.solid_keep.contains(&slot.address))
+                        || self.solid_only.contains(&slot.address))
                 {
                     // Bring-up switch: every fragment is magenta.
                     use nx_shader::asm::{assemble, exit, mov32i};
@@ -190,12 +232,20 @@ impl Shaders {
                 ));
             }
         }
+        let spirv = if slot.kind == StageKind::Vertex && self.trivial_vertex.contains(&slot.address)
+        {
+            TRIVIAL_VERTEX.to_vec()
+        } else {
+            Shaders::tuned(
+                &self.spirv_opt,
+                &translation.spirv,
+                &format!("the {name} program at {:#x}", slot.address),
+            )
+        };
         // SAFETY: valid SPIR-V from the translator; the module is destroyed with the cache.
         let module = unsafe {
-            vk.device.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(&translation.spirv),
-                None,
-            )
+            vk.device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spirv), None)
         }
         .map_err(|e| format!("creating the module of the {name} program: {e}"))?;
         self.next_id += 1;

@@ -25,6 +25,9 @@ pub struct Capabilities {
     pub custom_border_color: bool,
     pub index_type_uint8: bool,
     pub vertex_input_dynamic_state: bool,
+    /// `VK_NV_device_diagnostic_checkpoints` is enabled (`NX_DEBUG_CHECKPOINTS`): commands can say
+    /// where they are, and a lost device can say which it reached.
+    pub checkpoints: bool,
     pub swapchain: bool,
     pub shader_int64: bool,
     pub shader_float64: bool,
@@ -59,6 +62,7 @@ pub struct Vk {
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub push_descriptor: Option<khr::push_descriptor::Device>,
     pub external_memory_host: Option<ash::ext::external_memory_host::Device>,
+    checkpoints: Option<ash::nv::device_diagnostic_checkpoints::Device>,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
 }
 
@@ -281,6 +285,12 @@ impl Vk {
             ash::ext::vertex_input_dynamic_state::NAME,
             &mut caps.vertex_input_dynamic_state,
         );
+        if std::env::var_os("NX_DEBUG_CHECKPOINTS").is_some() {
+            want(
+                ash::nv::device_diagnostic_checkpoints::NAME,
+                &mut caps.checkpoints,
+            );
+        }
 
         // Properties that depend on extensions.
         let mut host_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
@@ -455,6 +465,9 @@ impl Vk {
         let push_descriptor = caps
             .push_descriptor
             .then(|| khr::push_descriptor::Device::new(&instance, &device));
+        let checkpoints = caps
+            .checkpoints
+            .then(|| ash::nv::device_diagnostic_checkpoints::Device::new(&instance, &device));
         Ok(Vk {
             entry,
             instance,
@@ -466,8 +479,35 @@ impl Vk {
             memory_properties,
             push_descriptor,
             external_memory_host,
+            checkpoints,
             debug,
         })
+    }
+
+    /// Say in `cmd` that the commands recorded before are done when the device reaches this
+    /// point, as `marker` (`NX_DEBUG_CHECKPOINTS`).
+    pub fn checkpoint(&self, cmd: vk::CommandBuffer, marker: u64) {
+        if let Some(c) = &self.checkpoints {
+            // SAFETY: the command buffer is recording; the marker is a number, not a pointer.
+            unsafe { c.cmd_set_checkpoint(cmd, marker as *const std::ffi::c_void) };
+        }
+    }
+
+    /// The markers the queue reached, as pairs of the pipeline stage and the marker: after a loss of
+    /// the device, where the work stopped.
+    pub fn checkpoints_reached(&self) -> Vec<(vk::PipelineStageFlags, u64)> {
+        let Some(c) = &self.checkpoints else {
+            return Vec::new();
+        };
+        // SAFETY: a plain query on the queue, into as many entries as it says there are.
+        unsafe {
+            let n = c.get_queue_checkpoint_data_len(self.queue);
+            let mut data = vec![vk::CheckpointDataNV::default(); n];
+            c.get_queue_checkpoint_data(self.queue, &mut data);
+            data.iter()
+                .map(|d| (d.stage, d.p_checkpoint_marker as usize as u64))
+                .collect()
+        }
     }
 
     /// Can images of `format` (optimal tiling) do all of `features`?

@@ -52,6 +52,16 @@ pub struct Debug {
     /// number), run the commands and wait for them after every draw, so that a draw that loses the
     /// device (a program that never ends, a bad address) is named when it does.
     pub sync_draws: Option<u64>,
+    /// `NX_DEBUG_SYNC_FROM=<frame>`: the same from that presented frame on (a loss of the device
+    /// that comes at a known frame, after a run that is too long to wait for at every draw).
+    pub sync_from: Option<u64>,
+    /// `NX_DEBUG_SKIP_PROGRAMS=<hex address>[,...]`: a draw whose vertex or pixel program is at one
+    /// of these addresses is not drawn (does the loss of a device come from those draws?).
+    pub skip_programs: Vec<u64>,
+    /// `NX_DEBUG_DISCARD_PROGRAMS=<hex address>[,...]`: a draw whose vertex program is at one of
+    /// these addresses runs its vertex stage and rasterizes nothing (does the device get lost in
+    /// the vertex stage or after it?).
+    pub discard_programs: Vec<u64>,
 }
 
 impl Debug {
@@ -80,6 +90,20 @@ impl Debug {
             flip_front: set("NX_DEBUG_FLIP_FRONT"),
             sync_draws: set("NX_DEBUG_SYNC_DRAWS")
                 .then(|| number("NX_DEBUG_SYNC_DRAWS").unwrap_or(1)),
+            sync_from: number("NX_DEBUG_SYNC_FROM"),
+            skip_programs: addresses("NX_DEBUG_SKIP_PROGRAMS"),
+            discard_programs: addresses("NX_DEBUG_DISCARD_PROGRAMS"),
         }
     }
+}
+
+/// The hexadecimal addresses a switch lists, separated by commas.
+pub fn addresses(name: &str) -> Vec<u64> {
+    std::env::var(name)
+        .map(|v| {
+            v.split(',')
+                .filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }

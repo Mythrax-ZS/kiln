@@ -1042,6 +1042,13 @@ impl Textures {
             r.buffer_offset += base_offset;
         }
         let cmd = frame.upload_cmd(vk)?;
+        frame.mark(vk, cmd, || {
+            format!(
+                "upload of the texture at {:#x}: {width}x{height}, {layers} layers, {levels} levels, {:?}",
+                tic.address(),
+                format.vk
+            )
+        });
         let range = vk::ImageSubresourceRange {
             aspect_mask: aspect,
             base_mip_level: 0,

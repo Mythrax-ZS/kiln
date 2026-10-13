@@ -106,6 +106,9 @@ struct Core {
     phases: Phases,
     /// Draws wait for the device (`NX_DEBUG_SYNC_DRAWS`).
     sync_on: bool,
+    /// What the textures of the draw being recorded are, kept while draws wait for the device so
+    /// that the one that loses it can say.
+    last_textures: Vec<String>,
     /// The textures that made targets be written back since the last report: the address of the
     /// texture, how often, and how many targets the last time.
     write_back_causes: std::collections::HashMap<u64, (u64, usize, String)>,
@@ -246,6 +249,7 @@ impl Renderer {
                     pass_target: None,
                     phases: Phases::default(),
                     sync_on: false,
+                    last_textures: Vec::new(),
                     write_back_causes: std::collections::HashMap::new(),
                     #[cfg(feature = "window")]
                     display,
@@ -254,6 +258,7 @@ impl Renderer {
             self.core = Some(made);
         }
         match self.core.as_mut().expect("just made") {
+            Ok(core) if core.frame.lost() => Err("the Vulkan device was lost".to_string()),
             Ok(core) => Ok(core),
             Err(e) => Err(format!("no Vulkan device to render with: {e}")),
         }
@@ -679,6 +684,9 @@ impl Core {
                 .device
                 .cmd_clear_attachments(cmd, &attachments, &[rect]);
         }
+        self.frame.mark(&self.vk, cmd, || {
+            format!("clear of {} attachments", attachments.len())
+        });
         Ok(())
     }
 
@@ -713,6 +721,9 @@ impl Renderer {
                     stages.join(", ")
                 );
                 for line in describe_draw(scene, draw) {
+                    eprintln!("[vulkan]     {line}");
+                }
+                for line in &core.last_textures {
                     eprintln!("[vulkan]     {line}");
                 }
                 result = Err(e);
@@ -864,7 +875,9 @@ impl Renderer {
         let draws = self.frame_draws;
         let core = self.core()?;
         core.flush()?;
-        if core.debug.sync_draws.is_some_and(|n| draws >= n.max(1)) {
+        if core.debug.sync_draws.is_some_and(|n| draws >= n.max(1))
+            || core.debug.sync_from.is_some_and(|f| p.frame >= f)
+        {
             core.sync_on = true;
         }
         // A displayed buffer ends a frame: textures are compared with memory again in the next.

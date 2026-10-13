@@ -193,6 +193,12 @@ impl Core {
                 &[],
             );
             device.cmd_dispatch(cmd, d.grid[0], d.grid[1], d.grid[2]);
+            self.frame.mark(&self.vk, cmd, || {
+                format!(
+                    "compute launch of the program at {:#x}, grid {:?}",
+                    d.program, d.grid
+                )
+            });
             device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,

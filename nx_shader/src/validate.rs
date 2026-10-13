@@ -97,3 +97,40 @@ pub fn assert_valid(words: &[u32]) {
         }
     }
 }
+
+/// The module after `spirv-opt` has run with `args` (`-O`, say). `Ok(None)` when the tool is not
+/// installed. For finding out whether a driver does better with another shape of the same program.
+pub fn optimize(words: &[u32], args: &[&str]) -> Result<Option<Vec<u32>>, String> {
+    let Some(tool) = find_tool("spirv-opt") else {
+        return Ok(None);
+    };
+    let input = words_to_file(words, "opt")?;
+    let output = input.with_extension("out.spv");
+    let ran = Command::new(tool)
+        .args(args)
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .map_err(|e| format!("running spirv-opt: {e}"));
+    let _ = std::fs::remove_file(&input);
+    let ran = ran?;
+    if !ran.status.success() {
+        let _ = std::fs::remove_file(&output);
+        return Err(String::from_utf8_lossy(&ran.stderr).into_owned());
+    }
+    let bytes = std::fs::read(&output).map_err(|e| format!("reading {}: {e}", output.display()));
+    let _ = std::fs::remove_file(&output);
+    let bytes = bytes?;
+    if !bytes.len().is_multiple_of(4) {
+        return Err("spirv-opt wrote a file that is not a whole number of words".to_string());
+    }
+    Ok(Some(
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect(),
+    ))
+}
