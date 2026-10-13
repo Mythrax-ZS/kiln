@@ -283,8 +283,8 @@ fn real_functions_run_the_same_natively_and_interpreted() {
             // Arguments: small integers, boundary values, pointers into scratch, thread-local
             // and module memory.
             let mut cpu0 = NativeCpu::new(0).state;
-            for r in 0..29 {
-                cpu0.x[r] = match rng.below(16) {
+            for reg in cpu0.x.iter_mut().take(29) {
+                *reg = match rng.below(16) {
                     0 => rng.below(16),
                     1 => rng.next_u64(),
                     2..=5 => SCRATCH + rng.below(SCRATCH_SIZE - 256),
