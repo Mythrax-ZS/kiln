@@ -95,16 +95,16 @@ impl Vk {
             let req = self.device.get_buffer_memory_requirements(buffer);
             let wanted =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            // A buffer the device writes and the host reads is made in cached memory where there is
-            // some: the host reads uncached (write-combined) memory about forty times slower.
-            let readback = usage.contains(vk::BufferUsageFlags::TRANSFER_DST).then(|| {
-                self.find_memory_type(
+            // Cached memory where there is some. The host reads uncached (write-combined) memory
+            // about thirty times slower than cached, which is what a buffer the device writes and
+            // the host reads (a render target put into memory) needs; and what the host writes to
+            // it a piece at a time (constants and vertices of every draw) goes out over the bus in
+            // partial lines and costs the thread about a tenth of a frame.
+            let Some(ty) = self
+                .find_memory_type(
                     req.memory_type_bits,
                     wanted | vk::MemoryPropertyFlags::HOST_CACHED,
                 )
-            });
-            let Some(ty) = readback
-                .flatten()
                 .or_else(|| self.find_memory_type(req.memory_type_bits, wanted))
             else {
                 self.device.destroy_buffer(buffer, None);
