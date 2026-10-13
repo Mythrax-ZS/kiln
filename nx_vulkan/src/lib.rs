@@ -3,6 +3,7 @@
 //! Runs on a host GPU what the GPU model decoded: the compute harness the shader translator is
 //! tested with, and (in later modules) the draws themselves.
 
+pub mod astc;
 pub mod blocklinear;
 pub mod compute;
 pub mod device;
