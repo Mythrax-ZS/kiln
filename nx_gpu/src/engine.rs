@@ -10,6 +10,8 @@ use crate::gpu::class;
 use crate::mem::GuestMemory;
 use crate::mme;
 use crate::names;
+use crate::shaders::Inventory;
+use crate::state::{CbufBindings, Regs};
 use crate::syncpt::Syncpoints;
 use crate::vm::AddressSpace;
 use std::collections::BTreeMap;
@@ -54,6 +56,8 @@ pub struct Stats {
     pub macro_writes: BTreeMap<(u32, u32), u64>,
     pub draws: DrawStats,
     pub semaphore_releases: u64,
+    /// The shader programs the draws used.
+    pub shaders: Inventory,
 }
 
 impl Stats {
@@ -113,6 +117,9 @@ impl Stats {
         }
         for first in &d.first {
             s.push_str(&format!("  first draws: {first}\n"));
+        }
+        if self.shaders.draws > 0 {
+            s.push_str(&self.shaders.report(top));
         }
         s
     }
@@ -204,6 +211,14 @@ mod m3d {
     pub const DRAW_INDEX_BEGIN_END_LAST: u32 = 0x17f8 / 4;
     pub const CLEAR_SURFACE: u32 = 0x19d0 / 4;
     pub const SET_COLOR_TARGET_A: u32 = 0x800 / 4;
+    // Constant buffers: `LOAD_CONSTANT_BUFFER(i)` for i in 0..16, and `BIND_GROUP_CONSTANT_BUFFER(j)`
+    // every 8 words for the five binding groups.
+    pub const LOAD_CONSTANT_BUFFER_OFFSET: u32 = 0x238c / 4;
+    pub const LOAD_CONSTANT_BUFFER_FIRST: u32 = 0x2390 / 4;
+    pub const LOAD_CONSTANT_BUFFER_LAST: u32 = 0x2390 / 4 + 15;
+    pub const BIND_GROUP_CONSTANT_BUFFER: u32 = 0x2410 / 4;
+    pub const BIND_GROUP_CONSTANT_BUFFER_LAST: u32 =
+        0x2410 / 4 + 8 * (crate::state::BIND_GROUPS as u32 - 1);
 }
 
 #[derive(Debug)]
@@ -219,6 +234,8 @@ pub struct Engine {
     topology: u32,
     /// Vertices or indices sent inline since the last `BEGIN`.
     inline_elements: u32,
+    /// The constant buffers bound to each slot of each binding group.
+    pub cbufs: CbufBindings,
 }
 
 /// The name of a primitive type (`BEGIN`'s operation; the topology field of the combined draws).
@@ -293,11 +310,17 @@ impl Engine {
             running: None,
             topology: 0,
             inline_elements: 0,
+            cbufs: CbufBindings::default(),
         }
     }
 
     pub fn reg(&self, method: u32) -> u32 {
         self.regs.get(method as usize).copied().unwrap_or(0)
+    }
+
+    /// The register file, to decode state from.
+    pub fn regs(&self) -> Regs<'_> {
+        Regs(&self.regs)
     }
 
     /// A write to `method` (a word index). `last` marks the last word of its command.
@@ -369,6 +392,22 @@ impl Engine {
                     self.finish_macro(cx)?;
                 }
             }
+            // The words of a constant buffer are written through the selected buffer at the
+            // running offset, which advances by a word each time.
+            m3d::LOAD_CONSTANT_BUFFER_FIRST..=m3d::LOAD_CONSTANT_BUFFER_LAST => {
+                let (address, _) = self.regs().selected_constant_buffer();
+                let offset = self.reg(m3d::LOAD_CONSTANT_BUFFER_OFFSET) & 0xFFFF;
+                cx.write(address + u64::from(offset), &data.to_le_bytes())?;
+                self.regs[m3d::LOAD_CONSTANT_BUFFER_OFFSET as usize] = (offset + 4) & 0xFFFF;
+            }
+            // The buffer the selector names is bound to the slot the write gives.
+            m3d::BIND_GROUP_CONSTANT_BUFFER..=m3d::BIND_GROUP_CONSTANT_BUFFER_LAST
+                if (method - m3d::BIND_GROUP_CONSTANT_BUFFER).is_multiple_of(8) =>
+            {
+                let group = ((method - m3d::BIND_GROUP_CONSTANT_BUFFER) / 8) as usize;
+                let selected = self.regs().selected_constant_buffer();
+                self.cbufs.bind(group, data, selected);
+            }
             m3d::BEGIN => {
                 self.topology = data & 0xFFFF;
                 self.inline_elements = 0;
@@ -428,6 +467,10 @@ impl Engine {
         count: u32,
         topology: u32,
     ) {
+        let stages = self.regs().stages();
+        let mut shaders = std::mem::take(&mut cx.stats.shaders);
+        shaders.observe(cx, &stages);
+        cx.stats.shaders = shaders;
         let d = &mut cx.stats.draws;
         *d.by_kind.entry(kind).or_default() += 1;
         d.elements += u64::from(count);
@@ -550,6 +593,7 @@ mod tests {
     use super::*;
     use crate::mem::testing::TestMemory;
     use crate::vm::{map_flags, MapRequest};
+    use nx_shader::inst::Guard;
 
     /// An address space with 0x1000 bytes of memory at GPU address 0x500_0000.
     fn world() -> (TestMemory, AddressSpace, Syncpoints) {
@@ -817,6 +861,123 @@ mod tests {
             let err = e.write(cx, 0x1b0c / 4, 0, true).unwrap_err();
             assert!(err.contains("not mapped"), "{err}");
         });
+    }
+
+    /// A vertex program header (type 1, version 3, shader type 1) followed by `code`.
+    fn vertex_program(code: &[u8]) -> Vec<u8> {
+        let mut words = [0u32; nx_shader::sph::SPH_WORDS];
+        words[0] = 1 | 3 << 5 | 1 << 10;
+        let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        bytes.extend_from_slice(code);
+        bytes
+    }
+
+    #[test]
+    fn constant_buffer_words_are_written_through_the_selected_buffer() {
+        let ((), mem, _) = with_cx(|cx| {
+            let mut e = Engine::new(class::THREED);
+            // Select 0x100 bytes at 0x500_0200, start at byte 0x10 and write two words.
+            e.write(cx, 0x2380 / 4, 0x100, false).unwrap();
+            e.write(cx, 0x2384 / 4, 0, false).unwrap();
+            e.write(cx, 0x2388 / 4, 0x500_0200, false).unwrap();
+            e.write(cx, 0x238c / 4, 0x10, false).unwrap();
+            e.write(cx, 0x2390 / 4, 0x1122_3344, false).unwrap();
+            e.write(cx, 0x2394 / 4, 0x5566_7788, false).unwrap();
+            assert_eq!(e.reg(0x238c / 4), 0x18);
+            // The sixteenth and last data method writes the same way.
+            e.write(cx, 0x23cc / 4, 0xAABB_CCDD, false).unwrap();
+            assert_eq!(e.reg(0x238c / 4), 0x1c);
+            // A selected buffer that is not mapped is an error, not a lost write.
+            e.write(cx, 0x2388 / 4, 0x700_0000, false).unwrap();
+            let err = e.write(cx, 0x2390 / 4, 1, false).unwrap_err();
+            assert!(err.contains("not mapped"), "{err}");
+        });
+        assert_eq!(mem.read_u32(0x1000_0210), Some(0x1122_3344));
+        assert_eq!(mem.read_u32(0x1000_0214), Some(0x5566_7788));
+        assert_eq!(mem.read_u32(0x1000_0218), Some(0xAABB_CCDD));
+    }
+
+    #[test]
+    fn binding_a_group_records_the_buffer_the_selector_names() {
+        with_cx(|cx| {
+            let mut e = Engine::new(class::THREED);
+            e.write(cx, 0x2380 / 4, 0x40, false).unwrap();
+            e.write(cx, 0x2384 / 4, 0x3, false).unwrap();
+            e.write(cx, 0x2388 / 4, 0x1234_5678, false).unwrap();
+            // Group 2 is the third group: 0x2410 + 2 * 32. Slot 5, valid.
+            e.write(cx, (0x2410 + 64) / 4, 1 | 5 << 4, false).unwrap();
+            let b = e.cbufs.get(2, 5).unwrap();
+            assert_eq!((b.address, b.size), (0x3_1234_5678, 0x40));
+            // Selecting another buffer afterwards does not move the binding.
+            e.write(cx, 0x2388 / 4, 0x9999_0000, false).unwrap();
+            assert_eq!(e.cbufs.get(2, 5).unwrap().address, 0x3_1234_5678);
+            // The other methods around the groups are not bindings.
+            e.write(cx, (0x2410 + 4) / 4, 1 | 6 << 4, false).unwrap();
+            assert!(e.cbufs.get(2, 6).is_none() && e.cbufs.get(0, 6).is_none());
+            // Writing without the valid bit unbinds.
+            e.write(cx, (0x2410 + 64) / 4, 5 << 4, false).unwrap();
+            assert!(e.cbufs.get(2, 5).is_none());
+        });
+    }
+
+    #[test]
+    fn draws_count_the_programs_they_use_and_notice_changed_code() {
+        use nx_shader::asm::*;
+        let program = vertex_program(&assemble(&[
+            mov32i(1, 5),
+            mov32i(2, 6),
+            exit(Guard::ALWAYS),
+        ]));
+        let ((), mem, stats) = with_cx(|cx| {
+            // Put the program at GPU address 0x500_0100.
+            cx.write(0x500_0100, &program).unwrap();
+            let mut e = Engine::new(class::THREED);
+            // The region is 0x500_0000; the vertex program (slot 1) is at offset 0x100.
+            e.write(cx, 0x1608 / 4, 0, false).unwrap();
+            e.write(cx, 0x160c / 4, 0x500_0000, false).unwrap();
+            e.write(cx, 0x2044 / 4, 0x100, false).unwrap();
+            e.write(cx, 0x1618 / 4, 4, false).unwrap();
+            e.write(cx, 0xd78 / 4, 3, true).unwrap();
+            e.write(cx, 0xd78 / 4, 3, true).unwrap();
+            // Overwrite the first instruction with another: the same address, other code.
+            let changed = vertex_program(&assemble(&[mov32i(1, 7), exit(Guard::ALWAYS)]));
+            cx.write(0x500_0100, &changed).unwrap();
+            e.write(cx, 0xd78 / 4, 3, true).unwrap();
+        });
+        let _ = mem;
+        let inv = &stats.shaders;
+        assert_eq!(inv.draws, 3);
+        assert_eq!(inv.programs.len(), 1);
+        let p = &inv.programs[&0x500_0100];
+        assert_eq!(p.uses, 3);
+        assert_eq!(p.rewrites, 1);
+        assert_eq!(p.instructions, 2, "the second version has two instructions");
+        assert_eq!(inv.combinations["VERTEX"], 3);
+        let report = stats.report(3);
+        assert!(
+            report.contains("3 draws used 1 different programs"),
+            "{report}"
+        );
+        assert!(report.contains("Mov32iImm32"), "{report}");
+    }
+
+    #[test]
+    fn a_stage_whose_program_cannot_be_read_is_reported_not_skipped() {
+        let ((), _, stats) = with_cx(|cx| {
+            let mut e = Engine::new(class::THREED);
+            // The region is not mapped at all.
+            e.write(cx, 0x160c / 4, 0x900_0000, false).unwrap();
+            e.write(cx, 0xd78 / 4, 3, true).unwrap();
+        });
+        assert_eq!(stats.shaders.programs.len(), 0);
+        assert_eq!(stats.shaders.unreadable.len(), 1);
+        assert!(
+            stats
+                .report(3)
+                .contains("unreadable: VERTEX program at 0x9000000"),
+            "{}",
+            stats.report(3)
+        );
     }
 
     #[test]

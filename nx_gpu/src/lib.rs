@@ -25,6 +25,8 @@ pub mod nvdrv;
 pub mod nvmap;
 pub mod parcel;
 pub mod pushbuf;
+pub mod shaders;
+pub mod state;
 pub mod syncpt;
 pub mod vm;
 

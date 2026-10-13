@@ -8,3 +8,6 @@ publish = false
 [lib]
 name = "nx_gpu"
 path = "src/lib.rs"
+
+[dependencies]
+nx_shader = { path = "../nx_shader" }
