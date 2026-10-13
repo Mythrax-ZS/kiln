@@ -131,6 +131,8 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   program through `spirv-opt` first),
   `NX_DEBUG_EQUAL_AS_LEQUAL=1`, `NX_DEBUG_NO_DEPTH_TEST=1`, `NX_DEBUG_FLIP_FRONT=1`,
   `NX_TRACE_TARGETS=1` (each render target configuration, the first time it is drawn to) and
+  `NX_GPU_SYNC=1` runs the commands of a submission in the call that makes it (with a renderer they
+  otherwise run on a thread of their own, A-124);
   `NX_SPIRV_CHECK=1` look at one thing each; `NX_DEBUG_WAIT_FINISH=1` waits for the device at the end
   of every submission of the guest (the renderer otherwise lets the device run behind the
   recording, A-123); `NX_DEBUG_SYNC_DRAWS=<n>` waits for the device after

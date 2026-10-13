@@ -54,7 +54,7 @@ pub fn implemented_names() -> Vec<String> {
 /// kernel itself answers.
 pub fn register_defaults(kernel: &Arc<Kernel>) {
     let applet = applet::Shared::default();
-    let gpu = Arc::new(nvdrv::Shared::new());
+    let gpu = nvdrv::Shared::new();
     let display = Arc::new(vi::Shared::new());
     display.set_gpu(gpu.clone());
     applet.lock().unwrap_or_else(|e| e.into_inner()).display = Some(display.clone());

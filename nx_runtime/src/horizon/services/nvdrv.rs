@@ -8,11 +8,15 @@ use super::super::kernel::Kernel;
 use super::super::object::KObject;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
 use crate::rt::runtime::rt;
+use nx_gpu::gpu::{Queue, SubmitError, Task};
 use nx_gpu::nvdrv::args::Fail;
 use nx_gpu::nvdrv::{EventToken, Nvdrv};
 use nx_gpu::{GuestMemory, NvError};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::collections::{HashMap, VecDeque};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::time::Duration;
 
 /// The guest process's memory as the GPU sees it: no CPU permissions in the way.
 struct ProcessMemory;
@@ -35,6 +39,109 @@ impl GuestMemory for ProcessMemory {
 pub struct Shared {
     core: Mutex<Nvdrv>,
     events: Mutex<HashMap<EventToken, (KObject, KObject)>>,
+    /// The kernel whose events the thread that runs the commands sets.
+    kernel: Mutex<Weak<Kernel>>,
+    /// The thread that runs the commands of submissions and shows the buffers, when there is a
+    /// renderer to draw with (docs/ASSUMPTIONS.md A-124); without one they are run in the call.
+    worker: Option<Arc<Worker>>,
+    /// Calls that want the driver now: the worker lets them in between two of its steps.
+    callers: AtomicUsize,
+    /// Held while a call that is over tells the worker, so that the worker does not miss it.
+    way: Mutex<()>,
+    way_clear: Condvar,
+    /// How many calls have locked the driver (for the report of `NX_TRACE_PERF`).
+    calls: std::sync::atomic::AtomicU64,
+}
+
+/// The driver, locked for a call. While a caller waits for it the worker makes way.
+struct Core<'a> {
+    guard: MutexGuard<'a, Nvdrv>,
+    shared: &'a Shared,
+}
+
+impl Deref for Core<'_> {
+    type Target = Nvdrv;
+
+    fn deref(&self) -> &Nvdrv {
+        &self.guard
+    }
+}
+
+impl DerefMut for Core<'_> {
+    fn deref_mut(&mut self) -> &mut Nvdrv {
+        &mut self.guard
+    }
+}
+
+impl Drop for Core<'_> {
+    fn drop(&mut self) {
+        // The worker may be waiting for the call to be over.
+        let _way = self.shared.way.lock().unwrap_or_else(|e| e.into_inner());
+        if self.shared.callers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.shared.way_clear.notify_all();
+        }
+    }
+}
+
+/// How many tasks the worker may be behind by before the calls that give it more wait.
+const MAX_TASKS: usize = 64;
+/// How many buffers to show it may be behind by (a frame the title has queued and the window has
+/// not shown is one): the title is held back to the pace of the renderer, as the display's
+/// refresh holds it back on the console.
+const MAX_PRESENTS: usize = 2;
+
+/// What the worker has been given and not finished.
+#[derive(Default)]
+struct Backlog {
+    tasks: VecDeque<Task>,
+    /// The tasks that show a buffer, among those queued and the one being run.
+    presents: usize,
+    /// A task is being run.
+    running: bool,
+}
+
+/// The queue the commands of submissions wait in for the thread that runs them.
+struct Worker {
+    backlog: Mutex<Backlog>,
+    /// Signaled when a task arrives and when one has been run.
+    changed: Condvar,
+}
+
+impl Worker {
+    fn lock(&self) -> MutexGuard<'_, Backlog> {
+        self.backlog.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wait until the backlog has room for one more task (a buffer to show, when `present`).
+    fn wait_for_room(&self, present: bool) {
+        let mut b = self.lock();
+        while b.tasks.len() + usize::from(b.running) >= MAX_TASKS
+            || (present && b.presents >= MAX_PRESENTS)
+        {
+            b = self.changed.wait(b).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Wait (for `limit` at most) until everything given so far has been run.
+    fn drain(&self, limit: Duration) {
+        let b = self.lock();
+        let _ = self
+            .changed
+            .wait_timeout_while(b, limit, |b| !b.tasks.is_empty() || b.running)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+impl Queue for Worker {
+    fn push(&self, task: Task) {
+        let mut b = self.lock();
+        if matches!(task, Task::Present(_)) {
+            b.presents += 1;
+        }
+        b.tasks.push_back(task);
+        drop(b);
+        self.changed.notify_all();
+    }
 }
 
 /// The renderer `NX_RENDERER` asks for: `vulkan`, or nothing (the default: the commands are
@@ -71,12 +178,89 @@ fn vulkan_renderer() -> Option<Box<dyn nx_gpu::render::Backend>> {
 }
 
 impl Shared {
-    pub fn new() -> Shared {
+    pub fn new() -> Arc<Shared> {
         let mut core = Nvdrv::new(Arc::new(ProcessMemory));
         core.gpu.backend = renderer();
-        Shared {
-            core: Mutex::new(core),
-            events: Mutex::new(HashMap::new()),
+        // With a renderer the commands of a submission run on a thread of their own, and the
+        // call that made them is over at once, as the console's driver's is (`NX_GPU_SYNC=1`:
+        // in the call, as every run did before).
+        let queued =
+            core.gpu.backend.is_some() && !std::env::var("NX_GPU_SYNC").is_ok_and(|v| v != "0");
+        let worker = queued.then(|| {
+            Arc::new(Worker {
+                backlog: Mutex::new(Backlog::default()),
+                changed: Condvar::new(),
+            })
+        });
+        if let Some(w) = &worker {
+            core.gpu.queue = Some(w.clone());
+        }
+        Arc::new_cyclic(|weak: &Weak<Shared>| {
+            if let Some(w) = &worker {
+                let (weak, w) = (weak.clone(), w.clone());
+                std::thread::Builder::new()
+                    .name("gpu".to_string())
+                    .spawn(move || run_worker(weak, w))
+                    .expect("the thread that runs the renderer's commands");
+            }
+            Shared {
+                core: Mutex::new(core),
+                events: Mutex::new(HashMap::new()),
+                kernel: Mutex::new(Weak::new()),
+                worker,
+                callers: AtomicUsize::new(0),
+                way: Mutex::new(()),
+                way_clear: Condvar::new(),
+                calls: std::sync::atomic::AtomicU64::new(0),
+            }
+        })
+    }
+
+    /// The driver, locked for a call.
+    fn lock(&self) -> Core<'_> {
+        self.callers.fetch_add(1, Ordering::AcqRel);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Core {
+            guard: self.core.lock().unwrap_or_else(|e| e.into_inner()),
+            shared: self,
+        }
+    }
+
+    /// Wait until no call of the program is waiting for the driver: a short spin first, since
+    /// most calls are over in a few microseconds, then sleeping until the last one says so.
+    fn wait_for_calls(&self) {
+        for _ in 0..400 {
+            if self.callers.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        let mut way = self.way.lock().unwrap_or_else(|e| e.into_inner());
+        while self.callers.load(Ordering::Acquire) > 0 {
+            way = self.way_clear.wait(way).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Let the worker catch up when it is too far behind.
+    fn wait_for_room(&self) {
+        if let Some(w) = &self.worker {
+            w.wait_for_room(false);
+        }
+    }
+
+    /// Stop the run for a failure of the commands the worker ran.
+    fn fail(&self, what: String) {
+        let kernel = self
+            .kernel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade();
+        match kernel {
+            Some(kernel) => kernel.fatal(what),
+            None => {
+                eprintln!("recomp runtime: {what}");
+                std::process::exit(1);
+            }
         }
     }
 
@@ -91,12 +275,23 @@ impl Shared {
 
     /// The title queued a buffer for display: tell the renderer (if there is one).
     pub fn present(&self, frame: &nx_gpu::display::Frame) -> Result<(), String> {
-        let mut core = self.core.lock().unwrap_or_else(|e| e.into_inner());
-        core.gpu.present(frame)
+        let Some(worker) = &self.worker else {
+            return self.lock().gpu.present(frame);
+        };
+        // The buffer is shown after the commands queued before it have run.
+        worker.wait_for_room(true);
+        let request = self.lock().gpu.present_request(frame)?;
+        if let Some(request) = request {
+            worker.push(Task::Present(request));
+        }
+        Ok(())
     }
 
     /// Print what the command processor counted (`NX_TRACE_GPU`), once the process has ended.
     pub fn report(&self) {
+        if let Some(w) = &self.worker {
+            w.drain(Duration::from_secs(10));
+        }
         let core = self.core.lock().unwrap_or_else(|e| e.into_inner());
         if core.gpu.level >= 1 && core.gpu.stats.submits > 0 {
             // `NX_GPU_TOP` is how many of the busiest methods the report lists (25 if unset, all
@@ -127,9 +322,105 @@ impl Shared {
     }
 }
 
-impl Default for Shared {
-    fn default() -> Shared {
-        Shared::new()
+/// The thread that runs what the queue was given, in order: a step of a submission at a time,
+/// with the driver let go of between two steps so that the calls of the program get in.
+fn run_worker(shared: Weak<Shared>, worker: Arc<Worker>) {
+    // Where the thread's time goes, reported every few seconds with `NX_TRACE_PERF`.
+    let trace = std::env::var_os("NX_TRACE_PERF").is_some();
+    let mut spent = [Duration::ZERO; 4];
+    let (mut steps, mut yields, mut tasks_run) = (0u64, 0u64, 0u64);
+    let mut calls_before = 0u64;
+    let mut reported = std::time::Instant::now();
+    loop {
+        let waiting = std::time::Instant::now();
+        let mut task = {
+            let mut b = worker.lock();
+            loop {
+                if let Some(task) = b.tasks.pop_front() {
+                    b.running = true;
+                    break task;
+                }
+                b.running = false;
+                worker.changed.notify_all();
+                b = worker.changed.wait(b).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        if trace {
+            spent[0] += waiting.elapsed();
+        }
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        let is_present = matches!(task, Task::Present(_));
+        let outcome = loop {
+            // A call of the program that is waiting for the driver goes first.
+            let made_way = std::time::Instant::now();
+            let mut yielded = false;
+            if shared.callers.load(Ordering::Acquire) > 0 {
+                yielded = true;
+                shared.wait_for_calls();
+            }
+            let locking = std::time::Instant::now();
+            let mut core = shared.core.lock().unwrap_or_else(|e| e.into_inner());
+            let running = std::time::Instant::now();
+            let stepped = core.gpu.run_task(&mut task);
+            if trace {
+                spent[1] += locking.duration_since(made_way);
+                spent[2] += running.duration_since(locking);
+                spent[3] += running.elapsed();
+                steps += 1;
+                yields += u64::from(yielded);
+            }
+            match stepped {
+                Ok(None) => {}
+                Ok(Some(done)) => {
+                    core.wake(done.woken);
+                    break Ok(());
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        tasks_run += 1;
+        if trace && reported.elapsed() >= Duration::from_secs(2) {
+            eprintln!(
+                "[gpu thread] in the last {:.1} s: {} tasks, {} steps; no task to run {:.0} ms, made way {:.0} ms ({yields} times), waited for the driver {:.0} ms, ran {:.0} ms; the program called the driver {} times",
+                reported.elapsed().as_secs_f64(),
+                tasks_run,
+                steps,
+                spent[0].as_secs_f64() * 1000.0,
+                spent[1].as_secs_f64() * 1000.0,
+                spent[2].as_secs_f64() * 1000.0,
+                spent[3].as_secs_f64() * 1000.0,
+                shared.calls.load(Ordering::Relaxed) - calls_before
+            );
+            spent = [Duration::ZERO; 4];
+            (steps, yields, tasks_run) = (0, 0, 0);
+            calls_before = shared.calls.load(Ordering::Relaxed);
+            reported = std::time::Instant::now();
+        }
+        match outcome {
+            Ok(()) => {
+                let kernel = shared
+                    .kernel
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .upgrade();
+                if let Some(kernel) = kernel {
+                    shared.deliver_signals(&kernel);
+                }
+            }
+            Err(e) => shared.fail(match e {
+                SubmitError::Nv(e) => format!("a submission failed with {e:?}"),
+                SubmitError::Unimplemented(why) => why,
+            }),
+        }
+        let mut b = worker.lock();
+        if is_present {
+            b.presents -= 1;
+        }
+        b.running = false;
+        drop(b);
+        worker.changed.notify_all();
     }
 }
 
@@ -148,6 +439,7 @@ pub struct NvDrv {
 
 impl NvDrv {
     pub fn new(kernel: Weak<Kernel>, shared: Arc<Shared>) -> NvDrv {
+        *shared.kernel.lock().unwrap_or_else(|e| e.into_inner()) = kernel.clone();
         NvDrv { kernel, shared }
     }
 }
@@ -161,8 +453,8 @@ fn stop(what: String) -> Stop {
 }
 
 impl NvDrv {
-    fn core(&self) -> std::sync::MutexGuard<'_, Nvdrv> {
-        self.shared.core.lock().unwrap_or_else(|e| e.into_inner())
+    fn core(&self) -> Core<'_> {
+        self.shared.lock()
     }
 
     /// An ioctl with up to two input and two output buffers (`Ioctl`, `Ioctl2`, `Ioctl3`).
@@ -195,6 +487,7 @@ impl NvDrv {
         } else {
             Vec::new()
         };
+        self.shared.wait_for_room();
         let reply = self
             .core()
             .ioctl(fd, code, &input, &extra_in)
