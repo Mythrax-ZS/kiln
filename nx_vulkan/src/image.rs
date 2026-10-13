@@ -23,6 +23,7 @@ pub struct ImageInfo {
 /// An image with its memory and a view of all of it.
 pub struct Image {
     pub image: vk::Image,
+    /// A view of all of it (null for an image that is only ever transferred to and from).
     pub view: vk::ImageView,
     pub memory: vk::DeviceMemory,
     pub info: ImageInfo,
@@ -144,21 +145,34 @@ impl Vk {
                 d.destroy_image(image, None);
                 return Err(format!("binding image memory: {e}"));
             }
-            let view = d.create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(info.view_type)
-                    .components(info.components)
-                    .format(info.format)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: aspect_of(info.format),
-                        base_mip_level: 0,
-                        level_count: info.levels.max(1),
-                        base_array_layer: 0,
-                        layer_count: info.layers,
-                    }),
-                None,
+            // An image that only transfers (a copy's scratch space) cannot have a view.
+            let viewable = info.usage.intersects(
+                vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::STORAGE
+                    | vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                    | vk::ImageUsageFlags::INPUT_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
             );
+            let view = if viewable {
+                d.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(info.view_type)
+                        .components(info.components)
+                        .format(info.format)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: aspect_of(info.format),
+                            base_mip_level: 0,
+                            level_count: info.levels.max(1),
+                            base_array_layer: 0,
+                            layer_count: info.layers,
+                        }),
+                    None,
+                )
+            } else {
+                Ok(vk::ImageView::null())
+            };
             match view {
                 Ok(view) => Ok(Image {
                     image,

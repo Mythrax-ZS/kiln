@@ -9,7 +9,14 @@ publish = false
 name = "nx_vulkan"
 path = "src/lib.rs"
 
+[features]
+# Presenting frames in a window of its own (`NX_WINDOW=1` at run time).
+window = ["dep:winit", "dep:ash-window", "dep:raw-window-handle"]
+
 [dependencies]
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
 nx_shader = { path = "../nx_shader" }
 nx_gpu = { path = "../nx_gpu" }
+winit = { version = "0.30", optional = true }
+ash-window = { version = "0.13", optional = true }
+raw-window-handle = { version = "0.6", optional = true }

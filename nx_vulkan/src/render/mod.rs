@@ -5,8 +5,12 @@
 //! recorded and run when the submission ends ([`Backend::finish`]), after which the guest may
 //! rely on them having happened.
 
+#[cfg(feature = "window")]
+mod blit;
 mod convert;
 mod debug;
+#[cfg(feature = "window")]
+mod display;
 mod draw;
 mod frame;
 mod global;
@@ -33,15 +37,33 @@ pub struct Config {
     pub dump_every: u64,
     /// Stop dumping after this many pictures (`NX_DUMP_COUNT`).
     pub dump_limit: Option<u64>,
+    /// Show the displayed buffers in a window of this size in pixels (`NX_WINDOW`, with
+    /// `NX_WINDOW_SIZE=<width>x<height>`, 1280x720 by default). Needs the `window` feature.
+    pub window: Option<(u32, u32)>,
+    /// The title of the window (`NX_WINDOW_TITLE`).
+    pub window_title: String,
+    /// Told what the person does in the window: keys and the keyboard focus.
+    pub input: Option<crate::InputSink>,
 }
 
 impl Config {
     pub fn from_env() -> Config {
         let number = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+        let window = std::env::var("NX_WINDOW").is_ok_and(|v| v != "0").then(|| {
+            let size = std::env::var("NX_WINDOW_SIZE").ok().and_then(|v| {
+                let (w, h) = v.split_once('x')?;
+                Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
+            });
+            size.filter(|(w, h)| *w > 0 && *h > 0)
+                .unwrap_or((1280, 720))
+        });
         Config {
             dump_dir: std::env::var_os("NX_DUMP_FRAMES").map(PathBuf::from),
             dump_every: number("NX_DUMP_EVERY").unwrap_or(1).max(1),
             dump_limit: number("NX_DUMP_COUNT"),
+            window,
+            window_title: std::env::var("NX_WINDOW_TITLE").unwrap_or_else(|_| "recomp".to_string()),
+            input: None,
         }
     }
 }
@@ -69,6 +91,9 @@ struct Core {
     debug: Debug,
     /// Commands of the traced frame so far (`NX_TRACE_DRAWS`).
     traced_commands: u64,
+    /// The window frames are shown in, when there is one.
+    #[cfg(feature = "window")]
+    display: Option<display::Display>,
 }
 
 pub struct Renderer {
@@ -84,8 +109,34 @@ impl Renderer {
     fn core(&mut self) -> Result<&mut Core, String> {
         if self.core.is_none() {
             let debug = Debug::from_env();
-            let made = Vk::new().and_then(|vk| {
+            // A window comes first: the device is made with what presenting to it needs.
+            #[cfg(feature = "window")]
+            let window = self.config.window.and_then(|(w, h)| {
+                let (title, input) = (&self.config.window_title, self.config.input.clone());
+                match crate::window::open(title, w, h, input) {
+                    Ok(window) => Some(window),
+                    Err(e) => {
+                        eprintln!("[vulkan] no window: {e}");
+                        None
+                    }
+                }
+            });
+            #[cfg(feature = "window")]
+            let options = crate::Options {
+                presentation: window.is_some(),
+            };
+            #[cfg(not(feature = "window"))]
+            let options = crate::Options::default();
+            let made = Vk::create(options).and_then(|vk| {
                 let frame = Frame::new(&vk)?;
+                #[cfg(feature = "window")]
+                let display = window.and_then(|w| match display::Display::new(&vk, w) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        eprintln!("[vulkan] frames will not be shown in the window: {e}");
+                        None
+                    }
+                });
                 if debug.trace_gpu {
                     eprintln!(
                         "[vulkan] {} (Vulkan {}.{})",
@@ -107,6 +158,8 @@ impl Renderer {
                     dumped: 0,
                     debug,
                     traced_commands: 0,
+                    #[cfg(feature = "window")]
+                    display,
                 })
             });
             self.core = Some(made);
@@ -521,6 +574,18 @@ impl Backend for Renderer {
         core.flush()?;
         // A displayed buffer ends a frame: textures are compared with memory again in the next.
         core.textures.frame += 1;
+        #[cfg(feature = "window")]
+        if let Some(display) = core.display.as_mut() {
+            if let Some(target) = core.targets.at_address(p.address) {
+                if let Err(e) = display.show(&core.vk, target, p.crop) {
+                    // A window that cannot be shown to does not stop the game.
+                    eprintln!("[vulkan] the window is given up: {e}");
+                    if let Some(mut gone) = core.display.take() {
+                        gone.destroy(&core.vk);
+                    }
+                }
+            }
+        }
         let Some(dir) = config.dump_dir.as_ref() else {
             return Ok(());
         };
@@ -597,6 +662,10 @@ impl Drop for Renderer {
                     core.global.bytes(),
                     core.dumped
                 );
+            }
+            #[cfg(feature = "window")]
+            if let Some(mut display) = core.display.take() {
+                display.destroy(&core.vk);
             }
             core.pipelines.destroy(&core.vk);
             core.layouts.destroy(&core.vk);

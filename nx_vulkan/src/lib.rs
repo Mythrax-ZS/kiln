@@ -9,9 +9,13 @@ pub mod compute;
 pub mod device;
 pub mod formats;
 pub mod image;
+pub mod input;
 pub mod png;
 pub mod render;
+#[cfg(feature = "window")]
+pub mod window;
 
 pub use compute::{AddressPatch, SampledImage};
 pub use device::{Capabilities, Options, Vk};
+pub use input::{InputEvent, InputSink};
 pub use render::{Config as RenderConfig, Renderer};

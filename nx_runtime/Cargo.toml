@@ -11,12 +11,14 @@ path = "src/lib.rs"
 crate-type = ["rlib", "staticlib"]
 
 [features]
-default = ["vulkan"]
+default = ["vulkan", "window"]
 # Test-only helpers (temp dirs, PRNG, A64 assembler) used to build synthetic fixtures.
 testing = []
 # The Vulkan renderer (`NX_RENDERER=vulkan` at run time). It loads Vulkan when the program first
 # draws, so a machine without a driver still runs programs that never do.
 vulkan = ["dep:nx_vulkan"]
+# A window to present the renderer's frames in (`NX_WINDOW=1`).
+window = ["vulkan", "nx_vulkan/window"]
 
 [dependencies]
 nx_gpu = { path = "../nx_gpu" }

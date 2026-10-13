@@ -95,6 +95,7 @@ fn a_displayed_buffer_is_dumped_as_a_picture_when_asked() {
         dump_dir: Some(dir.clone()),
         dump_every: 1,
         dump_limit: None,
+        ..RenderConfig::default()
     });
     r.clear(&w.scene(), &clear_all()).unwrap();
     r.finish().unwrap();
