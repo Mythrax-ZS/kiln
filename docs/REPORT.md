@@ -1,9 +1,10 @@
 # recomp: final report
 
-Eight milestones, written down in `docs/reports/`. This page collects what the brief asks the final
-report to say: what is implemented, every interpreter fallback, every assumption, what is untested,
-and, plainly, what was not verified. The detail and the numbers are in the milestone reports; the
-numbers here are the ones measured at the end of M8.
+Ten milestones, written down in `docs/reports/` (the tenth is open at the window). This page
+collects what the brief asks the final report to say: what is implemented, every interpreter
+fallback, every assumption, what is untested, and, plainly, what was not verified. The detail and
+the numbers are in the milestone reports; the numbers here are the ones measured at the end of the
+milestone they belong to.
 
 ## Where it stands
 
@@ -19,9 +20,15 @@ display through `vi:u`, and then draws: in 600 presented frames it submits 1,201
 batches, 30,641 macro calls of 11 macros and 138,125 indexed draws into a 1600x900 target, all of
 which the command processor of `nx_gpu` decodes and counts (M8; M7 had stopped at the first call
 to `nvdrv`). The programs it binds in those frames translate to SPIR-V and run correctly in a
-test harness on a GPU (M9). **Nothing renders**: no draw reaches a GPU, no picture is made, the
-fonts are blank stand-ins, the sound is not played and nobody's input reaches the title. The
-next work is the Vulkan backend (M10), and nothing here is a claim that a game is playable.
+test harness on a GPU (M9).
+
+**Its first screens render** (M10, up to the window): over 1,500 presented frames the renderer of
+`nx_vulkan` ran its 380,376 draws and 1,499 clears on a Vulkan device and none failed; the
+frames, dumped as PNG files and looked at, show an introduction screen (photographs, a logo, text
+and three small pictures, fading in) and then a menu screen with artwork, in 23 s of wall clock on
+an RTX 5070 Ti. There is **no window** yet, the sound is not played and nobody's input reaches the
+title, and what lies beyond those screens has not been tried. Nothing here is a claim that a game
+is playable.
 
 ## What each milestone delivered
 
@@ -36,6 +43,7 @@ next work is the Vulkan backend (M10), and nothing here is a claim that a game i
 | M7 title boot | several modules in one program, six services, the RomFS, transfer memory, the cryptographic extension | the title boots to `nvdrv` on Windows and on Linux |
 | M8 GPU front | `nx_gpu`: `nvdrv` and its nodes, the display and buffer queue, a command processor with a macro engine; 14 more services; shared memory; the title's main loop | 600 frames, 1,201 submissions, 138,125 draws, 0 undecoded methods or macros; `docs/reports/M8-gpu-front.md` |
 | M9 shader translation | `nx_shader`: the Maxwell program header, decoder and control flow graph, a SPIR-V builder, the translation of 149 of 296 instruction rows (arithmetic, integer multiply-add, bit fields, comparisons, conversions, attributes, constant buffers, `TEXS`, `LDG`/`STG`, flow); `nx_vulkan`: the Vulkan device and a compute harness | the 8 programs the title binds in its first frames translate and validate; 36 GPU tests compare the translation with Rust arithmetic; `docs/reports/M9-shader-translation.md` |
+| M10 Vulkan backend (up to the window) | `nx_vulkan`'s renderer: dynamic rendering from the decoded state, cached pipelines, detiled textures with mips, ASTC decoded on the host, render targets sampled as textures, guest memory imported for global access, instance counters, frame dumps and tracing switches; a `Backend` interface in `nx_gpu` | the title's first 1,500 frames: 380,376 draws and 1,499 clears, none failed; its first screens look right in the dumped frames; 21 renderer tests on a GPU; the ASTC decoder agrees with ARM's `astcenc` on 45,197 random legal blocks; `docs/reports/M10-vulkan-backend.md` |
 
 ## Instructions
 
@@ -189,20 +197,22 @@ Plainly:
   compared with a console or with Atmosphère's output; where the answer is not documented the run
   stops instead, except where a stand-in was needed to go on (the fonts, the idle controller, the
   offline answers), which are listed as assumptions.
-- **One title.** Its first 600 frames are what was measured. What a different title asks for is
-  unknown.
+- **One title.** Its first 600 frames (1,500 for the renderer) are what was measured. What a
+  different title asks for is unknown.
 - Cycle timing, GPU timing, audio timing and any real-time behavior beyond the 60 Hz and 200 Hz
   threads.
-- **Whether a title would ever be *playable***: nothing renders, plays sound or reads a person's
-  input. That the title submits draws is a count, not a picture.
+- **Whether a title would be *playable***: its first screens are drawn (the dumped frames were
+  looked at), but there is no window, no sound and no input from a person, and nothing past those
+  screens was tried. Frame times were measured only for those screens.
 
 ## The next work
 
 The owner approved shader translation and the Vulkan backend on 2026-10-13. Shader translation
-(M9) is done as far as it can be checked without drawing (`docs/reports/M9-shader-translation.md`).
-The Vulkan backend (M10) is next: interpret the state the draws read, render into images, and
-look at the first frame. Independent of them: input from a real device, audio output, and the 22
-services of the title's list that are not implemented.
+(M9) is done as far as it can be checked without drawing, and the backend (M10) draws the title's
+first screens (`docs/reports/M10-vulkan-backend.md`). What is left of M10 is a window to present
+frames in, with settings for it in the GUI; after that the draws of later screens (more shader
+instructions, other texture types) as they stop the run, input from a real device, audio output,
+and the 22 services of the title's list that are not implemented.
 
 ## Repository state
 

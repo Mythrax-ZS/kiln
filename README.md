@@ -13,7 +13,7 @@ keys or title data are stored in this repository.
 
 ## Status
 
-Work proceeds in milestones M1 to M8. Each milestone has a report under `docs/reports/` that states
+Work proceeds in milestones M1 to M10. Each milestone has a report under `docs/reports/` that states
 what was implemented, what was tested and how, and what was not verified. `docs/ARCHITECTURE.md`
 explains how the pieces fit together.
 
@@ -24,14 +24,17 @@ LLVM code generation, integer ISA), M5 (floating point and Advanced SIMD in all 
 layer, through its own `rtld` and SDK start-up, until it asks for the GPU driver; the
 cryptographic extension was added on the way), M8 (the GPU front, `nx_gpu`: the driver service and
 its device nodes, the display and buffer queue, a Maxwell command processor with a macro engine
-that traces what a title sends; the same title now runs its main loop and submits draw calls).
+that traces what a title sends; the same title now runs its main loop and submits draw calls), M9
+(shader translation, `nx_shader`: the Maxwell programs the title binds translate to SPIR-V and are
+compared with Rust arithmetic by tests on a GPU) and M10 up to the window (the Vulkan backend: `nx_vulkan` draws
+what the command processor decodes, with ASTC textures decoded on the host).
 
-**Nothing renders.** The command processor decodes and counts what the title sends (in 600 frames:
-1,201 submissions, 30,641 macro calls, 138,125 draws). Its shader programs translate to SPIR-V
-(`nx_shader`, M9: the 8 programs of its first frames translate and validate, and the translation
-is compared with Rust arithmetic by 36 tests on a GPU), but no draw reaches a GPU yet, no picture
-is made and no sound or input reaches the title from a person. The Vulkan backend (`nx_vulkan`,
-M10) is the next work. Nothing here is a claim that a game is playable.
+**First frames, no window.** Over its first 1,500 presented frames the title's 380,376 draws and
+1,499 clears run on a Vulkan device and none fails; the frames, dumped as PNG files and looked at,
+show its first screens (an introduction screen with photographs, a logo and text, then a menu with
+artwork), in 23 s of wall clock on an RTX 5070 Ti (`docs/reports/M10-vulkan-backend.md`). There is
+no window yet, no sound, no input reaches the title from a person, and screens beyond those have
+not been tried. Nothing here is a claim that a game is playable.
 
 ## Using it
 

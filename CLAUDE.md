@@ -10,11 +10,11 @@ Crates:
   `rlib` and `staticlib`; every produced binary links against it.
 - `nx_gpu` (`nx_gpu/`): the GPU front, with no knowledge of Horizon: the driver service's device nodes,
   the display buffer queue and a Maxwell command processor with a macro engine. `nx_runtime`
-  depends on it. Nothing is drawn.
+  depends on it. It draws nothing itself: draws, clears and displayed buffers go to a `Backend`.
 - `nx_shader` (`nx_shader/`): Maxwell shader programs: header, decoder, control flow, a SPIR-V builder
   and the translation to SPIR-V. No dependencies and no knowledge of the GPU model that feeds it.
-- `nx_vulkan` (`nx_vulkan/`): the Vulkan device and the compute harness the translator is tested
-  with (`ash`, loaded at run time).
+- `nx_vulkan` (`nx_vulkan/`): the Vulkan device, the compute harness the translator is tested
+  with, and the renderer (a `Backend`) with the ASTC decoder (`ash`, loaded at run time).
 - `recomp_gui` (`recomp_gui/`): the desktop front end (`egui`); it runs `recomp` and the games as
   processes. Run `cargo run -p recomp_gui`; `RECOMP_GUI_SCREENSHOT=<png>` saves its window.
 
@@ -52,7 +52,8 @@ Small chunks. Title at most 50 characters. No body. No attribution lines of any 
   (`nvdrv` and its device nodes, the display and buffer-queue path, a tracing command processor
   with a macro engine). The owner approved shader translation (Maxwell SASS to SPIR-V, crate
   `nx_shader`, M9) and the Vulkan backend (`ash`, crate `nx_vulkan`, M10) on 2026-10-13; M9
-  passed the same day. Never describe the output as playable before frames are measured; saying
+  passed the same day, and M10 draws the title's first screens (frames dumped and looked at) and is
+  open at the window. Never describe the output as playable before frames are measured; saying
   what a frame shows needs the frame itself (a dumped image looked at), not a count.
 - Out of scope: online services, account checks, licensing checks, AArch32 (detect and error).
 
@@ -88,6 +89,21 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   is where save data goes (default `./nx_save`). `recomp symbols --exefs <dir> [--match <text>]
   [<address>...]` names the function around an address, for reading the return addresses a stop
   report ends with.
+- Renderer: `nx_vulkan`'s tests need a Vulkan device (`NX_VULKAN_DEVICE` picks one; they print
+  `SKIPPED` without one) and `spirv-val` for the translator's. `NX_RENDERER=vulkan` makes a
+  produced program draw; `NX_DUMP_FRAMES=<dir>` writes each displayed frame as a PNG (opaque, cropped
+  to what is shown; `NX_DUMP_EVERY=<n>`, `NX_DUMP_COUNT=<n>`, `NX_DUMP_TARGETS=1` for every render
+  target too: a PNG is uncompressed, so dump every n-th frame); `NX_TRACE_DRAWS=<frame>` lists the
+  draws and clears of one frame (with `NX_TRACE_STATE=1` their state and vertices, `NX_DUMP_DRAWS=<dir>`
+  and `NX_DUMP_FROM=<n>` a picture after each); `NX_TRACE_TEXTURES=1`, `NX_TRACE_CBUFS=1`,
+  `NX_DEBUG_NO_CULL=1`, `NX_DEBUG_FULL_VIEWPORT=1`, `NX_DEBUG_SOLID_PIXEL=1` and
+  `NX_SPIRV_CHECK=1` look at one thing each; `NX_VULKAN_VALIDATE=1` turns the validation layer on;
+  `NX_SHADER_DUMP=<dir>` writes the programs draws use (read them with `cargo run --release -p
+  nx_shader --example sass -- <file>`). Never `NX_DUMP_FRAMES` without `NX_DUMP_EVERY` for a long run.
+- ASTC decoder: `nx_vulkan/tests/astc_reference.rs` compares it with ARM's `astcenc`
+  (`RECOMP_ASTCENC=<path>`, or `astcenc` on the `PATH`; the tool may be unpacked from a distribution
+  package without installing it); `RECOMP_ASTC_BATCHES` (default 4, 4,096 blocks each) scales it and
+  `RECOMP_ASTC_ONLY=<n>` runs one footprint.
 - A real title through the whole pipeline (opt-in, by hand; nothing from it is stored): build with
   `recomp build --exefs <exefs> --romfs <romfs> --out <dir>`, run `<dir>/<name>` with
   `NX_TRACE_SVC=1`, and use `recomp relink` / `--reuse-objects` to iterate on the runtime.

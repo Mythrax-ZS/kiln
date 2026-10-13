@@ -21,9 +21,9 @@ ExeFS / NRO ──loader──▶ Module ──discover──▶ per-function CF
 | Build | `src/build` | clang discovery, parallel compile, link against `nx_runtime`. |
 | Run | `nx_runtime/src/rt` | Guest memory, exclusive monitor, function table, slow path, process start-up. |
 | Horizon | `nx_runtime/src/horizon` | The kernel a produced NSO or NRO runs on: SVCs, threads, synchronization, IPC, `sm:`, and the services. |
-| GPU | `nx_gpu` | The driver service and its device nodes, the display and buffer queue, and a command processor with a macro engine (nothing is drawn). It decodes the 3D state (`state.rs`), keeps the constant buffer bindings, and counts the shader programs draws use (`shaders.rs`). |
+| GPU | `nx_gpu` | The driver service and its device nodes, the display and buffer queue, and a command processor with a macro engine. It decodes the 3D state (`state.rs`, `draw_state.rs`), keeps the constant buffer bindings, counts the shader programs draws use (`shaders.rs`), and hands each draw, clear and displayed buffer to a `Backend` (`render.rs`) when there is one. |
 | Shaders | `nx_shader` | The Maxwell program header, the instruction decoder, the control-flow graph (with the `SSY`/`PBK` stacks), a SPIR-V module builder, and the translation of a program to SPIR-V (`translate/`): registers and predicates as function variables, a dispatch loop over the blocks; `alu`, `int`, `io`, `tex`, `global` and `flow` hold the instructions (149 of 296 table rows, `example coverage`). |
-| Vulkan | `nx_vulkan` | The Vulkan device (loaded at run time), buffers, images with staging upload, and a compute harness with textures and device-address patching; the translator's tests run its shaders here against plain Rust arithmetic. |
+| Vulkan | `nx_vulkan` | The Vulkan device (loaded at run time), buffers, images with staging upload, a compute harness with textures and device-address patching (the translator's tests run its shaders here against plain Rust arithmetic), and the renderer, a `Backend` that draws with dynamic rendering, cached pipelines, textures (detiled, ASTC decoded by `astc.rs`), render targets that can be sampled, and guest memory imported for global access. |
 | Front end | `recomp_gui` | The desktop window around the command line: pick a game, recompile, keep a library of games and the settings each runs with. It runs `recomp` and the games as processes. |
 
 ## Calling protocol (generated code)
@@ -106,7 +106,7 @@ results there as the Switchbrew SVC pages lay them out, and the generated code r
 
 `nx_gpu/` is a separate crate with no knowledge of Horizon: it depends on nothing, and `nx_runtime`
 depends on it. It models what the NVIDIA driver service and the display stack do, and a command
-processor for the Maxwell engines that decodes and counts what a title sends. Nothing is drawn
+processor for the Maxwell engines that decodes and counts what a title sends. It draws nothing itself: pictures are the business of a `Backend`, the renderer below
 (`docs/reports/M8-gpu-front.md`).
 
 ```
@@ -132,6 +132,39 @@ guest ──IHOSBinderDriver──▶ vi service ──▶ nx_gpu::display (parc
 - Time: syncpoint fences complete at once; the vsync is a 60 Hz host thread that sets the display's
   event (`vi.rs`), and the audio renderer's frame event a 200 Hz one (`audren.rs`).
 
+## The renderer (`nx_vulkan`)
+
+`nx_vulkan::Renderer` is a `nx_gpu::render::Backend`. The command processor calls `draw` and
+`clear` as commands arrive, `finish` when a GPFIFO submission ends and `present` when the title
+queues a buffer; the Vulkan device and everything on it are made at the first of those calls
+(`NX_RENDERER=vulkan` turns it on in a produced program; without it the processor only counts).
+
+```
+registers ─▶ nx_gpu::draw_state ─▶ pass (targets) ─▶ pipeline key ─▶ cached pipeline
+program slots ─▶ shaders (by address and hash) ─▶ nx_shader::translate ─▶ SPIR-V module
+texture handles ─▶ header pools ─▶ textures (detile, ASTC decode, hash) or a render target's view
+constant buffers, vertices, indices ─▶ upload ring ─▶ one command buffer per submission
+```
+
+- **Passes and targets** (`render/mod.rs`, `targets.rs`): a color or depth target is an image found
+  again by the guest address of its memory (and made, zero-filled, the first time); a rendering is
+  begun with the attachments the registers name and ended when they change, when a texture needs a
+  render target in a sampling layout, or when the submission ends.
+- **Textures** (`textures.rs`, `astc.rs`): a draw's handles are looked up in the header and sampler
+  pools, the memory is read and detiled (block linear, with mip levels), ASTC blocks are decoded to
+  plain texels on the host (the device usually cannot sample them), and the image is cached by its
+  header and the hash of its bytes, compared again at most once a frame. A texture whose memory
+  is the address of a render target of the same size and format is that target's image.
+- **Pipelines** (`draw.rs`, `shaders.rs`): the program of each stage is translated once per
+  variation (attribute classes, target classes, depth range) and the pipeline is cached by the
+  programs, vertex layout, topology, formats, blend, depth clamp and descriptor layout; viewport,
+  scissor, culling, depth and stencil state and the instance counter are set per draw.
+- **Memory a program reads by address** (`global.rs`): the guest's memory is imported into the
+  device where it is, and a table of GPU address ranges lets the translated program find it.
+- **Looking** (`debug.rs`, `png.rs`): frames, every render target, and the target after each
+  command of one frame can be written as PNG, with a line of statistics; the draws, state, texture
+  headers and constant buffers of a frame can be traced (`docs/reports/M10-vulkan-backend.md`).
+
 ## Guest memory
 
 One checked interface (`nx_runtime/src/rt/mem.rs`): a 39-bit address space of 4 KiB pages through a
@@ -152,3 +185,6 @@ runtime functions the emitter calls against the runtime's exports.
 | Kernel layer | the Switchbrew contract of each call, with real host threads | `nx_runtime/src/horizon/tests.rs` and the unit tests next to each file |
 | Homebrew NRO and NSO | expected output and exit status of built programs | `src/build/e2e_tests.rs` (`mod homebrew`) |
 | GPU front | hand-built ioctl argument bytes, pushbuffers and assembled macros, with the layouts of NVIDIA's headers and `libnx` | `nx_gpu` unit tests and the service tests in `nx_runtime/src/horizon/tests.rs` |
+| Shader translation | Rust arithmetic, run on a GPU in a compute harness, per instruction family | `nx_vulkan/tests/translate_*.rs` |
+| Renderer | the pictures expected of hand-built scenes (clears, draws, blending, textures, render targets, global memory, instances), compared pixel by pixel on a GPU | `nx_vulkan/tests/render_*.rs` |
+| ASTC decoder | hand-built blocks, and ARM's reference decoder (`astcenc`) on random blocks of all footprints, opt-in | `nx_vulkan/src/astc.rs`, `nx_vulkan/tests/astc_reference.rs` |
