@@ -5,6 +5,7 @@
 //! per change per waiter, which does not matter at this scale. Guest memory is touched through the
 //! runtime's checked interface, never directly.
 
+use super::cores::Cores;
 use super::handle::{Handle, HandleTable, CURRENT_PROCESS, CURRENT_THREAD};
 use super::layout::{attr, mem_type, PAGE, TLS_BASE, TLS_SLOT_SIZE};
 use super::memory::{Info, MemoryMap};
@@ -19,7 +20,7 @@ use crate::rt::runtime::{rt, run};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::io::Write;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -140,6 +141,8 @@ pub struct ThreadCtx {
     pub thread: u64,
     /// What the thread is doing, as the watchdog sees it.
     pub monitor: Arc<ThreadMonitor>,
+    /// The core the thread holds while it runs guest code (`NX_CORES`).
+    pub core: AtomicUsize,
 }
 
 pub struct Kernel {
@@ -159,6 +162,8 @@ pub struct Kernel {
     monitors: Mutex<BTreeMap<u64, Arc<ThreadMonitor>>>,
     /// A watchdog is running (`NX_WATCHDOG`): calls say what they are about.
     watched: bool,
+    /// Threads hold a core to run guest code (`NX_CORES`).
+    cores: Option<Cores>,
 }
 
 impl Drop for Kernel {
@@ -345,6 +350,7 @@ impl Kernel {
             finish_hooks: Mutex::new(Vec::new()),
             monitors: Mutex::new(BTreeMap::new()),
             watched: super::watchdog::requested().is_some(),
+            cores: Cores::from_env(),
         })
     }
 
@@ -689,16 +695,43 @@ impl Kernel {
             kernel: Arc::clone(self),
             thread,
             monitor: Arc::clone(&monitor),
+            core: AtomicUsize::new(usize::MAX),
         }));
         cpu.ctl.user = ctx.cast::<c_void>();
+        // SAFETY: just created, and only this thread touches it.
+        let core = unsafe { &(*ctx).core };
+        self.take_core(thread, core);
         // SAFETY: the CPU belongs to this thread alone and generated code is registered.
         let reason = unsafe { run(cpu, entry) };
+        self.give_core(core);
         cpu.ctl.user = std::ptr::null_mut();
         self.monitors().remove(&thread);
         monitor.retire();
         // SAFETY: created above and no longer referenced.
         drop(unsafe { Box::from_raw(ctx) });
         self.thread_ended(thread, reason, cpu);
+    }
+
+    /// Wait for the core `thread` runs on, if cores are modelled (`NX_CORES`); `held` records it.
+    pub(super) fn take_core(&self, thread: u64, held: &AtomicUsize) {
+        if let Some(cores) = &self.cores {
+            let ideal = self.lock().threads.get(&thread).map_or(0, |t| t.ideal_core);
+            let core = cores.core_of(ideal);
+            cores.acquire(core);
+            held.store(core, Ordering::Relaxed);
+        }
+    }
+
+    /// Let go of the core the thread holds.
+    pub(super) fn give_core(&self, held: &AtomicUsize) {
+        if let Some(cores) = &self.cores {
+            cores.release(held.load(Ordering::Relaxed));
+        }
+    }
+
+    /// Does the supervisor call `imm` leave the core for others (when cores are modelled)?
+    pub(super) fn call_gives_way(&self, imm: u32) -> bool {
+        self.cores.is_some() && super::cores::gives_way(imm)
     }
 
     fn thread_ended(&self, thread: u64, reason: u32, cpu: &NativeCpu) {

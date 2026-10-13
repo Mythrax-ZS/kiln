@@ -123,8 +123,19 @@ pub extern "C" fn svc_entry(cpu: *mut NativeCpu, imm: u32) -> i32 {
             Arc::clone(&(*ctx).monitor),
         )
     };
+    // SAFETY: as above; only this thread uses the field.
+    let core = unsafe { &(*ctx).core };
     monitor.enter(imm, &cpu.state.x);
+    // A call that can block or reschedule leaves the core for the threads waiting for it, and
+    // the thread asks for a core again when the call is over (`NX_CORES`).
+    let gives_way = kernel.call_gives_way(imm);
+    if gives_way {
+        kernel.give_core(core);
+    }
     let flow = kernel.svc(cpu, thread, imm);
+    if gives_way {
+        kernel.take_core(thread, core);
+    }
     monitor.leave();
     i32::from(flow == Flow::Stop)
 }

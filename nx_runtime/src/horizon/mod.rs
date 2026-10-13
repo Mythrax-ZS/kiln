@@ -8,6 +8,7 @@
 //! One [`kernel::Kernel`] is one process. It runs the guest's threads on host threads, each
 //! executing generated code through the runtime in [`crate::rt`].
 
+pub mod cores;
 pub mod gamepad;
 pub mod handle;
 pub mod input;
