@@ -271,6 +271,27 @@ impl Core {
                 ));
             }
         }
+        if std::env::var_os("NX_TRACE_TEXTURES").is_some() {
+            for group in 0..5u32 {
+                let bound: Vec<String> = (0..18u32)
+                    .filter_map(|s| {
+                        scene
+                            .cbufs
+                            .get(group, s)
+                            .map(|b| format!("c{s}={:#x}+{:#x}", b.address, b.size))
+                    })
+                    .collect();
+                eprintln!("[vulkan] group {group}: {}", bound.join(" "));
+            }
+            for s in &stages {
+                eprintln!(
+                    "[vulkan] stage {} at {:#x} uses group {}",
+                    s.kind.name(),
+                    s.address,
+                    s.group
+                );
+            }
+        }
         // The textures the programs sample: handle, headers, image and sampler.
         let pools = regs.texture_pools();
         let mut image_infos: Vec<(u32, vk::DescriptorImageInfo)> = Vec::new();
@@ -302,7 +323,18 @@ impl Core {
                     super::textures::Tic(words(&tic)),
                     super::textures::Tsc(words(&tsc)),
                     used,
-                )?;
+                )
+                .map_err(|e| {
+                    format!(
+                        "{e} [texture {}: handle {handle:#x} from slot {} of group {} ({:?}), header {tic_id} at {:#x}, sampler {tsc_id} at {:#x}]",
+                        used.index,
+                        pools.bindless_slot,
+                        slot.group,
+                        scene.cbufs.get(slot.group, pools.bindless_slot),
+                        pools.header_address + 32 * u64::from(tic_id),
+                        pools.sampler_address + 32 * u64::from(tsc_id)
+                    )
+                })?;
                 image_infos.push((
                     base + 24 + used.index,
                     vk::DescriptorImageInfo::default()
@@ -426,6 +458,22 @@ impl Core {
                 "texture {index} is named at byte {offset} of a constant buffer of {} bytes",
                 b.size
             ));
+        }
+        if std::env::var_os("NX_TRACE_TEXTURES").is_some() {
+            let n = (b.size as usize).min(128);
+            if let Some(table) = scene.read_vec(b.address, n) {
+                let words: Vec<String> = table
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| format!("{:x}", u32::from_le_bytes(*c)))
+                    .collect();
+                eprintln!(
+                    "[vulkan] handles in slot {slot} of group {group} ({:#x}): {}",
+                    b.address,
+                    words.join(" ")
+                );
+            }
         }
         let word = self.read_gpu(scene, b.address + offset, 4)?;
         Ok(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))

@@ -517,8 +517,9 @@ impl Textures {
         let arrayed = matches!(ty, 5);
         if !matches!(ty, 1 | 5 | 7) || arrayed != used.arrayed {
             return Err(format!(
-                "a texture header of type {ty} sampled as a 2D texture{}",
-                if used.arrayed { " array" } else { "" }
+                "a texture header of type {ty} sampled as a 2D texture{} (header words {:08x?})",
+                if used.arrayed { " array" } else { "" },
+                tic.0
             ));
         }
         let view = self.texture(vk, frame, scene, tic, arrayed)?;

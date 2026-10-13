@@ -240,6 +240,7 @@ mod m3d {
     pub const DRAW_INLINE_VERTEX: u32 = 0x1640 / 4;
     pub const DRAW_INDEX_BUFFER: u32 = 0x17e0 / 4;
     pub const SET_INDEX_BUFFER_F: u32 = 0x17dc / 4;
+    pub const SET_RASTER_ENABLE: u32 = 0x37c / 4;
     /// `DRAW_INDEX_BUFFER32/16/8_BEGIN_END_INSTANCE_FIRST` then the same three `_SUBSEQUENT`.
     pub const DRAW_INDEX_BEGIN_END_FIRST: u32 = 0x17e4 / 4;
     pub const DRAW_INDEX_BEGIN_END_LAST: u32 = 0x17f8 / 4;
@@ -338,9 +339,21 @@ impl mme::Host for MacroHost<'_, '_> {
 
 impl Engine {
     pub fn new(class_num: u32) -> Engine {
+        let mut regs = vec![0; REGISTERS];
+        if class_num == class::THREED {
+            // Rasterization is on until a title turns it off (it never writes the register).
+            regs[m3d::SET_RASTER_ENABLE as usize] = 1;
+            // The constant buffer binding group of each program slot starts as the stage it is:
+            // vertex (both slots) 0, tessellation control 1, evaluation 2, geometry 3, pixel 4. A
+            // title that does not write `SET_PIPELINE_BINDING` leaves them so (the title does not,
+            // and its pixel program reads the constant buffers bound to group 4).
+            for (slot, group) in [0u32, 0, 1, 2, 3, 4].into_iter().enumerate() {
+                regs[(0x2010 + 0x40 * slot as u32) as usize / 4] = group;
+            }
+        }
         Engine {
             class: class_num,
-            regs: vec![0; REGISTERS],
+            regs,
             mme: Mme::default(),
             pending: None,
             running: None,
@@ -952,6 +965,18 @@ mod tests {
         );
         assert_eq!(d.by_kind["DRAW_INDEX_BUFFER16_BEGIN_END_INSTANCE_FIRST"], 1);
         assert_eq!(d.by_kind["inline vertices or indices"], 1);
+    }
+
+    #[test]
+    fn registers_a_title_never_writes_start_at_the_hardware_values() {
+        let e = Engine::new(class::THREED);
+        assert_eq!(e.reg(0x37c / 4), 1, "rasterization is on");
+        // Program slot 5 (pixel) is bound to group 4 and slot 1 (vertex) to group 0.
+        assert_eq!(e.reg((0x2010 + 5 * 0x40) / 4), 4);
+        assert_eq!(e.reg((0x2010 + 0x40) / 4), 0);
+        assert_eq!(e.reg((0x2010 + 2 * 0x40) / 4), 1);
+        // The other classes start empty.
+        assert_eq!(Engine::new(class::COMPUTE).reg(0x37c / 4), 0);
     }
 
     #[test]

@@ -115,6 +115,19 @@ impl Gpu {
                 buffer.nvmap_id
             ));
         };
+        if self.level >= 1 && frame.number <= 2 {
+            eprintln!(
+                "[gpu] frame {} shows nvmap handle {} (memory at {base:#x}), offset {:#x}, \
+                 layout {}, pitch {}, block height {}; native handle words {:x?}",
+                frame.number,
+                buffer.nvmap_id,
+                buffer.offset(),
+                buffer.layout(),
+                buffer.pitch(),
+                buffer.block_height_log2(),
+                buffer.ints
+            );
+        }
         backend.present(&crate::render::Present {
             address: base + u64::from(buffer.offset()),
             width: buffer.width,

@@ -146,6 +146,26 @@ impl Targets {
             .max_by_key(|t| t.touched)
     }
 
+    /// The targets made so far, for messages.
+    pub fn describe(&self) -> String {
+        let mut list: Vec<String> = self
+            .map
+            .values()
+            .map(|t| {
+                format!(
+                    "{:#x} {}x{} {:?}",
+                    t.key.address, t.key.width, t.key.height, t.key.format
+                )
+            })
+            .collect();
+        list.sort();
+        if list.is_empty() {
+            "none".to_string()
+        } else {
+            list.join(", ")
+        }
+    }
+
     pub fn destroy(&mut self, vk: &Vk) {
         for (_, t) in self.map.drain() {
             vk.destroy_image(t.image);

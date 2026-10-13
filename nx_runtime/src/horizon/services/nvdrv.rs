@@ -33,10 +33,38 @@ pub struct Shared {
     events: Mutex<HashMap<EventToken, (KObject, KObject)>>,
 }
 
+/// The renderer `NX_RENDERER` asks for: `vulkan`, or nothing (the default: the commands are
+/// decoded and counted, not drawn).
+fn renderer() -> Option<Box<dyn nx_gpu::render::Backend>> {
+    match std::env::var("NX_RENDERER").as_deref() {
+        Ok("vulkan") => vulkan_renderer(),
+        Ok("none") | Ok("") | Err(_) => None,
+        Ok(other) => {
+            eprintln!("recomp runtime: NX_RENDERER={other} is not a renderer (vulkan, none)");
+            None
+        }
+    }
+}
+
+#[cfg(feature = "vulkan")]
+fn vulkan_renderer() -> Option<Box<dyn nx_gpu::render::Backend>> {
+    Some(Box::new(nx_vulkan::Renderer::new(
+        nx_vulkan::RenderConfig::from_env(),
+    )))
+}
+
+#[cfg(not(feature = "vulkan"))]
+fn vulkan_renderer() -> Option<Box<dyn nx_gpu::render::Backend>> {
+    eprintln!("recomp runtime: NX_RENDERER=vulkan, and this runtime was built without it");
+    None
+}
+
 impl Shared {
     pub fn new() -> Shared {
+        let mut core = Nvdrv::new(Arc::new(ProcessMemory));
+        core.gpu.backend = renderer();
         Shared {
-            core: Mutex::new(Nvdrv::new(Arc::new(ProcessMemory))),
+            core: Mutex::new(core),
             events: Mutex::new(HashMap::new()),
         }
     }

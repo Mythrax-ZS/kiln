@@ -1934,6 +1934,7 @@ dependencies = [
  "libloading",
  "nx_gpu",
  "nx_runtime",
+ "nx_vulkan",
 ]
 
 [[package]]

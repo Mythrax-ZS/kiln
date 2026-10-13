@@ -426,6 +426,7 @@ impl Backend for Renderer {
                 "[vulkan] frame {}: no render target was drawn at the displayed buffer ({:#x}, {}x{})",
                 p.frame, p.address, p.width, p.height
             );
+            eprintln!("[vulkan]   targets drawn so far: {}", targets.describe());
             return Ok(());
         };
         let (w, h) = (target.key.width, target.key.height);

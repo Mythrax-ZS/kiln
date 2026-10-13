@@ -107,8 +107,9 @@ impl GraphicBuffer {
 
     /// A word of the native handle after its header, for the fields of the surface description
     /// `NvGraphicBuffer` carries (`libnx`'s `graphic_buffer.h`): the first plane starts at word
-    /// 13 with width, height, color format, layout, pitch, an unused word, offset, kind and
-    /// the block height.
+    /// 13 with width, height, the 64-bit color format, layout, pitch, an unused word, offset,
+    /// kind and the block height. (The words of a real buffer show it: the second buffer of a
+    /// pair has the offset of its size, and the size sits where this layout puts it.)
     fn plane_word(&self, index: usize) -> u32 {
         self.ints.get(13 + index).copied().unwrap_or(0)
     }
@@ -116,22 +117,22 @@ impl GraphicBuffer {
     /// The layout of the first plane (`libnx`'s `NvLayout`: 1 pitch linear, 2 Tegra tiled, 3 block
     /// linear).
     pub fn layout(&self) -> u32 {
-        self.plane_word(3)
+        self.plane_word(4)
     }
 
     /// The distance between rows in bytes (of a pitch linear plane).
     pub fn pitch(&self) -> u32 {
-        self.plane_word(4)
+        self.plane_word(5)
     }
 
     /// Where the plane starts in its `nvmap` memory.
     pub fn offset(&self) -> u32 {
-        self.plane_word(6)
+        self.plane_word(7)
     }
 
     /// The height of a block of a block linear plane, as a power of two in GOBs.
     pub fn block_height_log2(&self) -> u32 {
-        self.plane_word(8)
+        self.plane_word(9)
     }
 }
 
@@ -738,6 +739,67 @@ mod tests {
             b.extend_from_slice(&v.to_le_bytes());
         }
         b
+    }
+
+    #[test]
+    fn the_surface_of_a_real_buffer_is_read_from_its_native_handle() {
+        // The words of a native handle as a title sent them (a 1600x900 block linear buffer, the
+        // second of a pair): the nvmap id, the plane with its layout, pitch, offset and kind.
+        let mut ints = vec![0u32; 51];
+        ints[..28].copy_from_slice(&[
+            0xFFFF_FFFF,
+            7,
+            0,
+            0xDAFF_CAFF,
+            0x2A,
+            0,
+            0xB00,
+            1,
+            1,
+            0x640,
+            0x64_0000,
+            1,
+            0,
+            0x640,
+            0x384,
+            0x53_2120,
+            1,
+            3,
+            0x1900,
+            7,
+            0x64_0000,
+            0xFE,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0x64_0000,
+        ]);
+        let mut b = Vec::new();
+        for v in [
+            GRAPHIC_BUFFER_MAGIC,
+            1600,
+            900,
+            1600,
+            1,
+            0xB00,
+            42,
+            0,
+            0,
+            51,
+        ] {
+            b.extend_from_slice(&u32::to_le_bytes(v));
+        }
+        for v in &ints {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        let g = GraphicBuffer::parse(&b).unwrap();
+        assert_eq!(g.nvmap_id, 7);
+        assert_eq!(g.layout(), 3, "block linear");
+        assert_eq!(g.pitch(), 0x1900);
+        assert_eq!(g.offset(), 0x64_0000);
+        assert_eq!(g.block_height_log2(), 4);
     }
 
     fn token_parcel(f: impl FnOnce(&mut ParcelWriter)) -> Vec<u8> {
