@@ -127,11 +127,12 @@ fn watch(kernel: &Kernel, limit: Duration) {
             nx_gpu::progress::phase()
         );
         (methods, commands) = (m, c);
-        report_threads(kernel);
+        report_threads(kernel, "watchdog");
     }
 }
 
-fn report_threads(kernel: &Kernel) {
+/// Say what every running guest thread is doing, one line each, starting with `[label]`.
+pub(super) fn report_threads(kernel: &Kernel, label: &str) {
     let monitors: Vec<(u64, Arc<ThreadMonitor>)> = kernel
         .monitors()
         .iter()
@@ -139,7 +140,7 @@ fn report_threads(kernel: &Kernel) {
         .collect();
     let now = now_ms();
     for (id, monitor) in monitors {
-        let (entry, arg) = kernel.thread_entry(id).unwrap_or((0, 0));
+        let (entry, arg, priority, core) = kernel.thread_entry(id).unwrap_or((0, 0, 0, 0));
         let svc = monitor.svc.load(Ordering::Acquire);
         let what = if svc > 0 {
             let imm = svc - 1;
@@ -185,7 +186,8 @@ fn report_threads(kernel: &Kernel) {
         };
         drop(guard);
         eprintln!(
-            "[watchdog]   thread {id} (entry {entry:#x}, argument {arg:#x}): {what}; {stack}"
+            "[{label}]   thread {id} (entry {entry:#x}, argument {arg:#x}, priority {priority}, \
+             core {core}): {what}; {stack}"
         );
     }
 }

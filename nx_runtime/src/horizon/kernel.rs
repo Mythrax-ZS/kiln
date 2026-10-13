@@ -185,6 +185,66 @@ pub(super) enum Waited<R> {
     Terminating,
 }
 
+/// For reading a crash: 256 bytes at each distinct register value of a stopped thread that is a
+/// mapped guest address outside its stack, as words eight to a line, and 64 bytes at what the words of
+/// the first few of them point at in the heap (the blocks of a heap's lists, say).
+fn dump_pointees(cpu: &NativeCpu) {
+    // The words of `len` bytes at `addr`, eight to a line, or None when they are not readable.
+    fn words(addr: u64, len: usize) -> Option<Vec<u64>> {
+        let mut bytes = vec![0u8; len];
+        rt().mem.read_bytes(addr, &mut bytes, false).ok()?;
+        Some(
+            bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|w| u64::from_le_bytes(*w))
+                .collect(),
+        )
+    }
+    fn print(label: &str, ws: &[u64]) {
+        eprintln!("[stop]   {label}:");
+        for (n, line) in ws.chunks(8).enumerate() {
+            let text: Vec<String> = line.iter().map(|w| format!("{w:016x}")).collect();
+            eprintln!("[stop]     +{:#05x}: {}", n * 64, text.join(" "));
+        }
+    }
+    let sp = cpu.state.sp;
+    let mut seen: Vec<u64> = Vec::new();
+    let mut objects: Vec<(u64, Vec<u64>)> = Vec::new();
+    for (i, &a) in cpu.state.x.iter().enumerate().take(29) {
+        if a < 0x1_0000 || seen.contains(&a) || a.abs_diff(sp) < 0x4_0000 || seen.len() >= 10 {
+            continue;
+        }
+        let Some(ws) = words(a, 256) else { continue };
+        seen.push(a);
+        print(&format!("x{i} = {a:#x} points at"), &ws);
+        objects.push((a, ws));
+    }
+    // What the first few of those objects point at in the heap: the blocks of a heap's lists, say.
+    let heap = 0x30_0000_0000u64..0x40_0000_0000;
+    let mut followed = 0;
+    for (a, ws) in objects.iter().take(4) {
+        for (n, &w) in ws.iter().enumerate() {
+            if followed >= 16
+                || !heap.contains(&w)
+                || seen.contains(&w)
+                || w.abs_diff(sp) < 0x4_0000
+            {
+                continue;
+            }
+            if let Some(inner) = words(w, 64) {
+                seen.push(w);
+                followed += 1;
+                print(
+                    &format!("{w:#x}, the word at {a:#x}+{:#x}, points at", 8 * n),
+                    &inner,
+                );
+            }
+        }
+    }
+}
+
 /// The seed for the kernel's pseudo-random values: `NX_RANDOM_SEED` when set, otherwise the clock.
 fn random_seed() -> u64 {
     if let Some(v) = std::env::var("NX_RANDOM_SEED")
@@ -303,9 +363,13 @@ impl Kernel {
         }
     }
 
-    /// The entry point and argument a thread was created with.
-    pub(super) fn thread_entry(&self, thread: u64) -> Option<(u64, u64)> {
-        self.lock().threads.get(&thread).map(|t| (t.entry, t.arg))
+    /// The entry point, argument, priority and ideal core a thread was created with (they may
+    /// have been changed since).
+    pub(super) fn thread_entry(&self, thread: u64) -> Option<(u64, u64, i32, i32)> {
+        self.lock()
+            .threads
+            .get(&thread)
+            .map(|t| (t.entry, t.arg, t.priority, t.ideal_core))
     }
 
     pub fn trace_log(&self) -> bool {
@@ -453,9 +517,15 @@ impl Kernel {
     /// The run cannot go on; the first report wins.
     pub fn fatal(&self, report: String) {
         let mut st = self.lock();
+        let first = st.exit.is_none();
         st.exit.get_or_insert(Exit::Fatal(report));
         drop(st);
         self.notify();
+        if first {
+            // What the other threads were doing when the run stopped is half of the story.
+            eprintln!("[stop] the other threads at the stop:");
+            super::watchdog::report_threads(self, "stop");
+        }
     }
 
     pub fn exit_state(&self) -> Option<Exit> {
@@ -654,6 +724,19 @@ impl Kernel {
                         frames.join(" ")
                     ));
                 }
+                let registers: Vec<String> = cpu
+                    .state
+                    .x
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| format!("x{i}={v:#x}"))
+                    .collect();
+                eprintln!(
+                    "[stop] registers of thread {thread} as of its last call: {} sp={:#x}",
+                    registers.join(" "),
+                    cpu.state.sp
+                );
+                dump_pointees(cpu);
                 self.fatal(report);
             }
         }
