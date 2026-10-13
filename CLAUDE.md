@@ -11,6 +11,12 @@ Crates:
 - `nx_gpu` (`nx_gpu/`): the GPU front, with no knowledge of Horizon: the driver service's device nodes,
   the display buffer queue and a Maxwell command processor with a macro engine. `nx_runtime`
   depends on it. Nothing is drawn.
+- `nx_shader` (`nx_shader/`): Maxwell shader programs: header, decoder, control flow, a SPIR-V builder
+  and the translation to SPIR-V. No dependencies and no knowledge of the GPU model that feeds it.
+- `nx_vulkan` (`nx_vulkan/`): the Vulkan device and the compute harness the translator is tested
+  with (`ash`, loaded at run time).
+- `recomp_gui` (`recomp_gui/`): the desktop front end (`egui`); it runs `recomp` and the games as
+  processes. Run `cargo run -p recomp_gui`; `RECOMP_GUI_SCREENSHOT=<png>` saves its window.
 
 ## Inputs (owner instruction, 2026-10-12)
 

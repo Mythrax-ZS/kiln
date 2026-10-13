@@ -41,9 +41,27 @@ recomp build   (--exefs <dir|pfs0> | --nro <file>) --out <dir> [--name <name>] [
                [--reuse-objects]
 recomp relink  --out <dir> --name <name>
 recomp symbols (--exefs <dir|pfs0> | --nro <file>) [--match <text>] [<address>...]
+recomp doctor
 ```
 
 `inspect` also says which of the SVCs and services a program may use this runtime does not implement.
+`doctor` says what the tool can use on this machine (its version, the C compiler it will run, the
+runtime library programs link) as `key: value` lines, and builds nothing.
+
+### The desktop front end
+
+`recomp-gui` (the `recomp_gui` crate, built with `cargo build --release -p recomp_gui`) wraps the
+command line in a window: pick a game's already extracted folder (the one that holds `exefs` and
+`romfs`, or a homebrew `.nro`) or drop it on the window, choose how hard the compiler works, and
+press Recompile. The output of `recomp` streams into the window; the finished game appears in the
+Library, which keeps one folder per game and the settings each is run with (frame limit, save data
+and RomFS locations, the logging and GPU trace switches, extra environment variables), and starts
+the game with the output shown beside them. The Settings screen names the `recomp` program, the C
+compiler and the runtime library to use; the header shows whether each was found. The GUI finds
+`recomp` beside itself or on the `PATH`. It reads no keys and opens no NSP, XCI or NCA files, as
+the command line does not. `RECOMP_GUI_CONFIG_DIR` moves its settings folder, and
+`RECOMP_GUI_SCREENSHOT=<file.png>` makes it save a picture of its window and exit (with
+`RECOMP_GUI_TAB` and `RECOMP_GUI_GAME` choosing what is shown), which is how its looks are checked.
 
 `build` writes `<name>.exe` (or `<name>`), optionally `<name>.dll` with `--shared`, the embedded
 image, and `<name>.report.txt` listing everything the analysis could not settle: indirect branches

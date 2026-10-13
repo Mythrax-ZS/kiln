@@ -21,7 +21,10 @@ ExeFS / NRO ──loader──▶ Module ──discover──▶ per-function CF
 | Build | `src/build` | clang discovery, parallel compile, link against `nx_runtime`. |
 | Run | `nx_runtime/src/rt` | Guest memory, exclusive monitor, function table, slow path, process start-up. |
 | Horizon | `nx_runtime/src/horizon` | The kernel a produced NSO or NRO runs on: SVCs, threads, synchronization, IPC, `sm:`, and the services. |
-| GPU | `nx_gpu` | The driver service and its device nodes, the display and buffer queue, and a command processor with a macro engine (nothing is drawn). |
+| GPU | `nx_gpu` | The driver service and its device nodes, the display and buffer queue, and a command processor with a macro engine (nothing is drawn). It decodes the 3D state (`state.rs`), keeps the constant buffer bindings, and counts the shader programs draws use (`shaders.rs`). |
+| Shaders | `nx_shader` | The Maxwell program header, the instruction decoder, the control-flow graph (with the `SSY`/`PBK` stacks), a SPIR-V module builder, and the translation of a program to SPIR-V (`translate/`): registers and predicates as function variables, a dispatch loop over the blocks. |
+| Vulkan | `nx_vulkan` | The Vulkan device (loaded at run time) and a compute harness; the translator's tests run its shaders here against plain Rust arithmetic. |
+| Front end | `recomp_gui` | The desktop window around the command line: pick a game, recompile, keep a library of games and the settings each runs with. It runs `recomp` and the games as processes. |
 
 ## Calling protocol (generated code)
 

@@ -22,8 +22,8 @@ nx_runtime = { path = "nx_runtime", features = ["testing"] }
 libloading = "0.8"
 
 [workspace]
-members = ["nx_runtime", "nx_gpu", "nx_shader", "nx_vulkan"]
-default-members = [".", "nx_runtime", "nx_gpu", "nx_shader", "nx_vulkan"]
+members = ["nx_runtime", "nx_gpu", "nx_shader", "nx_vulkan", "recomp_gui"]
+default-members = [".", "nx_runtime", "nx_gpu", "nx_shader", "nx_vulkan", "recomp_gui"]
 
 [profile.release]
 debug = false
