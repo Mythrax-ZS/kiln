@@ -1,9 +1,10 @@
 # M10: the Vulkan backend (`nx_vulkan` renderer)
 
-Status: the title's first screens and its opening cutscene (after the first menu) are rendered,
-shown in a window, and the keyboard reaches the title; the milestone is open at speed (about 15
-frames a second in the cutscene), at what comes after the cutscene, at an early stop that happens
-in about one run in 30, and at sound (see "What is not done"). Date: 2026-10-14.
+Status: the title's first screens, its opening cutscene (after the first menu) and its first
+stage are rendered, shown in a window, and the keyboard reaches the title; the milestone is open
+at speed (about 28 frames a second in the stage), at what the stage does past its first prompt,
+at an early stop that happens in about one run in 30, and at sound (see "What is not done").
+Date: 2026-10-14.
 
 The task (owner approval of 2026-10-13, "begin the shader translation and Vulkan backend"): turn
 what the command processor of `nx_gpu` decodes into pictures with the translated programs, on a
@@ -203,6 +204,29 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
   13,000 were drawn with no loss, and a device test shows both forms give the same registers
   for 256 random states. Why the driver hangs on the loop is not known; the loop was also tried
   with its test in the loop header and with blocks numbered 0, 1, 2, and hung in both.
+- **The loading screen after the cutscene never ended, and it was not slowness (A-073).** The
+  first thought was that the title's loader ran too slowly: its thread sat in a string-length
+  loop for 13 minutes. Reading the live process from outside (`tools/guest_memory.ps1`: the
+  registers a frame saved on the stack, then the text box it was laying out, the font object, the
+  font's table of virtual functions and the metrics table of the font cache) showed a text layout
+  that divides by the height of its font: the stand-in system fonts had no `OS/2` table, the
+  engine took a height and an ascent of zero from the missing Windows metrics, the quotient was
+  infinite, `FCVTZS` saturated it to the largest integer, and the loop that appends a line break
+  that many times counts with 16 bits and never reaches it. With the table the loading screen
+  takes a minute.
+- **Pixels in the title's own objects (A-118).** In the first frames of the stage the title
+  stopped twice on a pointer that was a depth value, in different objects each time. A held
+  process (`NX_HOLD_ON_STOP`, read from outside) showed a 64 KiB tiled blob of such values lying
+  over a list of objects: a render target that was drawn to long ago and never read was still
+  waiting to be written to the memory it stood for (A-111), the title had freed that memory and
+  put objects in it, and a texture that overlapped it made the write-back overwrite them.
+  Targets nothing draws to for a long time are let go; a test makes the overwrite happen and
+  shows it no longer does.
+- **What the stage asked for next.** `IApplicationFunctions::GetDisplayVersion` (A-117); the media
+  engines (A-119: refusing to open `nvhost-nvdec` made the title's movie thread use the null it
+  got, so the nodes open, take the host1x channel ioctls and decode nothing); the clock manager
+  `mm:u` (A-120). With them the title loads its first stage: the frames show Mario, the
+  tutorial prompt "Look Around" and a panel for the tutorial's video, which stays empty.
 - **Things the scene needed that the first screens did not** (all found by the draws that
   failed, each with its program's address): texture instructions beyond `TEXS` (`TEX`, `TLD4S`,
   `TLD4`, `TXQ`, `TMML`; A-106), the four condition code flags where only the carry was modelled
@@ -226,19 +250,27 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
 
 ## What is not done, and what is not checked
 
-- **What follows the opening cutscene.** Nothing past it has been seen: the runs that were
-  watched went to frame 13,000 (the cutscene starts at about frame 9,000 when the first menu is
-  confirmed at frame 5,000 in a run without a person; the frames before it are the introduction
-  screens, the first menu and the story card).
-- **Speed.** The cutscene runs at about 15 frames a second (it was 6 before the textures were
-  hashed in place and the mip chains copied on the device): about 600 draws a frame, most of the
-  time in the renderer's draw path. An AMD integrated GPU of the same machine ran the same
-  cutscene at about 26 frames a second, so the RTX card is slowed by something of the discrete
-  device (the uploads through the ring in host memory, the waits for the device) and not by the
-  draws themselves; that has not been looked into.
-  A step-by-step account is printed every 100 frames with `NX_TRACE_GPU`. Nothing here is a claim
-  about speed on other hardware or other scenes (A-102: every submission still waits for the
-  device).
+- **What follows the opening cutscene is seen only as far as its first prompt.** The cutscene can
+  be skipped (the scripted presses of the start button: `NX_INPUT_SCRIPT`), the title loads for
+  about a minute and shows its first stage: dumped frames from 10,000 to 16,000 show a character
+  with a companion on a dark ball and the prompt "Look Around", and a pale rectangle at the
+  bottom right that is the tutorial's video panel, empty because the media engines decode
+  nothing (A-119). The scene waits for the right stick; after scripted presses of it the camera
+  was seen to orbit. That the left stick walks the character, that the stage can be played
+  through, and that it stays up for long are not checked: the longest run was 16,000 frames.
+- **Speed.** The stage runs at about 28 frames a second (frames 10,658 to 11,929 took 44 s, on
+  an NVIDIA RTX 5070 Ti, untraced); the title's own pace is 60, so its logic runs slower than on
+  the console. The render thread is the limit: per 100 frames it spends about 2.1 s in the draw
+  path (1.4 s on textures, of which 1.0 s writing one render target of 320 x 360 back to memory
+  every frame, A-111: half of it waiting for the device, half laying the pixels out), 0.5 s on
+  the one compute launch of each frame (a wait for the device), 0.2 s finishing the frame, 0.2 s
+  on vertices and 0.2 s on descriptors. The guest's own code was made faster by native lowering
+  of the hot floating-point and vector forms, fast paths for memory accesses and a lock-free
+  function table, and by analysis that resolves the jump tables of loops (the interpreter ran
+  2.1 billion instructions of one cutscene before, and 150 million of 16,000 frames of the stage
+  without hints now). A step-by-step account is printed every 100 frames with `NX_TRACE_GPU`.
+  Nothing here is a claim about speed on other hardware or other scenes (A-102: every submission
+  still waits for the device).
 - **A run that stops answering.** `NX_WATCHDOG` caught one in about four runs of the cutscene:
   the main thread waiting for a mutex that another thread held while it was inside a request to
   a service (the command submission), with the command processor handling no methods and the GPU
