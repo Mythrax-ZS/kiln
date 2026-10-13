@@ -27,9 +27,11 @@ its device nodes, the display and buffer queue, a Maxwell command processor with
 that traces what a title sends; the same title now runs its main loop and submits draw calls).
 
 **Nothing renders.** The command processor decodes and counts what the title sends (in 600 frames:
-1,201 submissions, 30,641 macro calls, 138,125 draws), but no shader is read, no picture is made
-and no sound or input reaches the title from a person. Shader translation and a Vulkan backend are
-the next, separate work. Nothing here is a claim that a game is playable.
+1,201 submissions, 30,641 macro calls, 138,125 draws). Its shader programs translate to SPIR-V
+(`nx_shader`, M9: the 8 programs of its first frames translate and validate, and the translation
+is compared with Rust arithmetic by 36 tests on a GPU), but no draw reaches a GPU yet, no picture
+is made and no sound or input reaches the title from a person. The Vulkan backend (`nx_vulkan`,
+M10) is the next work. Nothing here is a claim that a game is playable.
 
 ## Using it
 

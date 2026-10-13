@@ -18,9 +18,10 @@ listed below, mounts its RomFS and reads from it, initializes the GPU through `n
 display through `vi:u`, and then draws: in 600 presented frames it submits 1,201 GPFIFO
 batches, 30,641 macro calls of 11 macros and 138,125 indexed draws into a 1600x900 target, all of
 which the command processor of `nx_gpu` decodes and counts (M8; M7 had stopped at the first call
-to `nvdrv`). **Nothing renders**: no shader is read, no picture is made, the fonts are blank
-stand-ins, the sound is not played and nobody's input reaches the title. The next work is shader
-translation and a Vulkan backend, and nothing here is a claim that a game is playable.
+to `nvdrv`). The programs it binds in those frames translate to SPIR-V and run correctly in a
+test harness on a GPU (M9). **Nothing renders**: no draw reaches a GPU, no picture is made, the
+fonts are blank stand-ins, the sound is not played and nobody's input reaches the title. The
+next work is the Vulkan backend (M10), and nothing here is a claim that a game is playable.
 
 ## What each milestone delivered
 
@@ -34,6 +35,7 @@ translation and a Vulkan backend, and nothing here is a claim that a game is pla
 | M6 kernel layer | 38 SVCs, handles, memory, threads, synchronization, IPC, `sm:` gated by the NPDM, homebrew start-up | 46 kernel tests, four native programs, 680 repeated runs |
 | M7 title boot | several modules in one program, six services, the RomFS, transfer memory, the cryptographic extension | the title boots to `nvdrv` on Windows and on Linux |
 | M8 GPU front | `nx_gpu`: `nvdrv` and its nodes, the display and buffer queue, a command processor with a macro engine; 14 more services; shared memory; the title's main loop | 600 frames, 1,201 submissions, 138,125 draws, 0 undecoded methods or macros; `docs/reports/M8-gpu-front.md` |
+| M9 shader translation | `nx_shader`: the Maxwell program header, decoder and control flow graph, a SPIR-V builder, the translation of 149 of 296 instruction rows (arithmetic, integer multiply-add, bit fields, comparisons, conversions, attributes, constant buffers, `TEXS`, `LDG`/`STG`, flow); `nx_vulkan`: the Vulkan device and a compute harness | the 8 programs the title binds in its first frames translate and validate; 36 GPU tests compare the translation with Rust arithmetic; `docs/reports/M9-shader-translation.md` |
 
 ## Instructions
 
@@ -196,11 +198,11 @@ Plainly:
 
 ## The next work
 
-`docs/reports/M8-gpu-front.md` ends with the proposal: interpret the state the draws read, then
-shaders (SASS to SPIR-V, tested against a reference interpreter), then a Vulkan backend with `ash`.
-Shaders and the backend need the owner's go-ahead; nothing of them is started. Independent of
-them: input from a real device, audio output, and the 22 services of the title's list that are
-not implemented.
+The owner approved shader translation and the Vulkan backend on 2026-10-13. Shader translation
+(M9) is done as far as it can be checked without drawing (`docs/reports/M9-shader-translation.md`).
+The Vulkan backend (M10) is next: interpret the state the draws read, render into images, and
+look at the first frame. Independent of them: input from a real device, audio output, and the 22
+services of the title's list that are not implemented.
 
 ## Repository state
 

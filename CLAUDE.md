@@ -51,9 +51,9 @@ Small chunks. Title at most 50 characters. No body. No attribution lines of any 
   then move on. M8 passed (2026-10-12): the owner approved the GPU front, the `nx_gpu` crate
   (`nvdrv` and its device nodes, the display and buffer-queue path, a tracing command processor
   with a macro engine). The owner approved shader translation (Maxwell SASS to SPIR-V, crate
-  `nx_shader`, M9) and the Vulkan backend (`ash`, crate `nx_vulkan`, M10) on 2026-10-13. Never
-  describe the output as playable before frames are measured; saying what a frame shows needs the
-  frame itself (a dumped image looked at), not a count.
+  `nx_shader`, M9) and the Vulkan backend (`ash`, crate `nx_vulkan`, M10) on 2026-10-13; M9
+  passed the same day. Never describe the output as playable before frames are measured; saying
+  what a frame shows needs the frame itself (a dumped image looked at), not a count.
 - Out of scope: online services, account checks, licensing checks, AArch32 (detect and error).
 
 ## External tools used by tests
