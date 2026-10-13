@@ -6,8 +6,10 @@
 //! rely on them having happened.
 
 mod convert;
+mod debug;
 mod draw;
 mod frame;
+mod global;
 mod shaders;
 mod targets;
 mod textures;
@@ -15,6 +17,7 @@ mod textures;
 use crate::device::Vk;
 use crate::formats::{color_format, depth_format};
 use ash::vk;
+use debug::Debug;
 use frame::Frame;
 use nx_gpu::draw_state::Layout;
 use nx_gpu::render::{Backend, Clear, Draw, Present, Scene};
@@ -57,11 +60,15 @@ struct Core {
     targets: Targets,
     shaders: shaders::Shaders,
     textures: textures::Textures,
+    global: global::GlobalMemory,
     layouts: shaders::Layouts,
     pipelines: draw::Pipelines,
     /// The attachments of the rendering that is begun in the command buffer, if any.
     pass: Option<Pass>,
     dumped: u64,
+    debug: Debug,
+    /// Commands of the traced frame so far (`NX_TRACE_DRAWS`).
+    traced_commands: u64,
 }
 
 pub struct Renderer {
@@ -76,9 +83,10 @@ impl Renderer {
 
     fn core(&mut self) -> Result<&mut Core, String> {
         if self.core.is_none() {
+            let debug = Debug::from_env();
             let made = Vk::new().and_then(|vk| {
                 let frame = Frame::new(&vk)?;
-                if std::env::var("NX_TRACE_GPU").is_ok() {
+                if debug.trace_gpu {
                     eprintln!(
                         "[vulkan] {} (Vulkan {}.{})",
                         vk.caps.name,
@@ -90,12 +98,15 @@ impl Renderer {
                     vk,
                     frame,
                     targets: Targets::default(),
-                    shaders: shaders::Shaders::default(),
+                    shaders: shaders::Shaders::new(&debug),
                     textures: textures::Textures::default(),
+                    global: global::GlobalMemory::new(debug.trace_gpu),
                     layouts: shaders::Layouts::default(),
                     pipelines: draw::Pipelines::default(),
                     pass: None,
                     dumped: 0,
+                    debug,
+                    traced_commands: 0,
                 })
             });
             self.core = Some(made);
@@ -124,6 +135,58 @@ impl Renderer {
 }
 
 impl Core {
+    /// `NX_TRACE_DRAWS=<frame>` lists every draw and clear of that frame (counting the buffers
+    /// shown so far); this is that frame while it is the one being recorded.
+    fn traced(&self) -> Option<u64> {
+        let frame = self.debug.trace_frame?;
+        (frame == self.textures.frame).then_some(frame)
+    }
+
+    /// Say what a command of the traced frame was; with `NX_DUMP_DRAWS` the first color target is
+    /// also written as it is after the command.
+    fn trace_command(&mut self, scene: &Scene<'_>, frame: u64, said: &str) {
+        let n = self.traced_commands;
+        self.traced_commands += 1;
+        eprintln!("[vulkan] #{n} {said}");
+        if let Some(dir) = self.debug.dump_draws.clone() {
+            if n >= self.debug.dump_from {
+                if let Err(e) = self.dump_first_target(scene, &dir, frame, n) {
+                    eprintln!("[vulkan] dumping the target after command {n}: {e}");
+                }
+            }
+        }
+    }
+
+    /// Write the first color target the registers name as a picture, as of the commands so far.
+    fn dump_first_target(
+        &mut self,
+        scene: &Scene<'_>,
+        dir: &std::path::Path,
+        frame: u64,
+        n: u64,
+    ) -> Result<(), String> {
+        let Some((_, t)) = scene.regs.color_targets_in_use().into_iter().next() else {
+            return Ok(());
+        };
+        let Some((address, _)) = scene.host_address(t.address) else {
+            return Err(format!("the target at {:#x} is not mapped", t.address));
+        };
+        self.end_pass();
+        let Some(target) = self.targets.at_address(address) else {
+            return Ok(());
+        };
+        let (w, h) = (target.key.width, target.key.height);
+        let rgba = targets::read_rgba(&self.vk, &mut self.frame, target)?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let path = dir.join(format!("draw_{frame}_{n:04}_{address:x}.png"));
+        eprintln!(
+            "[vulkan]   after command {n}: {}",
+            crate::png::describe(w, h, &rgba)
+        );
+        crate::png::write_opaque_png(&path, w, h, &rgba)
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
     /// Leave the rendering that is begun, if there is one.
     fn end_pass(&mut self) {
         if self.pass.take().is_some() {
@@ -389,11 +452,60 @@ impl Core {
 
 impl Backend for Renderer {
     fn draw(&mut self, scene: &Scene<'_>, draw: &Draw) -> Result<(), String> {
-        self.core()?.draw(scene, draw)
+        let core = self.core()?;
+        let result = core.draw(scene, draw);
+        if let Some(frame) = core.traced() {
+            let regs = scene.regs;
+            let stages: Vec<String> = regs
+                .stages()
+                .iter()
+                .map(|s| format!("{} {:#x}", s.kind.name(), s.address))
+                .collect();
+            let said = format!(
+                "draw {:?} topology {} instance {} -> {}; {}; {}",
+                draw.source,
+                draw.topology,
+                draw.instance,
+                first_target(scene),
+                stages.join(", "),
+                match &result {
+                    Ok(()) => "ok".to_string(),
+                    Err(e) => format!("FAILED: {}", e.chars().take(120).collect::<String>()),
+                }
+            );
+            if core.debug.trace_state {
+                for line in describe_draw(scene, draw) {
+                    eprintln!("[vulkan]     {line}");
+                }
+            }
+            core.trace_command(scene, frame, &said);
+        }
+        result
     }
 
     fn clear(&mut self, scene: &Scene<'_>, clear: &Clear) -> Result<(), String> {
-        self.core()?.clear(scene, clear)
+        let core = self.core()?;
+        let result = core.clear(scene, clear);
+        if let Some(frame) = core.traced() {
+            let v = scene.regs.clear_values();
+            let said = format!(
+                "clear (color {} depth {} stencil {}) {:?} rect {} {:?} scissor0 {} -> {}; {}",
+                clear.red || clear.green || clear.blue || clear.alpha,
+                clear.depth,
+                clear.stencil,
+                v.color.map(f32::from_bits),
+                v.use_clear_rect,
+                v.rect,
+                v.use_scissor0,
+                first_target(scene),
+                match &result {
+                    Ok(()) => "ok".to_string(),
+                    Err(e) => format!("FAILED: {}", e.chars().take(120).collect::<String>()),
+                }
+            );
+            core.trace_command(scene, frame, &said);
+        }
+        result
     }
 
     fn finish(&mut self) -> Result<(), String> {
@@ -431,11 +543,45 @@ impl Backend for Renderer {
         };
         let (w, h) = (target.key.width, target.key.height);
         let rgba = targets::read_rgba(vk, frame, target)?;
+        // What the display shows is the producer's crop of the buffer.
+        let (rgba, w, h) = targets::crop_rgba(&rgba, w, h, p.crop);
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let path = dir.join(format!("frame_{:05}.png", p.frame));
-        crate::png::write_png(&path, w, h, &rgba)
+        if core.debug.trace_gpu {
+            eprintln!(
+                "[vulkan] frame {}: {}",
+                p.frame,
+                crate::png::describe(w, h, &rgba)
+            );
+        }
+        crate::png::write_opaque_png(&path, w, h, &rgba)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         core.dumped += 1;
+        if core.debug.dump_targets {
+            let Core {
+                vk, frame, targets, ..
+            } = core;
+            for key in targets.color_keys().into_iter().take(16) {
+                let Some(t) = targets.existing(&key) else {
+                    continue;
+                };
+                match targets::read_rgba(vk, frame, t) {
+                    Ok(rgba) => {
+                        let name = format!(
+                            "target_{:x}_{}x{}_{:05}.png",
+                            key.address, key.width, key.height, p.frame
+                        );
+                        let _ = crate::png::write_opaque_png(
+                            &dir.join(name),
+                            key.width,
+                            key.height,
+                            &rgba,
+                        );
+                    }
+                    Err(e) => eprintln!("[vulkan] target {:#x}: {e}", key.address),
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -444,10 +590,11 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         if let Some(Ok(mut core)) = self.core.take() {
             let _ = core.flush();
-            if std::env::var("NX_TRACE_GPU").is_ok() {
+            if core.debug.trace_gpu {
                 eprintln!(
-                    "[vulkan] {} bytes of textures in the cache, {} pictures written",
+                    "[vulkan] {} bytes of textures in the cache, {} bytes of guest memory imported, {} pictures written",
                     core.textures.bytes(),
+                    core.global.bytes(),
                     core.dumped
                 );
             }
@@ -455,8 +602,105 @@ impl Drop for Renderer {
             core.layouts.destroy(&core.vk);
             core.shaders.destroy(&core.vk);
             core.textures.destroy(&core.vk);
+            core.global.destroy(&core.vk);
             core.targets.destroy(&core.vk);
             core.frame.destroy(&core.vk);
         }
     }
+}
+
+/// The first color target the registers name, for messages.
+fn first_target(scene: &Scene<'_>) -> String {
+    scene
+        .regs
+        .color_targets_in_use()
+        .first()
+        .map(|(_, t)| {
+            format!(
+                "{:#x} {}x{} fmt {:#x}",
+                t.address, t.width, t.height, t.format
+            )
+        })
+        .unwrap_or_else(|| "no target".to_string())
+}
+
+/// What a draw was given, for `NX_TRACE_STATE`: the state that places and culls its primitives
+/// and the first indices and vertices it reads.
+fn describe_draw(scene: &Scene<'_>, draw: &Draw) -> Vec<String> {
+    let regs = scene.regs;
+    let mut lines = vec![
+        format!(
+            "viewport 0 {:?}; scissor 0 {:?}",
+            regs.viewport(0),
+            regs.scissor(0)
+        ),
+        format!("window {:?}", regs.window()),
+        format!("raster {:?}", regs.raster()),
+        format!(
+            "depth {:?}; target {:?}",
+            regs.depth_stencil().depth_test,
+            regs.depth_target()
+        ),
+        {
+            let b = regs.blend();
+            format!(
+                "blend 0: enabled {} mask {:#x} {:?} independent {} logic {} {:#x}; color targets {:?}",
+                b.enabled[0],
+                b.write_mask[0],
+                b.equation[0],
+                b.independent,
+                b.logic_op,
+                b.logic_op_func,
+                regs.color_targets_in_use()
+            )
+        },
+    ];
+    let floats = |va: u64, n: usize| -> String {
+        match scene.read_vec(va, 4 * n) {
+            Some(bytes) => bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| format!("{}", f32::from_le_bytes(*c)))
+                .collect::<Vec<_>>()
+                .join(" "),
+            None => "unreadable".to_string(),
+        }
+    };
+    if let nx_gpu::render::Source::Indexed { count, .. } = draw.source {
+        let ib = regs.index_buffer();
+        let n = (count as usize).min(12);
+        let idx = scene
+            .read_vec(ib.address, n * ib.size as usize)
+            .map(|b| {
+                b.chunks_exact(ib.size as usize)
+                    .map(|c| {
+                        c.iter()
+                            .rev()
+                            .fold(0u32, |acc, byte| acc << 8 | u32::from(*byte))
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_else(|| "unreadable".to_string());
+        lines.push(format!("index buffer {ib:?}: {idx}"));
+    }
+    for s in 0..16 {
+        let st = regs.vertex_stream(s);
+        if st.enabled {
+            let words = (st.stride as usize / 4).max(1) * 4;
+            lines.push(format!(
+                "stream {s} {st:?}: {}",
+                floats(st.address, words.min(32))
+            ));
+        }
+    }
+    for i in 0..32 {
+        let a = regs.vertex_attribute(i);
+        if a.active {
+            lines.push(format!("attribute {i} {a:?}"));
+        }
+    }
+    lines
 }

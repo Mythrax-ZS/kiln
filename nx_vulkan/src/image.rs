@@ -26,6 +26,8 @@ pub struct Image {
     pub view: vk::ImageView,
     pub memory: vk::DeviceMemory,
     pub info: ImageInfo,
+    /// Other views of the image, by the swizzle they apply (see [`Vk::swizzled_view`]).
+    pub extra_views: Vec<(vk::ComponentMapping, vk::ImageView)>,
 }
 
 /// The aspect an image of `format` is read through.
@@ -163,6 +165,7 @@ impl Vk {
                     view,
                     memory,
                     info,
+                    extra_views: Vec::new(),
                 }),
                 Err(e) => {
                     d.free_memory(memory, None);
@@ -173,9 +176,46 @@ impl Vk {
         }
     }
 
+    /// A view of all of `image` that applies `components` (made once per swizzle).
+    pub fn swizzled_view(
+        &self,
+        image: &mut Image,
+        components: vk::ComponentMapping,
+    ) -> Result<vk::ImageView, String> {
+        if let Some((_, v)) = image.extra_views.iter().find(|(c, _)| {
+            (c.r, c.g, c.b, c.a) == (components.r, components.g, components.b, components.a)
+        }) {
+            return Ok(*v);
+        }
+        // SAFETY: valid create info over an image that lives as long as the view.
+        let view = unsafe {
+            self.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image.image)
+                    .view_type(image.info.view_type)
+                    .components(components)
+                    .format(image.info.format)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: aspect_of(image.info.format),
+                        base_mip_level: 0,
+                        level_count: image.info.levels.max(1),
+                        base_array_layer: 0,
+                        layer_count: image.info.layers,
+                    }),
+                None,
+            )
+        }
+        .map_err(|e| format!("creating an image view: {e}"))?;
+        image.extra_views.push((components, view));
+        Ok(view)
+    }
+
     pub fn destroy_image(&self, image: Image) {
         // SAFETY: the image is no longer in use by the caller.
         unsafe {
+            for (_, v) in &image.extra_views {
+                self.device.destroy_image_view(*v, None);
+            }
             self.device.destroy_image_view(image.view, None);
             self.device.destroy_image(image.image, None);
             self.device.free_memory(image.memory, None);

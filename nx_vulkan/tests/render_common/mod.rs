@@ -12,7 +12,6 @@ use nx_shader::inst::{Guard, RZ};
 use nx_shader::ops::Op;
 use nx_shader::sph::SPH_WORDS;
 use nx_vulkan::Vk;
-use std::sync::Mutex;
 
 /// Where the test memory is in the guest, and where in the GPU's address space.
 pub const CPU_BASE: u64 = 0x4000_0000;
@@ -32,31 +31,69 @@ pub fn vulkan() -> Option<Vk> {
     }
 }
 
-pub struct Memory(Mutex<Vec<u8>>);
+/// Guest memory for tests: one page-aligned block, so a device can be given its address.
+pub struct Memory {
+    ptr: *mut u8,
+}
+
+// SAFETY: the block is owned by this value and only reached through its methods or the device.
+unsafe impl Send for Memory {}
+unsafe impl Sync for Memory {}
+
+impl Memory {
+    fn new() -> Memory {
+        let layout = std::alloc::Layout::from_size_align(SIZE as usize, 4096).unwrap();
+        // SAFETY: the layout has a non-zero size.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null());
+        Memory { ptr }
+    }
+}
+
+impl Drop for Memory {
+    fn drop(&mut self) {
+        let layout = std::alloc::Layout::from_size_align(SIZE as usize, 4096).unwrap();
+        // SAFETY: allocated with this layout in `new`.
+        unsafe { std::alloc::dealloc(self.ptr, layout) };
+    }
+}
 
 impl GuestMemory for Memory {
     fn read(&self, addr: u64, out: &mut [u8]) -> bool {
-        let m = self.0.lock().unwrap();
         let Some(off) = addr.checked_sub(CPU_BASE) else {
             return false;
         };
-        let Some(src) = m.get(off as usize..off as usize + out.len()) else {
+        if off + out.len() as u64 > SIZE {
             return false;
+        }
+        // SAFETY: the range is inside the block.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.ptr.add(off as usize), out.as_mut_ptr(), out.len())
         };
-        out.copy_from_slice(src);
         true
     }
 
     fn write(&self, addr: u64, data: &[u8]) -> bool {
-        let mut m = self.0.lock().unwrap();
         let Some(off) = addr.checked_sub(CPU_BASE) else {
             return false;
         };
-        let Some(dst) = m.get_mut(off as usize..off as usize + data.len()) else {
+        if off + data.len() as u64 > SIZE {
             return false;
+        }
+        // SAFETY: the range is inside the block.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(off as usize), data.len())
         };
-        dst.copy_from_slice(data);
         true
+    }
+
+    fn host_run(&self, addr: u64, max: u64) -> Option<(*mut u8, u64)> {
+        let off = addr.checked_sub(CPU_BASE)?;
+        if off >= SIZE {
+            return None;
+        }
+        // SAFETY: inside the block.
+        Some((unsafe { self.ptr.add(off as usize) }, (SIZE - off).min(max)))
     }
 }
 
@@ -84,7 +121,7 @@ impl World {
             })
             .unwrap();
         World {
-            mem: Memory(Mutex::new(vec![0; SIZE as usize])),
+            mem: Memory::new(),
             space,
             regs: vec![0; 0x1000],
             cbufs: CbufBindings::default(),

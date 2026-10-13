@@ -106,6 +106,7 @@ fn a_displayed_buffer_is_dumped_as_a_picture_when_asked() {
         format: 1,
         layout: 3,
         block_height_log2: 4,
+        crop: [0; 4],
         frame: 7,
     })
     .unwrap();

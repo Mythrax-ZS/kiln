@@ -41,6 +41,38 @@ impl Target {
         }
     }
 
+    /// Fill a new target with what freshly mapped memory holds (zeros; 1.0 for depth), so that what
+    /// a draw leaves uncovered is the same on every device. The target is left in the layout of
+    /// the transfer.
+    fn zero(&mut self, vk: &Vk, cmd: vk::CommandBuffer) {
+        self.transition(vk, cmd, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        let range = self.range();
+        // SAFETY: the command buffer is recording outside a rendering; the image is in the
+        // transfer layout and has transfer usage.
+        unsafe {
+            if self.aspect() == vk::ImageAspectFlags::COLOR {
+                vk.device.cmd_clear_color_image(
+                    cmd,
+                    self.image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue { uint32: [0; 4] },
+                    &[range],
+                );
+            } else {
+                vk.device.cmd_clear_depth_stencil_image(
+                    cmd,
+                    self.image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                    &[range],
+                );
+            }
+        }
+    }
+
     /// Record the barrier that moves the image to `layout` (all earlier work finishes first and
     /// the image's contents are kept).
     pub fn transition(&mut self, vk: &Vk, cmd: vk::CommandBuffer, layout: vk::ImageLayout) {
@@ -120,15 +152,20 @@ impl Targets {
                 components: vk::ComponentMapping::default(),
                 levels: 1,
             })?;
-            self.map.insert(
+            let mut target = Target {
                 key,
-                Target {
-                    key,
-                    image,
-                    layout: vk::ImageLayout::UNDEFINED,
-                    touched: 0,
-                },
-            );
+                image,
+                layout: vk::ImageLayout::UNDEFINED,
+                touched: 0,
+            };
+            match frame.cmd(vk) {
+                Ok(cmd) => target.zero(vk, cmd),
+                Err(e) => {
+                    vk.destroy_image(target.image);
+                    return Err(e);
+                }
+            }
+            self.map.insert(key, target);
         }
         let submissions = self.submissions;
         let target = self.map.get_mut(&key).expect("just inserted");
@@ -144,6 +181,23 @@ impl Targets {
                 t.key.address == address && aspect_of(t.key.format) == vk::ImageAspectFlags::COLOR
             })
             .max_by_key(|t| t.touched)
+    }
+
+    /// The keys of the color targets made so far.
+    pub fn color_keys(&self) -> Vec<Key> {
+        let mut keys: Vec<Key> = self
+            .map
+            .keys()
+            .filter(|k| aspect_of(k.format) == vk::ImageAspectFlags::COLOR)
+            .copied()
+            .collect();
+        keys.sort_by_key(|k| (k.address, k.width, k.height));
+        keys
+    }
+
+    /// A target already made.
+    pub fn existing(&mut self, key: &Key) -> Option<&mut Target> {
+        self.map.get_mut(key)
     }
 
     /// The targets made so far, for messages.
@@ -261,6 +315,23 @@ pub fn to_rgba8(format: vk::Format, data: &[u8], width: u32, height: u32) -> Opt
     Some(out)
 }
 
+/// The part of an RGBA picture inside `crop` (left, top, right, bottom), clamped to the picture;
+/// the whole picture when the rectangle has no area.
+pub fn crop_rgba(rgba: &[u8], width: u32, height: u32, crop: [i32; 4]) -> (Vec<u8>, u32, u32) {
+    let clamp = |v: i32, max: u32| v.clamp(0, max as i32) as u32;
+    let (left, right) = (clamp(crop[0], width), clamp(crop[2], width));
+    let (top, bottom) = (clamp(crop[1], height), clamp(crop[3], height));
+    if left >= right || top >= bottom || rgba.len() < width as usize * height as usize * 4 {
+        return (rgba.to_vec(), width, height);
+    }
+    let mut out = Vec::with_capacity((right - left) as usize * (bottom - top) as usize * 4);
+    for y in top..bottom {
+        let row = y as usize * width as usize * 4;
+        out.extend_from_slice(&rgba[row + left as usize * 4..row + right as usize * 4]);
+    }
+    (out, right - left, bottom - top)
+}
+
 /// Read a color target back as RGBA bytes: its contents as of the commands recorded so far (they
 /// are run first).
 pub fn read_rgba(vk: &Vk, frame: &mut Frame, target: &mut Target) -> Result<Vec<u8>, String> {
@@ -324,6 +395,26 @@ mod tests {
         assert_eq!(half_to_f32(0x3800), 0.5);
         assert!(half_to_f32(0x7E00).is_nan());
         assert_eq!(half_to_f32(0x7C00), f32::INFINITY);
+    }
+
+    #[test]
+    fn a_crop_keeps_the_rectangle_and_an_empty_one_keeps_everything() {
+        // 4x3 pixels whose red channel is x + 10 y.
+        let rgba: Vec<u8> = (0..3u8)
+            .flat_map(|y| (0..4u8).flat_map(move |x| [x + 10 * y, 0, 0, 255]))
+            .collect();
+        let (out, w, h) = crop_rgba(&rgba, 4, 3, [1, 1, 3, 3]);
+        assert_eq!((w, h), (2, 2));
+        let reds: Vec<u8> = out.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
+        assert_eq!(reds, vec![11, 12, 21, 22]);
+        // Clamped to the picture.
+        let (_, w, h) = crop_rgba(&rgba, 4, 3, [-5, 0, 100, 2]);
+        assert_eq!((w, h), (4, 2));
+        // No area, or all zero: the whole picture.
+        for crop in [[0; 4], [2, 2, 2, 2], [3, 0, 1, 3]] {
+            let (out, w, h) = crop_rgba(&rgba, 4, 3, crop);
+            assert_eq!((w, h, out.len()), (4, 3, rgba.len()));
+        }
     }
 
     #[test]

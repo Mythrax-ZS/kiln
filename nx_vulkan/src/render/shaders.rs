@@ -5,7 +5,7 @@ use crate::device::Vk;
 use ash::vk;
 use nx_gpu::render::Scene;
 use nx_gpu::shaders::hash_bytes;
-use nx_gpu::state::StageSlot;
+use nx_gpu::state::{StageKind, StageSlot};
 use nx_shader::cfg::{Cfg, Code};
 use nx_shader::sph::{Sph, SPH_BYTES};
 use nx_shader::translate::{translate, Class, Config, Info, Stage};
@@ -57,10 +57,24 @@ struct Entry {
     variations: HashMap<Variation, Arc<Program>>,
 }
 
-#[derive(Default)]
 pub struct Shaders {
     entries: HashMap<u64, Entry>,
     next_id: u64,
+    /// `NX_SPIRV_CHECK`: validate each translation.
+    spirv_check: bool,
+    /// `NX_DEBUG_SOLID_PIXEL`: pixel programs write a constant color.
+    solid_pixel: bool,
+}
+
+impl Shaders {
+    pub fn new(debug: &super::Debug) -> Shaders {
+        Shaders {
+            entries: HashMap::new(),
+            next_id: 0,
+            spirv_check: debug.spirv_check,
+            solid_pixel: debug.solid_pixel,
+        }
+    }
 }
 
 /// Read up to `max` bytes at GPU address `va`, as many as are mapped.
@@ -115,11 +129,23 @@ impl Shaders {
                     ));
                 }
                 let size = SPH_BYTES + cfg.extent as usize;
+                let mut code = code[..cfg.extent as usize].to_vec();
+                if self.solid_pixel && slot.kind == StageKind::Pixel {
+                    // Bring-up switch: every fragment is magenta.
+                    use nx_shader::asm::{assemble, exit, mov32i};
+                    code = assemble(&[
+                        mov32i(0, 0x3F80_0000),
+                        mov32i(1, 0),
+                        mov32i(2, 0x3F80_0000),
+                        mov32i(3, 0x3F80_0000),
+                        exit(nx_shader::inst::Guard::ALWAYS),
+                    ]);
+                }
                 v.insert(Entry {
                     size,
                     hash: hash_bytes(&bytes[..size]),
                     sph,
-                    code: code[..cfg.extent as usize].to_vec(),
+                    code,
                     variations: HashMap::new(),
                 })
             }
@@ -130,7 +156,7 @@ impl Shaders {
         let config = variation.config();
         let translation = translate(Code(&entry.code), Some(&entry.sph), &config)
             .map_err(|e| format!("the {name} program at {:#x}: {e}", slot.address))?;
-        if std::env::var_os("NX_SPIRV_CHECK").is_some() {
+        if self.spirv_check {
             if let Err(e) = nx_shader::validate::validate(&translation.spirv) {
                 return Err(format!(
                     "the {name} program at {:#x} translated to invalid SPIR-V: {e}",
@@ -251,10 +277,17 @@ impl Layouts {
         }
         .map_err(|e| format!("creating a descriptor set layout: {e}"))?;
         let sets = [set];
+        // The instance counter of the draw (`Info::instance_counter`) goes in a push constant.
+        let push = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(4)];
         // SAFETY: as above.
         let pipeline = unsafe {
             vk.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().set_layouts(&sets),
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&sets)
+                    .push_constant_ranges(&push),
                 None,
             )
         }

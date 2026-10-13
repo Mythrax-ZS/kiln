@@ -3,6 +3,7 @@
 use super::convert;
 use super::convert::Topology;
 use super::shaders::{bindings_of, Program, Variation};
+use super::textures::{texture_format, Tic, Tsc};
 use super::Core;
 use ash::vk;
 use nx_gpu::draw_state::{Blend, DepthStencil, Raster, StencilFace};
@@ -23,6 +24,7 @@ pub struct PipelineKey {
     bindings: Vec<(u32, u32, bool)>,
     topology: i32,
     polygon_mode: i32,
+    depth_clamp: bool,
     color_formats: Vec<i32>,
     depth_format: i32,
     blend: Vec<BlendKey>,
@@ -162,12 +164,90 @@ impl Core {
             }
             None => None,
         };
-        for p in std::iter::once(&vs).chain(ps.iter()) {
-            if p.info.global_memory {
-                return Err("a program that reads or writes global memory".to_string());
+
+        if self.debug.trace_textures {
+            for group in 0..5u32 {
+                let bound: Vec<String> = (0..18u32)
+                    .filter_map(|s| {
+                        scene
+                            .cbufs
+                            .get(group, s)
+                            .map(|b| format!("c{s}={:#x}+{:#x}", b.address, b.size))
+                    })
+                    .collect();
+                eprintln!("[vulkan] group {group}: {}", bound.join(" "));
+            }
+            for s in &stages {
+                eprintln!(
+                    "[vulkan] stage {} at {:#x} uses group {}",
+                    s.kind.name(),
+                    s.address,
+                    s.group
+                );
             }
         }
-
+        // The textures the programs sample: handle, headers, image and sampler.
+        let pools = regs.texture_pools();
+        let mut image_infos: Vec<(u32, vk::DescriptorImageInfo)> = Vec::new();
+        for (p, slot) in std::iter::once((&vs, vs_slot)).chain(ps.iter().zip(ps_slot)) {
+            let base = 64 * p.stage.index();
+            for used in &p.info.textures {
+                let handle =
+                    self.texture_handle(scene, slot.group, pools.bindless_slot, used.index)?;
+                let (tic_id, tsc_id) = (handle & 0xF_FFFF, handle >> 20);
+                if tic_id >= pools.header_count || tsc_id >= pools.sampler_count {
+                    return Err(format!(
+                        "the texture handle {handle:#x} (header {tic_id} of {}, sampler {tsc_id} of {})",
+                        pools.header_count, pools.sampler_count
+                    ));
+                }
+                let tic_bytes =
+                    self.read_gpu(scene, pools.header_address + 32 * u64::from(tic_id), 32)?;
+                let tsc_bytes =
+                    self.read_gpu(scene, pools.sampler_address + 32 * u64::from(tsc_id), 32)?;
+                let words = |b: &[u8]| -> [u32; 8] {
+                    std::array::from_fn(|i| {
+                        u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap())
+                    })
+                };
+                let (tic, tsc) = (Tic(words(&tic_bytes)), Tsc(words(&tsc_bytes)));
+                if self.debug.trace_textures {
+                    eprintln!(
+                        "[vulkan] texture {} of the {} program: header {tic_id} {:08x?} sampler {tsc_id} {:08x?}",
+                        used.index,
+                        slot.kind.name(),
+                        tic.0,
+                        tsc.0
+                    );
+                }
+                let bound = match self.render_target_view(scene, &tic)? {
+                    Some(view) => self.textures.bind_view(&self.vk, &tic, tsc, used, view),
+                    None => self
+                        .textures
+                        .bind(&self.vk, &mut self.frame, scene, tic, tsc, used),
+                }
+                .map_err(|e| {
+                    format!(
+                        "{e} [texture {}: handle {handle:#x} from slot {} of group {} ({:?}), header {tic_id} at {:#x}, sampler {tsc_id} at {:#x}]",
+                        used.index,
+                        pools.bindless_slot,
+                        slot.group,
+                        scene.cbufs.get(slot.group, pools.bindless_slot),
+                        pools.header_address + 32 * u64::from(tic_id),
+                        pools.sampler_address + 32 * u64::from(tsc_id)
+                    )
+                })?;
+                image_infos.push((
+                    base + 24 + used.index,
+                    vk::DescriptorImageInfo::default()
+                        .sampler(bound.sampler)
+                        .image_view(bound.view)
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                ));
+            }
+        }
+        let image_arrays: Vec<[vk::DescriptorImageInfo; 1]> =
+            image_infos.iter().map(|(_, i)| [*i]).collect();
         self.begin_pass(scene)?;
         let pass = self.pass.clone().expect("the pass was begun");
 
@@ -213,7 +293,8 @@ impl Core {
                 // One element for this instance: bound with a zero stride so that every vertex
                 // reads it.
                 let divisor = u64::from(stream.frequency.max(1));
-                let element = u64::from(draw.instance) / divisor;
+                let (_, base_instance, _) = regs.bases();
+                let element = u64::from(base_instance) + u64::from(draw.instance) / divisor;
                 let data = self.read_gpu(
                     scene,
                     stream.address + element * stride,
@@ -270,82 +351,17 @@ impl Core {
                         .range(range),
                 ));
             }
-        }
-        if std::env::var_os("NX_TRACE_TEXTURES").is_some() {
-            for group in 0..5u32 {
-                let bound: Vec<String> = (0..18u32)
-                    .filter_map(|s| {
-                        scene
-                            .cbufs
-                            .get(group, s)
-                            .map(|b| format!("c{s}={:#x}+{:#x}", b.address, b.size))
-                    })
-                    .collect();
-                eprintln!("[vulkan] group {group}: {}", bound.join(" "));
-            }
-            for s in &stages {
-                eprintln!(
-                    "[vulkan] stage {} at {:#x} uses group {}",
-                    s.kind.name(),
-                    s.address,
-                    s.group
-                );
-            }
-        }
-        // The textures the programs sample: handle, headers, image and sampler.
-        let pools = regs.texture_pools();
-        let mut image_infos: Vec<(u32, vk::DescriptorImageInfo)> = Vec::new();
-        for (p, slot) in std::iter::once((&vs, vs_slot)).chain(ps.iter().zip(ps_slot)) {
-            let base = 64 * p.stage.index();
-            for used in &p.info.textures {
-                let handle =
-                    self.texture_handle(scene, slot.group, pools.bindless_slot, used.index)?;
-                let (tic_id, tsc_id) = (handle & 0xF_FFFF, handle >> 20);
-                if tic_id >= pools.header_count || tsc_id >= pools.sampler_count {
-                    return Err(format!(
-                        "the texture handle {handle:#x} (header {tic_id} of {}, sampler {tsc_id} of {})",
-                        pools.header_count, pools.sampler_count
-                    ));
-                }
-                let tic =
-                    self.read_gpu(scene, pools.header_address + 32 * u64::from(tic_id), 32)?;
-                let tsc =
-                    self.read_gpu(scene, pools.sampler_address + 32 * u64::from(tsc_id), 32)?;
-                let words = |b: &[u8]| -> [u32; 8] {
-                    std::array::from_fn(|i| {
-                        u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap())
-                    })
-                };
-                let bound = self.textures.bind(
-                    &self.vk,
-                    &mut self.frame,
-                    scene,
-                    super::textures::Tic(words(&tic)),
-                    super::textures::Tsc(words(&tsc)),
-                    used,
-                )
-                .map_err(|e| {
-                    format!(
-                        "{e} [texture {}: handle {handle:#x} from slot {} of group {} ({:?}), header {tic_id} at {:#x}, sampler {tsc_id} at {:#x}]",
-                        used.index,
-                        pools.bindless_slot,
-                        slot.group,
-                        scene.cbufs.get(slot.group, pools.bindless_slot),
-                        pools.header_address + 32 * u64::from(tic_id),
-                        pools.sampler_address + 32 * u64::from(tsc_id)
-                    )
-                })?;
-                image_infos.push((
-                    base + 24 + used.index,
-                    vk::DescriptorImageInfo::default()
-                        .sampler(bound.sampler)
-                        .image_view(bound.view)
-                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            if p.info.global_memory {
+                let (buffer, size) = self.global.table(&self.vk, &mut self.frame, scene)?;
+                buffer_infos.push((
+                    base + 20,
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(buffer)
+                        .offset(0)
+                        .range(size),
                 ));
             }
         }
-        let image_arrays: Vec<[vk::DescriptorImageInfo; 1]> =
-            image_infos.iter().map(|(_, i)| [*i]).collect();
         let infos: Vec<[vk::DescriptorBufferInfo; 1]> =
             buffer_infos.iter().map(|(_, i)| [*i]).collect();
         let writes: Vec<vk::WriteDescriptorSet> = buffer_infos
@@ -405,6 +421,15 @@ impl Core {
                 &[set],
                 &[],
             );
+            // The instance counter of the draw: the hardware runs the instances of a draw one by
+            // one, and the program sees which it is through this.
+            d.cmd_push_constants(
+                cmd,
+                pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                &draw.instance.to_ne_bytes(),
+            );
             for &(binding, buffer, offset) in &bound {
                 d.cmd_bind_vertex_buffers(cmd, binding, &[buffer], &[offset]);
             }
@@ -416,19 +441,68 @@ impl Core {
             match geometry.indices {
                 Some((buffer, offset, ty, n)) => {
                     d.cmd_bind_index_buffer(cmd, buffer, offset, ty);
-                    d.cmd_draw_indexed(cmd, n, 1, 0, geometry.vertex_offset, draw.instance);
+                    d.cmd_draw_indexed(cmd, n, 1, 0, geometry.vertex_offset, 0);
                 }
-                None => d.cmd_draw(
-                    cmd,
-                    geometry.vertices.1,
-                    1,
-                    geometry.vertices.0,
-                    draw.instance,
-                ),
+                None => d.cmd_draw(cmd, geometry.vertices.1, 1, geometry.vertices.0, 0),
             }
         }
         let _ = geometry.restart;
         Ok(())
+    }
+
+    /// A view of the render target that stands for the memory of the texture `tic`, in the layout
+    /// for sampling, when there is one of the same size and format: what the title drew into that
+    /// memory is in the target and never reaches the memory itself. A target the draw writes to is
+    /// not given (it cannot be read while it is written; the memory is read instead).
+    fn render_target_view(
+        &mut self,
+        scene: &Scene<'_>,
+        tic: &Tic,
+    ) -> Result<Option<vk::ImageView>, String> {
+        if tic.texture_type() == 5 {
+            return Ok(None);
+        }
+        let Some((cpu, _)) = scene.host_address(tic.address()) else {
+            return Ok(None);
+        };
+        let Some(format) = texture_format(tic.components(), tic.types()[0], tic.srgb()) else {
+            return Ok(None);
+        };
+        // Compressed memory is not what a render target holds, whatever its size.
+        if format.astc {
+            return Ok(None);
+        }
+        let Some(target) = self.targets.at_address(cpu) else {
+            return Ok(None);
+        };
+        let key = target.key;
+        if key.format != format.vk
+            || key.layers != 1
+            || (key.width, key.height) != (tic.width(), tic.height())
+        {
+            return Ok(None);
+        }
+        let (colors, depth) = self.attachments(scene)?;
+        if colors.contains(&key) || depth == Some(key) {
+            return Ok(None);
+        }
+        // Leaving the rendering is what lets the image change layout.
+        self.end_pass();
+        let cmd = self.frame.cmd(&self.vk)?;
+        let Some(target) = self.targets.at_address(cpu) else {
+            return Ok(None);
+        };
+        target.transition(&self.vk, cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let view = self
+            .vk
+            .swizzled_view(&mut target.image, tic.component_mapping())?;
+        if self.debug.trace_textures {
+            eprintln!(
+                "[vulkan] a texture is the render target at {cpu:#x} ({}x{})",
+                key.width, key.height
+            );
+        }
+        Ok(Some(view))
     }
 
     /// Read GPU memory, failing with a message when it is not all mapped.
@@ -459,7 +533,7 @@ impl Core {
                 b.size
             ));
         }
-        if std::env::var_os("NX_TRACE_TEXTURES").is_some() {
+        if self.debug.trace_textures {
             let n = (b.size as usize).min(128);
             if let Some(table) = scene.read_vec(b.address, n) {
                 let words: Vec<String> = table
@@ -502,6 +576,28 @@ impl Core {
                 "the constant buffer of slot {slot} at GPU address {:#x} ({size} bytes) is not mapped",
                 b.address
             ));
+        }
+        if self.debug.trace_cbufs {
+            let words: Vec<String> = data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .take(48)
+                .map(|c| {
+                    let w = u32::from_le_bytes(*c);
+                    let f = f32::from_bits(w);
+                    if f.is_finite() && f != 0.0 && f.abs() > 1e-6 && f.abs() < 1e6 {
+                        format!("{f}")
+                    } else {
+                        format!("{w:#x}")
+                    }
+                })
+                .collect();
+            eprintln!(
+                "[vulkan] constant buffer {slot} of group {group} at {:#x}, {size} bytes: {}",
+                b.address,
+                words.join(" ")
+            );
         }
         let (buffer, offset) = self.frame.upload(&self.vk, &data, align)?;
         Ok((buffer, offset, data.len() as u64))
@@ -699,6 +795,7 @@ impl Core {
             bindings: bindings.to_vec(),
             topology: topology.as_raw(),
             polygon_mode: convert::polygon_mode(raster.front_mode).as_raw(),
+            depth_clamp: raster.depth_clamp && self.vk.caps.depth_clamp,
             color_formats,
             depth_format: pass.depth.map_or(0, |k| k.format.as_raw()),
             blend: blend_keys,
@@ -756,6 +853,7 @@ impl Core {
             .scissor_count(1);
         let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::from_raw(key.polygon_mode))
+            .depth_clamp_enable(key.depth_clamp)
             .cull_mode(vk::CullModeFlags::NONE)
             .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .line_width(1.0);
@@ -917,8 +1015,30 @@ impl Core {
                 },
             }
         };
+        // Bring-up experiment: ignore the registers' viewport and scissor.
+        let (viewport, scissor) = if self.debug.full_viewport {
+            (
+                vk::Viewport {
+                    x: 0.0,
+                    y: h,
+                    width: w,
+                    height: -h,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                },
+                vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: pass.extent.0,
+                        height: pass.extent.1,
+                    },
+                },
+            )
+        } else {
+            (viewport, scissor)
+        };
         let d = &self.vk.device;
-        let cull = if raster.cull {
+        let cull = if raster.cull && !self.debug.no_cull {
             match raster.cull_face {
                 0x404 => vk::CullModeFlags::FRONT,
                 0x408 => vk::CullModeFlags::FRONT_AND_BACK,

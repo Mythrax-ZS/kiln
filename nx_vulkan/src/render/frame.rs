@@ -39,6 +39,7 @@ pub struct Frame {
 /// Something a submission needed that can be destroyed after it ran.
 pub enum Garbage {
     Image(crate::image::Image),
+    Buffer(HostBuffer),
 }
 
 impl Frame {
@@ -276,6 +277,7 @@ impl Frame {
         for g in self.garbage.drain(..) {
             match g {
                 Garbage::Image(i) => vk.destroy_image(i),
+                Garbage::Buffer(b) => vk.destroy_host_buffer(b),
             }
         }
         result

@@ -123,6 +123,17 @@ impl Tic {
     pub fn levels(&self) -> u32 {
         self.bits(124, 4) + 1
     }
+
+    /// What the view of the texture makes of the components.
+    pub fn component_mapping(&self) -> vk::ComponentMapping {
+        let s = self.sources();
+        vk::ComponentMapping {
+            r: swizzle(s[0]),
+            g: swizzle(s[1]),
+            b: swizzle(s[2]),
+            a: swizzle(s[3]),
+        }
+    }
 }
 
 /// A sampler header: eight words.
@@ -225,23 +236,46 @@ impl Tsc {
     }
 }
 
-/// A texture format: the Vulkan format and how texels are grouped in memory.
+/// A texture format: the Vulkan format of the image made of it and how texels are grouped in
+/// memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TexFormat {
     pub vk: vk::Format,
     /// Texels per element across and down (4x4 for the block compressed formats).
     pub block: (u32, u32),
+    /// Bytes per element in memory.
     pub bytes: u32,
+    /// The memory holds ASTC blocks, which are decoded on the host: `vk` is the (uncompressed)
+    /// format of the decoded texels.
+    pub astc: bool,
 }
 
 const fn tf(vk: vk::Format, block: (u32, u32), bytes: u32) -> Option<TexFormat> {
-    Some(TexFormat { vk, block, bytes })
+    Some(TexFormat {
+        vk,
+        block,
+        bytes,
+        astc: false,
+    })
 }
 
 /// The format of a texture: `components` is the header's format code and `data_type` the type of
 /// its first component (1 snorm, 2 unorm, 3 sint, 4 uint, 7 float).
 pub fn texture_format(components: u32, data_type: u32, srgb: bool) -> Option<TexFormat> {
     use vk::Format as F;
+    // ASTC is decoded here into plain texels, since most devices cannot sample it.
+    if let Some(block) = crate::astc::footprint(components) {
+        return Some(TexFormat {
+            vk: if srgb {
+                F::R8G8B8A8_SRGB
+            } else {
+                F::R8G8B8A8_UNORM
+            },
+            block,
+            bytes: 16,
+            astc: true,
+        });
+    }
     let one = (1, 1);
     let bc = (4, 4);
     let pick = |unorm: Option<F>,
@@ -450,12 +484,24 @@ fn swizzle(source: u32) -> vk::ComponentSwizzle {
     }
 }
 
-/// The tiling of mip level `level` of a texture whose level 0 is `base`: half the size, and a
-/// block that shrinks while the level is small enough for a smaller one.
-pub fn mip_geometry(base: &Geometry, level: u32) -> Geometry {
+/// The elements (texels, or blocks of `block` texels) across mip level `level` of a texture that is
+/// `texels` wide at level 0: half as many texels each level, and at least one element.
+pub fn level_elements(texels: u32, block: u32, level: u32) -> u32 {
+    (texels >> level).max(1).div_ceil(block)
+}
+
+/// The tiling of mip level `level` of a texture whose level 0 is `base`, of `texels` by `texels`
+/// texels in elements of `block` texels: the size of the level, and a block that shrinks while the
+/// level is small enough for a smaller one.
+pub fn mip_geometry(
+    base: &Geometry,
+    level: u32,
+    texels: (u32, u32),
+    block: (u32, u32),
+) -> Geometry {
     let mut g = *base;
-    g.width = (base.width >> level).max(1);
-    g.height = (base.height >> level).max(1);
+    g.width = level_elements(texels.0, block.0, level);
+    g.height = level_elements(texels.1, block.1, level);
     g.depth = (base.depth >> level).max(1);
     while g.block_height_log2 > 0 && g.height <= (8u32 << g.block_height_log2) / 2 {
         g.block_height_log2 -= 1;
@@ -489,6 +535,34 @@ pub struct Bound {
     pub sampler: vk::Sampler,
 }
 
+/// Whether the header `tic` can be sampled as `used` (a 2D texture or array); whether it is an
+/// array.
+fn check_sampled_2d(tic: &Tic, used: &TextureUse) -> Result<bool, String> {
+    let wants_2d = used.dim == Dim::D2 && !used.shadow;
+    if !wants_2d {
+        return Err(format!(
+            "a texture sampled as {:?}{}{}",
+            used.dim,
+            if used.arrayed { " array" } else { "" },
+            if used.shadow {
+                " with depth comparison"
+            } else {
+                ""
+            }
+        ));
+    }
+    let ty = tic.texture_type();
+    let arrayed = matches!(ty, 5);
+    if !matches!(ty, 1 | 5 | 7) || arrayed != used.arrayed {
+        return Err(format!(
+            "a texture header of type {ty} sampled as a 2D texture{} (header words {:08x?})",
+            if used.arrayed { " array" } else { "" },
+            tic.0
+        ));
+    }
+    Ok(arrayed)
+}
+
 impl Textures {
     /// The view and sampler for the headers `tic` and `tsc` that a shader samples as `used`.
     pub fn bind(
@@ -500,53 +574,53 @@ impl Textures {
         tsc: Tsc,
         used: &TextureUse,
     ) -> Result<Bound, String> {
-        let wants_2d = used.dim == Dim::D2 && !used.shadow;
-        if !wants_2d {
-            return Err(format!(
-                "a texture sampled as {:?}{}{}",
-                used.dim,
-                if used.arrayed { " array" } else { "" },
-                if used.shadow {
-                    " with depth comparison"
-                } else {
-                    ""
-                }
-            ));
-        }
-        let ty = tic.texture_type();
-        let arrayed = matches!(ty, 5);
-        if !matches!(ty, 1 | 5 | 7) || arrayed != used.arrayed {
-            return Err(format!(
-                "a texture header of type {ty} sampled as a 2D texture{} (header words {:08x?})",
-                if used.arrayed { " array" } else { "" },
-                tic.0
-            ));
-        }
+        let arrayed = check_sampled_2d(&tic, used)?;
         let view = self.texture(vk, frame, scene, tic, arrayed)?;
-        let sampler = match self.samplers.get(&tsc) {
-            Some(s) => *s,
-            None => {
-                let (info, border) = tsc.sampler_info(vk);
-                let mut info = info;
-                let mut custom;
-                if vk.caps.custom_border_color
-                    && info.border_color == vk::BorderColor::FLOAT_OPAQUE_WHITE
-                    && border != [1.0, 1.0, 1.0, 1.0]
-                {
-                    custom = vk::SamplerCustomBorderColorCreateInfoEXT::default()
-                        .custom_border_color(vk::ClearColorValue { float32: border });
-                    info = info
-                        .border_color(vk::BorderColor::FLOAT_CUSTOM_EXT)
-                        .push_next(&mut custom);
-                }
-                // SAFETY: valid create info; the sampler lives as long as the cache.
-                let s = unsafe { vk.device.create_sampler(&info, None) }
-                    .map_err(|e| format!("creating a sampler: {e}"))?;
-                self.samplers.insert(tsc, s);
-                s
-            }
-        };
-        Ok(Bound { view, sampler })
+        Ok(Bound {
+            view,
+            sampler: self.sampler(vk, tsc)?,
+        })
+    }
+
+    /// As [`Textures::bind`] for a texture whose memory a render target stands for: `view` is the
+    /// target's own, already in the layout for sampling, and nothing is read from memory.
+    pub fn bind_view(
+        &mut self,
+        vk: &Vk,
+        tic: &Tic,
+        tsc: Tsc,
+        used: &TextureUse,
+        view: vk::ImageView,
+    ) -> Result<Bound, String> {
+        check_sampled_2d(tic, used)?;
+        Ok(Bound {
+            view,
+            sampler: self.sampler(vk, tsc)?,
+        })
+    }
+
+    fn sampler(&mut self, vk: &Vk, tsc: Tsc) -> Result<vk::Sampler, String> {
+        if let Some(s) = self.samplers.get(&tsc) {
+            return Ok(*s);
+        }
+        let (info, border) = tsc.sampler_info(vk);
+        let mut info = info;
+        let mut custom;
+        if vk.caps.custom_border_color
+            && info.border_color == vk::BorderColor::FLOAT_OPAQUE_WHITE
+            && border != [1.0, 1.0, 1.0, 1.0]
+        {
+            custom = vk::SamplerCustomBorderColorCreateInfoEXT::default()
+                .custom_border_color(vk::ClearColorValue { float32: border });
+            info = info
+                .border_color(vk::BorderColor::FLOAT_CUSTOM_EXT)
+                .push_next(&mut custom);
+        }
+        // SAFETY: valid create info; the sampler lives as long as the cache.
+        let s = unsafe { vk.device.create_sampler(&info, None) }
+            .map_err(|e| format!("creating a sampler: {e}"))?;
+        self.samplers.insert(tsc, s);
+        Ok(s)
     }
 
     fn texture(
@@ -602,7 +676,9 @@ impl Textures {
             return Err(format!("a texture header of version {}", tic.version()));
         };
         // Where the bytes are: each mip level after the one before; layers one after another.
-        let level_geometry: Vec<Geometry> = (0..levels).map(|l| mip_geometry(&base, l)).collect();
+        let level_geometry: Vec<Geometry> = (0..levels)
+            .map(|l| mip_geometry(&base, l, (width, height), format.block))
+            .collect();
         let layer_size: u64 = if tic.is_block_linear() {
             level_geometry.iter().map(Geometry::tiled_size).sum()
         } else {
@@ -636,12 +712,7 @@ impl Textures {
                 frame.garbage.push(Garbage::Image(old.image));
             }
         }
-        let components = vk::ComponentMapping {
-            r: swizzle(tic.sources()[0]),
-            g: swizzle(tic.sources()[1]),
-            b: swizzle(tic.sources()[2]),
-            a: swizzle(tic.sources()[3]),
-        };
+        let components = tic.component_mapping();
         let image = vk.create_image(ImageInfo {
             format: format.vk,
             width,
@@ -677,6 +748,16 @@ impl Textures {
                             linear[y * row..(y + 1) * row].copy_from_slice(&raw[from..from + row]);
                         }
                     }
+                }
+                if format.astc {
+                    linear = crate::astc::decode_image(
+                        &linear,
+                        (width >> level).max(1),
+                        (height >> level).max(1),
+                        format.block.0,
+                        format.block.1,
+                        tic.srgb(),
+                    );
                 }
                 let offset = (packed.len() as u64).next_multiple_of(16);
                 packed.resize(offset as usize, 0);
@@ -902,10 +983,14 @@ mod tests {
             texture_format(0x03, 7, false).unwrap().vk,
             vk::Format::R16G16B16A16_SFLOAT
         );
-        assert!(
-            texture_format(0x40, 2, false).is_none(),
-            "ASTC is not decoded"
+        let astc = texture_format(0x40, 2, false).unwrap();
+        assert_eq!(
+            (astc.vk, astc.block, astc.bytes, astc.astc),
+            (vk::Format::R8G8B8A8_UNORM, (4, 4), 16, true),
+            "ASTC is decoded to plain texels"
         );
+        let astc = texture_format(0x46, 2, true).unwrap();
+        assert_eq!((astc.vk, astc.block), (vk::Format::R8G8B8A8_SRGB, (12, 12)));
         assert!(
             texture_format(0x08, 7, false).is_none(),
             "8-bit floats do not exist"
@@ -922,14 +1007,37 @@ mod tests {
             block_height_log2: 4,
             block_depth_log2: 0,
         };
-        assert_eq!(mip_geometry(&base, 0), base);
-        let l1 = mip_geometry(&base, 1);
+        let size = (256, 256);
+        let one = (1, 1);
+        assert_eq!(mip_geometry(&base, 0, size, one), base);
+        let l1 = mip_geometry(&base, 1, size, one);
         assert_eq!((l1.width, l1.height, l1.block_height_log2), (128, 128, 4));
-        let l4 = mip_geometry(&base, 4);
+        let l4 = mip_geometry(&base, 4, size, one);
         assert_eq!((l4.width, l4.height), (16, 16));
         assert_eq!(l4.block_height_log2, 1, "16 rows need two GOBs");
-        let l8 = mip_geometry(&base, 8);
+        let l8 = mip_geometry(&base, 8, size, one);
         assert_eq!((l8.width, l8.height, l8.block_height_log2), (1, 1, 0));
+    }
+
+    #[test]
+    fn the_levels_of_a_compressed_texture_count_blocks_of_the_smaller_texture() {
+        // 100 texels are 25 blocks of 4, but half of 100 is 50 texels, which is 13 blocks, not 12.
+        assert_eq!(level_elements(100, 4, 0), 25);
+        assert_eq!(level_elements(100, 4, 1), 13);
+        assert_eq!(level_elements(100, 4, 2), 7);
+        assert_eq!(level_elements(100, 4, 6), 1);
+        assert_eq!(level_elements(100, 4, 9), 1, "never fewer than one block");
+        assert_eq!(level_elements(100, 1, 3), 12);
+        let base = Geometry {
+            width: 25,
+            height: 25,
+            depth: 1,
+            bytes_per_element: 16,
+            block_height_log2: 0,
+            block_depth_log2: 0,
+        };
+        let l1 = mip_geometry(&base, 1, (100, 100), (4, 4));
+        assert_eq!((l1.width, l1.height), (13, 13));
     }
 
     #[test]

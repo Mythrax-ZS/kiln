@@ -78,6 +78,31 @@ pub fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> std::io::
     std::fs::write(path, encode_png(width, height, rgba))
 }
 
+/// Write `rgba` as a picture of the screen: what a display shows of a buffer leaves its alpha out,
+/// so the picture is opaque (a viewer would otherwise show transparent pixels as the background).
+pub fn write_opaque_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {
+    let mut opaque = rgba.to_vec();
+    for px in opaque.as_chunks_mut::<4>().0 {
+        px[3] = 255;
+    }
+    write_png(path, width, height, &opaque)
+}
+
+/// A line of numbers about a picture, to tell a blank one from a drawn one without looking: how
+/// many pixels are not black, how many have alpha, and the pixel at the center.
+pub fn describe(width: u32, height: u32, rgba: &[u8]) -> String {
+    let px = rgba.as_chunks::<4>().0;
+    let lit = px.iter().filter(|p| p[..3] != [0, 0, 0]).count();
+    let alpha = px.iter().filter(|p| p[3] != 0).count();
+    let at = |x: usize, y: usize| px.get(y * width as usize + x).copied().unwrap_or([0; 4]);
+    format!(
+        "{lit} of {} pixels have color, {alpha} have alpha; center {:?}, corner {:?}",
+        px.len(),
+        at(width as usize / 2, height as usize / 2),
+        at(0, 0)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

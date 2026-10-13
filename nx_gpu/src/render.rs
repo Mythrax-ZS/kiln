@@ -115,6 +115,9 @@ pub struct Present {
     /// linear) and, if block linear, the height of a block in GOBs as a power of two.
     pub layout: u32,
     pub block_height_log2: u32,
+    /// The part of the buffer to show (left, top, right, bottom): the producer's crop. A
+    /// rectangle with no area stands for the whole buffer.
+    pub crop: [i32; 4],
     /// The number of this frame (counting from 1).
     pub frame: u64,
 }

@@ -369,3 +369,109 @@ impl Vk {
         result
     }
 }
+
+/// Host memory the device reads and writes in place (`VK_EXT_external_memory_host`).
+pub struct ImportedMemory {
+    pub buffer: vk::Buffer,
+    pub memory: vk::DeviceMemory,
+    /// The device address of the first byte.
+    pub address: u64,
+    pub size: u64,
+}
+
+impl Vk {
+    /// Make `size` bytes of this process's memory at `ptr` (both a multiple of the import
+    /// alignment) visible to the device, as a storage buffer with a device address. The device
+    /// reads and writes the bytes themselves.
+    pub fn import_host_memory(&self, ptr: *mut u8, size: u64) -> Result<ImportedMemory, String> {
+        let Some(ext) = self.external_memory_host.as_ref() else {
+            return Err(
+                "the device cannot import host memory (VK_EXT_external_memory_host)".to_string(),
+            );
+        };
+        let align = self.caps.min_imported_host_pointer_alignment.max(1);
+        if !(ptr as u64).is_multiple_of(align) || !size.is_multiple_of(align) || size == 0 {
+            return Err(format!(
+                "host memory at {:p} of {size} bytes does not meet the import alignment of {align}",
+                ptr
+            ));
+        }
+        let handle_type = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+        // SAFETY: the pointer is to memory this process owns for as long as the import lives;
+        // every handle made here is destroyed on failure or by `destroy_imported`.
+        unsafe {
+            let mut props = vk::MemoryHostPointerPropertiesEXT::default();
+            (ext.fp().get_memory_host_pointer_properties_ext)(
+                ext.device(),
+                handle_type,
+                ptr.cast(),
+                &mut props,
+            )
+            .result()
+            .map_err(|e| format!("asking what host memory at {ptr:p} can be: {e}"))?;
+            let mut external =
+                vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
+            let info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                        | vk::BufferUsageFlags::TRANSFER_SRC
+                        | vk::BufferUsageFlags::TRANSFER_DST,
+                )
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .push_next(&mut external);
+            let buffer = self
+                .device
+                .create_buffer(&info, None)
+                .map_err(|e| format!("creating a buffer over {size} bytes of host memory: {e}"))?;
+            let req = self.device.get_buffer_memory_requirements(buffer);
+            let Some(ty) = self.find_memory_type(
+                req.memory_type_bits & props.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE,
+            ) else {
+                self.device.destroy_buffer(buffer, None);
+                return Err("no memory type can hold imported host memory".to_string());
+            };
+            let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+                .handle_type(handle_type)
+                .host_pointer(ptr.cast());
+            let mut flags = vk::MemoryAllocateFlagsInfo::default()
+                .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(size)
+                .memory_type_index(ty)
+                .push_next(&mut import)
+                .push_next(&mut flags);
+            let memory = match self.device.allocate_memory(&alloc, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(format!("importing {size} bytes of host memory: {e}"));
+                }
+            };
+            if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
+                self.device.free_memory(memory, None);
+                self.device.destroy_buffer(buffer, None);
+                return Err(format!("binding imported host memory: {e}"));
+            }
+            let address = self
+                .device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer));
+            Ok(ImportedMemory {
+                buffer,
+                memory,
+                address,
+                size,
+            })
+        }
+    }
+
+    pub fn destroy_imported(&self, m: ImportedMemory) {
+        // SAFETY: the buffer is no longer in use by the caller.
+        unsafe {
+            self.device.destroy_buffer(m.buffer, None);
+            self.device.free_memory(m.memory, None);
+        }
+    }
+}

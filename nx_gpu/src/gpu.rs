@@ -136,6 +136,7 @@ impl Gpu {
             format: buffer.format,
             layout: buffer.layout(),
             block_height_log2: buffer.block_height_log2(),
+            crop: frame.input.crop,
             frame: frame.number,
         })
     }

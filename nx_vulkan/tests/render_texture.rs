@@ -3,7 +3,7 @@
 
 mod render_common;
 
-use nx_gpu::render::{Backend, Draw, Present, Source};
+use nx_gpu::render::{Backend, Clear, Draw, Present, Source};
 use nx_shader::asm::{exit, Enc};
 use nx_shader::inst::Guard;
 use nx_shader::ops::Op;
@@ -253,6 +253,7 @@ fn a_texture_is_compared_with_memory_once_a_frame() {
         format: 1,
         layout: 3,
         block_height_log2: 4,
+        crop: [0; 4],
         frame: 1,
     })
     .unwrap();
@@ -273,4 +274,173 @@ fn a_handle_that_names_no_header_stops_the_draw_with_what_it_named() {
     let mut r = Renderer::new(RenderConfig::default());
     let err = r.draw(&w.scene(), &DRAW).unwrap_err();
     assert!(err.contains("header 100 of 8"), "{err}");
+}
+
+fn clear_to(r: &mut Renderer, w: &mut World, rgba: [f32; 4], rect: Option<(u32, u32, u32, u32)>) {
+    for (i, v) in rgba.iter().enumerate() {
+        w.set(0xd80 + 4 * i as u32, v.to_bits());
+    }
+    match rect {
+        Some((x0, x1, y0, y1)) => {
+            w.set(0x10f8, 1 << 4);
+            w.set(0xd6c, x0 | x1 << 16);
+            w.set(0xd70, y0 | y1 << 16);
+        }
+        None => w.set(0x10f8, 0),
+    }
+    let all = Clear {
+        depth: false,
+        stencil: false,
+        red: true,
+        green: true,
+        blue: true,
+        alpha: true,
+        target: 0,
+        layer: 0,
+    };
+    r.clear(&w.scene(), &all).unwrap();
+}
+
+#[test]
+fn a_render_target_is_sampled_from_the_target_and_not_from_memory() {
+    if vulkan().is_none() {
+        return;
+    }
+    let source = GPU_BASE + 0x50_0000;
+    let target = GPU_BASE + 0x20_0000;
+    // The memory of `source` stays zero: only the renderer's target holds what was drawn there.
+    let mut w = textured(
+        16,
+        target,
+        header(0x08, 2, 16, 16, source),
+        nearest_sampler(),
+    );
+    let mut r = Renderer::new(RenderConfig::default());
+    w.color_target(0, source, 16, 16, 0xD5);
+    clear_to(&mut r, &mut w, [0.0, 1.0, 0.0, 1.0], None);
+    clear_to(&mut r, &mut w, [1.0, 0.0, 0.0, 1.0], Some((0, 8, 0, 16)));
+    w.color_target(0, target, 16, 16, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let (rgba, width, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    for y in 0..16usize {
+        for x in 0..16usize {
+            let want = if x < 8 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 255, 0, 255]
+            };
+            assert_eq!(
+                &rgba[(y * width as usize + x) * 4..][..4],
+                want,
+                "({x}, {y})"
+            );
+        }
+    }
+    // The source is drawn to again after having been read, and read again.
+    w.color_target(0, source, 16, 16, 0xD5);
+    clear_to(&mut r, &mut w, [0.0, 0.0, 1.0, 1.0], None);
+    w.color_target(0, target, 16, 16, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    for px in rgba.as_chunks::<4>().0 {
+        assert_eq!(px, &[0, 0, 255, 255]);
+    }
+}
+
+#[test]
+fn the_header_swizzle_applies_to_a_render_target_read_as_a_texture() {
+    if vulkan().is_none() {
+        return;
+    }
+    let source = GPU_BASE + 0x50_0000;
+    let target = GPU_BASE + 0x20_0000;
+    let mut tic = header(0x08, 2, 8, 8, source);
+    // x from blue, y from red, z from one, w from zero.
+    set_bits(&mut tic, 19, 3, 4);
+    set_bits(&mut tic, 22, 3, 2);
+    set_bits(&mut tic, 25, 3, 7);
+    set_bits(&mut tic, 28, 3, 0);
+    let mut w = textured(8, target, tic, nearest_sampler());
+    let mut r = Renderer::new(RenderConfig::default());
+    w.color_target(0, source, 8, 8, 0xD5);
+    clear_to(&mut r, &mut w, [1.0, 0.0, 0.0, 1.0], None);
+    clear_to(&mut r, &mut w, [0.0, 0.0, 1.0, 1.0], Some((4, 8, 0, 8)));
+    w.color_target(0, target, 8, 8, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let (rgba, width, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    assert_eq!(&rgba[..4], [0, 255, 255, 0], "red source: x = b, y = r");
+    let right = &rgba[(7 * width as usize + 7) * 4..][..4];
+    assert_eq!(right, [255, 0, 255, 0], "blue source");
+}
+
+#[test]
+fn a_target_is_not_read_while_the_same_draw_writes_it() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    let w = textured(8, target, header(0x08, 2, 8, 8, target), nearest_sampler());
+    let mut r = Renderer::new(RenderConfig::default());
+    // The first draw makes the target; the second would find it, and reads the memory (zeros).
+    r.draw(&w.scene(), &DRAW).unwrap();
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    for px in rgba.as_chunks::<4>().0 {
+        assert_eq!(px, &[0, 0, 0, 0]);
+    }
+}
+
+/// A void-extent ASTC block of one color (16-bit components) with no extent.
+fn astc_solid(rgba: [u16; 4]) -> [u8; 16] {
+    let mut v: u128 = 0x1FC | 3 << 10;
+    for lo in [12, 25, 38, 51] {
+        v |= 0x1FFF << lo;
+    }
+    for (i, c) in rgba.iter().enumerate() {
+        v |= u128::from(*c) << (64 + 16 * i);
+    }
+    v.to_le_bytes()
+}
+
+#[test]
+fn an_astc_texture_is_decoded_on_the_host_and_sampled() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    // 8x8 texels in 4x4 blocks (format code 0x40): two blocks across and down.
+    let w = textured(16, target, header(0x40, 2, 8, 8, TEXELS), nearest_sampler());
+    let colors = [
+        [0xFFFFu16, 0, 0, 0xFFFF],
+        [0, 0xFFFF, 0, 0xFFFF],
+        [0, 0, 0xFFFF, 0xFFFF],
+        [0x8000, 0x8000, 0, 0x4000],
+    ];
+    let linear: Vec<u8> = colors.iter().flat_map(|c| astc_solid(*c)).collect();
+    let g = Geometry {
+        width: 2,
+        height: 2,
+        depth: 1,
+        bytes_per_element: 16,
+        block_height_log2: 0,
+        block_depth_log2: 0,
+    };
+    let mut tiled = vec![0u8; g.tiled_size() as usize];
+    swizzle(&g, &linear, &mut tiled);
+    w.put(TEXELS, &tiled);
+    let mut r = Renderer::new(RenderConfig::default());
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let (rgba, width, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    for py in 0..16usize {
+        for px in 0..16usize {
+            let got = &rgba[(py * width as usize + px) * 4..][..4];
+            let want = match (px / 8, py / 8) {
+                (0, 0) => [255, 0, 0, 255],
+                (1, 0) => [0, 255, 0, 255],
+                (0, 1) => [0, 0, 255, 255],
+                _ => [128, 128, 0, 64],
+            };
+            assert_eq!(got, want, "pixel ({px}, {py})");
+        }
+    }
 }

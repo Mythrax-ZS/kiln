@@ -20,6 +20,7 @@ pub struct Capabilities {
     pub push_descriptor: bool,
     pub buffer_device_address: bool,
     pub depth_clip_control: bool,
+    pub depth_clamp: bool,
     pub provoking_vertex: bool,
     pub custom_border_color: bool,
     pub index_type_uint8: bool,
@@ -57,6 +58,7 @@ pub struct Vk {
     pub caps: Capabilities,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub push_descriptor: Option<khr::push_descriptor::Device>,
+    pub external_memory_host: Option<ash::ext::external_memory_host::Device>,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
 }
 
@@ -333,6 +335,7 @@ impl Vk {
         caps.geometry_shader = supported.geometry_shader != 0;
         caps.texture_compression_bc = supported.texture_compression_bc != 0;
         caps.sampler_anisotropy = supported.sampler_anisotropy != 0;
+        caps.depth_clamp = supported.depth_clamp != 0;
         caps.buffer_device_address = f12.buffer_device_address != 0;
         caps.depth_clip_control &= clip.depth_clip_control != 0;
         caps.provoking_vertex &= provoking.provoking_vertex_last != 0;
@@ -446,6 +449,9 @@ impl Vk {
         // SAFETY: the family and index were requested above.
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical) };
+        let external_memory_host = caps
+            .external_memory_host
+            .then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
         let push_descriptor = caps
             .push_descriptor
             .then(|| khr::push_descriptor::Device::new(&instance, &device));
@@ -459,6 +465,7 @@ impl Vk {
             caps,
             memory_properties,
             push_descriptor,
+            external_memory_host,
             debug,
         })
     }
