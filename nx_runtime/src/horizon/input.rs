@@ -290,20 +290,82 @@ impl Keyboard {
     /// direction while a key for it is down; with keys for two axes it is on the diagonal, as far
     /// from the center as a full tilt (so that it does not run faster across corners).
     pub fn pad(&self) -> Pad {
-        let mut pad = Pad::default();
-        let (mut lx, mut ly, mut rx, mut ry) = (0i32, 0i32, 0i32, 0i32);
-        for key in &self.down {
-            for action in self.map.keys.get(key).into_iter().flatten() {
-                match action {
-                    Action::Button(bit) => pad.buttons |= bit,
-                    Action::LeftStick(d) => add(&mut lx, &mut ly, *d),
-                    Action::RightStick(d) => add(&mut rx, &mut ry, *d),
+        pad_of(
+            self.down
+                .iter()
+                .flat_map(|key| self.map.keys.get(key).into_iter().flatten().copied()),
+        )
+    }
+}
+
+/// The state of the controls while the actions given are being done.
+fn pad_of(actions: impl IntoIterator<Item = Action>) -> Pad {
+    let mut pad = Pad::default();
+    let (mut lx, mut ly, mut rx, mut ry) = (0i32, 0i32, 0i32, 0i32);
+    for action in actions {
+        match action {
+            Action::Button(bit) => pad.buttons |= bit,
+            Action::LeftStick(d) => add(&mut lx, &mut ly, d),
+            Action::RightStick(d) => add(&mut rx, &mut ry, d),
+        }
+    }
+    pad.left = scaled(lx, ly);
+    pad.right = scaled(rx, ry);
+    pad
+}
+
+/// Presses made without a person, by the number of the presented frame they start at
+/// (`NX_INPUT_SCRIPT`): for runs of a title that have to get somewhere, such as past its first
+/// menu, without a window and the same way every time. Each entry is `<frame> <Action>
+/// [<frames>]`: the action (named as in a keymap file) is done from that presented frame for that
+/// many frames (6 by default). Entries are separated by `;` or new lines, and `#` starts a comment.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Script {
+    presses: Vec<(u64, u64, Action)>,
+}
+
+impl Script {
+    pub fn parse(text: &str) -> Result<Script, String> {
+        let mut presses = Vec::new();
+        for (n, line) in text.lines().enumerate() {
+            let line = line.split('#').next().unwrap_or("");
+            for entry in line.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+                let mut words = entry.split_whitespace();
+                let (Some(frame), Some(name)) = (words.next(), words.next()) else {
+                    return Err(format!(
+                        "line {}: expected `<frame> <Action> [<frames>]`, found `{entry}`",
+                        n + 1
+                    ));
+                };
+                let frame: u64 = frame
+                    .parse()
+                    .map_err(|_| format!("line {}: `{frame}` is not a frame number", n + 1))?;
+                let Some(action) = action_named(name) else {
+                    return Err(format!("line {}: `{name}` is not an action", n + 1));
+                };
+                let frames: u64 = match words.next() {
+                    None => 6,
+                    Some(w) => w
+                        .parse()
+                        .map_err(|_| format!("line {}: `{w}` is not a number of frames", n + 1))?,
+                };
+                if let Some(extra) = words.next() {
+                    return Err(format!("line {}: `{extra}` is left over", n + 1));
                 }
+                presses.push((frame, frame.saturating_add(frames), action));
             }
         }
-        pad.left = scaled(lx, ly);
-        pad.right = scaled(rx, ry);
-        pad
+        Ok(Script { presses })
+    }
+
+    /// The state of the controls while `frame` is the number of frames presented so far.
+    pub fn pad_at(&self, frame: u64) -> Pad {
+        pad_of(
+            self.presses
+                .iter()
+                .filter(|(from, to, _)| (*from..*to).contains(&frame))
+                .map(|(_, _, action)| *action),
+        )
     }
 }
 
@@ -413,10 +475,39 @@ fn combine(keys: Pad, focused: bool, gamepad: impl FnOnce() -> Option<Pad>) -> P
     held.map_or(keys, |g| keys.merged(g)).with_stick_buttons()
 }
 
-/// The state of the controls now: the keyboard and the gamepad together.
+/// The number of frames presented so far, as the display tells it: the clock of the script.
+static FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// The display has presented `total` frames.
+pub fn frames_presented(total: u64) {
+    FRAMES.store(total, Ordering::Relaxed);
+}
+
+/// `NX_INPUT_SCRIPT`: the script it holds (the contents of the file, if it names one), read once.
+/// One that cannot be understood is said so and left out.
+fn script() -> &'static Script {
+    static SCRIPT: OnceLock<Script> = OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        let Ok(text) = std::env::var("NX_INPUT_SCRIPT") else {
+            return Script::default();
+        };
+        let text = if std::path::Path::new(&text).is_file() {
+            std::fs::read_to_string(&text).unwrap_or(text)
+        } else {
+            text
+        };
+        Script::parse(&text).unwrap_or_else(|e| {
+            eprintln!("recomp runtime: NX_INPUT_SCRIPT: {e}; it is not used");
+            Script::default()
+        })
+    })
+}
+
+/// The state of the controls now: the keyboard, the script and the gamepad together.
 pub fn sample(gamepad: &mut Gamepad) -> Pad {
     let focused = FOCUSED.load(Ordering::Relaxed);
-    let pad = combine(keyboard_pad(), focused, || gamepad.poll());
+    let scripted = script().pad_at(FRAMES.load(Ordering::Relaxed));
+    let pad = combine(keyboard_pad().merged(scripted), focused, || gamepad.poll());
     if tracing() {
         static LAST: AtomicU64 = AtomicU64::new(0);
         if LAST.swap(pad.buttons, Ordering::Relaxed) != pad.buttons {
@@ -616,6 +707,42 @@ mod tests {
         kb.release_all();
         kb.key("KeyD", true);
         assert_eq!(kb.pad().left, (STICK_MAX, 0));
+    }
+
+    #[test]
+    fn a_script_does_actions_for_a_number_of_frames() {
+        let s =
+            Script::parse("100 A 6; 200 DpadDown\n# a comment\n300 LeftStickUp 10 # up\n").unwrap();
+        assert_eq!(s.pad_at(99), Pad::default());
+        assert_eq!(s.pad_at(100).buttons, button::A);
+        assert_eq!(s.pad_at(105).buttons, button::A);
+        assert_eq!(s.pad_at(106), Pad::default(), "six frames from 100");
+        assert_eq!(s.pad_at(205).buttons, button::DOWN, "six frames by default");
+        assert_eq!(s.pad_at(206), Pad::default());
+        assert_eq!(s.pad_at(305).left, (0, STICK_MAX));
+        assert_eq!(s.pad_at(310), Pad::default());
+        // Entries that overlap are done together.
+        let both = Script::parse("10 A 5; 12 B 5").unwrap();
+        assert_eq!(both.pad_at(13).buttons, button::A | button::B);
+        // The last frame a number can name is still a frame.
+        let late = Script::parse(&format!("{} X 3", u64::MAX - 1)).unwrap();
+        assert_eq!(late.pad_at(u64::MAX - 1).buttons, button::X);
+    }
+
+    #[test]
+    fn a_script_with_a_mistake_says_where() {
+        for (text, says) in [
+            ("x A", "frame number"),
+            ("10 Jump", "not an action"),
+            ("10", "expected"),
+            ("10 A x", "number of frames"),
+            ("10 A 5 6", "left over"),
+        ] {
+            let e = Script::parse(&format!("\n{text}")).unwrap_err();
+            assert!(e.contains("line 2") && e.contains(says), "{text}: {e}");
+        }
+        assert_eq!(Script::parse("").unwrap(), Script::default());
+        assert_eq!(Script::parse("# nothing\n ; ;").unwrap(), Script::default());
     }
 
     #[test]

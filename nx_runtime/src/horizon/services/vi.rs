@@ -345,6 +345,11 @@ impl BinderDriver {
                 })?;
             }
         }
+        if code == nx_gpu::display::code::QUEUE_BUFFER {
+            // The clock of `NX_INPUT_SCRIPT`.
+            let frames = self.shared.comp().frames_presented();
+            super::super::input::frames_presented(frames);
+        }
         if let Some(limit) = self.shared.frame_limit {
             let frames = self.shared.comp().frames_presented();
             if code == nx_gpu::display::code::QUEUE_BUFFER && frames >= limit {
