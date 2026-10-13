@@ -215,6 +215,32 @@ fn static_lib_name() -> &'static str {
     }
 }
 
+/// Where the runtime library is, without building anything: `RECOMP_RUNTIME_LIB`, the file next to
+/// the running binary (or up to two directories above it, for binaries in `deps/`), or the one an
+/// earlier build in this checkout made. `None` when there is no such file.
+pub fn runtime_lib_location() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("RECOMP_RUNTIME_LIB") {
+        let p = PathBuf::from(p);
+        return p.is_file().then_some(p);
+    }
+    let name = static_lib_name();
+    if let Ok(exe) = std::env::current_exe() {
+        for dir in exe.ancestors().skip(1).take(3) {
+            let c = dir.join(name);
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let target =
+        std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| manifest.join("target"), PathBuf::from);
+    ["release", "debug"]
+        .iter()
+        .map(|profile| target.join(profile).join(name))
+        .find(|p| p.is_file())
+}
+
 /// The `nx_runtime` static library. `RECOMP_RUNTIME_LIB` wins; otherwise the file next to the
 /// running binary (or one directory up, for test binaries in `deps/`); otherwise it is built with
 /// cargo from the workspace this crate came from.
@@ -223,7 +249,16 @@ pub fn runtime_lib() -> Result<PathBuf> {
         return Ok(PathBuf::from(p));
     }
     let name = static_lib_name();
+    let not_found = || {
+        Error::Toolchain(format!(
+            "{name} not found; build it with `cargo build -p nx_runtime` or set RECOMP_RUNTIME_LIB"
+        ))
+    };
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // A program that was shipped has no source tree to build from: it uses the library beside it.
+    if !manifest.join("Cargo.toml").is_file() {
+        return runtime_lib_location().ok_or_else(not_found);
+    }
     let profile = if cfg!(debug_assertions) {
         "debug"
     } else {
@@ -239,26 +274,22 @@ pub fn runtime_lib() -> Result<PathBuf> {
         cmd.arg("--release");
     }
     cmd.current_dir(manifest);
-    let out = cmd
-        .output()
-        .map_err(|e| Error::Toolchain(format!("cannot run cargo to build the runtime: {e}")))?;
-    if !out.status.success() {
-        return Err(tool_error("building nx_runtime", &out));
+    match cmd.output() {
+        Ok(out) if out.status.success() => {}
+        // Without a working cargo, a library that is already there is still good.
+        Ok(out) => {
+            return runtime_lib_location().ok_or_else(|| tool_error("building nx_runtime", &out))
+        }
+        Err(e) => {
+            return runtime_lib_location().ok_or_else(|| {
+                Error::Toolchain(format!("cannot run cargo to build the runtime: {e}"))
+            })
+        }
     }
     if built.is_file() {
         return Ok(built);
     }
-    if let Ok(exe) = std::env::current_exe() {
-        for dir in exe.ancestors().skip(1).take(3) {
-            let c = dir.join(name);
-            if c.is_file() {
-                return Ok(c);
-            }
-        }
-    }
-    Err(Error::Toolchain(format!(
-        "{name} not found; build it with `cargo build -p nx_runtime` or set RECOMP_RUNTIME_LIB"
-    )))
+    runtime_lib_location().ok_or_else(not_found)
 }
 
 /// Write `funcs` as function units of about `per_unit` functions plus the support unit into

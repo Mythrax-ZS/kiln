@@ -25,6 +25,7 @@ usage:
                  [--hints <file>] [--shared] [--keep-ir] [--main-only] [--romfs <dir|image>] [--reuse-objects]
   recomp relink  --out <dir> --name <name>
   recomp symbols (--exefs <dir|pfs0> | --nro <file>) [--match <text>] [<address>...]
+  recomp doctor
   recomp --version
 
 Inputs are the already extracted ExeFS and RomFS of a game. No keys are read. From an ExeFS
@@ -327,6 +328,58 @@ fn describe_npdm(out: &mut String, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// What the tool can use on this machine, as `key: value` lines (for people and for the GUI):
+/// the version, the C compiler it will run and its version, and the runtime library programs
+/// link. Nothing is built or changed.
+pub fn doctor() -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "recomp: {}", crate::VERSION);
+    let _ = writeln!(
+        out,
+        "host: {} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    match Toolchain::discover() {
+        Ok(tc) => {
+            let _ = writeln!(out, "clang: {}", tc.clang.display());
+            let version = std::process::Command::new(&tc.clang)
+                .arg("--version")
+                .output()
+                .ok()
+                .and_then(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .next()
+                        .map(str::to_string)
+                });
+            match version {
+                Some(v) => {
+                    let _ = writeln!(out, "clang version: {v}");
+                }
+                None => {
+                    let _ = writeln!(out, "clang version: unknown (it did not answer --version)");
+                }
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(out, "clang: not found ({e})");
+        }
+    }
+    match crate::build::runtime_lib_location() {
+        Some(p) => {
+            let _ = writeln!(out, "runtime library: {}", p.display());
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "runtime library: not found (build it with `cargo build -p nx_runtime` or set RECOMP_RUNTIME_LIB)"
+            );
+        }
+    }
+    out
+}
+
 /// Run the CLI. Returns the text to print on success.
 pub fn run(argv: &[String]) -> Result<String> {
     let args = parse_args(argv)?;
@@ -346,6 +399,7 @@ pub fn run(argv: &[String]) -> Result<String> {
         "build" => build_command(&args),
         "relink" => relink_command(&args),
         "symbols" => symbols_command(&args),
+        "doctor" => Ok(doctor()),
         other => Err(Error::format(
             "command line",
             format!("unknown command `{other}`"),
@@ -547,6 +601,16 @@ mod tests {
         assert_eq!(a.positional, ["extra"]);
         assert!(parse_args(&argv(&["inspect", "--exefs"])).is_err());
         assert!(parse_args(&argv(&["-V"])).unwrap().has("version"));
+    }
+
+    #[test]
+    fn doctor_reports_each_thing_on_its_own_line() {
+        let text = run(&argv(&["doctor"])).unwrap();
+        assert!(text.starts_with("recomp: "), "{text}");
+        for key in ["host: ", "clang: ", "runtime library: "] {
+            assert!(text.lines().any(|l| l.starts_with(key)), "{key} in {text}");
+        }
+        assert!(run(&argv(&["--help"])).unwrap().contains("recomp doctor"));
     }
 
     #[test]
