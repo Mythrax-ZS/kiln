@@ -70,8 +70,9 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   with `cargo build -p nx_runtime` (the native tests do this themselves).
 - Native differential test sizes: `RECOMP_NATIVE_WORDS` (instructions per encoding group, default
   40), `RECOMP_NATIVE_STATES` (random states per instruction, 4), `RECOMP_NATIVE_PROGRAMS` (random
-  control-flow programs, 150). The IR-level tests scale with `RECOMP_LIFT_CASES` and
-  `RECOMP_LIFT_PROGRAMS`.
+  control-flow programs, 150), `RECOMP_FLOAT_STATES` (random states for each word of the tests of
+  the floating-point and vector forms the code generator lowers itself, 600). The IR-level tests
+  scale with `RECOMP_LIFT_CASES` and `RECOMP_LIFT_PROGRAMS`.
 - Real title (opt-in, `RECOMP_TITLE_DIR` = a folder holding `exefs/`): `tests/real_title.rs` checks
   the loader; `tests/real_code.rs` recompiles `main` and compares native with interpreted runs of
   sampled functions (`RECOMP_REAL_FUNCTIONS`, `RECOMP_REAL_STATES`, `RECOMP_REAL_ALL=1` for every

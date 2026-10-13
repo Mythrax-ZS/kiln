@@ -144,6 +144,31 @@ mod tests {
     }
 
     #[test]
+    fn the_hot_floating_point_forms_are_lowered_and_the_others_keep_the_runtime_call() {
+        // fadd s0, s1, s2 ; mov v3.16b, v4.16b ; ldr q5, [x0] ; fsqrt s6, s7
+        let ll = unit_for(vec![
+            0x1E22_2820,
+            0x4EA4_1C83,
+            0x3DC0_0005,
+            0x1E21_C0E6,
+            asm::ret(30),
+        ]);
+        // The add is IR, with the runtime call as its slow form; so is the single-precision
+        // inexact test.
+        assert!(ll.contains("fadd float"), "{ll}");
+        // The move and the load have no call; the square root is only a call.
+        assert_eq!(
+            ll.matches("call i64 @nx_vec(").count(),
+            2,
+            "the slow form of the add and the square root: {ll}"
+        );
+        assert_eq!(ll.matches("call void @nx_vecmem(").count(), 0, "{ll}");
+        // A 128-bit load is two 64-bit loads, each followed by the test of the fault flag.
+        assert_eq!(ll.matches("@nx_ld64(ptr %cpu").count(), 2, "{ll}");
+        assert_eq!(ll.matches("icmp ne i32").count(), 2, "{ll}");
+    }
+
+    #[test]
     fn divisions_are_guarded() {
         let ll = unit_for(vec![
             asm::dp2(true, 2, 1, 0, 2), // udiv x2, x0, x1

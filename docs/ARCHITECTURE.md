@@ -56,8 +56,31 @@ the interpreter runs, and returns the integer result or the new flags. Only what
 integer register file travels as an SSA value: the source of `SCVTF`/`DUP`/`FMOV Dn, Xn`, the result
 of `FCVTZS`/`UMOV`/`FMOV Xd, Dn`, and the `NZCV` nibble of `FCMP`/`FCCMP`/`FCSEL`. A vector load or
 store is `VecMem { word, pc, addr }`, lowered to `nx_vecmem` followed by the usual fault check; the
-base register's address computation and writeback are ordinary integer IR. Nothing is inlined, so
-the flags and rounding come out of the exact soft-float whatever the host FPU does.
+base register's address computation and writeback are ordinary integer IR.
+
+The hot forms are lowered to LLVM IR instead (`src/codegen/llvm/vecs.rs`: the emitter decodes the
+word with the runtime's own decoder, and the call stays as the slow form of anything that is not
+on the fast path):
+
+- *Exact by construction, inline*: register moves, the bitwise operations, `FMOV`, `FABS`, `FNEG`,
+  `FCSEL`, the immediate and general-register forms of `FMOV`, `DUP`/`INS` of an element, `ZIP`,
+  `UZP`, `TRN`, `EXT`.
+- *Guarded*: the single-precision `FADD`, `FSUB`, `FMUL`, `FDIV`, `FCMP`, the vector `FADD`, `FSUB`,
+  `FMUL`, `FMLA`, `FMLS` (also by element), `SCVTF`/`UCVTF` of 32-bit integers and `FCVTZS`/`FCVTZU`
+  to a 32-bit register. The fast form runs when `FPCR` is zero and every result is finite and not
+  tiny (zero results only when exact); then the host's answer is the architecture's, and the one
+  flag it can raise, inexact, is worked out exactly (a sum by error-free transformation, a
+  product, a quotient or a fused sum in double precision, which holds a product of two singles
+  exactly, leaving to the call the one case where rounding twice could differ) so that `FPSR`
+  ends as the soft-float leaves it. NaNs, infinities, denormals, overflow, other rounding and flush
+  modes take the call.
+- *Memory*: the loads and stores of one or two registers of 1 to 16 bytes are 64-bit (or narrower)
+  accesses through the same `nx_ld*`/`nx_st*` as the integer ones.
+
+The native differential tests (`src/native_tests.rs`) compare all of it with the interpreter over
+random operands (ordinary numbers, exact ones and the special values) and states, `FPSR` and the
+flags included; a mutation of any of these lowerings fails them. Everything else (double
+precision, the fused scalar forms, the other conversions and the rest of SIMD) is the call.
 
 ## The Horizon layer
 

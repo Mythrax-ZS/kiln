@@ -14,6 +14,8 @@
 //!   consistent, `ISB` a compiler-only barrier);
 //! - a call is followed by a check that control came back to the return address.
 
+mod vecs;
+
 use crate::lift::ir::*;
 use nx_runtime::rt::abi::{offsets as cpu_offsets, trap};
 use std::collections::BTreeSet;
@@ -70,8 +72,10 @@ pub fn declarations(defines_dispatcher: bool) -> String {
     s
 }
 
-/// Branch weights for "this access faulted": taken almost never.
-pub const METADATA: &str = "!0 = !{!\"branch_weights\", i32 1, i32 4000}\n";
+/// Branch weights: `!0` for "this access faulted" (taken almost never), `!1` for "the fast form of
+/// a floating-point operation applies" (taken almost always).
+pub const METADATA: &str =
+    "!0 = !{!\"branch_weights\", i32 1, i32 4000}\n!1 = !{!\"branch_weights\", i32 4000, i32 1}\n";
 
 fn const_text(ty: Ty, v: u128) -> String {
     match ty {
@@ -125,18 +129,6 @@ fn edges(t: &Term) -> Vec<BlockId> {
         }
         Term::Call(c) => vec![c.cont],
     }
-}
-
-fn can_fault(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Load { .. }
-            | Op::Store { .. }
-            | Op::LoadExcl { .. }
-            | Op::StoreExcl { .. }
-            | Op::DcZva { .. }
-            | Op::VecMem { .. }
-    )
 }
 
 struct Emitter<'a> {
@@ -505,6 +497,9 @@ impl<'a> Emitter<'a> {
             Op::Vec { word, src, nzcv } => {
                 let src = src.map_or_else(|| "0".to_string(), |s| self.val(s));
                 let nzcv = nzcv.map_or_else(|| "0".to_string(), |n| self.val(n));
+                if self.native_vec(b, split, v, word, &src, &nzcv) {
+                    return;
+                }
                 let line = format!(
                     "{r} = call i64 @nx_vec(ptr %cpu, i32 {}, i64 {src}, i64 {nzcv})",
                     word as i32
@@ -512,6 +507,10 @@ impl<'a> Emitter<'a> {
                 self.line(&line);
             }
             Op::VecMem { word, pc, addr } => {
+                let at = self.val(addr);
+                if self.native_vecmem(b, split, word, pc, &at) {
+                    return;
+                }
                 let line = format!(
                     "call void @nx_vecmem(ptr %cpu, i32 {}, i64 {}, i64 {})",
                     word as i32,
@@ -670,11 +669,11 @@ pub fn emit_function(
     };
     // Where each IR block ends in LLVM terms, for the phis of its successors.
     for b in &f.blocks {
-        let splits = b
+        let splits: usize = b
             .body
             .iter()
-            .filter(|&&v| can_fault(&f.insts[v as usize].op))
-            .count();
+            .map(|&v| vecs::splits_of(&f.insts[v as usize].op))
+            .sum();
         let id = e.last_label.len() as BlockId;
         e.last_label.push(if splits == 0 {
             label(id)

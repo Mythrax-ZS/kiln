@@ -21,7 +21,7 @@ use nx_runtime::a64::bus::{Fault, FaultKind};
 use nx_runtime::a64::inst::Inst;
 use nx_runtime::a64::{decode, CpuState};
 use nx_runtime::rt::abi::{perm, stop, trap, NativeCpu};
-use nx_runtime::testing::{asm, TempDir};
+use nx_runtime::testing::{asm, Rng, TempDir};
 
 /// Spacing between programs in the shared guest address space: wider than the reach of a literal
 /// load (1 MiB), so a program's own accesses never land in another program's memory.
@@ -508,4 +508,343 @@ fn control_flow_programs_match_the_interpreter_natively() {
     // The slow path ran for the programs that need it, and only for those.
     let unknown = batch.unknown_targets();
     assert!(!unknown.is_empty(), "no program used the slow path");
+}
+
+// ---- floating point and vectors lowered to IR (src/codegen/llvm/vecs.rs) ----
+
+/// A single-precision operand: mostly ordinary numbers of a moderate size (random significands, so
+/// that sums and products round, and short ones, so that some are exact), now and then a special
+/// one: a zero, an infinity, a NaN, a denormal, a number next to the overflow or underflow limit.
+fn single_operand(rng: &mut Rng) -> u32 {
+    let sign = (rng.below(2) as u32) << 31;
+    let fraction = rng.next_u32() & 0x007F_FFFF;
+    match rng.below(24) {
+        0 => sign,
+        1 => sign | 0x7F80_0000,
+        2 => sign | 0x7FC0_0000 | fraction,
+        3 => sign | 0x7F80_0000 | (fraction | 1) & 0x003F_FFFF,
+        4 => sign | fraction,
+        5 => sign | ((0xFD + rng.below(2) as u32) << 23) | fraction,
+        6 => sign | ((1 + rng.below(3) as u32) << 23) | fraction,
+        7 => sign | (127 << 23),
+        8..=12 => sign | ((100 + rng.below(54) as u32) << 23) | (fraction & 0x007F_E000),
+        _ => sign | ((96 + rng.below(64) as u32) << 23) | fraction,
+    }
+}
+
+/// The state for a case: ordinary registers, vector registers whose low words are operands (and
+/// whose other bits are random, to show they are cleared), and mostly the default `FPCR`.
+fn float_state(g: &mut Gen, base: u64) -> CpuState {
+    let mut cpu = g.state_at(base);
+    for n in 0..8u8 {
+        let low = u128::from(single_operand(&mut g.rng));
+        let rest = u128::from(g.rng.next_u64()) << 32 | u128::from(g.rng.next_u32()) << 96;
+        cpu.set_vreg(n, low | rest);
+    }
+    if !g.rng.chance(10) {
+        cpu.fpcr = 0;
+    }
+    if g.rng.chance(2) {
+        cpu.fpsr = 0;
+    }
+    cpu
+}
+
+/// Run `words` (one program each) natively and in the interpreter on `states` states made by
+/// [`float_state`].
+fn check_float_words(words: &[u32], states: usize, seed: u64) {
+    let Some(tc) = toolchain_or_skip() else {
+        return;
+    };
+    for &w in words {
+        assert!(
+            matches!(decode(w), Inst::Vec { .. } | Inst::VecMem { .. }),
+            "{w:08x} is not a floating-point or vector instruction: {:?}",
+            decode(w)
+        );
+    }
+    let programs: Vec<Program> = words
+        .iter()
+        .map(|&w| Program::new(vec![w, asm::svc(0)]))
+        .collect();
+    let batch = Batch::build(&tc, &programs).unwrap();
+    let mut g = Gen::new(seed);
+    let mut failures = Vec::new();
+    for (i, p) in programs.iter().enumerate() {
+        let base = batch.base(i);
+        for _ in 0..states {
+            let cpu = float_state(&mut g, base);
+            let data = g.data();
+            let mut expect = run_interpreter_at(base, &p.words, &cpu, &data, 50_000);
+            let mut got = batch.run(i, &cpu, &data);
+            if matches!(expect.outcome, Outcome::Exited) {
+                expect.cpu.pc = EXIT;
+            }
+            if matches!(got.outcome, Outcome::Exited) {
+                got.cpu.pc = EXIT;
+            }
+            if let Some(why) = compare(&expect, &got) {
+                failures.push(format!(
+                    "{:08x}: fpcr {:#x} fpsr {:#x} v0..v3 {:x?}\n  {why}",
+                    p.words[0],
+                    cpu.fpcr,
+                    cpu.fpsr,
+                    (0..4).map(|n| cpu.vreg(n)).collect::<Vec<_>>()
+                ));
+                break;
+            }
+        }
+        if failures.len() >= 4 {
+            break;
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn single_precision_arithmetic_and_compares_match_the_interpreter_natively() {
+    let mut words = Vec::new();
+    // FMUL, FDIV, FADD, FSUB (single): Sd = Sn op Sm.
+    for opcode in [0u32, 1, 2, 3] {
+        for (rd, rn, rm) in [(0, 1, 2), (3, 3, 4), (5, 6, 6), (7, 7, 7), (1, 0, 0)] {
+            words.push(0x1E20_0800 | opcode << 12 | rm << 16 | rn << 5 | rd);
+        }
+    }
+    // FCMP, FCMPE against a register and against zero.
+    for opcode2 in [0x00u32, 0x10, 0x08, 0x18] {
+        for (rn, rm) in [(0, 1), (2, 2), (3, 0)] {
+            // The forms against zero have no second register.
+            let rm = if opcode2 & 8 != 0 { 0 } else { rm };
+            words.push(0x1E20_2000 | rm << 16 | rn << 5 | opcode2);
+        }
+    }
+    let states = env_count("RECOMP_FLOAT_STATES", 600);
+    check_float_words(&words, states, 0xF10A7);
+}
+
+#[test]
+fn register_moves_selects_and_bit_operations_match_the_interpreter_natively() {
+    let mut words = Vec::new();
+    // FMOV, FABS, FNEG (single and double), FMOV immediate, FMOV Sd,Wn / Wd,Sn / Dd,Xn / Xd,Dn /
+    // Vd.D[1],Xn / Xd,Vn.D[1].
+    for ftype in [0u32, 1] {
+        for opcode in [0u32, 1, 2] {
+            for (rd, rn) in [(0, 1), (2, 2)] {
+                words.push(0x1E20_4000 | ftype << 22 | opcode << 15 | rn << 5 | rd);
+            }
+        }
+        for imm8 in [0u32, 0x70, 0xFF, 0x3C] {
+            words.push(0x1E20_1000 | ftype << 22 | imm8 << 13 | 3);
+        }
+        // FCSEL for every condition.
+        for cond in 0u32..16 {
+            words.push(0x1E20_0C00 | ftype << 22 | 2 << 16 | cond << 12 | 1 << 5 | 4);
+        }
+    }
+    for word in [
+        0x1E27_0020u32, // fmov s0, w1
+        0x1E26_0040,    // fmov w0, s2
+        0x9E67_0041,    // fmov d1, x2
+        0x9E66_0041,    // fmov x1, d2
+        0x9EAF_0061,    // fmov v1.d[1], x3
+        0x9EAE_0062,    // fmov x2, v3.d[1]
+    ] {
+        words.push(word);
+    }
+    // AND, BIC, ORR, ORN, EOR, BSL, BIT, BIF on 16 and on 8 bytes.
+    for q in [1u32, 0] {
+        for (size_opc, base) in [
+            (0u32, 0x0E20_1C00u32), // and
+            (1, 0x0E20_1C00),       // bic
+            (2, 0x0E20_1C00),       // orr
+            (3, 0x0E20_1C00),       // orn
+        ] {
+            words.push(base | q << 30 | size_opc << 22 | 2 << 16 | 1 << 5);
+        }
+        for (u, size) in [(1u32, 0u32), (1, 1), (1, 2), (1, 3)] {
+            words.push(0x0E20_1C00 | q << 30 | u << 29 | size << 22 | 2 << 16 | 1 << 5 | 3);
+        }
+        words.push(0x0EA2_1C21 | q << 30); // orr v1, v1, v2 (mov-like)
+        words.push(0x0EA1_1C20 | q << 30); // orr v0, v1, v1 (mov v0, v1)
+    }
+    let states = env_count("RECOMP_FLOAT_STATES", 600) / 4;
+    check_float_words(&words, states.max(20), 0xB175);
+}
+
+#[test]
+fn vector_loads_and_stores_of_one_or_two_registers_match_the_interpreter_natively() {
+    let mut words = Vec::new();
+    // LDR/STR of B, H, S, D, Q, unsigned offset, from x1 (which points into the test's memory).
+    for (size, opc) in [(0u32, 0u32), (1, 0), (2, 0), (3, 0), (0, 2)] {
+        for load in [0u32, 1] {
+            words.push(0x3D00_0000 | size << 30 | (opc | load) << 22 | 8 << 10 | 1 << 5 | 2);
+        }
+    }
+    // LDP/STP of S, D, Q: offset, pre-index and post-index.
+    for opc in [0u32, 1, 2] {
+        for load in [0u32, 1] {
+            for mode in [0x2D00_0000u32, 0x2D80_0000, 0x2C80_0000] {
+                words.push(mode | opc << 30 | load << 22 | 1 << 15 | 2 << 10 | 1 << 5 | 3);
+            }
+        }
+    }
+    let states = env_count("RECOMP_FLOAT_STATES", 600) / 4;
+    check_float_words(&words, states.max(20), 0x7E5);
+}
+
+/// Like [`float_state`], but every lane of the first eight vector registers is an operand, and now
+/// and then a small integer (for the conversions from integers and the by-element forms).
+fn lane_state(g: &mut Gen, base: u64) -> CpuState {
+    let mut cpu = float_state(g, base);
+    for n in 0..8u8 {
+        let mut v = 0u128;
+        for lane in 0..4 {
+            let word = if g.rng.chance(4) {
+                (g.rng.below(1 << 14) as i32 - (1 << 13)) as u32
+            } else {
+                single_operand(&mut g.rng)
+            };
+            v |= u128::from(word) << (32 * lane);
+        }
+        cpu.set_vreg(n, v);
+    }
+    cpu
+}
+
+/// [`check_float_words`] with the states of [`lane_state`].
+fn check_lane_words(words: &[u32], states: usize, seed: u64) {
+    let Some(tc) = toolchain_or_skip() else {
+        return;
+    };
+    for &w in words {
+        assert!(
+            matches!(decode(w), Inst::Vec { .. } | Inst::VecMem { .. }),
+            "{w:08x} is not a floating-point or vector instruction: {:?}",
+            decode(w)
+        );
+    }
+    let programs: Vec<Program> = words
+        .iter()
+        .map(|&w| Program::new(vec![w, asm::svc(0)]))
+        .collect();
+    let batch = Batch::build(&tc, &programs).unwrap();
+    let mut g = Gen::new(seed);
+    let mut failures = Vec::new();
+    for (i, p) in programs.iter().enumerate() {
+        let base = batch.base(i);
+        for _ in 0..states {
+            let cpu = lane_state(&mut g, base);
+            let data = g.data();
+            let mut expect = run_interpreter_at(base, &p.words, &cpu, &data, 50_000);
+            let mut got = batch.run(i, &cpu, &data);
+            if matches!(expect.outcome, Outcome::Exited) {
+                expect.cpu.pc = EXIT;
+            }
+            if matches!(got.outcome, Outcome::Exited) {
+                got.cpu.pc = EXIT;
+            }
+            if let Some(why) = compare(&expect, &got) {
+                failures.push(format!(
+                    "{:08x}: fpcr {:#x} fpsr {:#x} v0..v3 {:x?} x0..x3 {:x?}\n  {why}",
+                    p.words[0],
+                    cpu.fpcr,
+                    cpu.fpsr,
+                    (0..4).map(|n| cpu.vreg(n)).collect::<Vec<_>>(),
+                    &cpu.x[..4]
+                ));
+                break;
+            }
+        }
+        if failures.len() >= 4 {
+            break;
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn vector_single_precision_arithmetic_matches_the_interpreter_natively() {
+    let mut words = Vec::new();
+    for q in [1u32, 0] {
+        // FADD, FSUB, FMUL, FMLA, FMLS (vector).
+        for base in [
+            0x0E20_D400u32,
+            0x0EA0_D400,
+            0x2E20_DC00,
+            0x0E20_CC00,
+            0x0EA0_CC00,
+        ] {
+            for (rd, rn, rm) in [(0, 1, 2), (3, 3, 4), (5, 6, 6), (7, 7, 7), (1, 0, 0)] {
+                words.push(base | q << 30 | rm << 16 | rn << 5 | rd);
+            }
+        }
+        // FMUL, FMLA, FMLS by element, every index.
+        for opcode in [0x9u32, 0x1, 0x5] {
+            for idx in 0u32..4 {
+                let (h, l) = (idx >> 1, idx & 1);
+                words.push(
+                    0x0F80_0000 | q << 30 | l << 21 | 2 << 16 | opcode << 12 | h << 11 | 1 << 5 | 3,
+                );
+            }
+        }
+        // SCVTF, UCVTF (vector).
+        for u in [0u32, 1] {
+            words.push(0x0E21_D800 | q << 30 | u << 29 | 1 << 5 | 2);
+        }
+    }
+    // SCVTF, UCVTF (scalar, vector register and general register), FCVTZS, FCVTZU (to W).
+    for u in [0u32, 1] {
+        words.push(0x5E21_D800 | u << 29 | 1 << 5 | 2);
+        words.push(0x1E22_0000 | u << 16 | 1 << 5 | 2);
+        words.push(0x1E38_0000 | u << 16 | 1 << 5 | 2);
+    }
+    let states = env_count("RECOMP_FLOAT_STATES", 600);
+    check_lane_words(&words, states, 0x5EC7);
+}
+
+#[test]
+fn lane_moves_and_permutes_match_the_interpreter_natively() {
+    let mut words = Vec::new();
+    for q in [1u32, 0] {
+        // DUP (element) of 8, 16, 32 and 64 bit lanes, an index each.
+        for (imm5, ok) in [
+            (0b00111u32, q == 1 || true),
+            (0b01010, true),
+            (0b10100, true),
+            (0b11000, q == 1),
+        ] {
+            if ok {
+                words.push(0x0E00_0400 | q << 30 | imm5 << 16 | 1 << 5 | 2);
+            }
+        }
+        for size in 0u32..4 {
+            if size == 3 && q == 0 {
+                continue;
+            }
+            // ZIP1, UZP1, TRN1, ZIP2, UZP2, TRN2.
+            for opc in [3u32, 1, 2, 7, 5, 6] {
+                words.push(0x0E00_0800 | q << 30 | size << 22 | 2 << 16 | opc << 12 | 1 << 5 | 3);
+            }
+        }
+        // EXT.
+        for imm4 in [0u32, 3, 7] {
+            words.push(0x2E00_0000 | q << 30 | 2 << 16 | imm4 << 11 | 1 << 5 | 3);
+        }
+        if q == 1 {
+            words.push(0x2E00_0000 | q << 30 | 2 << 16 | 15 << 11 | 1 << 5 | 3);
+        }
+    }
+    // INS (element) of every lane size, to the same register and to another.
+    for (imm5, imm4) in [
+        (0b00001u32 | 3 << 1 << 1, 5u32),
+        (0b00010 | 2 << 2, 6 << 1),
+        (0b00100 | 1 << 3, 2 << 2),
+        (0b01000 | 1 << 4, 0),
+    ] {
+        for (rd, rn) in [(1u32, 2u32), (3, 3)] {
+            words.push(0x6E00_0400 | imm5 << 16 | imm4 << 11 | rn << 5 | rd);
+        }
+    }
+    let states = env_count("RECOMP_FLOAT_STATES", 600) / 2;
+    check_lane_words(&words, states.max(20), 0xA27E);
 }
