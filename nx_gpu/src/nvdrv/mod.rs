@@ -246,6 +246,11 @@ impl Nvdrv {
         t
     }
 
+    /// The events a submission that ran elsewhere has set (the renderer's thread, A-124).
+    pub fn wake(&mut self, tokens: impl IntoIterator<Item = EventToken>) {
+        self.signal(tokens);
+    }
+
     fn signal(&mut self, tokens: impl IntoIterator<Item = EventToken>) {
         for token in tokens {
             self.signals.push(Signal {

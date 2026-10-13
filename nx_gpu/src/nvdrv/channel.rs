@@ -180,7 +180,18 @@ impl Nvdrv {
                     .take(n)
                     .map(|c| u64::from_le_bytes(*c))
                     .collect();
-                match self.gpu.submit(id, &entries, flags, fence) {
+                let result = if self.gpu.defers(flags) {
+                    self.gpu.defer(id, &entries, flags, fence)
+                } else if self.gpu.queue.is_some() {
+                    return unimplemented(
+                        "a submission whose fence is made by running it (FENCE_GET) while the \
+                         renderer runs submissions on a thread of its own (NX_GPU_SYNC=1 runs \
+                         them in the call)",
+                    );
+                } else {
+                    self.gpu.submit(id, &entries, flags, fence)
+                };
+                match result {
                     Ok(done) => {
                         args.set_u32(16, done.fence.0);
                         args.set_u32(20, done.fence.1);
@@ -356,6 +367,82 @@ mod tests {
 
     fn words(ws: &[u32]) -> Vec<u8> {
         ws.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// A queue that keeps what it is given, for the test to run.
+    #[derive(Default)]
+    struct Kept(std::sync::Mutex<Vec<crate::gpu::Task>>);
+
+    impl crate::gpu::Queue for Kept {
+        fn push(&self, task: crate::gpu::Task) {
+            self.0.lock().unwrap().push(task);
+        }
+    }
+
+    #[test]
+    fn a_deferred_submission_gives_its_fence_at_once_and_runs_later_the_same() {
+        let (mut nv, mem, ch, syncpt) = ready();
+        let kept = std::sync::Arc::new(Kept::default());
+        nv.gpu.queue = Some(kept.clone());
+        let pb = words(&[
+            0x2001_0000,
+            0xB197,
+            0x2004_06C0,
+            0,
+            0x500_0100,
+            0xFEED_F00D,
+            0,
+        ]);
+        assert!(mem.write(0x2000_0000, &pb));
+        // INCREMENT (bit 8) with the one increment the semaphore release stands for.
+        let (e, out) = submit(&mut nv, ch, &[entry(0x500_0000, 7)], 0x104, (syncpt, 1));
+        assert_eq!(e, NvError::SUCCESS);
+        assert_eq!(
+            (out.u32(16), out.u32(20)),
+            (syncpt, 1),
+            "the fence is at once"
+        );
+        assert_eq!(mem.read_u32(0x2000_0100), Some(0), "nothing has run");
+        assert_eq!(nv.gpu.syncpoints.value(syncpt), Some(0));
+        assert_eq!(
+            nv.gpu.syncpoints.max(syncpt),
+            Some(1),
+            "the increment is promised"
+        );
+        // The program uses the memory of its commands again: the submission has its own copy.
+        assert!(mem.write(0x2000_0000, &words(&[0; 7])));
+        let mut tasks = std::mem::take(&mut *kept.0.lock().unwrap());
+        assert_eq!(tasks.len(), 1);
+        let mut steps = 0;
+        let done = loop {
+            steps += 1;
+            if let Some(done) = nv.gpu.run_task(&mut tasks[0]).unwrap() {
+                break done;
+            }
+        };
+        assert_eq!(steps, 2, "an entry, then the end of the submission");
+        assert_eq!(done.fence, (syncpt, 1));
+        assert_eq!(mem.read_u32(0x2000_0100), Some(0xFEED_F00D));
+        assert_eq!(nv.gpu.syncpoints.value(syncpt), Some(1));
+    }
+
+    #[test]
+    fn a_fence_that_running_makes_cannot_be_given_before_the_run() {
+        let (mut nv, _mem, ch, _) = ready();
+        nv.gpu.queue = Some(std::sync::Arc::new(Kept::default()));
+        let err = nv
+            .ioctl(
+                ch,
+                0xC018_4808,
+                &{
+                    let mut a = vec![0u8; 24];
+                    a[12..16].copy_from_slice(&2u32.to_le_bytes());
+                    a
+                },
+                &[],
+            )
+            .unwrap_err();
+        assert!(err.contains("FENCE_GET"), "{err}");
     }
 
     #[test]
