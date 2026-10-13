@@ -14,6 +14,7 @@ mod friend;
 mod fsp;
 mod hid;
 mod lm;
+mod mm;
 mod nfp;
 mod nifm;
 mod nvdrv;
@@ -78,6 +79,7 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
         hid::HidServer::new(k, input.clone())
     });
     register(kernel, "lm", lm::LogService::new);
+    register(kernel, "mm:u", |_| mm::Requests::new());
     register(kernel, "nfp:user", nfp::UserManager::new);
     register(kernel, "nifm:u", nifm::StaticService::new);
     let report = gpu.clone();
