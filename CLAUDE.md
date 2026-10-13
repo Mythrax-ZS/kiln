@@ -178,6 +178,9 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   outside (it walks the page table the map names, `nx_mem_l1`; a frame's saved registers on the
   stack and the objects they point to answer what a stuck loop is looping on).
   `NX_HOLD_ON_STOP=1` keeps the process alive after a stop, so that its memory can still be read.
+  `pwsh -File tools/game_window.ps1 -ProcessId <pid> [-Capture <png>] [-Keys "F13:200,..."]` takes a
+  picture of the program's own window (never of the screen) and posts keys to its message queue;
+  run the program with an `NX_KEYMAP` that binds F13 and up so that nobody's typing disturbs it.
   `NX_CENSUS=<file>` counts the floating-point and SIMD instruction words that reach the runtime
   (`nx_vec`, `nx_vecmem`), the words the lifter left to the interpreter and the addresses the slow
   path interprets, and rewrites the file every ten seconds, most frequent first, with the decoded
