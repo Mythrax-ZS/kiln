@@ -242,9 +242,11 @@ impl Frame {
                     cmds.push(self.cmd);
                 }
                 let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+                let _phase = nx_gpu::progress::enter(nx_gpu::progress::SUBMITTING);
                 vk.device
                     .queue_submit(vk.queue, &submit, self.fence)
                     .map_err(|e| format!("submitting the commands: {e}"))?;
+                let _phase = nx_gpu::progress::enter(nx_gpu::progress::WAITING_FOR_DEVICE);
                 vk.device
                     .wait_for_fences(&[self.fence], true, 120_000_000_000)
                     .map_err(|e| format!("waiting for the commands: {e}"))?;

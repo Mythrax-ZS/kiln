@@ -32,11 +32,48 @@ pub struct Program {
     pub rewrites: u64,
 }
 
-/// FNV-1a over bytes: enough to notice that code under an address changed.
+/// A fast hash of bytes: enough to notice that code or texels under an address changed, and
+/// nothing more. Four lanes over 8-byte words, so that memory is the limit and not the chain of
+/// multiplications.
 pub fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for b in bytes {
-        h = (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
+    // SAFETY: the pointer and the length are those of a slice.
+    unsafe { hash_raw(bytes.as_ptr(), bytes.len()) }
+}
+
+/// [`hash_bytes`] of `len` bytes at `ptr`.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads of `len` bytes. Another thread writing the bytes meanwhile makes
+/// the hash wrong (it is a hash of what was there at some time), and nothing worse.
+pub unsafe fn hash_raw(ptr: *const u8, len: usize) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut lane = [
+        0x243F_6A88_85A3_08D3u64,
+        0x1319_8A2E_0370_7344,
+        0xA409_3822_299F_31D0,
+        0x082E_FA98_EC4E_6C89,
+    ];
+    let mut at = 0;
+    while at + 32 <= len {
+        for (k, l) in lane.iter_mut().enumerate() {
+            // SAFETY: `at + 32 <= len`, so the word is inside the bytes.
+            let word = unsafe { (ptr.add(at + 8 * k) as *const u64).read_unaligned() };
+            *l = (*l ^ word).wrapping_mul(K);
+            *l ^= *l >> 29;
+        }
+        at += 32;
+    }
+    let mut h = len as u64;
+    for l in lane {
+        h = (h ^ l).wrapping_mul(K);
+        h ^= h >> 32;
+    }
+    while at < len {
+        // SAFETY: `at < len`.
+        let byte = unsafe { *ptr.add(at) };
+        h = (h ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        at += 1;
     }
     h
 }
@@ -128,8 +165,8 @@ impl Inventory {
     fn observe_program(&mut self, cx: &Cx<'_>, s: &StageSlot) {
         if let Some(p) = self.programs.get_mut(&s.address) {
             // The same address: unchanged when the bytes it was made of still hash the same.
-            let mut now = vec![0u8; p.size];
-            let same = cx.space.read(cx.mem, s.address, &mut now) && hash_bytes(&now) == p.hash;
+            let (hash, mapped) = cx.space.hash(cx.mem, s.address, p.size as u64);
+            let same = mapped == p.size as u64 && hash == p.hash;
             if same && p.kind == s.kind {
                 p.uses += 1;
                 return;
@@ -163,7 +200,9 @@ impl Inventory {
                 .or_default() += 1;
             return None;
         }
-        let program = analyze(s.kind, s.address, &bytes);
+        let mut program = analyze(s.kind, s.address, &bytes);
+        // Hashed the way the draws compare it with memory.
+        program.hash = cx.space.hash(cx.mem, s.address, program.size as u64).0;
         if let Some(dir) = std::env::var_os("NX_SHADER_DUMP") {
             // For looking at programs by hand: the program and, when it has problems, the window
             // that was read. The directory is the user's; nothing is stored in the repository.

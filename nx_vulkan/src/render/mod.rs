@@ -104,6 +104,11 @@ struct Core {
     pass_target: Option<(u64, u32, u32)>,
     /// Where the draws spent their time since the last report.
     phases: Phases,
+    /// Draws wait for the device (`NX_DEBUG_SYNC_DRAWS`).
+    sync_on: bool,
+    /// The textures that made targets be written back since the last report: the address of the
+    /// texture, how often, and how many targets the last time.
+    write_back_causes: std::collections::HashMap<u64, (u64, usize, String)>,
     /// The window frames are shown in, when there is one.
     #[cfg(feature = "window")]
     display: Option<display::Display>,
@@ -124,6 +129,12 @@ struct Phases {
     descriptors: std::time::Duration,
     /// The pipeline.
     pipeline: std::time::Duration,
+    /// Inside the textures: the handles and headers, finding out whether the texture is a
+    /// render target, writing targets back, and making or finding the image and sampler.
+    texture_headers: std::time::Duration,
+    texture_target: std::time::Duration,
+    texture_write_back: std::time::Duration,
+    texture_bind: std::time::Duration,
     /// The dynamic state and the draw command.
     record: std::time::Duration,
 }
@@ -234,6 +245,8 @@ impl Renderer {
                     seen_targets: std::collections::HashSet::new(),
                     pass_target: None,
                     phases: Phases::default(),
+                    sync_on: false,
+                    write_back_causes: std::collections::HashMap::new(),
                     #[cfg(feature = "window")]
                     display,
                 })
@@ -682,10 +695,23 @@ impl Renderer {
     fn draw_command(&mut self, scene: &Scene<'_>, draw: &Draw) -> Result<(), String> {
         let core = self.core()?;
         let mut result = core.draw(scene, draw);
-        if core.debug.sync_draws && result.is_ok() {
+        if core.sync_on && result.is_ok() {
             if let Err(e) = core.flush() {
                 // What was submitted up to this draw failed, and this was the last to join it.
                 eprintln!("[vulkan] the commands up to this draw failed: {e}");
+                let stages: Vec<String> = scene
+                    .regs
+                    .stages()
+                    .iter()
+                    .map(|s| format!("{} {:#x}", s.kind.name(), s.address))
+                    .collect();
+                eprintln!(
+                    "[vulkan]     draw {:?} topology {} instance {}; programs {}",
+                    draw.source,
+                    draw.topology,
+                    draw.instance,
+                    stages.join(", ")
+                );
                 for line in describe_draw(scene, draw) {
                     eprintln!("[vulkan]     {line}");
                 }
@@ -755,6 +781,7 @@ impl Renderer {
 
     /// Show a displayed buffer, and every 100th say where the time of the last 100 went.
     fn present_command(&mut self, p: &Present) -> Result<(), String> {
+        let _phase = nx_gpu::progress::enter(nx_gpu::progress::PRESENTING);
         let entered = std::time::Instant::now();
         let result = self.present_frame(p);
         self.frame_draws = 0;
@@ -768,7 +795,8 @@ impl Renderer {
                 eprintln!(
                     "[vulkan] frame {}: the draws spent {:?} on programs, {:?} on textures, {:?} \
                      on the pass, {:?} on vertices, {:?} on descriptors, {:?} on the pipeline, \
-                     {:?} on recording",
+                     {:?} on recording; of the textures, {:?} on headers, {:?} on whether a texture \
+                     is a target, {:?} on writing targets back, {:?} on images and samplers",
                     p.frame,
                     ph.programs,
                     ph.textures,
@@ -776,8 +804,31 @@ impl Renderer {
                     ph.vertices,
                     ph.descriptors,
                     ph.pipeline,
-                    ph.record
+                    ph.record,
+                    ph.texture_headers,
+                    ph.texture_target,
+                    ph.texture_write_back,
+                    ph.texture_bind
                 );
+                let wb = std::mem::take(&mut core.targets.write_backs);
+                let mut causes: Vec<(u64, (u64, usize, String))> =
+                    std::mem::take(&mut core.write_back_causes)
+                        .into_iter()
+                        .collect();
+                causes.sort_by_key(|(_, (n, _, _))| std::cmp::Reverse(*n));
+                if wb.runs > 0 {
+                    eprintln!(
+                        "[vulkan] frame {}: targets were written back to memory {} times ({} \
+                         targets, {} bytes): {:?} running the commands and reading the targets \
+                         out, {:?} laying the pixels out and writing them",
+                        p.frame, wb.runs, wb.targets, wb.bytes, wb.device, wb.memory
+                    );
+                    for (address, (times, targets, what)) in causes.iter().take(6) {
+                        eprintln!(
+                            "[vulkan]   the texture at GPU address {address:#x}: {times} times, \n                             {targets} targets at the last; {what}"
+                        );
+                    }
+                }
                 let s = std::mem::take(&mut self.spent);
                 let renderer =
                     s.draw.time + s.clear.time + s.finish.time + s.present.time + s.dispatch.time;
@@ -810,8 +861,12 @@ impl Renderer {
         if busy {
             self.busy_dumped = true;
         }
+        let draws = self.frame_draws;
         let core = self.core()?;
         core.flush()?;
+        if core.debug.sync_draws.is_some_and(|n| draws >= n.max(1)) {
+            core.sync_on = true;
+        }
         // A displayed buffer ends a frame: textures are compared with memory again in the next.
         core.textures.frame += 1;
         if busy && core.debug.trace_after_busy {

@@ -148,10 +148,42 @@ impl Target {
 #[derive(Default)]
 pub struct Targets {
     map: HashMap<Key, Target>,
+    /// The target at each guest address (one at a time: a new shape retires the old one), so that
+    /// a texture's memory finds its targets without looking at all of them.
+    by_address: std::collections::BTreeMap<u64, Key>,
+    /// The most memory any target stands for: no target that overlaps an address starts further
+    /// below it than this.
+    largest: u64,
     /// How many submissions have run, to age targets by.
     pub submissions: u64,
     /// Counts the draws to targets, for [`Target::serial`].
     next_serial: u64,
+    /// What writing targets back to memory cost since the last report.
+    pub write_backs: WriteBacks,
+}
+
+/// A color target that overlaps some memory.
+#[derive(Clone, Copy, Debug)]
+pub struct Covering {
+    pub key: Key,
+    /// How many times targets were drawn to when this one last was.
+    pub serial: u64,
+    /// Drawn to since its pixels were last put into the memory.
+    pub dirty: bool,
+}
+
+/// The cost of writing targets back to memory (docs/ASSUMPTIONS.md A-111), for the report that
+/// `NX_TRACE_GPU` makes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WriteBacks {
+    /// Times targets were written back, and how many targets and bytes that was.
+    pub runs: u64,
+    pub targets: u64,
+    pub bytes: u64,
+    /// Running what had been recorded and the copies out of the device, waited for.
+    pub device: std::time::Duration,
+    /// Putting the pixels in the layout of the memory and writing them.
+    pub memory: std::time::Duration,
 }
 
 impl Targets {
@@ -171,6 +203,7 @@ impl Targets {
                 if let Some(t) = self.map.remove(&k) {
                     frame.garbage.push(Garbage::Image(t.image));
                 }
+                self.by_address.remove(&k.address);
             }
             let depth = aspect_of(key.format) != vk::ImageAspectFlags::COLOR;
             let usage = if depth {
@@ -211,6 +244,8 @@ impl Targets {
                 }
             }
             self.map.insert(key, target);
+            self.by_address.insert(key.address, key);
+            self.largest = self.largest.max(key.memory_bytes().unwrap_or(0));
         }
         let submissions = self.submissions;
         self.next_serial += 1;
@@ -224,40 +259,38 @@ impl Targets {
 
     /// The color target standing for the guest memory at `address`, if one was drawn to.
     pub fn at_address(&mut self, address: u64) -> Option<&mut Target> {
-        self.map
-            .values_mut()
-            .filter(|t| {
-                t.key.address == address && aspect_of(t.key.format) == vk::ImageAspectFlags::COLOR
-            })
-            .max_by_key(|t| t.touched)
+        let key = self.by_address.get(&address)?;
+        let t = self.map.get_mut(key)?;
+        (aspect_of(t.key.format) == vk::ImageAspectFlags::COLOR).then_some(t)
     }
 
     /// The depth target standing for the guest memory at `address`, if one was drawn to.
     pub fn depth_at_address(&mut self, address: u64) -> Option<&mut Target> {
-        self.map
-            .values_mut()
-            .filter(|t| {
-                t.key.address == address && aspect_of(t.key.format) != vk::ImageAspectFlags::COLOR
-            })
-            .max_by_key(|t| t.touched)
+        let key = self.by_address.get(&address)?;
+        let t = self.map.get_mut(key)?;
+        (aspect_of(t.key.format) != vk::ImageAspectFlags::COLOR).then_some(t)
     }
 
-    /// The keys of the color targets drawn to since their pixels were last put into memory whose
-    /// bytes overlap `[start, end)` (addresses in the guest process).
-    pub fn dirty_in(&self, start: u64, end: u64) -> Vec<Key> {
-        let mut found: Vec<(u64, Key)> = self
-            .map
-            .values()
-            .filter(|t| t.dirty && aspect_of(t.key.format) == vk::ImageAspectFlags::COLOR)
+    /// The color targets whose memory overlaps `[start, end)` (addresses in the guest process),
+    /// in the order they were drawn to.
+    pub fn covering(&self, start: u64, end: u64) -> Vec<Covering> {
+        let from = start.saturating_sub(self.largest);
+        let mut found: Vec<Covering> = self
+            .by_address
+            .range(from..end)
+            .filter_map(|(_, key)| self.map.get(key))
+            .filter(|t| aspect_of(t.key.format) == vk::ImageAspectFlags::COLOR)
             .filter_map(|t| {
                 let bytes = t.key.memory_bytes()?;
-                (t.key.address < end && t.key.address + bytes > start).then_some((t.serial, t.key))
+                (t.key.address < end && t.key.address + bytes > start).then_some(Covering {
+                    key: t.key,
+                    serial: t.serial,
+                    dirty: t.dirty,
+                })
             })
             .collect();
-        // Written in the order they were drawn to: where two stand for the same memory (the title
-        // reuses memory for targets of different shapes), the later one is what stays.
-        found.sort_by_key(|(serial, _)| *serial);
-        found.into_iter().map(|(_, key)| key).collect()
+        found.sort_by_key(|c| c.serial);
+        found
     }
 
     /// Put the pixels of the color targets `keys` into the memory they stand for, in the layout
@@ -320,7 +353,12 @@ impl Targets {
                 &[],
             );
         }
+        let began = std::time::Instant::now();
         let submitted = frame.submit(vk);
+        let waited = began.elapsed();
+        let began = std::time::Instant::now();
+        self.write_backs.runs += 1;
+        self.write_backs.targets += staged.len() as u64;
         for (key, staging) in staged {
             if submitted.is_ok() {
                 let bpp = pixel_bytes(key.format).unwrap_or(4);
@@ -344,6 +382,7 @@ impl Targets {
                         tiled
                     }
                 };
+                self.write_backs.bytes += tiled.len() as u64;
                 mem.write(key.address, &tiled);
                 if let Some(t) = self.map.get_mut(&key) {
                     t.dirty = false;
@@ -351,6 +390,8 @@ impl Targets {
             }
             vk.destroy_host_buffer(staging);
         }
+        self.write_backs.device += waited;
+        self.write_backs.memory += began.elapsed();
         submitted
     }
 
@@ -556,6 +597,7 @@ pub fn crop_rgba(rgba: &[u8], width: u32, height: u32, crop: [i32; 4]) -> (Vec<u
 /// The depth of every pixel of a `D32_SFLOAT` depth target, as of the commands recorded so far
 /// (they are run first), for looking at what a pass left in it.
 pub fn read_depth(vk: &Vk, frame: &mut Frame, target: &mut Target) -> Result<Vec<f32>, String> {
+    let _phase = nx_gpu::progress::enter(nx_gpu::progress::READING_BACK);
     let key = target.key;
     if key.format != vk::Format::D32_SFLOAT {
         return Err(format!(
@@ -618,6 +660,7 @@ pub fn read_depth(vk: &Vk, frame: &mut Frame, target: &mut Target) -> Result<Vec
 /// Read a color target back as RGBA bytes: its contents as of the commands recorded so far (they
 /// are run first).
 pub fn read_rgba(vk: &Vk, frame: &mut Frame, target: &mut Target) -> Result<Vec<u8>, String> {
+    let _phase = nx_gpu::progress::enter(nx_gpu::progress::READING_BACK);
     let key = target.key;
     let Some(bpp) = pixel_bytes(key.format) else {
         return Err(format!("a picture cannot be made of {:?}", key.format));

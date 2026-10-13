@@ -3,7 +3,7 @@
 use super::convert;
 use super::convert::Topology;
 use super::shaders::{bindings_of, Program, Variation};
-use super::textures::{texture_format, Tic, Tsc};
+use super::textures::{texture_format, Copy, Overlay, Tic, Tsc};
 use super::Core;
 use ash::vk;
 use nx_gpu::draw_state::{Blend, DepthStencil, Raster, StencilFace};
@@ -439,8 +439,9 @@ impl Core {
         tic: &Tic,
         used: &TextureUse,
     ) -> Result<Option<vk::ImageView>, String> {
-        // Only a plain 2D texture is a target's picture (the others have more to them).
-        if used.dim != Dim::D2 || used.arrayed || !matches!(tic.texture_type(), 1 | 7) {
+        // Only a plain 2D texture is a target's picture (the others have more to them); that is
+        // a 2D header, and the first layer of an array or a cube header (as `shape_of` has it).
+        if used.dim != Dim::D2 || used.arrayed || !matches!(tic.texture_type(), 1 | 3 | 5 | 7) {
             return Ok(None);
         }
         let Some((cpu, _)) = scene.host_address(tic.address()) else {
@@ -524,6 +525,7 @@ impl Core {
                     pools.header_count, pools.sampler_count
                 ));
             }
+            let mut mark = Instant::now();
             let tic_bytes =
                 self.read_gpu(scene, pools.header_address + 32 * u64::from(tic_id), 32)?;
             let tsc_bytes =
@@ -538,23 +540,37 @@ impl Core {
                     used.index, tic.0, tsc.0
                 );
             }
-            let bound = match self.render_target_view(scene, &tic, used)? {
-                Some(view) => self.textures.bind_view(&self.vk, &tic, tsc, used, view),
-                None => {
-                    // What the title drew into memory this texture reads has to be there.
-                    self.write_back_targets(scene, &tic, used)?;
-                    self.textures
-                        .bind(&self.vk, &mut self.frame, scene, tic, tsc, used)
-                }
-            }
-            .map_err(|e| {
+            lap(&mut mark, &mut self.phases.texture_headers);
+            let target_view = self.render_target_view(scene, &tic, used)?;
+            lap(&mut mark, &mut self.phases.texture_target);
+            let decorate = |e: String| {
                 format!(
                     "{e} [texture {}: handle {handle:#x} from {from}, header {tic_id} at {:#x}, sampler {tsc_id} at {:#x}]",
                     used.index,
                     pools.header_address + 32 * u64::from(tic_id),
                     pools.sampler_address + 32 * u64::from(tsc_id)
                 )
-            })?;
+            };
+            let bound = match target_view {
+                Some(view) => self
+                    .textures
+                    .bind_view(&self.vk, &tic, tsc, used, view)
+                    .map_err(decorate)?,
+                None => {
+                    // The render targets that stand for parts of this texture: the ones that are
+                    // exactly a layer and a level of it are copied into its image on the device,
+                    // the others that were drawn to are written into the memory it is read from.
+                    let overlays = self.sync_targets(scene, &tic, used)?;
+                    lap(&mut mark, &mut self.phases.texture_write_back);
+                    let (bound, copies) = self
+                        .textures
+                        .bind(&self.vk, &mut self.frame, scene, tic, tsc, used, &overlays)
+                        .map_err(decorate)?;
+                    self.record_copies(&copies)?;
+                    lap(&mut mark, &mut self.phases.texture_bind);
+                    bound
+                }
+            };
             out.push((
                 base + 24 + used.slot,
                 vk::DescriptorImageInfo::default()
@@ -566,24 +582,58 @@ impl Core {
         Ok(out)
     }
 
-    /// Render targets drawn to that stand for memory the texture `tic` reads are written to that
-    /// memory first (the title draws into the faces of a cube map and the levels of a mip chain
-    /// and then reads them as one texture).
-    fn write_back_targets(
+    /// The render targets that stand for parts of the memory the texture `tic` reads. Those that
+    /// are exactly a layer and a level of it are returned, for the texture's image to be brought
+    /// up to date with by copying them on the device (docs/ASSUMPTIONS.md A-113); the others
+    /// that were drawn to are written to that memory first (A-111): the title draws into the
+    /// faces of a cube map and the levels of a mip chain and then reads them as one texture.
+    fn sync_targets(
         &mut self,
         scene: &Scene<'_>,
         tic: &Tic,
         used: &TextureUse,
-    ) -> Result<(), String> {
-        let Some(bytes) = super::textures::memory_bytes(tic, used) else {
-            return Ok(());
+    ) -> Result<Vec<Overlay>, String> {
+        let Some(bytes) = self.textures.span(tic, used) else {
+            return Ok(Vec::new());
         };
         let Some((cpu, _)) = scene.host_address(tic.address()) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
-        let keys = self.targets.dirty_in(cpu, cpu + bytes);
+        let covering = self.targets.covering(cpu, cpu + bytes);
+        if covering.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut overlays = Vec::new();
+        let mut keys = Vec::new();
+        for c in covering {
+            match super::textures::overlay_of(tic, used, cpu, &c.key, c.serial) {
+                Some(overlay) => overlays.push(overlay),
+                None if c.dirty => keys.push(c.key),
+                None => {}
+            }
+        }
         if keys.is_empty() {
-            return Ok(());
+            return Ok(overlays);
+        }
+        let _phase = nx_gpu::progress::enter(nx_gpu::progress::WRITING_BACK);
+        let cause = self.write_back_causes.entry(tic.address()).or_default();
+        cause.0 += 1;
+        cause.1 = keys.len();
+        if cause.2.is_empty() {
+            cause.2 = format!(
+                "the header says {}x{}, type {}, {} levels, components {:#x}, array {}; the first target is {}x{} with format {:?}, {} layers, tiling {:?}",
+                tic.width(),
+                tic.height(),
+                tic.texture_type(),
+                tic.levels(),
+                tic.components(),
+                used.arrayed,
+                keys[0].width,
+                keys[0].height,
+                keys[0].format,
+                keys[0].layers,
+                keys[0].tiling
+            );
         }
         // The rendering in progress ends, and what was recorded runs, so that the pixels are
         // the ones drawn so far.
@@ -597,6 +647,112 @@ impl Core {
                 keys.len(),
                 tic.address()
             );
+        }
+        Ok(overlays)
+    }
+
+    /// Record the copies of render targets into layers and levels of texture images.
+    fn record_copies(&mut self, copies: &[Copy]) -> Result<(), String> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        // The rendering in progress ends: neither a copy nor a layout change can be in one.
+        self.end_pass();
+        let cmd = self.frame.cmd(&self.vk)?;
+        let range = |c: &Copy| vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: c.levels,
+            base_array_layer: 0,
+            layer_count: c.layers,
+        };
+        let barrier = |c: &Copy, old, new, from, to| {
+            vk::ImageMemoryBarrier::default()
+                .old_layout(old)
+                .new_layout(new)
+                .src_access_mask(from)
+                .dst_access_mask(to)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(c.image)
+                .subresource_range(range(c))
+        };
+        for c in copies {
+            let Some(target) = self.targets.existing(&c.overlay.key) else {
+                continue;
+            };
+            target.transition(&self.vk, cmd, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            let source = target.image.image;
+            let o = c.overlay;
+            let region = [vk::ImageCopy::default()
+                .src_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .dst_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: o.level,
+                    base_array_layer: o.layer,
+                    layer_count: 1,
+                })
+                .dst_offset(vk::Offset3D {
+                    x: 0,
+                    y: o.y as i32,
+                    z: 0,
+                })
+                .extent(vk::Extent3D {
+                    width: o.width,
+                    height: o.height,
+                    depth: 1,
+                })];
+            let to_dst = [barrier(
+                c,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::SHADER_READ,
+                vk::AccessFlags::TRANSFER_WRITE,
+            )];
+            let to_read = [barrier(
+                c,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+            )];
+            // SAFETY: the command buffer is recording outside a rendering; the images are valid
+            // (the target stays in the map and the texture in its cache until the submission
+            // ends) and in the layouts the barriers and the copy say.
+            unsafe {
+                let d = &self.vk.device;
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_dst,
+                );
+                d.cmd_copy_image(
+                    cmd,
+                    source,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    c.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &region,
+                );
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_read,
+                );
+            }
         }
         Ok(())
     }

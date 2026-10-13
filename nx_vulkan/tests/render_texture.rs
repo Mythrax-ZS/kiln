@@ -4,6 +4,7 @@
 mod render_common;
 
 use nx_gpu::render::{Backend, Clear, Draw, Present, Source};
+use nx_gpu::GuestMemory;
 use nx_shader::asm::{exit, Enc};
 use nx_shader::inst::Guard;
 use nx_shader::ops::Op;
@@ -480,4 +481,53 @@ fn a_render_target_that_a_texture_reads_through_memory_is_written_to_it_first() 
     for px in rgba.as_chunks::<4>().0 {
         assert_eq!(px, &[0, 0, 255, 255]);
     }
+}
+
+#[test]
+fn a_render_target_that_is_a_part_of_a_texture_is_copied_into_it_on_the_device() {
+    if vulkan().is_none() {
+        return;
+    }
+    let source = GPU_BASE + 0x50_0000;
+    let target = GPU_BASE + 0x20_0000;
+    // The texture is 8 by 8 texels. The target at its address is 16 by 8: not the texture's
+    // picture (the sizes differ), but its rows lie where the texture's do (one 64-byte column of
+    // a GOB each, one GOB high), so its left half is the texture, copied on the device.
+    let mut w = textured(8, target, header(0x08, 2, 8, 8, source), nearest_sampler());
+    let mut r = Renderer::new(RenderConfig::default());
+    w.color_target_blocks(0, source, 16, 8, 0xD5, 0);
+    clear_to(&mut r, &mut w, [0.0, 1.0, 0.0, 1.0], None);
+    clear_to(&mut r, &mut w, [1.0, 0.0, 0.0, 1.0], Some((0, 8, 0, 8)));
+    w.color_target(0, target, 8, 8, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let (rgba, width, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    let all = |rgba: &[u8], px: [u8; 4], what: &str| {
+        for y in 0..8usize {
+            for x in 0..8usize {
+                assert_eq!(
+                    &rgba[(y * width as usize + x) * 4..][..4],
+                    px,
+                    "{what} ({x}, {y})"
+                );
+            }
+        }
+    };
+    all(&rgba, [255, 0, 0, 255], "the left half of the target");
+    // Nothing was written to the memory: the pixels stayed on the device.
+    let mut memory = vec![0u8; 512];
+    assert!(w.mem.read(w.cpu(source), &mut memory));
+    assert!(memory.iter().all(|b| *b == 0), "no write-back");
+    // Drawn to again, it is copied again; and a draw with the target unchanged does not copy.
+    w.color_target_blocks(0, source, 16, 8, 0xD5, 0);
+    clear_to(&mut r, &mut w, [0.0, 0.0, 1.0, 1.0], None);
+    w.color_target(0, target, 8, 8, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    all(
+        &rgba,
+        [0, 0, 255, 255],
+        "after the target was drawn to again",
+    );
+    assert!(w.mem.read(w.cpu(source), &mut memory));
+    assert!(memory.iter().all(|b| *b == 0), "still no write-back");
 }

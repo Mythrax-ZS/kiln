@@ -4,7 +4,6 @@
 use crate::device::Vk;
 use ash::vk;
 use nx_gpu::render::Scene;
-use nx_gpu::shaders::hash_bytes;
 use nx_gpu::state::{StageKind, StageSlot};
 use nx_shader::cfg::{Cfg, Code};
 use nx_shader::sph::{Sph, SPH_BYTES};
@@ -132,8 +131,8 @@ impl Shaders {
         let name = slot.kind.name();
         // The same address: unchanged if the bytes still hash the same.
         if let Some(e) = self.entries.get(&slot.address) {
-            let mut now = vec![0u8; e.size];
-            if !(scene.read(slot.address, &mut now) && hash_bytes(&now) == e.hash) {
+            let (hash, mapped) = scene.hash(slot.address, e.size as u64);
+            if !(mapped == e.size as u64 && hash == e.hash) {
                 self.entries.remove(&slot.address);
             }
         }
@@ -169,7 +168,7 @@ impl Shaders {
                 }
                 v.insert(Entry {
                     size,
-                    hash: hash_bytes(&bytes[..size]),
+                    hash: scene.hash(slot.address, size as u64).0,
                     sph,
                     code,
                     variations: HashMap::new(),
@@ -180,6 +179,7 @@ impl Shaders {
             return Ok(Arc::clone(p));
         }
         let config = variation.config();
+        let _phase = nx_gpu::progress::enter(nx_gpu::progress::TRANSLATING);
         let translation = translate(Code(&entry.code), Some(&entry.sph), &config)
             .map_err(|e| format!("the {name} program at {:#x}: {e}", slot.address))?;
         if self.spirv_check {
@@ -219,8 +219,8 @@ impl Shaders {
     ) -> Result<Arc<Program>, String> {
         // The same program: unchanged if the bytes still hash the same.
         if let Some(e) = self.kernels.get(&(address, block)) {
-            let mut now = vec![0u8; e.size];
-            if scene.read(address, &mut now) && hash_bytes(&now) == e.hash {
+            let (hash, mapped) = scene.hash(address, e.size as u64);
+            if mapped == e.size as u64 && hash == e.hash {
                 return Ok(Arc::clone(&e.program));
             }
             self.kernels.remove(&(address, block));
@@ -235,6 +235,7 @@ impl Shaders {
         let size = cfg.extent as usize;
         let mut config = Config::new(Stage::Kernel);
         config.block = block;
+        let _phase = nx_gpu::progress::enter(nx_gpu::progress::TRANSLATING);
         let translation = translate(Code(&bytes[..size]), None, &config)
             .map_err(|e| format!("the compute program at {address:#x}: {e}"))?;
         if self.spirv_check {
@@ -263,7 +264,7 @@ impl Shaders {
             (address, block),
             KernelEntry {
                 size,
-                hash: hash_bytes(&bytes[..size]),
+                hash: scene.hash(address, size as u64).0,
                 program: Arc::clone(&program),
             },
         );

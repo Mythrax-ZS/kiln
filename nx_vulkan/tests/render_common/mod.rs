@@ -150,13 +150,27 @@ impl World {
 
     /// Bind color target `j` as the only output: an address, a size and a format.
     pub fn color_target(&mut self, j: u32, va: u64, width: u32, height: u32, format: u32) {
+        // Block linear, a block of 16 GOBs; it does not matter to the renderer unless the memory
+        // is read as a texture.
+        self.color_target_blocks(j, va, width, height, format, 4);
+    }
+
+    /// As [`World::color_target`] with a block of `1 << block_log2` GOBs.
+    pub fn color_target_blocks(
+        &mut self,
+        j: u32,
+        va: u64,
+        width: u32,
+        height: u32,
+        format: u32,
+        block_log2: u32,
+    ) {
         let b = 0x800 + j * 64;
         self.set_address(b, va);
         self.set(b + 8, width);
         self.set(b + 0xC, height);
         self.set(b + 0x10, format);
-        // Block linear, a block of 16 GOBs; it does not matter to the renderer.
-        self.set(b + 0x14, 4 << 4);
+        self.set(b + 0x14, block_log2 << 4);
         self.set(b + 0x18, 1);
         self.set(0x121c, 1 | j << 4);
     }

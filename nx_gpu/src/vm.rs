@@ -411,6 +411,43 @@ impl AddressSpace {
         (off < m.len).then(|| (m.cpu + off, m.len - off))
     }
 
+    /// A hash of up to `len` bytes of GPU memory at `va` as they are now, and how many of them
+    /// are mapped (the hash covers those). The bytes are not copied when memory can be reached
+    /// by address: a texture or a program is compared with what it was made of every frame, which
+    /// would otherwise copy megabytes. The same memory hashes the same as long as the mappings
+    /// under it stay as they are, which is all a comparison with an earlier call needs.
+    pub fn hash(&self, mem: &dyn GuestMemory, mut va: u64, len: u64) -> (u64, u64) {
+        const K: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut h = K;
+        let mut done = 0u64;
+        while done < len {
+            let Some((cpu, avail)) = self.translate(va) else {
+                break;
+            };
+            let wanted = (len - done).min(avail);
+            let (part, n) = match mem.host_run(cpu, wanted) {
+                // SAFETY: `host_run` gives a pointer valid for the run it names, for as long as
+                // the process runs.
+                Some((ptr, run)) if run > 0 => unsafe {
+                    let run = run.min(wanted);
+                    (crate::shaders::hash_raw(ptr, run as usize), run)
+                },
+                _ => {
+                    let mut copy = vec![0u8; wanted as usize];
+                    if !mem.read(cpu, &mut copy) {
+                        break;
+                    }
+                    (crate::shaders::hash_bytes(&copy), wanted)
+                }
+            };
+            h = (h ^ part).wrapping_mul(K);
+            h ^= h >> 32;
+            done += n;
+            va += n;
+        }
+        (h ^ done, done)
+    }
+
     /// Read GPU memory, across mappings that touch. `false` when any byte is unmapped.
     pub fn read(&self, mem: &dyn GuestMemory, mut va: u64, out: &mut [u8]) -> bool {
         let mut done = 0;
@@ -740,5 +777,150 @@ mod tests {
             !a.read(&mem, 0x500_1FFC, &mut past),
             "runs off the second mapping"
         );
+    }
+
+    /// Memory that can be reached by address, as the guest's is: one block at `base`.
+    struct Direct {
+        base: u64,
+        data: std::sync::Mutex<Box<[u8]>>,
+        ptr: *mut u8,
+    }
+
+    // SAFETY: the pointer is into the boxed bytes, which live as long as the value; the tests
+    // touch the bytes from one thread at a time.
+    unsafe impl Send for Direct {}
+    unsafe impl Sync for Direct {}
+
+    impl Direct {
+        fn new(base: u64, size: usize) -> Direct {
+            let mut data = vec![0u8; size].into_boxed_slice();
+            let ptr = data.as_mut_ptr();
+            Direct {
+                base,
+                data: std::sync::Mutex::new(data),
+                ptr,
+            }
+        }
+    }
+
+    impl GuestMemory for Direct {
+        fn read(&self, addr: u64, out: &mut [u8]) -> bool {
+            let data = self.data.lock().unwrap();
+            let Some(off) = addr.checked_sub(self.base).map(|o| o as usize) else {
+                return false;
+            };
+            match data.get(off..off + out.len()) {
+                Some(src) => {
+                    out.copy_from_slice(src);
+                    true
+                }
+                None => false,
+            }
+        }
+
+        fn write(&self, addr: u64, src: &[u8]) -> bool {
+            let mut data = self.data.lock().unwrap();
+            let Some(off) = addr.checked_sub(self.base).map(|o| o as usize) else {
+                return false;
+            };
+            match data.get_mut(off..off + src.len()) {
+                Some(dst) => {
+                    dst.copy_from_slice(src);
+                    true
+                }
+                None => false,
+            }
+        }
+
+        fn host_run(&self, addr: u64, max: u64) -> Option<(*mut u8, u64)> {
+            let size = self.data.lock().unwrap().len() as u64;
+            let off = addr.checked_sub(self.base)?;
+            (off < size).then(|| {
+                // SAFETY: `off` is inside the block.
+                (unsafe { self.ptr.add(off as usize) }, max.min(size - off))
+            })
+        }
+    }
+
+    fn space_over(cpu: u64, size: u64, va: u64) -> AddressSpace {
+        let mut a = AddressSpace::new();
+        let mut r = req(1, cpu, size);
+        r.flags = map_flags::FIXED_OFFSET;
+        r.offset = va;
+        a.map_buffer(&r).unwrap();
+        a
+    }
+
+    #[test]
+    fn a_hash_of_memory_notices_a_change_anywhere_by_either_route() {
+        let by_address = Direct::new(0x1000_0000, 0x3000);
+        let by_copy = TestMemory::new();
+        by_copy.map(0x1000_0000, 0x3000);
+        let a = space_over(0x1000_0000, 0x3000, 0x500_0000);
+        let pattern: Vec<u8> = (0..0x3000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+        assert!(by_address.write(0x1000_0000, &pattern));
+        assert!(by_copy.write(0x1000_0000, &pattern));
+        let (h, n) = a.hash(&by_address, 0x500_0000, 0x3000);
+        assert_eq!(n, 0x3000);
+        assert_eq!(
+            a.hash(&by_copy, 0x500_0000, 0x3000),
+            (h, n),
+            "the route is not part of the hash"
+        );
+        assert_eq!(
+            a.hash(&by_address, 0x500_0000, 0x3000),
+            (h, n),
+            "and it is stable"
+        );
+        for at in [0u64, 1, 31, 32, 33, 0x1234, 0x2FDF, 0x2FFF] {
+            let old = pattern[at as usize];
+            assert!(by_address.write(0x1000_0000 + at, &[old ^ 0x10]));
+            assert_ne!(
+                a.hash(&by_address, 0x500_0000, 0x3000).0,
+                h,
+                "byte {at:#x} changed"
+            );
+            assert!(by_address.write(0x1000_0000 + at, &[old]));
+            assert_eq!(a.hash(&by_address, 0x500_0000, 0x3000).0, h, "and restored");
+        }
+    }
+
+    #[test]
+    fn a_hash_covers_what_is_mapped_and_says_how_much_that_is() {
+        let mem = Direct::new(0x1000_0000, 0x3000);
+        let a = space_over(0x1000_0000, 0x3000, 0x500_0000);
+        let (whole, n) = a.hash(&mem, 0x500_0000, 0x3000);
+        assert_eq!(n, 0x3000);
+        let (past, n) = a.hash(&mem, 0x500_0000, 0x4000);
+        assert_eq!(n, 0x3000, "the rest is not mapped");
+        assert_eq!(
+            past, whole,
+            "the hash is of what is mapped, not of the length asked for"
+        );
+        assert_eq!(
+            a.hash(&mem, 0x600_0000, 0x1000).1,
+            0,
+            "nothing is mapped there"
+        );
+        assert_eq!(a.hash(&mem, 0x500_0000, 0).1, 0);
+    }
+
+    #[test]
+    fn the_hash_of_bytes_depends_on_every_byte_and_on_the_length() {
+        let zeros = [0u8; 80];
+        let mut seen = std::collections::HashSet::new();
+        for len in 0..=80 {
+            assert!(
+                seen.insert(crate::shaders::hash_bytes(&zeros[..len])),
+                "{len} zeros hash like fewer"
+            );
+        }
+        let mut bytes = [0u8; 70];
+        let base = crate::shaders::hash_bytes(&bytes);
+        for at in 0..70 {
+            bytes[at] = 1;
+            assert_ne!(crate::shaders::hash_bytes(&bytes), base, "byte {at}");
+            bytes[at] = 0;
+        }
     }
 }

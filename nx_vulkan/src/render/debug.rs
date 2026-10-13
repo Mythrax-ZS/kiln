@@ -48,9 +48,10 @@ pub struct Debug {
     pub no_depth_test: bool,
     /// `NX_DEBUG_FLIP_FRONT`: the winding that makes a face a front face is the other one.
     pub flip_front: bool,
-    /// `NX_DEBUG_SYNC_DRAWS`: run the commands and wait for them after every draw, so that a draw
-    /// that loses the device (a program that never ends, a bad address) is named when it does.
-    pub sync_draws: bool,
+    /// `NX_DEBUG_SYNC_DRAWS=<n>`: from the first frame with `n` draws on (at once for 1 or no
+    /// number), run the commands and wait for them after every draw, so that a draw that loses the
+    /// device (a program that never ends, a bad address) is named when it does.
+    pub sync_draws: Option<u64>,
 }
 
 impl Debug {
@@ -77,7 +78,8 @@ impl Debug {
             equal_as_lequal: set("NX_DEBUG_EQUAL_AS_LEQUAL"),
             no_depth_test: set("NX_DEBUG_NO_DEPTH_TEST"),
             flip_front: set("NX_DEBUG_FLIP_FRONT"),
-            sync_draws: set("NX_DEBUG_SYNC_DRAWS"),
+            sync_draws: set("NX_DEBUG_SYNC_DRAWS")
+                .then(|| number("NX_DEBUG_SYNC_DRAWS").unwrap_or(1)),
         }
     }
 }

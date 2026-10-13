@@ -27,6 +27,12 @@ impl Scene<'_> {
         self.space.read(self.mem, va, out)
     }
 
+    /// A hash of up to `len` bytes of GPU memory at `va` as they are now, and how many of them
+    /// are mapped (see [`AddressSpace::hash`]).
+    pub fn hash(&self, va: u64, len: u64) -> (u64, u64) {
+        self.space.hash(self.mem, va, len)
+    }
+
     /// `len` bytes of GPU memory at `va`.
     pub fn read_vec(&self, va: u64, len: usize) -> Option<Vec<u8>> {
         let mut v = vec![0u8; len];

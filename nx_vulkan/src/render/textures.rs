@@ -7,12 +7,12 @@
 //! the whole 256-bit header.
 
 use super::frame::{Frame, Garbage};
+use super::targets::{Key, Tiling};
 use crate::blocklinear::{deswizzle, Geometry};
 use crate::device::Vk;
 use crate::image::{aspect_of, Image, ImageInfo};
 use ash::vk;
 use nx_gpu::render::Scene;
-use nx_gpu::shaders::hash_bytes;
 use nx_shader::translate::{Dim, TextureUse};
 use std::collections::HashMap;
 
@@ -514,6 +514,97 @@ pub fn mip_geometry(
     g
 }
 
+/// A render target that stands for one layer and level of a texture: where the title draws the
+/// levels of a mip chain or the faces of a cube map as separate targets and then samples them as
+/// one texture. The texture's image is brought up to date by copying the target's pixels into
+/// it on the device (docs/ASSUMPTIONS.md A-113), where the alternative is to put them into
+/// memory, which waits for the device and swizzles them (A-111).
+#[derive(Clone, Copy, Debug)]
+pub struct Overlay {
+    pub key: Key,
+    /// How many times targets were drawn to when this one last was (a copy is made again when it
+    /// changes).
+    pub serial: u64,
+    pub layer: u32,
+    pub level: u32,
+    /// The row of the level the target's first row is (a whole number of blocks down).
+    pub y: u32,
+    /// The texels of the level that the target covers: the target may be wider than the level (its
+    /// rows are padded) or taller, or a strip of it.
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A copy of a target into a layer and level of a texture's image, for the renderer to record.
+#[derive(Clone, Copy, Debug)]
+pub struct Copy {
+    pub image: vk::Image,
+    pub levels: u32,
+    pub layers: u32,
+    pub overlay: Overlay,
+}
+
+/// The layer and level of the texture `tic` (sampled as `used`, its memory starting at `base` in
+/// the guest process) that the render target `target` is, or a strip of: the same memory, laid
+/// out the same way (the same block height and the same number of GOB columns per row), in the
+/// same format, starting at the start of the level or a whole number of blocks down it. Then its
+/// texels and the texture's are the same bytes read the same way.
+pub fn overlay_of(
+    tic: &Tic,
+    used: &TextureUse,
+    base: u64,
+    target: &Key,
+    serial: u64,
+) -> Option<Overlay> {
+    let Tiling::Block(log2) = target.tiling else {
+        return None;
+    };
+    if !tic.is_block_linear() || target.layers != 1 {
+        return None;
+    }
+    let shape = shape_of(tic, used).ok()?;
+    if shape.kind == Kind::D3 {
+        return None;
+    }
+    let format = texture_format(tic.components(), tic.types()[0], tic.srgb())?;
+    if format.astc || format.block != (1, 1) || format.vk != target.format {
+        return None;
+    }
+    let plan = plan(tic, shape, format).ok()?;
+    let gobs = |width: u32, bytes: u32| (u64::from(width) * u64::from(bytes)).div_ceil(64);
+    for layer in 0..plan.layers {
+        let mut at = base + u64::from(layer) * plan.layer_stride;
+        for (level, g) in plan.level_geometry.iter().enumerate() {
+            let size = g.tiled_size();
+            if target.address >= at && target.address < at + size {
+                // A block is `1 << block_height_log2` GOBs of 8 rows, every GOB column of a row
+                // of blocks being 512 bytes of each GOB.
+                let columns = gobs(g.width, g.bytes_per_element);
+                let block_bytes = (columns * 512) << g.block_height_log2;
+                let offset = target.address - at;
+                let y = offset / block_bytes * (8u64 << g.block_height_log2);
+                let fits = offset.is_multiple_of(block_bytes)
+                    && g.block_height_log2 == log2
+                    && gobs(target.width, g.bytes_per_element) == columns
+                    && y < u64::from(g.height)
+                    && target.memory_bytes().is_some_and(|b| offset + b <= size);
+                let y = y as u32;
+                return fits.then(|| Overlay {
+                    key: *target,
+                    serial,
+                    layer,
+                    level: level as u32,
+                    y,
+                    width: target.width.min(g.width),
+                    height: target.height.min(g.height - y),
+                });
+            }
+            at += size;
+        }
+    }
+    None
+}
+
 /// A texture on the device.
 struct Texture {
     image: Image,
@@ -523,6 +614,11 @@ struct Texture {
     bytes: u64,
     /// The value of [`Textures::generation`] when it was compared with memory.
     generation: u64,
+    /// The render targets that stand for parts of the image, by how many times each was drawn to
+    /// when its pixels were last copied into it.
+    overlays: HashMap<Key, u64>,
+    levels: u32,
+    layers: u32,
 }
 
 /// How a shader sees a texture: the type of image view the descriptor needs.
@@ -660,13 +756,6 @@ fn plan(tic: &Tic, shape: Shape, format: TexFormat) -> Result<Plan, String> {
     })
 }
 
-/// How many bytes of memory the texture `tic` takes when a shader samples it as `used`.
-pub fn memory_bytes(tic: &Tic, used: &TextureUse) -> Option<u64> {
-    let shape = shape_of(tic, used).ok()?;
-    let format = texture_format(tic.components(), tic.types()[0], tic.srgb())?;
-    plan(tic, shape, format).ok().map(|p| p.total)
-}
-
 #[derive(Default)]
 pub struct Textures {
     map: HashMap<(Tic, Shape), Texture>,
@@ -679,6 +768,8 @@ pub struct Textures {
     /// Counts the times memory was written by the renderer itself (a render target put into it): a
     /// texture compared with memory before that is compared again.
     pub generation: u64,
+    /// How many bytes of memory a texture takes (see [`Textures::span`]), by header and shape.
+    spans: HashMap<(Tic, Shape), Option<u64>>,
 }
 
 /// Everything a draw needs of a texture.
@@ -688,6 +779,15 @@ pub struct Bound {
 }
 
 impl Textures {
+    /// How many bytes of memory the texture `tic` takes when a shader samples it as `used`.
+    pub fn span(&mut self, tic: &Tic, used: &TextureUse) -> Option<u64> {
+        let shape = shape_of(tic, used).ok()?;
+        *self.spans.entry((*tic, shape)).or_insert_with(|| {
+            let format = texture_format(tic.components(), tic.types()[0], tic.srgb())?;
+            plan(tic, shape, format).ok().map(|p| p.total)
+        })
+    }
+
     pub fn new(trace: bool) -> Textures {
         Textures {
             trace,
@@ -695,7 +795,10 @@ impl Textures {
         }
     }
 
-    /// The view and sampler for the headers `tic` and `tsc` that a shader samples as `used`.
+    /// The view and sampler for the headers `tic` and `tsc` that a shader samples as `used`, and
+    /// the copies that bring the image up to date with the render targets `overlays` that stand
+    /// for parts of it (each when it was drawn to since it was last copied).
+    #[allow(clippy::too_many_arguments)]
     pub fn bind(
         &mut self,
         vk: &Vk,
@@ -704,13 +807,29 @@ impl Textures {
         tic: Tic,
         tsc: Tsc,
         used: &TextureUse,
-    ) -> Result<Bound, String> {
+        overlays: &[Overlay],
+    ) -> Result<(Bound, Vec<Copy>), String> {
         let shape = shape_of(&tic, used)?;
         let view = self.texture(vk, frame, scene, tic, shape)?;
-        Ok(Bound {
+        let mut copies = Vec::new();
+        if let Some(t) = self.map.get_mut(&(tic, shape)) {
+            for o in overlays {
+                if t.overlays.get(&o.key) != Some(&o.serial) {
+                    t.overlays.insert(o.key, o.serial);
+                    copies.push(Copy {
+                        image: t.image.image,
+                        levels: t.levels,
+                        layers: t.layers,
+                        overlay: *o,
+                    });
+                }
+            }
+        }
+        let bound = Bound {
             view,
             sampler: self.sampler(vk, tsc, used.shadow)?,
-        })
+        };
+        Ok((bound, copies))
     }
 
     /// As [`Textures::bind`] for a texture whose memory a render target stands for: `view` is the
@@ -778,6 +897,14 @@ impl Textures {
         tic: Tic,
         shape: Shape,
     ) -> Result<vk::ImageView, String> {
+        // A texture compared with memory in this frame already is not read again.
+        let current = self.frame;
+        let key = (tic, shape);
+        if let Some(t) = self.map.get(&key) {
+            if t.checked == current && t.generation == self.generation {
+                return Ok(t.image.view);
+            }
+        }
         let types = tic.types();
         let Some(format) = texture_format(tic.components(), types[0], tic.srgb()) else {
             return Err(format!(
@@ -805,26 +932,30 @@ impl Textures {
             total,
             ..
         } = plan(&tic, shape, format)?;
-        // A texture compared with memory in this frame already is not read again.
-        let current = self.frame;
-        let key = (tic, shape);
-        if let Some(t) = self.map.get(&key) {
-            if t.checked == current && t.generation == self.generation {
-                return Ok(t.image.view);
-            }
-        }
-        // The memory as it is now.
-        let mut raw = vec![0u8; total as usize];
-        let readable = read_partial(scene, tic.address(), &mut raw);
+        // The memory as it is now, compared in place: a texture that has not changed (nearly
+        // all of them, nearly always) is not copied.
+        let (hash, readable) = scene.hash(tic.address(), total);
         if readable == 0 {
             return Err(format!(
                 "a texture at GPU address {:#x} ({total} bytes), which is not mapped",
                 tic.address()
             ));
         }
-        let hash = hash_bytes(&raw);
-        let known = self.map.get(&key).is_some_and(|t| t.hash == hash);
-        if self.trace && !known {
+        if let Some(t) = self.map.get_mut(&key) {
+            if t.hash == hash {
+                t.checked = current;
+                t.generation = self.generation;
+                return Ok(t.image.view);
+            }
+            // The contents changed: the old image goes once the submission is over.
+            if let Some(old) = self.map.remove(&key) {
+                frame.garbage.push(Garbage::Image(old.image));
+            }
+        }
+        let _phase = nx_gpu::progress::enter(nx_gpu::progress::MAKING_TEXTURE);
+        let mut raw = vec![0u8; total as usize];
+        let readable = read_partial(scene, tic.address(), &mut raw);
+        if self.trace {
             let filled = raw[..readable.min(raw.len())]
                 .iter()
                 .filter(|b| **b != 0)
@@ -836,17 +967,6 @@ impl Textures {
                 shape.kind,
                 raw.len()
             );
-        }
-        if let Some(t) = self.map.get_mut(&key) {
-            if (t.checked == current && t.generation == self.generation) || t.hash == hash {
-                t.checked = current;
-                t.generation = self.generation;
-                return Ok(t.image.view);
-            }
-            // The contents changed: the old image goes once the submission is over.
-            if let Some(old) = self.map.remove(&key) {
-                frame.garbage.push(Garbage::Image(old.image));
-            }
         }
         let components = tic.component_mapping();
         let image = vk.create_image(ImageInfo {
@@ -983,6 +1103,9 @@ impl Textures {
                 hash,
                 bytes: total,
                 generation: self.generation,
+                overlays: HashMap::new(),
+                levels,
+                layers,
             },
         );
         Ok(view)
@@ -1195,5 +1318,155 @@ mod tests {
         assert_eq!(info.mag_filter, vk::Filter::LINEAR);
         assert_eq!(info.mipmap_mode, vk::SamplerMipmapMode::LINEAR);
         assert!(info.max_lod > 15.0);
+    }
+
+    fn plain_2d() -> TextureUse {
+        TextureUse {
+            index: 0,
+            source: None,
+            slot: 0,
+            dim: Dim::D2,
+            arrayed: false,
+            shadow: false,
+        }
+    }
+
+    /// A block-linear A8B8G8R8 header of the given type, size, levels, layers and block height,
+    /// and the Vulkan format its texels have.
+    fn header_of(
+        ty: u32,
+        size: (u32, u32),
+        levels: u32,
+        layers: u32,
+        block: u32,
+    ) -> (Tic, vk::Format) {
+        let tic = tic_with(&[
+            (0, 7, 0x08),
+            (7, 3, 2),
+            (10, 3, 2),
+            (13, 3, 2),
+            (16, 3, 2),
+            (85, 3, 3),
+            (99, 3, block),
+            (124, 4, levels - 1),
+            (128, 16, size.0 - 1),
+            (151, 4, ty),
+            (160, 16, size.1 - 1),
+            (176, 14, layers - 1),
+        ]);
+        let format = texture_format(tic.components(), tic.types()[0], tic.srgb()).unwrap();
+        (tic, format.vk)
+    }
+
+    fn target(address: u64, format: vk::Format, size: (u32, u32), block: u32) -> Key {
+        Key {
+            address,
+            format,
+            width: size.0,
+            height: size.1,
+            layers: 1,
+            tiling: Tiling::Block(block),
+        }
+    }
+
+    #[test]
+    fn a_target_is_the_level_or_layer_of_a_texture_that_starts_where_it_does() {
+        // An array of 3 layers of 64 x 32 texels with 3 levels (64x32, 32x16, 16x8), a block
+        // of one GOB. Every level is one GOB column (a row of 64 bytes holds 16 texels, so the
+        // 64-texel level is 4 columns), and the layers are a block apart.
+        let (tic, format) = header_of(5, (64, 32), 3, 3, 0);
+        let used = TextureUse {
+            arrayed: true,
+            ..plain_2d()
+        };
+        let shape = shape_of(&tic, &used).unwrap();
+        let format_info = texture_format(tic.components(), tic.types()[0], tic.srgb()).unwrap();
+        let plan = plan(&tic, shape, format_info).unwrap();
+        let base = 0x8000_0000u64;
+        let level = |layer: u32, level: usize| {
+            base + u64::from(layer) * plan.layer_stride
+                + plan.level_geometry[..level]
+                    .iter()
+                    .map(Geometry::tiled_size)
+                    .sum::<u64>()
+        };
+        for layer in 0..3 {
+            for (l, (w, h)) in [(64, 32), (32, 16), (16, 8)].into_iter().enumerate() {
+                let t = target(level(layer, l), format, (w, h), 0);
+                let o = overlay_of(&tic, &used, base, &t, 7)
+                    .unwrap_or_else(|| panic!("layer {layer} level {l} is not found"));
+                assert_eq!(
+                    (o.layer, o.level, o.width, o.height, o.serial),
+                    (layer, l as u32, w, h, 7)
+                );
+            }
+        }
+        // A target a texel row or two off, or of another format, tiling or layer count, is not.
+        let fit = (64, 32);
+        let t = target(level(1, 0) + 512, format, fit, 0);
+        assert!(
+            overlay_of(&tic, &used, base, &t, 0).is_none(),
+            "not at a level"
+        );
+        let t = target(level(1, 0), vk::Format::R32_SFLOAT, fit, 0);
+        assert!(
+            overlay_of(&tic, &used, base, &t, 0).is_none(),
+            "another format"
+        );
+        let t = target(level(1, 0), format, fit, 1);
+        assert!(
+            overlay_of(&tic, &used, base, &t, 0).is_none(),
+            "another block height"
+        );
+        // A strip at the top of the level, or a block of rows down it, is a part of it.
+        let t = target(level(1, 0), format, (64, 16), 0);
+        let o = overlay_of(&tic, &used, base, &t, 0).expect("a strip at the top");
+        assert_eq!(
+            (o.layer, o.level, o.y, o.width, o.height),
+            (1, 0, 0, 64, 16)
+        );
+        // A GOB column of a 64-texel row is 4 columns of 512 bytes: a block (one GOB) is 2048
+        // bytes and 8 rows.
+        let t = target(level(1, 0) + 2048, format, (64, 8), 0);
+        let o = overlay_of(&tic, &used, base, &t, 0).expect("a block down");
+        assert_eq!((o.y, o.width, o.height), (8, 64, 8));
+        let t = target(level(1, 0) + 2048 + 512, format, (64, 8), 0);
+        assert!(
+            overlay_of(&tic, &used, base, &t, 0).is_none(),
+            "not at a block boundary"
+        );
+        let t = target(level(1, 0) + 3 * 2048, format, (64, 8), 0);
+        let o = overlay_of(&tic, &used, base, &t, 0).expect("the last block");
+        assert_eq!((o.y, o.height), (24, 8));
+        let t = target(level(1, 0) + 3 * 2048, format, (64, 16), 0);
+        assert!(
+            overlay_of(&tic, &used, base, &t, 0).is_none(),
+            "its memory runs past the level's"
+        );
+        let t = target(level(1, 0) + 4 * 2048, format, (64, 8), 0);
+        assert!(
+            overlay_of(&tic, &used, base, &t, 0).is_none(),
+            "past the rows of the level (and into the next)"
+        );
+        let mut t = target(level(1, 0), format, fit, 0);
+        t.layers = 2;
+        assert!(
+            overlay_of(&tic, &used, base, &t, 0).is_none(),
+            "a layered target"
+        );
+        t.layers = 1;
+        t.tiling = Tiling::Pitch(256);
+        assert!(
+            overlay_of(&tic, &used, base, &t, 0).is_none(),
+            "a pitch linear target"
+        );
+        // A target that is wider but whose rows are as many columns of GOBs is, cropped.
+        let (tic, format) = header_of(1, (40, 48), 1, 1, 0);
+        let t = target(base, format, (48, 48), 0);
+        let o = overlay_of(&tic, &plain_2d(), base, &t, 3).expect("padded rows");
+        assert_eq!((o.width, o.height), (40, 48));
+        // More columns is another layout.
+        let t = target(base, format, (64, 48), 0);
+        assert!(overlay_of(&tic, &plain_2d(), base, &t, 3).is_none());
     }
 }
