@@ -69,6 +69,8 @@ struct Sample {
     lod: Lod,
     /// The value a shadow sample compares against.
     dref: Option<Id>,
+    /// The texel offsets of a sample that has them (`AOFFI`), as a constant for the image operand.
+    offset: Option<Id>,
 }
 
 /// The dimension of the `TEX` family: bits 28..30 (0 1D, 1 1D array, 2 2D, 3 2D array, 4 3D,
@@ -226,16 +228,26 @@ fn sample(tx: &mut Tx<'_>, s: &Sample) -> R<Id> {
         Lod::Implicit | Lod::Bias(_) if tx.cfg.stage != Stage::Pixel => Lod::Zero,
         other => other,
     };
-    // The image operands that follow the coordinate (and the depth reference).
+    // The image operands that follow the coordinate (and the depth reference): the mask of the
+    // ones present, then their ids in the order of the mask's bits (bias, level, constant offset).
     let zero;
-    let operands: Vec<u32> = match lod {
-        Lod::Implicit => Vec::new(),
-        Lod::Bias(b) => vec![0x1, b],
-        Lod::Level(l) => vec![0x2, l],
+    let (mut mask, mut ids): (u32, Vec<u32>) = match lod {
+        Lod::Implicit => (0, Vec::new()),
+        Lod::Bias(b) => (0x1, vec![b]),
+        Lod::Level(l) => (0x2, vec![l]),
         Lod::Zero => {
             zero = tx.cf32(0.0);
-            vec![0x2, zero]
+            (0x2, vec![zero])
         }
+    };
+    if let Some(offset) = s.offset {
+        mask |= 0x8;
+        ids.push(offset);
+    }
+    let operands: Vec<u32> = if mask == 0 {
+        Vec::new()
+    } else {
+        std::iter::once(mask).chain(ids).collect()
     };
     let explicit = matches!(lod, Lod::Level(_) | Lod::Zero);
     if s.shadow {
@@ -410,6 +422,7 @@ pub(super) fn texs(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
             layer,
             lod,
             dref,
+            offset: None,
         },
     )?;
     write_short_results(tx, inst, result)
@@ -422,8 +435,9 @@ pub(super) fn tex(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
     if arrayed && dim == Dim::D1 {
         return tx.fail("TEX of a 1D array");
     }
-    if inst.bit(54) {
-        return tx.fail("TEX with texel offsets (AOFFI) is not translated yet");
+    let aoffi = inst.bit(54);
+    if aoffi && dim == Dim::Cube {
+        return tx.fail("TEX of a cube map with texel offsets");
     }
     let shadow = inst.bit(50);
     let index = inst.bits(36, 13) as u32;
@@ -459,6 +473,26 @@ pub(super) fn tex(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
         mode => return tx.fail(format!("TEX with level of detail mode {mode}")),
     };
     let dref = shadow.then(|| tx.read_f(m));
+    if shadow {
+        m = reg_at(m, 1);
+    }
+    // The texel offsets come in the register after the others, packed four bits to a coordinate;
+    // the compiler makes them with a `MOV32I` of the block (A-122).
+    let offset = if aoffi {
+        let packed = if m == RZ {
+            Some(0)
+        } else {
+            tx.reg_const.get(&m).copied()
+        };
+        let Some(packed) = packed else {
+            return tx.fail(format!(
+                "TEX with texel offsets in R{m}, which no instruction of the block made a constant"
+            ));
+        };
+        Some(texel_offsets(tx, packed, n as usize, 4, 4))
+    } else {
+        None
+    };
     let result = sample(
         tx,
         &Sample {
@@ -470,10 +504,33 @@ pub(super) fn tex(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
             layer,
             lod,
             dref,
+            offset,
         },
     )?;
     write_masked_results(tx, inst, result);
     Ok(())
+}
+
+/// The constant texel offsets `packed` holds for `count` coordinates: a signed field of `bits` bits
+/// for each, `stride` bits apart (a scalar for one coordinate).
+fn texel_offsets(tx: &mut Tx<'_>, packed: u32, count: usize, bits: u32, stride: u32) -> Id {
+    let wrap = 1i32 << (bits - 1);
+    let values: Vec<Id> = (0..count as u32)
+        .map(|k| {
+            let field = ((packed >> (stride * k)) & ((1 << bits) - 1)) as i32;
+            tx.ci32(if field >= wrap {
+                field - 2 * wrap
+            } else {
+                field
+            })
+        })
+        .collect();
+    if count == 1 {
+        return values[0];
+    }
+    let i = tx.t.i32;
+    let ty = tx.m.ty_vector(i, count as u32);
+    tx.m.const_composite(ty, &values)
 }
 
 /// Gather the component `component` of the four texels of a sample; with a reference, the results
@@ -495,6 +552,7 @@ fn gather(
         layer: None,
         lod: Lod::Zero,
         dref,
+        offset: None,
     };
     let (var, sampled_ty) = sampler(tx, Tex::table(index), Dim::D2, false, shadow)?;
     let coord = coordinate(tx, &s);
@@ -722,6 +780,7 @@ pub(super) fn tmml(tx: &mut Tx<'_>, inst: Inst, bindless: bool) -> R<()> {
         layer: None,
         lod: Lod::Implicit,
         dref: None,
+        offset: None,
     };
     let (var, sampled_ty) = sampler(tx, tex, dim, false, false)?;
     let coord = coordinate(tx, &s);

@@ -1057,6 +1057,18 @@ fn mov(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
         tx.reg_origin
             .insert(inst.rd(), (inst.cbuf_index(), inst.cbuf_offset() / 4));
     }
+    // An immediate (or zero), for an instruction that takes texel offsets from the register.
+    let constant = match inst.form() {
+        Form::Imm20 => Some(inst.imm20() as u32),
+        Form::Imm32 => Some(inst.imm32()),
+        Form::Reg if inst.rb() == RZ => Some(0),
+        _ => None,
+    };
+    if let Some(value) = constant {
+        if inst.guard().is_always() && inst.rd() != RZ {
+            tx.reg_const.insert(inst.rd(), value);
+        }
+    }
     Ok(())
 }
 
@@ -1066,6 +1078,9 @@ fn mov32i(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
     }
     let v = tx.c32(inst.imm32());
     tx.write(inst, inst.rd(), v);
+    if inst.guard().is_always() && inst.rd() != RZ {
+        tx.reg_const.insert(inst.rd(), inst.imm32());
+    }
     Ok(())
 }
 

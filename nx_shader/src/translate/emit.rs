@@ -71,6 +71,9 @@ pub(super) struct Tx<'a> {
     /// The constant buffer word (slot, word index) a register is known to hold in the block being
     /// translated: what a bindless texture instruction needs to know about its handle register.
     pub reg_origin: std::collections::HashMap<u8, (u32, u32)>,
+    /// The immediate a register is known to hold in the block being translated (a `MOV32I`): what a
+    /// texture instruction with texel offsets needs to know about its offset register.
+    pub reg_const: std::collections::HashMap<u8, u32>,
     /// The global memory table variable and the address translation function.
     pub gmap: Option<(Id, Id)>,
     /// The offset of the instruction being translated, for messages.
@@ -117,6 +120,7 @@ impl<'a> Tx<'a> {
             textures: std::collections::HashMap::new(),
             texture_dims: std::collections::HashMap::new(),
             reg_origin: std::collections::HashMap::new(),
+            reg_const: std::collections::HashMap::new(),
             gmap: None,
             pc: 0,
         }
@@ -344,6 +348,7 @@ impl<'a> Tx<'a> {
             return;
         }
         self.reg_origin.remove(&r);
+        self.reg_const.remove(&r);
         let v = self.register_variable(r);
         self.f.store(v, value);
     }

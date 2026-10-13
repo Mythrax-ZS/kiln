@@ -741,3 +741,85 @@ fn txq_reports_the_size_and_the_levels() {
         "width, height, layers, levels"
     );
 }
+
+/// `TEX` with texel offsets (`AOFFI`, bit 54): the offsets are in the register after the level and
+/// the reference, four bits to a coordinate (A-122).
+fn tex_with_offsets(rd: u8, ra: u8, rb: u8, dim: u64, mask: u64, lod: u64) -> Enc {
+    tex(rd, ra, rb, dim, mask, lod, false).bit(54, true)
+}
+
+/// The packed offsets a compiler gives `textureOffset(.., ivec2(x, y))`: a signed nibble for each.
+fn packed_offsets(x: i32, y: i32, z: i32) -> u32 {
+    (x as u32 & 0xF) | (y as u32 & 0xF) << 4 | (z as u32 & 0xF) << 8
+}
+
+#[test]
+fn tex_with_texel_offsets_reads_the_texels_next_to_the_point() {
+    let Some(vk) = vulkan() else { return };
+    let texel = |x: u32, y: u32| [x as f32 + 1.0, y as f32 + 10.0, (x * 6 + y) as f32, 0.5];
+    let texels: Vec<[f32; 4]> = (0..6)
+        .flat_map(|y| (0..6).map(move |x| texel(x, y)))
+        .collect();
+    let bytes = floats(&texels);
+    // Offsets (1, -1) in R4 and (-2, 3) in R6, made by `MOV32I` in the block; the level zero mode
+    // takes no register, so the offsets are those of `Rb`.
+    let program = [
+        nx_shader::asm::mov32i(4, packed_offsets(1, -1, 0)),
+        nx_shader::asm::mov32i(6, packed_offsets(-2, 3, 0)),
+        tex_with_offsets(8, 1, 4, 2, 0xF, 1).build(),
+        tex_with_offsets(12, 1, 6, 2, 0x3, 1).build(),
+        exit(Guard::ALWAYS),
+    ];
+    let mut inputs = Vec::new();
+    let mut expected = Vec::new();
+    for y in 2..4u32 {
+        for x in 2..4u32 {
+            inputs.push(regs(&[
+                (1, (x as f32 + 0.5) / 6.0),
+                (2, (y as f32 + 0.5) / 6.0),
+            ]));
+            expected.push((texel(x + 1, y - 1), texel(x - 2, (y + 3).min(5))));
+        }
+    }
+    let extras = Extras {
+        images: vec![image(
+            SampledKind::D2,
+            vk::Format::R32G32B32A32_SFLOAT,
+            (6, 6, 1),
+            1,
+            false,
+            &bytes,
+        )],
+        ..Extras::default()
+    };
+    let out = run_with(&vk, &program, &inputs, &[], extras);
+    for (i, (got, (first, second))) in out.states.iter().zip(&expected).enumerate() {
+        assert_eq!(
+            [f(got, 8), f(got, 9), f(got, 10), f(got, 11)],
+            *first,
+            "offset (1, -1), sample {i}"
+        );
+        // (-2, 3) from x of 2 or 3 is column 0 or 1; the row goes past the edge for y of 3 and is
+        // clamped to it, as the sampler clamps.
+        assert_eq!(
+            [f(got, 12), f(got, 13)],
+            [second[0], second[1]],
+            "offset (-2, 3), sample {i}"
+        );
+    }
+}
+
+#[test]
+fn tex_with_texel_offsets_that_are_not_a_constant_of_the_block_is_refused() {
+    use nx_shader::translate::{translate, Config, Stage};
+    // The offsets are in R4, which nothing in the program sets (a value from an earlier block or
+    // the caller would not be a constant the translator can give the image operation).
+    let program = [
+        tex_with_offsets(8, 1, 4, 2, 0xF, 1).build(),
+        exit(Guard::ALWAYS),
+    ];
+    let bytes = nx_shader::asm::assemble(&program);
+    let config = Config::new(Stage::Compute);
+    let err = translate(nx_shader::cfg::Code(&bytes), None, &config).expect_err("a refusal");
+    assert!(err.to_string().contains("texel offsets"), "{err}");
+}

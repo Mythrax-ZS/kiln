@@ -181,6 +181,7 @@ fn activate(tx: &mut Tx<'_>, block: &Block, flags: &BTreeMap<u32, Id>) -> R<bool
 fn body(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg, block: &Block) -> R<()> {
     // What is known of the registers does not carry over from another block.
     tx.reg_origin.clear();
+    tx.reg_const.clear();
     let mut insts: Vec<(u32, Inst)> = graph.instructions(code, block).collect();
     if !matches!(block.term, Term::Fall(_)) {
         insts.pop();
