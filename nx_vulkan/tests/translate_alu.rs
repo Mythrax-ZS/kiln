@@ -82,9 +82,9 @@ fn float_arithmetic_matches_rust() {
     let mut inputs = random_states(256, 11);
     // Keep the values ordinary: finite, moderate magnitudes.
     for s in &mut inputs {
-        for r in 0..4 {
-            let m = (s.regs[r] as f32 / u32::MAX as f32 - 0.5) * 200.0;
-            s.regs[r] = m.to_bits();
+        for reg in s.regs.iter_mut().take(4) {
+            let m = (*reg as f32 / u32::MAX as f32 - 0.5) * 200.0;
+            *reg = m.to_bits();
         }
     }
     let out = run(&vk, &program, &inputs, &[]);

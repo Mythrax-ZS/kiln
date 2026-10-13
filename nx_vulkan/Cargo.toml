@@ -11,5 +11,4 @@ path = "src/lib.rs"
 
 [dependencies]
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
-nx_gpu = { path = "../nx_gpu" }
 nx_shader = { path = "../nx_shader" }
