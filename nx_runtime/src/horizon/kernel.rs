@@ -164,6 +164,10 @@ pub struct Kernel {
     watched: bool,
     /// Threads hold a core to run guest code (`NX_CORES`).
     cores: Option<Cores>,
+    /// `NX_JITTER=<percent>[,<microseconds>]`: that share of the supervisor calls first sleeps for
+    /// up to that long (500 by default), to stir the threads' timing when looking for a race.
+    jitter: Option<(u64, u64)>,
+    jitter_state: std::sync::atomic::AtomicU64,
 }
 
 impl Drop for Kernel {
@@ -248,6 +252,18 @@ fn dump_pointees(cpu: &NativeCpu) {
             }
         }
     }
+}
+
+/// `NX_JITTER`: the share of supervisor calls to delay and the longest delay in microseconds.
+fn jitter_from_env() -> Option<(u64, u64)> {
+    let v = std::env::var("NX_JITTER").ok()?;
+    let mut parts = v.split(',');
+    let percent: u64 = parts.next()?.trim().parse().ok()?;
+    let micros: u64 = parts
+        .next()
+        .and_then(|m| m.trim().parse().ok())
+        .unwrap_or(500);
+    (percent > 0 && micros > 0).then_some((percent.min(100), micros))
 }
 
 /// The seed for the kernel's pseudo-random values: `NX_RANDOM_SEED` when set, otherwise the clock.
@@ -351,6 +367,8 @@ impl Kernel {
             monitors: Mutex::new(BTreeMap::new()),
             watched: super::watchdog::requested().is_some(),
             cores: Cores::from_env(),
+            jitter: jitter_from_env(),
+            jitter_state: std::sync::atomic::AtomicU64::new(0x9E37_79B9_7F4A_7C15),
         })
     }
 
@@ -710,6 +728,23 @@ impl Kernel {
         // SAFETY: created above and no longer referenced.
         drop(unsafe { Box::from_raw(ctx) });
         self.thread_ended(thread, reason, cpu);
+    }
+
+    /// Sleep a little at random before a supervisor call, when `NX_JITTER` asks.
+    pub(super) fn stir(&self) {
+        let Some((percent, micros)) = self.jitter else {
+            return;
+        };
+        // xorshift on a state all threads share: the sequence a thread sees is not repeatable, which
+        // is the point.
+        let mut x = self.jitter_state.load(Ordering::Relaxed);
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.jitter_state.store(x, Ordering::Relaxed);
+        if x % 100 < percent {
+            std::thread::sleep(Duration::from_micros((x >> 8) % micros));
+        }
     }
 
     /// Wait for the core `thread` runs on, if cores are modelled (`NX_CORES`); `held` records it.

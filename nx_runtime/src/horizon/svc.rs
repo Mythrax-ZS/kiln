@@ -125,6 +125,7 @@ pub extern "C" fn svc_entry(cpu: *mut NativeCpu, imm: u32) -> i32 {
     };
     // SAFETY: as above; only this thread uses the field.
     let core = unsafe { &(*ctx).core };
+    kernel.stir();
     monitor.enter(imm, &cpu.state.x);
     // A call that can block or reschedule leaves the core for the threads waiting for it, and
     // the thread asks for a core again when the call is over (`NX_CORES`).
