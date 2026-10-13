@@ -35,6 +35,48 @@ const FLAGS: u64 = 0xFFF;
 
 type L2 = [AtomicU64; L2_ENTRIES];
 
+/// The first level of the process's guest memory (the one in [`rt`](super::rt)), null until the
+/// runtime has made it. The access functions generated code calls read it from here, without
+/// going through `rt()`, to reach a page in a few instructions ([`fast_ptr`]).
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+pub static nx_mem_l1: AtomicPtr<AtomicPtr<L2>> = AtomicPtr::new(ptr::null_mut());
+
+/// The entry flag a fast read needs (a readable page is a present one).
+pub const FAST_READ: u64 = READ;
+/// The entry flag a fast write needs.
+pub const FAST_WRITE: u64 = WRITE;
+
+/// The host address of the `size` bytes (1, 2, 4 or 8) at `addr` in the process's guest memory
+/// when one aligned access reaches them and the page allows it (`need`: [`FAST_READ`] or
+/// [`FAST_WRITE`]). `None` for anything else, which the slow path then handles: an address
+/// beyond the 39 bits, an unaligned one (it may straddle pages), an unmapped page or a missing
+/// permission.
+#[inline(always)]
+pub fn fast_ptr(addr: u64, size: u64, need: u64) -> Option<*mut u8> {
+    if addr & (size - 1) != 0 || addr >> ADDRESS_BITS != 0 {
+        return None;
+    }
+    let l1 = nx_mem_l1.load(Ordering::Acquire);
+    if l1.is_null() {
+        return None;
+    }
+    // SAFETY: the address is below 2^39, so the index is inside the first level, which is never
+    // freed once published.
+    let l2 = unsafe { (*l1.add((addr >> 21) as usize)).load(Ordering::Acquire) };
+    if l2.is_null() {
+        return None;
+    }
+    // SAFETY: a published second level is a leaked box of 512 entries.
+    let entry = unsafe {
+        (*l2.cast::<AtomicU64>().add(((addr >> 12) & 511) as usize)).load(Ordering::Relaxed)
+    };
+    if entry & need == 0 {
+        return None;
+    }
+    Some(((entry & !FLAGS) | (addr & (PAGE_SIZE - 1))) as *mut u8)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapError {
     /// Address or size not a multiple of the page size, or outside the address space.
@@ -105,6 +147,11 @@ impl GuestMemory {
             l1: l1.into_boxed_slice(),
             blocks: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Make this the memory [`fast_ptr`] looks in. Only the process's own memory does this.
+    pub(crate) fn publish(&self) {
+        nx_mem_l1.store(self.l1.as_ptr().cast_mut(), Ordering::Release);
     }
 
     fn l2(&self, addr: u64) -> Option<&L2> {

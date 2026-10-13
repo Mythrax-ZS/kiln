@@ -99,6 +99,183 @@ fn ordered_accesses_must_be_aligned() {
     );
 }
 
+/// Four pages: read-write, read-only, mapped with no access, read-write; then a hole.
+const MIX: u64 = 0x1700_0000;
+const MIX_PERMISSIONS: [u32; 4] = [RW, perm::R, 0, RW];
+
+fn mix_pattern() -> Vec<u8> {
+    (0..0x4000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect()
+}
+
+/// The addresses worth trying around the pages of [`MIX`] and the ends of the address space.
+fn mix_addresses() -> Vec<u64> {
+    let mut v = Vec::new();
+    for page in 0..=5u64 {
+        let base = MIX + page * 0x1000;
+        for d in -9i64..=9 {
+            v.push(base.wrapping_add_signed(d));
+        }
+        v.push(base + 0x7c0);
+    }
+    v.extend([
+        0,
+        7,
+        MIX - 8,
+        (1 << 39) - 8,
+        (1 << 39) - 3,
+        1 << 39,
+        u64::MAX - 3,
+        u64::MAX,
+    ]);
+    v
+}
+
+#[test]
+fn the_fast_path_does_what_the_general_one_does() {
+    for (page, p) in MIX_PERMISSIONS.iter().enumerate() {
+        assert_eq!(nx_rt_map(MIX + page as u64 * 0x1000, 0x1000, *p), 0);
+    }
+    let pattern = mix_pattern();
+    // SAFETY: `pattern` is a live slice.
+    assert_eq!(unsafe { nx_rt_write(MIX, pattern.as_ptr(), 0x4000) }, 0);
+    // An instance of its own with the same pages stands for "the general path": the C ABI of the
+    // process must leave memory as it does, and fail where it fails.
+    let oracle = super::mem::GuestMemory::new();
+    for (page, p) in MIX_PERMISSIONS.iter().enumerate() {
+        oracle
+            .map(MIX + page as u64 * 0x1000, 0x1000, *p)
+            .expect("map");
+    }
+    oracle.write_bytes(MIX, &pattern, false).expect("fill");
+
+    type Load = fn(*mut NativeCpu, u64, u64) -> u64;
+    type Store = fn(*mut NativeCpu, u64, u64, u64);
+    let loads: [(u8, Load); 4] = [
+        (1, |c, a, pc| u64::from(nx_ld8(c, a, pc))),
+        (2, |c, a, pc| u64::from(nx_ld16(c, a, pc))),
+        (4, |c, a, pc| u64::from(nx_ld32(c, a, pc))),
+        (8, |c, a, pc| nx_ld64(c, a, pc)),
+    ];
+    let stores: [(u8, Store); 4] = [
+        (1, |c, a, v, pc| nx_st8(c, a, v as u8, pc)),
+        (2, |c, a, v, pc| nx_st16(c, a, v as u16, pc)),
+        (4, |c, a, v, pc| nx_st32(c, a, v as u32, pc)),
+        (8, |c, a, v, pc| nx_st64(c, a, v, pc)),
+    ];
+    for addr in mix_addresses() {
+        for (size, load) in loads {
+            let cpu = Cpu::new();
+            let got = load(cpu.0, addr, 0x700);
+            let c = cpu.c();
+            match oracle.read(addr, size, std::sync::atomic::Ordering::Relaxed) {
+                Ok(v) => assert_eq!(
+                    (got, c.ctl.fault_flag),
+                    (v as u64, 0),
+                    "load {size} at {addr:#x}"
+                ),
+                Err(kind) => {
+                    assert_eq!(
+                        (got, c.ctl.fault_flag, c.ctl.fault_addr),
+                        (0, 1, addr),
+                        "load {size} at {addr:#x}"
+                    );
+                    assert_eq!(c.ctl.fault_write, 0);
+                    assert_eq!(c.ctl.fault_kind, kind as u32, "load {size} at {addr:#x}");
+                }
+            }
+        }
+        for (size, store) in stores {
+            let value = 0x8877_6655_4433_2211u64.rotate_left(addr as u32 & 63) | 0x0101;
+            let cpu = Cpu::new();
+            store(cpu.0, addr, value, 0x704);
+            let c = cpu.c();
+            let expect = oracle.write(
+                addr,
+                size,
+                u128::from(value),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            assert_eq!(
+                c.ctl.fault_flag,
+                u32::from(expect.is_err()),
+                "store {size} at {addr:#x}"
+            );
+            if let Err(kind) = expect {
+                assert_eq!((c.ctl.fault_addr, c.ctl.fault_write), (addr, 1));
+                assert_eq!(c.ctl.fault_kind, kind as u32, "store {size} at {addr:#x}");
+            }
+            let (mut ours, mut theirs) = (vec![0u8; 0x4000], vec![0u8; 0x4000]);
+            // SAFETY: the buffer has the length passed.
+            assert_eq!(unsafe { nx_rt_read(MIX, ours.as_mut_ptr(), 0x4000) }, 0);
+            oracle.read_bytes(MIX, &mut theirs, false).expect("read");
+            assert!(
+                ours == theirs,
+                "memory differs after store {size} at {addr:#x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_fast_lookup_takes_only_what_it_can_do_in_one_access() {
+    use super::mem::{fast_ptr, FAST_READ, FAST_WRITE};
+    assert_eq!(nx_rt_map(0x1900_0000, 0x1000, RW), 0);
+    assert_eq!(nx_rt_map(0x1900_1000, 0x1000, perm::R), 0);
+    let host = |addr| super::rt().mem.host_run(addr, 1).expect("mapped").0;
+    for size in [1u64, 2, 4, 8] {
+        let at = 0x1900_0000 + 3 * size;
+        assert_eq!(fast_ptr(at, size, FAST_READ), Some(host(at)));
+        assert_eq!(fast_ptr(at, size, FAST_WRITE), Some(host(at)));
+        // The last aligned access of the page is still inside it.
+        let last = 0x1900_1000 - size;
+        assert_eq!(fast_ptr(last, size, FAST_READ), Some(host(last)));
+        // Read-only: reads only. Beyond the mapping and beyond the address space: nothing.
+        assert!(fast_ptr(0x1900_1000, size, FAST_READ).is_some());
+        assert!(fast_ptr(0x1900_1000, size, FAST_WRITE).is_none());
+        assert!(fast_ptr(0x1900_2000, size, FAST_READ).is_none());
+        assert!(fast_ptr(0x7_0000_0000, size, FAST_READ).is_none());
+        assert!(fast_ptr(1 << 39, size, FAST_READ).is_none());
+        assert!(fast_ptr(u64::MAX - size + 1, size, FAST_READ).is_none());
+        if size > 1 {
+            assert!(fast_ptr(0x1900_0000 + 1, size, FAST_READ).is_none());
+            assert!(fast_ptr(0x1900_0000 + size / 2, size, FAST_READ).is_none());
+        }
+    }
+}
+
+#[test]
+fn plain_stores_of_every_size_end_other_threads_reservations() {
+    map(0x1800_0000, 0x1000);
+    let a = Cpu::new();
+    let b = Cpu::new();
+    let addr = 0x1800_0040;
+    type Store = fn(*mut NativeCpu, u64);
+    let stores: [(&str, Store); 8] = [
+        ("st8", |c, a| nx_st8(c, a, 1, 0)),
+        ("st16", |c, a| nx_st16(c, a, 1, 0)),
+        ("st32", |c, a| nx_st32(c, a, 1, 0)),
+        ("st64", |c, a| nx_st64(c, a, 1, 0)),
+        ("stlr8", |c, a| nx_stlr8(c, a, 1, 0)),
+        ("stlr16", |c, a| nx_stlr16(c, a, 1, 0)),
+        ("stlr32", |c, a| nx_stlr32(c, a, 1, 0)),
+        ("stlr64", |c, a| nx_stlr64(c, a, 1, 0)),
+    ];
+    for (name, store) in stores {
+        nx_ldx(a.0, addr, 0x10, 8, 0);
+        store(b.0, addr);
+        assert_eq!(
+            nx_stx(a.0, addr, 5, 0, 0x14, 8, 0),
+            1,
+            "{name} did not end the reservation"
+        );
+    }
+    // Without a reservation anywhere the same stores work as plain stores.
+    nx_stlr64(b.0, addr, 77, 0);
+    assert_eq!(nx_ld64(a.0, addr, 0), 77);
+}
+
 #[test]
 fn store_exclusive_needs_its_own_reservation() {
     map(0x1300_0000, 0x1000);

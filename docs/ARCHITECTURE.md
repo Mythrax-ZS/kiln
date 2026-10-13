@@ -38,8 +38,9 @@ SSA values inside a function and in `cpu->state` between functions.
   therefore unwinds native frames until a frame can take it or the run loop dispatches it.
 - **Tail call** (`B` to another function, `BR` to a table-resolved or computed target): a
   `musttail` call, so loops built from jumps do not grow the native stack.
-- **Indirect target**: `nx_dispatch` looks the address up in the sorted function table and tail
-  calls the function, or tail calls the slow path. The slow path interprets from that address,
+- **Indirect target**: `nx_dispatch` looks the address up in the function table (open addressing,
+  built from the registered functions the first time a lookup follows a registration, read
+  without a lock) and tail calls the function, or tail calls the slow path. The slow path interprets from that address,
   logs the address (`NX_UNKNOWN_LOG`), and hands control back to native code at the next known
   entry. The log is a hints file (`recomp build --hints`).
 - **Stop**: a memory fault, an instruction that always stops (`BRK`, undefined, unimplemented), or
@@ -201,6 +202,16 @@ One checked interface (`nx_runtime/src/rt/mem.rs`): a 39-bit address space of 4 
 two-level table of atomic entries. Generated code calls `nx_ld*`/`nx_st*` (and the acquire/release
 and exclusive variants); each is followed by a test of the fault flag. A test pins the list of
 runtime functions the emitter calls against the runtime's exports.
+
+The plain and the acquire/release accesses of 1, 2, 4 and 8 bytes first try a short path in the
+export itself (`fast_ptr`): an aligned address below 2^39 whose page is mapped with the permission
+needed is read or written with one atomic access, through the table's first level (published as
+`nx_mem_l1` when the runtime is made, so no `rt()` call is needed). A store takes this path only
+while no reservation is outstanding anywhere (`nx_mem_armed` is zero, the same test the general
+path makes). Everything else (unaligned or page-straddling addresses, unmapped pages, missing
+permissions, 16-byte accesses, stores while a reservation exists) takes the general path, which
+reports the fault or does the copy; a test compares the two over the edges of mapped, read-only
+and unmapped pages and the end of the address space.
 
 ## Where tests compare what
 

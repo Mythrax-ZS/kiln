@@ -7,7 +7,8 @@
 //! which generated code tests after every access.
 
 use super::abi::{perm, stop, trap, FuncEntry, NativeCpu, STOP_PC};
-use super::mem::MapError;
+use super::mem::{fast_ptr, MapError, FAST_READ, FAST_WRITE};
+use super::monitor::nx_mem_armed;
 use super::runtime::{
     handle_trap, interpret, interpret_one, record_fault, record_stop, record_trap, rt, run,
     service_svc, slow_path, NativeBus, SvcHandler,
@@ -17,12 +18,16 @@ use crate::a64::bus::{FaultKind, ZVA_BLOCK};
 use crate::a64::vec;
 use std::ffi::c_void;
 use std::sync::atomic::Ordering::{self, Acquire, Relaxed, Release};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8};
 
 fn cpu<'a>(p: *mut NativeCpu) -> &'a mut NativeCpu {
     // SAFETY: generated code and hosts pass the pointer they were given for this thread.
     unsafe { &mut *p }
 }
 
+// The general case of an access: any size and alignment, the exclusive monitor, faults. The plain
+// accesses below try the page table directly first (`fast_ptr`) and come here for what it declines.
+#[inline(never)]
 fn do_load(p: *mut NativeCpu, addr: u64, pc: u64, size: u8, order: Ordering) -> u64 {
     let c = cpu(p);
     match rt().mem.read(addr, size, order) {
@@ -34,6 +39,7 @@ fn do_load(p: *mut NativeCpu, addr: u64, pc: u64, size: u8, order: Ordering) -> 
     }
 }
 
+#[inline(never)]
 fn do_store(p: *mut NativeCpu, addr: u64, pc: u64, size: u8, value: u64, order: Ordering) {
     let c = cpu(p);
     if let Err(k) = rt().store(c.ctl.thread_id, addr, size, u128::from(value), order) {
@@ -52,19 +58,35 @@ fn misaligned(p: *mut NativeCpu, addr: u64, pc: u64, size: u8, write: bool) -> b
 }
 
 macro_rules! plain_access {
-    ($ld:ident, $st:ident, $ldar:ident, $stlr:ident, $ty:ty, $size:expr) => {
+    ($ld:ident, $st:ident, $ldar:ident, $stlr:ident, $ty:ty, $atomic:ty, $size:expr) => {
         #[no_mangle]
         pub extern "C" fn $ld(p: *mut NativeCpu, addr: u64, pc: u64) -> $ty {
+            if let Some(host) = fast_ptr(addr, $size, FAST_READ) {
+                // SAFETY: `fast_ptr` found `$size` readable bytes, aligned for the access.
+                return unsafe { <$atomic>::from_ptr(host.cast()).load(Relaxed) };
+            }
             do_load(p, addr, pc, $size, Relaxed) as $ty
         }
 
         #[no_mangle]
         pub extern "C" fn $st(p: *mut NativeCpu, addr: u64, value: $ty, pc: u64) {
+            // With a reservation outstanding a store must tell the monitor (`Runtime::store`).
+            if nx_mem_armed.load(Relaxed) == 0 {
+                if let Some(host) = fast_ptr(addr, $size, FAST_WRITE) {
+                    // SAFETY: `fast_ptr` found `$size` writable bytes, aligned for the access.
+                    unsafe { <$atomic>::from_ptr(host.cast()).store(value, Relaxed) };
+                    return;
+                }
+            }
             do_store(p, addr, pc, $size, u64::from(value), Relaxed)
         }
 
         #[no_mangle]
         pub extern "C" fn $ldar(p: *mut NativeCpu, addr: u64, pc: u64) -> $ty {
+            if let Some(host) = fast_ptr(addr, $size, FAST_READ) {
+                // SAFETY: as above; `fast_ptr` also found the address aligned.
+                return unsafe { <$atomic>::from_ptr(host.cast()).load(Acquire) };
+            }
             if misaligned(p, addr, pc, $size, false) {
                 return 0;
             }
@@ -73,6 +95,13 @@ macro_rules! plain_access {
 
         #[no_mangle]
         pub extern "C" fn $stlr(p: *mut NativeCpu, addr: u64, value: $ty, pc: u64) {
+            if nx_mem_armed.load(Relaxed) == 0 {
+                if let Some(host) = fast_ptr(addr, $size, FAST_WRITE) {
+                    // SAFETY: as above.
+                    unsafe { <$atomic>::from_ptr(host.cast()).store(value, Release) };
+                    return;
+                }
+            }
             if misaligned(p, addr, pc, $size, true) {
                 return;
             }
@@ -81,10 +110,10 @@ macro_rules! plain_access {
     };
 }
 
-plain_access!(nx_ld8, nx_st8, nx_ldar8, nx_stlr8, u8, 1);
-plain_access!(nx_ld16, nx_st16, nx_ldar16, nx_stlr16, u16, 2);
-plain_access!(nx_ld32, nx_st32, nx_ldar32, nx_stlr32, u32, 4);
-plain_access!(nx_ld64, nx_st64, nx_ldar64, nx_stlr64, u64, 8);
+plain_access!(nx_ld8, nx_st8, nx_ldar8, nx_stlr8, u8, AtomicU8, 1);
+plain_access!(nx_ld16, nx_st16, nx_ldar16, nx_stlr16, u16, AtomicU16, 2);
+plain_access!(nx_ld32, nx_st32, nx_ldar32, nx_stlr32, u32, AtomicU32, 4);
+plain_access!(nx_ld64, nx_st64, nx_ldar64, nx_stlr64, u64, AtomicU64, 8);
 
 /// `LDXR` family. `bytes` is 1, 2, 4, 8 or 16; the low 64 bits are returned and, for 16, the high
 /// 64 bits are left in `ctl.aux`.

@@ -52,8 +52,15 @@ impl Reservation {
     }
 }
 
+/// How many reservations the process's monitor holds: the fast path of a plain store
+/// (`rt::exports`) reads it, without going through `rt()`, and takes the slow path when it is not
+/// zero.
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+pub static nx_mem_armed: AtomicUsize = AtomicUsize::new(0);
+
 pub struct Monitors {
-    armed: AtomicUsize,
+    armed: &'static AtomicUsize,
     state: Mutex<BTreeMap<u64, Reservation>>,
 }
 
@@ -69,9 +76,19 @@ impl Default for Monitors {
 }
 
 impl Monitors {
-    pub const fn new() -> Monitors {
+    /// A monitor of its own, for tests (the counter is leaked).
+    pub fn new() -> Monitors {
+        Monitors::counting(Box::leak(Box::new(AtomicUsize::new(0))))
+    }
+
+    /// The process's monitor, whose reservation count is [`nx_mem_armed`].
+    pub fn global() -> Monitors {
+        Monitors::counting(&nx_mem_armed)
+    }
+
+    fn counting(armed: &'static AtomicUsize) -> Monitors {
         Monitors {
-            armed: AtomicUsize::new(0),
+            armed,
             state: Mutex::new(BTreeMap::new()),
         }
     }

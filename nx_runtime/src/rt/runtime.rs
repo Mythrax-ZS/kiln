@@ -11,7 +11,7 @@ use crate::slow::{self, SlowHost};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -20,10 +20,70 @@ use std::time::Instant;
 /// supervisor call unless the handler recorded a stop of its own).
 pub type SvcHandler = extern "C" fn(*mut NativeCpu, u32) -> i32;
 
+/// The function table as generated code looks it up: open addressing over the guest address,
+/// immutable once built, so a lookup takes no lock and touches two cache lines.
+struct FuncTable {
+    mask: usize,
+    keys: Box<[u64]>,
+    funcs: Box<[*const c_void]>,
+}
+
+// SAFETY: the table only holds addresses of immutable generated code.
+unsafe impl Send for FuncTable {}
+unsafe impl Sync for FuncTable {}
+
+fn slot_of(pc: u64) -> usize {
+    ((pc >> 2).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize
+}
+
+impl FuncTable {
+    fn build(entries: &[FuncEntry]) -> FuncTable {
+        // A load factor under a third keeps the probes short.
+        let size = (entries.len() * 3).next_power_of_two().max(16);
+        let mut table = FuncTable {
+            mask: size - 1,
+            keys: vec![0u64; size].into_boxed_slice(),
+            funcs: vec![std::ptr::null(); size].into_boxed_slice(),
+        };
+        for e in entries.iter().filter(|e| e.addr != 0) {
+            let mut i = slot_of(e.addr) & table.mask;
+            while table.keys[i] != 0 && table.keys[i] != e.addr {
+                i = (i + 1) & table.mask;
+            }
+            if table.keys[i] == 0 {
+                table.keys[i] = e.addr;
+                table.funcs[i] = e.func;
+            }
+        }
+        table
+    }
+
+    fn get(&self, pc: u64) -> Option<*const c_void> {
+        if pc == 0 {
+            return None;
+        }
+        let mut i = slot_of(pc) & self.mask;
+        loop {
+            let key = self.keys[i];
+            if key == pc {
+                return Some(self.funcs[i]);
+            }
+            if key == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
 pub struct Runtime {
     pub mem: GuestMemory,
     pub monitors: Monitors,
     funcs: RwLock<Vec<FuncEntry>>,
+    /// What lookups read: built from `funcs` when a lookup finds `funcs_dirty`, and never freed (a
+    /// registration after the first lookup leaves the older table behind; they are small).
+    func_table: AtomicPtr<FuncTable>,
+    funcs_dirty: AtomicBool,
     svc: Mutex<Option<SvcHandler>>,
     /// Threads whose every `n`th store-exclusive fails even with an intact reservation:
     /// `(n, attempts so far)`. Empty in normal runs.
@@ -40,15 +100,21 @@ pub struct Runtime {
 static RT: OnceLock<Runtime> = OnceLock::new();
 
 pub fn rt() -> &'static Runtime {
-    RT.get_or_init(Runtime::new)
+    RT.get_or_init(|| {
+        let runtime = Runtime::new();
+        runtime.mem.publish();
+        runtime
+    })
 }
 
 impl Runtime {
     fn new() -> Runtime {
         Runtime {
             mem: GuestMemory::new(),
-            monitors: Monitors::new(),
+            monitors: Monitors::global(),
             funcs: RwLock::new(Vec::new()),
+            func_table: AtomicPtr::new(std::ptr::null_mut()),
+            funcs_dirty: AtomicBool::new(true),
             svc: Mutex::new(None),
             spurious: Mutex::new(BTreeMap::new()),
             spurious_any: AtomicBool::new(false),
@@ -69,13 +135,25 @@ impl Runtime {
         t.extend_from_slice(entries);
         t.sort_by_key(|e| e.addr);
         t.dedup_by_key(|e| e.addr);
+        self.funcs_dirty.store(true, Ordering::Release);
+    }
+
+    /// Build the table lookups read from the registered functions.
+    fn publish_funcs(&self) {
+        // A registration needs the write lock, so none comes between the build and the flag.
+        let t = self.funcs.read().unwrap_or_else(|e| e.into_inner());
+        let table = Box::into_raw(Box::new(FuncTable::build(&t)));
+        self.func_table.store(table, Ordering::Release);
+        self.funcs_dirty.store(false, Ordering::Release);
     }
 
     pub fn lookup(&self, pc: u64) -> Option<*const c_void> {
-        let t = self.funcs.read().unwrap_or_else(|e| e.into_inner());
-        t.binary_search_by_key(&pc, |e| e.addr)
-            .ok()
-            .map(|i| t[i].func)
+        if self.funcs_dirty.load(Ordering::Acquire) {
+            self.publish_funcs();
+        }
+        let table = self.func_table.load(Ordering::Acquire);
+        // SAFETY: published by `publish_funcs` and never freed.
+        unsafe { table.as_ref() }?.get(pc)
     }
 
     pub fn set_svc_handler(&self, h: Option<SvcHandler>) {
@@ -123,7 +201,9 @@ impl Runtime {
                     .append(true)
                     .open(path)
                 {
-                    let _ = writeln!(f, "{pc:#x}");
+                    // One write per line: several threads log, and `writeln!` on a file makes
+                    // a write for each piece of the line.
+                    let _ = f.write_all(format!("{pc:#x}\n").as_bytes());
                 }
             }
         }
@@ -565,4 +645,61 @@ pub unsafe fn interpret(cpu: *mut NativeCpu, entry: u64, max_steps: u64) -> u32 
     }
     record_stop(&mut *cpu, stop::HALTED, (*state).pc, 0);
     stop::HALTED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A "function" that is a number: only the lookup is under test.
+    fn tag(n: usize) -> *const c_void {
+        std::ptr::without_provenance(n)
+    }
+
+    fn entry(addr: u64) -> FuncEntry {
+        // The "function" is the address itself.
+        FuncEntry {
+            addr,
+            func: tag(addr as usize),
+        }
+    }
+
+    #[test]
+    fn the_function_table_finds_every_function_and_nothing_else() {
+        // Addresses of 4-byte instructions with long runs of neighbors, which hash close together.
+        let entries: Vec<FuncEntry> = (0..20_000u64)
+            .map(|i| entry(0x800_0000 + 4 * i + if i % 7 == 0 { 0x10_0000 } else { 0 }))
+            .collect();
+        let table = FuncTable::build(&entries);
+        for e in &entries {
+            assert_eq!(table.get(e.addr), Some(e.func), "{:#x}", e.addr);
+        }
+        for miss in [0, 4, 0x800_0002, 0x7FF_FFFC, 0x900_0000, u64::MAX] {
+            assert_eq!(table.get(miss), None, "{miss:#x}");
+        }
+        // The first entry for an address stands.
+        let dup = [
+            FuncEntry {
+                addr: 0x1000,
+                func: tag(1),
+            },
+            FuncEntry {
+                addr: 0x1000,
+                func: tag(2),
+            },
+        ];
+        assert_eq!(FuncTable::build(&dup).get(0x1000), Some(tag(1)));
+        assert_eq!(FuncTable::build(&[]).get(0x1000), None);
+    }
+
+    #[test]
+    fn a_registration_after_a_lookup_is_seen() {
+        let rt = Runtime::new();
+        assert_eq!(rt.lookup(0x4000), None);
+        rt.register(&[entry(0x4000)]);
+        assert_eq!(rt.lookup(0x4000), Some(tag(0x4000)));
+        rt.register(&[entry(0x4004), entry(0x4000)]);
+        assert_eq!(rt.lookup(0x4004), Some(tag(0x4004)));
+        assert_eq!(rt.lookup(0x4008), None);
+    }
 }
