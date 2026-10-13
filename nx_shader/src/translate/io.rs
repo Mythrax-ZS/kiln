@@ -58,7 +58,7 @@ fn scalar_type(tx: &Tx<'_>, class: Class) -> Id {
 }
 
 /// A read-only or writable `uint[]` storage buffer at a binding.
-fn storage_buffer(tx: &mut Tx<'_>, binding: u32, writable: bool) -> Id {
+pub(super) fn storage_buffer(tx: &mut Tx<'_>, binding: u32, writable: bool) -> Id {
     let u = tx.t.u32;
     let rt = tx.m.ty_runtime_array(u, 4);
     let block = tx.m.ty_struct(&[rt]);
@@ -76,7 +76,7 @@ fn storage_buffer(tx: &mut Tx<'_>, binding: u32, writable: bool) -> Id {
 }
 
 /// A pointer to word `index` of a `uint[]` storage buffer made by [`storage_buffer`].
-fn word_ptr(tx: &mut Tx<'_>, buffer: Id, index: Id) -> Id {
+pub(super) fn word_ptr(tx: &mut Tx<'_>, buffer: Id, index: Id) -> Id {
     let zero = tx.c32(0);
     let ptr_ty = tx.m.ty_pointer(storage::STORAGE_BUFFER, tx.t.u32);
     tx.f.emit_result(&mut tx.m, op::ACCESS_CHAIN, ptr_ty, &[buffer, zero, index])
@@ -333,6 +333,9 @@ pub(super) fn translate(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<bool> {
         Op::Ipa | Op::IpaIdx => ipa(tx, inst, opc)?,
         Op::Ldc => ldc(tx, inst)?,
         Op::S2r => s2r(tx, inst)?,
+        Op::Texs => super::tex::texs(tx, inst)?,
+        Op::Ldg => super::global::ldg(tx, inst)?,
+        Op::Stg => super::global::stg(tx, inst)?,
         _ => return Ok(false),
     }
     Ok(true)

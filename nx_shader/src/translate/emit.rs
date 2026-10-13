@@ -22,6 +22,7 @@ pub(super) struct Types {
     pub i32: Id,
     pub f32: Id,
     pub v2f32: Id,
+    pub v3f32: Id,
     pub v4f32: Id,
     pub v4u32: Id,
     pub v4i32: Id,
@@ -45,6 +46,10 @@ pub(super) struct Tx<'a> {
     /// Constant buffer slot variables, created on first use.
     pub cbufs: [Option<Id>; 18],
     pub io: super::io::Io,
+    /// Texture slot variables, created on first use.
+    pub textures: std::collections::HashMap<u32, Id>,
+    /// The global memory table variable and the address translation function.
+    pub gmap: Option<(Id, Id)>,
     /// The offset of the instruction being translated, for messages.
     pub pc: u32,
 }
@@ -59,6 +64,7 @@ impl<'a> Tx<'a> {
         let i32 = m.ty_i32();
         let f32 = m.ty_f32();
         let v2f32 = m.ty_vector(f32, 2);
+        let v3f32 = m.ty_vector(f32, 3);
         let v4f32 = m.ty_vector(f32, 4);
         let v4u32 = m.ty_vector(u32, 4);
         let v4i32 = m.ty_vector(i32, 4);
@@ -76,6 +82,7 @@ impl<'a> Tx<'a> {
                 i32,
                 f32,
                 v2f32,
+                v3f32,
                 v4f32,
                 v4u32,
                 v4i32,
@@ -86,6 +93,8 @@ impl<'a> Tx<'a> {
             interface: Vec::new(),
             cbufs: [None; 18],
             io: super::io::Io::default(),
+            textures: std::collections::HashMap::new(),
+            gmap: None,
             pc: 0,
         }
     }
@@ -495,7 +504,8 @@ pub fn translate(code: Code<'_>, sph: Option<&Sph>, cfg: &Config) -> Result<Tran
     } = tx;
     let id = f.id;
     m.add_function(f);
-    m.memory_model(0, 1);
+    // 5348 is PhysicalStorageBuffer64, which a program that reaches global memory needs.
+    m.memory_model(if info.global_memory { 5348 } else { 0 }, 1);
     let model = match cfg.stage {
         Stage::Vertex => exec::VERTEX,
         Stage::Pixel => exec::FRAGMENT,

@@ -12,7 +12,7 @@
 //! * binding `64 * stage + k` for constant buffer slot `k` (0..18): a read-only storage buffer of
 //!   32-bit words holding the buffer's bytes;
 //! * binding `64 * stage + 20`: the global memory map (see [`Info::global_memory`]);
-//! * binding `64 * stage + 24 + t` for the texture the program names with index `t` (0..32): a
+//! * binding `64 * stage + 24 + t` for the texture the program names with index `t` (0..40): a
 //!   combined image sampler;
 //! * compute tests (the harness mode) use bindings 100 and up, listed in [`test_bindings`].
 //!
@@ -22,7 +22,9 @@
 pub(crate) mod alu;
 mod emit;
 mod flow;
+mod global;
 mod io;
+mod tex;
 
 pub use emit::translate;
 
@@ -115,10 +117,10 @@ pub struct Info {
     pub cbuf_dynamic: [bool; 18],
     pub textures: Vec<TextureUse>,
     /// The program reads or writes global memory. Binding `64 * stage + 20` is then a storage
-    /// buffer of 32-bit words: word 0 the number of entries, word 1 the address of a zeroed
-    /// scratch page used for addresses no entry covers, then six words per entry: the first GPU
-    /// address (low, high), one past the last (low, high) and the device address of the first
-    /// byte (low, high), all little-endian.
+    /// buffer of 32-bit words: word 0 the number of entries, word 1 reserved (zero), words 2 and
+    /// 3 the device address (low, high) of a zeroed scratch page used for addresses no entry
+    /// covers, then from word 4 six words per entry: the first GPU address (low, high), one past
+    /// the last (low, high) and the device address of the first byte (low, high).
     pub global_memory: bool,
     /// Vertex stage: which components (bit `c` of entry `i`) of attribute location `i` are read.
     pub attributes_read: [u8; 32],

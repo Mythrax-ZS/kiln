@@ -253,3 +253,90 @@ fn a_guarded_instruction_and_a_branch_follow_the_predicates() {
         assert_eq!(got.preds, inp.preds, "predicates are untouched");
     }
 }
+
+/// `F2I` to 8, 16 and 32 bits saturates, rounds to nearest even and turns NaN into zero.
+#[test]
+fn float_to_integer_conversions_saturate() {
+    let Some(vk) = vulkan() else { return };
+    // The destination type: bits 8..9 the size (0 8-bit, 1 16, 2 32), bit 12 signed; the source
+    // is a 32-bit float (bits 10..11 = 2). The source register is in bits 20..27.
+    let f2i = |rd: u8, size: u64, signed: bool| {
+        Enc::op(Op::F2iReg)
+            .rd(rd)
+            .rb(1)
+            .field(8, 2, size)
+            .field(10, 2, 2)
+            .bit(12, signed)
+            .build()
+    };
+    let program = [
+        f2i(3, 0, false),
+        f2i(4, 0, true),
+        f2i(5, 1, false),
+        f2i(6, 1, true),
+        f2i(7, 2, false),
+        f2i(8, 2, true),
+        exit(Guard::ALWAYS),
+    ];
+    let mut values: Vec<f32> = vec![
+        0.0,
+        -0.0,
+        0.5,
+        1.5,
+        2.5,
+        -0.5,
+        -1.5,
+        127.5,
+        128.0,
+        255.4,
+        255.6,
+        300.0,
+        32767.5,
+        32768.0,
+        65535.0,
+        65535.5,
+        70000.0,
+        -129.0,
+        -32768.0,
+        -40000.0,
+        1.0e9,
+        -1.0e9,
+        3.0e9,
+        5.0e9,
+        -5.0e9,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        2147483520.0,
+        4294967040.0,
+    ];
+    let mut rng = Rng(99);
+    for _ in 0..200 {
+        values.push((rng.next() as f32 / u32::MAX as f32 - 0.5) * 140_000.0);
+    }
+    let inputs: Vec<State> = values
+        .iter()
+        .map(|v| {
+            let mut s = State::default();
+            s.regs[1] = v.to_bits();
+            s
+        })
+        .collect();
+    let out = run(&vk, &program, &inputs, &[]);
+    for (v, got) in values.iter().zip(&out) {
+        let r = v.round_ties_even();
+        let clamp = |lo: f32, hi: f32| if v.is_nan() { 0.0 } else { r.clamp(lo, hi) };
+        assert_eq!(got.regs[3], clamp(0.0, 255.0) as u32, "u8 of {v}");
+        assert_eq!(got.regs[4], clamp(-128.0, 127.0) as i32 as u32, "s8 of {v}");
+        assert_eq!(got.regs[5], clamp(0.0, 65535.0) as u32, "u16 of {v}");
+        assert_eq!(
+            got.regs[6],
+            clamp(-32768.0, 32767.0) as i32 as u32,
+            "s16 of {v}"
+        );
+        // Rust's float to integer casts saturate and map NaN to zero, which is what the
+        // hardware does too.
+        assert_eq!(got.regs[7], r as u32, "u32 of {v}");
+        assert_eq!(got.regs[8], r as i32 as u32, "s32 of {v}");
+    }
+}

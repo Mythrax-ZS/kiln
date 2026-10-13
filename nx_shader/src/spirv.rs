@@ -34,6 +34,7 @@ pub mod op {
     pub const CONSTANT_COMPOSITE: u16 = 44;
     pub const CONSTANT_NULL: u16 = 46;
     pub const FUNCTION: u16 = 54;
+    pub const FUNCTION_PARAMETER: u16 = 55;
     pub const FUNCTION_END: u16 = 56;
     pub const FUNCTION_CALL: u16 = 57;
     pub const VARIABLE: u16 = 59;
@@ -146,6 +147,7 @@ pub mod op {
     pub const SWITCH: u16 = 251;
     pub const KILL: u16 = 252;
     pub const RETURN: u16 = 253;
+    pub const RETURN_VALUE: u16 = 254;
     pub const UNREACHABLE: u16 = 255;
     pub const TERMINATE_INVOCATION: u16 = 4416;
     pub const DEMOTE_TO_HELPER_INVOCATION: u16 = 5380;
@@ -657,6 +659,7 @@ impl Module {
             return_type,
             function_type,
             entry_label,
+            params: Vec::new(),
             variables: Vec::new(),
             body: Vec::new(),
         }
@@ -669,6 +672,7 @@ impl Module {
             op::FUNCTION,
             &[f.return_type, f.id, 0, f.function_type],
         );
+        self.functions.extend(f.params);
         encode(&mut self.functions, op::LABEL, &[f.entry_label]);
         self.functions.extend(f.variables);
         self.functions.extend(f.body);
@@ -700,11 +704,19 @@ pub struct Function {
     function_type: Id,
     /// The label of the first block, already emitted.
     pub entry_label: Id,
+    params: Vec<u32>,
     variables: Vec<u32>,
     body: Vec<u32>,
 }
 
 impl Function {
+    /// A parameter of the function (they come before the first block); returns its id.
+    pub fn parameter(&mut self, m: &mut Module, ty: Id) -> Id {
+        let id = m.id();
+        encode(&mut self.params, op::FUNCTION_PARAMETER, &[ty, id]);
+        id
+    }
+
     /// A local variable, hoisted to the start of the entry block.
     pub fn local(&mut self, m: &mut Module, pointee: Id) -> Id {
         let ptr = m.ty_pointer(storage::FUNCTION, pointee);

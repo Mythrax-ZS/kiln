@@ -394,8 +394,39 @@ fn f2i(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
     }
     let size = inst.bits(8, 2);
     let signed = inst.bit(12);
-    if size != 2 {
-        return tx.fail("F2I to a destination that is not 32 bits");
+    if size == 3 {
+        return tx.fail("F2I to a 64-bit integer");
+    }
+    if size < 2 {
+        // 8 and 16 bits: saturate to the range of the destination, NaN gives zero. The result is
+        // the integer in a 32-bit register, sign-extended for the signed types.
+        let (lo, hi) = match (size, signed) {
+            (0, false) => (0.0, 255.0),
+            (0, true) => (-128.0, 127.0),
+            (_, false) => (0.0, 65535.0),
+            (_, true) => (-32768.0, 32767.0),
+        };
+        let src = src_b_f(tx, inst)?;
+        let src = fmods(tx, src, inst.bit(45), inst.bit(49));
+        let rounded = round_float(tx, src, inst.bits(39, 2));
+        let f = tx.t.f32;
+        let lo_c = tx.cf32(lo);
+        let hi_c = tx.cf32(hi);
+        let above_lo = tx.ext(f, glsl::N_MAX, &[rounded, lo_c]);
+        let clamped = tx.ext(f, glsl::N_MIN, &[above_lo, hi_c]);
+        let r = if signed {
+            let i = tx.t.i32;
+            let conv = tx.op1(op::CONVERT_F_TO_S, i, clamped);
+            tx.as_u32(conv)
+        } else {
+            let u = tx.t.u32;
+            tx.op1(op::CONVERT_F_TO_U, u, clamped)
+        };
+        let nan = tx.op1(op::IS_NAN, tx.t.bool_, rounded);
+        let zero = tx.c32(0);
+        let r = tx.select_u32(nan, zero, r);
+        tx.write(inst, inst.rd(), r);
+        return Ok(());
     }
     let src = src_b_f(tx, inst)?;
     let src = fmods(tx, src, inst.bit(45), inst.bit(49));

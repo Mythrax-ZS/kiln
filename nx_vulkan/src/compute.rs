@@ -276,3 +276,15 @@ impl Vk {
         result
     }
 }
+
+impl Vk {
+    /// The device address of a buffer made with `SHADER_DEVICE_ADDRESS` usage.
+    pub fn buffer_address(&self, buffer: &HostBuffer) -> u64 {
+        // SAFETY: the buffer is valid and was created with the device address usage.
+        unsafe {
+            self.device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(buffer.buffer),
+            )
+        }
+    }
+}
