@@ -6,7 +6,7 @@
 //! nothing is copied. A mapping is imported in runs of host-contiguous pages.
 
 use super::frame::{Frame, Garbage};
-use crate::compute::{HostBuffer, ImportedMemory};
+use crate::compute::{DeviceBuffer, HostBuffer, ImportedMemory};
 use crate::device::Vk;
 use ash::vk;
 use nx_gpu::render::Scene;
@@ -23,7 +23,7 @@ pub struct GlobalMemory {
     imports: HashMap<(usize, u64), ImportedMemory>,
     scratch: Option<HostBuffer>,
     /// The table built for the mappings with this signature.
-    table: Option<(HostBuffer, u64)>,
+    table: Option<(DeviceBuffer, u64)>,
     /// Say why an import failed (`NX_TRACE_GPU`).
     trace: bool,
     /// Imports that failed, by reason, so each is said once.
@@ -96,9 +96,8 @@ impl GlobalMemory {
             }
         }
         let bytes = (4 + 6 * entries.len() as u64) * 4;
-        let mut table = vk.create_host_buffer(bytes, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+        let mut words = vec![0u8; bytes as usize];
         {
-            let words = table.as_mut_slice();
             let mut put =
                 |i: usize, v: u32| words[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
             put(0, entries.len() as u32);
@@ -112,8 +111,36 @@ impl GlobalMemory {
                 }
             }
         }
+        // The table is read at every access of every program that reaches memory, so it lives
+        // in memory the device reads fast (not host memory across the bus): it is copied there
+        // before the commands recorded from now on.
+        let table = vk.create_device_buffer(bytes, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+        let (staging, offset) = frame.upload(vk, &words, 4)?;
+        let cmd = frame.upload_cmd(vk)?;
+        let copy = [vk::BufferCopy::default()
+            .src_offset(offset)
+            .dst_offset(0)
+            .size(table.size.min(bytes.max(4)))];
+        let barrier = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+        // SAFETY: the upload command buffer is recording; the buffers are valid.
+        unsafe {
+            vk.device.cmd_copy_buffer(cmd, staging, table.buffer, &copy);
+            vk.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::VERTEX_SHADER
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER
+                    | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &barrier,
+                &[],
+                &[],
+            );
+        }
         if let Some((old, _)) = self.table.take() {
-            frame.garbage.push(Garbage::Buffer(old));
+            frame.garbage.push(Garbage::Device(old));
         }
         let (buffer, size) = (table.buffer, table.size);
         self.table = Some((table, signature));
@@ -141,7 +168,7 @@ impl GlobalMemory {
 
     pub fn destroy(&mut self, vk: &Vk) {
         if let Some((t, _)) = self.table.take() {
-            vk.destroy_host_buffer(t);
+            vk.destroy_device_buffer(t);
         }
         if let Some(s) = self.scratch.take() {
             vk.destroy_host_buffer(s);

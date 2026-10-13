@@ -75,6 +75,13 @@ pub struct AddressPatch {
     pub addend: u64,
 }
 
+/// A buffer in device local memory (see [`Vk::create_device_buffer`]).
+pub struct DeviceBuffer {
+    pub buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    pub size: u64,
+}
+
 impl Vk {
     pub fn create_host_buffer(
         &self,
@@ -156,6 +163,68 @@ impl Vk {
         // SAFETY: the buffer is no longer in use by the caller.
         unsafe {
             self.device.unmap_memory(b.memory);
+            self.device.destroy_buffer(b.buffer, None);
+            self.device.free_memory(b.memory, None);
+        }
+    }
+
+    /// A buffer in memory only the device reaches (device local), for what shaders read many
+    /// times and the host writes once: filled by a copy the caller records.
+    pub fn create_device_buffer(
+        &self,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+    ) -> Result<DeviceBuffer, String> {
+        let size = size.max(4);
+        let info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(usage | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: valid create info; the handles are destroyed in `destroy_device_buffer`.
+        unsafe {
+            let buffer = self
+                .device
+                .create_buffer(&info, None)
+                .map_err(|e| format!("creating a buffer of {size} bytes: {e}"))?;
+            let req = self.device.get_buffer_memory_requirements(buffer);
+            let Some(ty) = self
+                .find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                .or_else(|| {
+                    self.find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::empty())
+                })
+            else {
+                self.device.destroy_buffer(buffer, None);
+                return Err("no memory type for a device buffer".to_string());
+            };
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(ty);
+            let memory = match self.device.allocate_memory(&alloc, None) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(format!(
+                        "allocating {} bytes of device memory: {e}",
+                        req.size
+                    ));
+                }
+            };
+            if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
+                self.device.free_memory(memory, None);
+                self.device.destroy_buffer(buffer, None);
+                return Err(format!("binding buffer memory: {e}"));
+            }
+            Ok(DeviceBuffer {
+                buffer,
+                memory,
+                size,
+            })
+        }
+    }
+
+    pub fn destroy_device_buffer(&self, b: DeviceBuffer) {
+        // SAFETY: the buffer is no longer in use by the caller or the device.
+        unsafe {
             self.device.destroy_buffer(b.buffer, None);
             self.device.free_memory(b.memory, None);
         }

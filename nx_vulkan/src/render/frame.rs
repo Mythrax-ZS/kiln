@@ -11,7 +11,7 @@
 //! recorded and waits for everything that is in flight. A slot's chunks and descriptor pools are
 //! reused, and the garbage it was given is destroyed, once the device has finished its batch.
 
-use crate::compute::HostBuffer;
+use crate::compute::{DeviceBuffer, HostBuffer};
 use crate::device::Vk;
 use ash::vk;
 use std::collections::VecDeque;
@@ -66,7 +66,7 @@ pub struct Frame {
 /// Something a submission needed that can be destroyed after it ran.
 pub enum Garbage {
     Image(crate::image::Image),
-    Buffer(HostBuffer),
+    Device(DeviceBuffer),
 }
 
 impl Frame {
@@ -431,7 +431,7 @@ impl Frame {
         for g in slot.garbage.drain(..) {
             match g {
                 Garbage::Image(i) => vk.destroy_image(i),
-                Garbage::Buffer(b) => vk.destroy_host_buffer(b),
+                Garbage::Device(b) => vk.destroy_device_buffer(b),
             }
         }
         Ok(())
@@ -473,7 +473,7 @@ impl Frame {
         for g in self.garbage.drain(..) {
             match g {
                 Garbage::Image(i) => vk.destroy_image(i),
-                Garbage::Buffer(b) => vk.destroy_host_buffer(b),
+                Garbage::Device(b) => vk.destroy_device_buffer(b),
             }
         }
     }

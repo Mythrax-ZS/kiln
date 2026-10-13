@@ -423,3 +423,80 @@ fn texs_of_an_array_takes_the_layer_from_the_first_register() {
         assert_eq!([f(4), f(5), f(6), f(7)], *want, "sample {i}");
     }
 }
+
+#[test]
+fn a_table_of_many_ranges_is_searched_for_the_one_that_holds_an_address() {
+    let Some(vk) = vulkan() else { return };
+    // Seven ranges of 0x400 bytes at addresses 0x1000 apart (in order of their start, as the
+    // renderer's table is), the i-th at offset 0x400 * i of one device memory of 0x1c00 bytes.
+    const START: u64 = 0x3_0000_0000;
+    const RANGES: u64 = 7;
+    let mut rng = Rng(1234);
+    let memory: Vec<u8> = (0..0x1c00 / 4)
+        .flat_map(|_| rng.next().to_le_bytes())
+        .collect();
+    let mut table = vec![0u8; 4 * (4 + 6 * RANGES as usize)];
+    let mut put =
+        |word: usize, v: u32| table[word * 4..word * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    put(0, RANGES as u32);
+    let mut patches = vec![AddressPatch {
+        into: 5,
+        offset: 8,
+        of: 7,
+        addend: 0,
+    }];
+    for i in 0..RANGES {
+        let (start, end) = (START + 0x1000 * i, START + 0x1000 * i + 0x400);
+        let at = 4 + 6 * i as usize;
+        put(at, start as u32);
+        put(at + 1, (start >> 32) as u32);
+        put(at + 2, end as u32);
+        put(at + 3, (end >> 32) as u32);
+        patches.push(AddressPatch {
+            into: 5,
+            offset: 4 * (at + 4),
+            of: 6,
+            addend: 0x400 * i,
+        });
+    }
+    // The address each invocation loads from: the edges of every range, the gaps, and below and
+    // above all of them.
+    let mut probes: Vec<u64> = vec![0, 4, START - 4, START + 0x1000 * RANGES, u64::MAX - 3];
+    for i in 0..RANGES {
+        let s = START + 0x1000 * i;
+        probes.extend([s - 4, s, s + 4, s + 0x3F8, s + 0x3FC, s + 0x400, s + 0x800]);
+    }
+    let model = |gpu: u64| -> u32 {
+        for i in 0..RANGES {
+            let s = START + 0x1000 * i;
+            if (s..s + 0x400).contains(&gpu) {
+                let at = (0x400 * i + gpu - s) as usize;
+                return u32::from_le_bytes(memory[at..at + 4].try_into().unwrap());
+            }
+        }
+        0
+    };
+    let program = [ldg(3, 1, 0, 4).build(), exit(Guard::ALWAYS)];
+    let inputs: Vec<State> = probes
+        .iter()
+        .map(|a| {
+            let mut s = State::default();
+            s.regs[1] = *a as u32;
+            s.regs[2] = (*a >> 32) as u32;
+            s
+        })
+        .collect();
+    let extras = Extras {
+        buffers: vec![
+            (TABLE, table),
+            (200, memory.clone()),
+            (201, vec![0u8; 4096]),
+        ],
+        patches,
+        ..Extras::default()
+    };
+    let out = run_with(&vk, &program, &inputs, &[], extras);
+    for (probe, got) in probes.iter().zip(&out.states) {
+        assert_eq!(got.regs[3], model(*probe), "a load from {probe:#x}");
+    }
+}

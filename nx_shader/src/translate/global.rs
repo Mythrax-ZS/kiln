@@ -2,7 +2,7 @@
 //!
 //! The shader cannot see GPU virtual addresses directly, so it gets a table of the ranges the host
 //! has made visible (see [`super::Info::global_memory`]) and turns an address into a device
-//! address with a small loop over it. The memory is then reached through a
+//! address with a binary search of it (its entries are in order of their start). The memory is then reached through a
 //! `PhysicalStorageBuffer` pointer (`VK_KHR_buffer_device_address`). An address no entry covers
 //! lands in a scratch page, so a stray access cannot fault.
 
@@ -35,12 +35,9 @@ fn ensure(tx: &mut Tx<'_>) -> (Id, Id) {
     let outer = std::mem::replace(&mut tx.f, g);
 
     let u = tx.t.u32;
-    let bool_t = tx.t.bool_;
     let zero = tx.c32(0);
     let one = tx.c32(1);
     let ptr_u = tx.m.ty_pointer(storage::FUNCTION, u);
-    let i_var = tx.m.id();
-    tx.f.local_with_init(ptr_u, i_var, zero);
     let word = |tx: &mut Tx<'_>, index: Id| -> Id {
         let p = super::io::word_ptr(tx, map, index);
         tx.f.load(&mut tx.m, u, p)
@@ -52,11 +49,17 @@ fn ensure(tx: &mut Tx<'_>) -> (Id, Id) {
         let shifted = tx.op2(op::SHIFT_LEFT_LOGICAL, u64t, hi64, c32);
         tx.op2(op::BITWISE_OR, u64t, lo64, shifted)
     };
+    // The entries are in order of their start and do not overlap: a binary search finds the last
+    // entry that starts at or below the address, and that is the only one that can hold it.
+    let (lo_var, hi_var) = (tx.m.id(), tx.m.id());
+    let count_ix = tx.c32(COUNT);
+    let count = word(tx, count_ix);
+    tx.f.local_with_init(ptr_u, lo_var, zero);
+    tx.f.local_with_init(ptr_u, hi_var, zero);
+    tx.f.store(hi_var, count);
     let header = tx.m.id();
     let check = tx.m.id();
     let body = tx.m.id();
-    let hit = tx.m.id();
-    let after = tx.m.id();
     let cont = tx.m.id();
     let exit = tx.m.id();
     tx.f.branch(header);
@@ -64,48 +67,61 @@ fn ensure(tx: &mut Tx<'_>) -> (Id, Id) {
     tx.f.loop_merge(exit, cont);
     tx.f.branch(check);
     tx.f.label(check);
-    let i = tx.f.load(&mut tx.m, u, i_var);
-    let count_ix = tx.c32(COUNT);
-    let count = word(tx, count_ix);
-    let more = tx.cmp(op::U_LESS_THAN, i, count);
+    let lo = tx.f.load(&mut tx.m, u, lo_var);
+    let hi = tx.f.load(&mut tx.m, u, hi_var);
+    let more = tx.cmp(op::U_LESS_THAN, lo, hi);
     tx.f.branch_conditional(more, body, exit);
     tx.f.label(body);
+    let sum = tx.iadd(lo, hi);
+    let mid = tx.shr(sum, one);
     let stride = tx.c32(ENTRY_WORDS);
-    let base0 = tx.imul(i, stride);
     let entries = tx.c32(ENTRIES);
+    let at = tx.imul(mid, stride);
+    let at = tx.iadd(at, entries);
+    let at_hi = tx.iadd(at, one);
+    let (start_lo, start_hi) = (word(tx, at), word(tx, at_hi));
+    let start = wide(tx, start_lo, start_hi);
+    let starts_below = tx.cmp(op::U_LESS_THAN_EQUAL, start, va);
+    let past = tx.iadd(mid, one);
+    let next_lo = tx.select_u32(starts_below, past, lo);
+    let next_hi = tx.select_u32(starts_below, hi, mid);
+    tx.f.store(lo_var, next_lo);
+    tx.f.store(hi_var, next_hi);
+    tx.f.branch(cont);
+    tx.f.label(cont);
+    tx.f.branch(header);
+    tx.f.label(exit);
+    // `lo` entries start at or below the address; the last of them, if any, is the candidate.
+    let lo = tx.f.load(&mut tx.m, u, lo_var);
+    let found = tx.cmp(op::I_NOT_EQUAL, lo, zero);
+    let before = tx.op2(op::I_SUB, u, lo, one);
+    let candidate = tx.select_u32(found, before, zero);
+    let stride = tx.c32(ENTRY_WORDS);
+    let entries = tx.c32(ENTRIES);
+    let base0 = tx.imul(candidate, stride);
     let base = tx.iadd(base0, entries);
     let mut w = [zero; 6];
     for (k, slot) in w.iter_mut().enumerate() {
         let off = tx.c32(k as u32);
         let ix = tx.iadd(base, off);
+        // With no entry the words are those of the header, which are there and not used.
+        let ix = tx.select_u32(found, ix, zero);
         *slot = word(tx, ix);
     }
     let start = wide(tx, w[0], w[1]);
     let end = wide(tx, w[2], w[3]);
     let dev = wide(tx, w[4], w[5]);
-    let ge = tx.cmp(op::U_GREATER_THAN_EQUAL, va, start);
-    let lt = tx.cmp(op::U_LESS_THAN, va, end);
-    let inside = tx.land(ge, lt);
-    tx.f.selection_merge(after);
-    tx.f.branch_conditional(inside, hit, after);
-    tx.f.label(hit);
+    let below_end = tx.cmp(op::U_LESS_THAN, va, end);
+    let inside = tx.land(found, below_end);
     let delta = tx.op2(op::I_SUB, u64t, va, start);
-    let result = tx.op2(op::I_ADD, u64t, dev, delta);
-    tx.f.emit(op::RETURN_VALUE, &[result]);
-    tx.f.label(after);
-    tx.f.branch(cont);
-    tx.f.label(cont);
-    let next = tx.iadd(i, one);
-    tx.f.store(i_var, next);
-    tx.f.branch(header);
-    tx.f.label(exit);
+    let mapped = tx.op2(op::I_ADD, u64t, dev, delta);
     let lo_ix = tx.c32(SCRATCH);
     let hi_ix = tx.c32(SCRATCH + 1);
-    let lo = word(tx, lo_ix);
-    let hi = word(tx, hi_ix);
-    let scratch = wide(tx, lo, hi);
-    tx.f.emit(op::RETURN_VALUE, &[scratch]);
-    let _ = bool_t;
+    let scratch_lo = word(tx, lo_ix);
+    let scratch_hi = word(tx, hi_ix);
+    let scratch = wide(tx, scratch_lo, scratch_hi);
+    let result = tx.select(u64t, inside, mapped, scratch);
+    tx.f.emit(op::RETURN_VALUE, &[result]);
 
     let done = std::mem::replace(&mut tx.f, outer);
     tx.m.add_function(done);
