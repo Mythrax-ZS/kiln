@@ -1,0 +1,261 @@
+//! The commands of one submission and the memory they use.
+//!
+//! The processor delivers the commands of a submission one at a time; they are recorded into a
+//! command buffer, together with the data they read (constant buffers, vertices, indices, texture
+//! uploads), which is copied into host-visible chunks at the moment of the command because the
+//! guest may change its memory afterwards. [`Frame::submit`] runs everything and waits, then the
+//! chunks and descriptor pools are reused by the next submission.
+
+use crate::compute::HostBuffer;
+use crate::device::Vk;
+use ash::vk;
+
+/// Size of the chunks the upload memory is carved from.
+const CHUNK: u64 = 16 << 20;
+
+struct Chunk {
+    buffer: HostBuffer,
+    used: u64,
+}
+
+pub struct Frame {
+    pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    recording: bool,
+    chunks: Vec<Chunk>,
+    /// How many chunks the submission in progress has used (the rest are free).
+    in_use: usize,
+    descriptor_pools: Vec<vk::DescriptorPool>,
+    pools_in_use: usize,
+    /// Resources to destroy once the submission has finished.
+    pub garbage: Vec<Garbage>,
+}
+
+/// Something a submission needed that can be destroyed after it ran.
+pub enum Garbage {
+    Image(crate::image::Image),
+}
+
+impl Frame {
+    pub fn new(vk: &Vk) -> Result<Frame, String> {
+        // SAFETY: plain object creation; destroyed in `destroy`.
+        unsafe {
+            let pool = vk
+                .device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default()
+                        .queue_family_index(vk.queue_family)
+                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .map_err(|e| format!("creating the command pool: {e}"))?;
+            let cmd = vk
+                .device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+                .map_err(|e| format!("allocating the command buffer: {e}"))?[0];
+            let fence = vk
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|e| format!("creating the fence: {e}"))?;
+            Ok(Frame {
+                pool,
+                cmd,
+                fence,
+                recording: false,
+                chunks: Vec::new(),
+                in_use: 0,
+                descriptor_pools: Vec::new(),
+                pools_in_use: 0,
+                garbage: Vec::new(),
+            })
+        }
+    }
+
+    /// The command buffer, started if it was not.
+    pub fn cmd(&mut self, vk: &Vk) -> Result<vk::CommandBuffer, String> {
+        if !self.recording {
+            // SAFETY: the buffer is not in use (the last submission was waited for).
+            unsafe {
+                vk.device
+                    .begin_command_buffer(
+                        self.cmd,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .map_err(|e| format!("beginning the command buffer: {e}"))?;
+            }
+            self.recording = true;
+        }
+        Ok(self.cmd)
+    }
+
+    /// Copy `data` into upload memory aligned to `align` and give the buffer and offset.
+    pub fn upload(
+        &mut self,
+        vk: &Vk,
+        data: &[u8],
+        align: u64,
+    ) -> Result<(vk::Buffer, u64), String> {
+        let (buffer, offset, ptr) = self.reserve(vk, data.len() as u64, align)?;
+        // SAFETY: `reserve` gives `data.len()` writable bytes at `ptr`.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
+        Ok((buffer, offset))
+    }
+
+    /// Upload memory of `size` bytes: the buffer, the offset in it and where to write.
+    pub fn reserve(
+        &mut self,
+        vk: &Vk,
+        size: u64,
+        align: u64,
+    ) -> Result<(vk::Buffer, u64, *mut u8), String> {
+        let align = align.max(1);
+        let size = size.max(4);
+        // Room in the chunk taken last?
+        if self.in_use > 0 {
+            let chunk = &mut self.chunks[self.in_use - 1];
+            let at = chunk.used.next_multiple_of(align);
+            if at + size <= chunk.buffer.size {
+                chunk.used = at + size;
+                return Ok((chunk.buffer.buffer, at, chunk.buffer.ptr_at(at)));
+            }
+        }
+        // A free chunk of an earlier submission that is big enough, or a new one.
+        let reusable = self
+            .chunks
+            .get(self.in_use)
+            .is_some_and(|c| c.buffer.size >= size);
+        if !reusable {
+            let buffer = vk.create_host_buffer(
+                size.max(CHUNK),
+                vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::VERTEX_BUFFER
+                    | vk::BufferUsageFlags::INDEX_BUFFER
+                    | vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::UNIFORM_BUFFER,
+            )?;
+            self.chunks.insert(self.in_use, Chunk { buffer, used: 0 });
+        }
+        let chunk = &mut self.chunks[self.in_use];
+        chunk.used = size;
+        self.in_use += 1;
+        Ok((chunk.buffer.buffer, 0, chunk.buffer.ptr_at(0)))
+    }
+
+    /// A descriptor set with the layout, from the pools of this submission.
+    pub fn descriptor_set(
+        &mut self,
+        vk: &Vk,
+        layout: vk::DescriptorSetLayout,
+    ) -> Result<vk::DescriptorSet, String> {
+        let layouts = [layout];
+        for _ in 0..64 {
+            if self.pools_in_use == self.descriptor_pools.len() {
+                let sizes = [
+                    vk::DescriptorPoolSize::default()
+                        .ty(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(8192),
+                    vk::DescriptorPoolSize::default()
+                        .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(8192),
+                ];
+                // SAFETY: valid create info; destroyed in `destroy`.
+                let pool = unsafe {
+                    vk.device.create_descriptor_pool(
+                        &vk::DescriptorPoolCreateInfo::default()
+                            .max_sets(512)
+                            .pool_sizes(&sizes),
+                        None,
+                    )
+                }
+                .map_err(|e| format!("creating a descriptor pool: {e}"))?;
+                self.descriptor_pools.push(pool);
+            }
+            let info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.descriptor_pools[self.pools_in_use])
+                .set_layouts(&layouts);
+            // SAFETY: the pool and layout are valid.
+            match unsafe { vk.device.allocate_descriptor_sets(&info) } {
+                Ok(sets) => return Ok(sets[0]),
+                Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL) => {
+                    self.pools_in_use += 1;
+                }
+                Err(e) => return Err(format!("allocating a descriptor set: {e}")),
+            }
+        }
+        Err("no descriptor set could be allocated".to_string())
+    }
+
+    /// End the recording, run it and wait for it. Afterwards the upload memory and the
+    /// descriptor pools are free again and the garbage is gone.
+    pub fn submit(&mut self, vk: &Vk) -> Result<(), String> {
+        if !self.recording {
+            return Ok(());
+        }
+        // SAFETY: the command buffer is recording; the fence is unsignaled; the wait makes
+        // everything the commands used safe to release.
+        let result = unsafe {
+            (|| -> Result<(), String> {
+                vk.device
+                    .end_command_buffer(self.cmd)
+                    .map_err(|e| format!("ending the command buffer: {e}"))?;
+                let cmds = [self.cmd];
+                let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+                vk.device
+                    .queue_submit(vk.queue, &submit, self.fence)
+                    .map_err(|e| format!("submitting the commands: {e}"))?;
+                vk.device
+                    .wait_for_fences(&[self.fence], true, 120_000_000_000)
+                    .map_err(|e| format!("waiting for the commands: {e}"))?;
+                vk.device
+                    .reset_fences(&[self.fence])
+                    .map_err(|e| format!("resetting the fence: {e}"))?;
+                Ok(())
+            })()
+        };
+        self.recording = false;
+        // SAFETY: nothing is using the pools now.
+        unsafe {
+            vk.device
+                .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| format!("resetting the command buffer: {e}"))?;
+            for pool in &self.descriptor_pools {
+                let _ = vk
+                    .device
+                    .reset_descriptor_pool(*pool, vk::DescriptorPoolResetFlags::empty());
+            }
+        }
+        self.pools_in_use = 0;
+        for chunk in &mut self.chunks {
+            chunk.used = 0;
+        }
+        self.in_use = 0;
+        for g in self.garbage.drain(..) {
+            match g {
+                Garbage::Image(i) => vk.destroy_image(i),
+            }
+        }
+        result
+    }
+
+    pub fn destroy(mut self, vk: &Vk) {
+        let _ = self.submit(vk);
+        for chunk in self.chunks.drain(..) {
+            vk.destroy_host_buffer(chunk.buffer);
+        }
+        // SAFETY: the device is idle after the last submit.
+        unsafe {
+            for pool in self.descriptor_pools.drain(..) {
+                vk.device.destroy_descriptor_pool(pool, None);
+            }
+            vk.device.destroy_fence(self.fence, None);
+            vk.device.destroy_command_pool(self.pool, None);
+        }
+    }
+}

@@ -17,6 +17,13 @@ pub struct HostBuffer {
 unsafe impl Send for HostBuffer {}
 
 impl HostBuffer {
+    /// The address of byte `offset` of the mapping.
+    pub fn ptr_at(&self, offset: u64) -> *mut u8 {
+        debug_assert!(offset <= self.size);
+        // SAFETY: the offset stays inside the mapping (checked in debug builds).
+        unsafe { self.ptr.add(offset as usize) }
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: `ptr` maps `size` bytes for the life of the memory.
         unsafe { std::slice::from_raw_parts(self.ptr, self.size as usize) }

@@ -1945,6 +1945,7 @@ name = "nx_vulkan"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "nx_gpu",
  "nx_shader",
 ]
 
