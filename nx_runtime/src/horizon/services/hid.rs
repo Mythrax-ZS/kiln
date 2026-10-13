@@ -2,12 +2,15 @@
 //!
 //! A program asks `hid` for an applet resource, maps the shared memory that comes with it, and
 //! reads input state the service publishes there. The console here is in handheld mode with its
-//! Joy-Cons attached and nobody touching anything (docs/ASSUMPTIONS.md A-070): once the program
-//! has activated the controllers and said it supports the handheld style, the handheld Npad is
-//! connected and a new sample with no button pressed and both sticks centered is published every
-//! 5 ms. The debug pad, touch screen, mouse and keyboard stay zero. The layouts of the shared
-//! memory are those `libnx` documents. A command not listed stops the run.
+//! Joy-Cons attached (docs/ASSUMPTIONS.md A-070): once the program has activated the controllers
+//! and said it supports the handheld style, the handheld Npad is connected and a new sample is
+//! published every 5 ms. The sample holds the buttons and sticks of the keyboard of the window and
+//! of a gamepad (docs/ASSUMPTIONS.md A-104); nobody touching anything is no button and both sticks
+//! centered. The debug pad, touch screen, mouse and keyboard devices stay zero. The layouts of
+//! the shared memory are those `libnx` documents. A command not listed stops the run.
 
+use super::super::gamepad::Gamepad;
+use super::super::input::{self, Pad};
 use super::super::kernel::Kernel;
 use super::super::object::KObject;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
@@ -85,9 +88,10 @@ impl Input {
                 .is_some_and(|i| i.contains(&NPAD_ID_HANDHELD))
     }
 
-    /// The writes that publish the next sample of the handheld npad, and move the lifo on. The
-    /// slot is written before the header that makes it visible.
-    fn next_sample(&mut self) -> Vec<Patch> {
+    /// The writes that publish the next sample of the handheld npad, with the controls in the
+    /// state `pad`, and move the lifo on. The slot is written before the header that makes it
+    /// visible.
+    fn next_sample(&mut self, pad: &Pad) -> Vec<Patch> {
         let entry = NPAD_BASE + NPAD_HANDHELD_ENTRY * NPAD_ENTRY_SIZE;
         let word = |v: u32| v.to_le_bytes().to_vec();
         let mut out = vec![
@@ -123,13 +127,15 @@ impl Input {
         let slot = (self.tail + 1) % LIFO_SLOTS;
         self.tail = slot;
         self.count = (self.count + 1).min(LIFO_SLOTS);
-        // The slot: its sampling number, then the state (the same number, no buttons, both sticks
-        // centered, the attributes of attached Joy-Cons, a reserved word).
+        // The slot: its sampling number, then the state (the same number, the buttons, the two
+        // sticks as pairs of signed words, the attributes of attached Joy-Cons, a reserved word).
         let mut state = Vec::with_capacity(LIFO_SLOT_SIZE);
         state.extend(self.sampling.to_le_bytes());
         state.extend(self.sampling.to_le_bytes());
-        state.extend(0u64.to_le_bytes());
-        state.extend([0u8; 16]);
+        state.extend(pad.buttons.to_le_bytes());
+        for axis in [pad.left.0, pad.left.1, pad.right.0, pad.right.1] {
+            state.extend(axis.to_le_bytes());
+        }
         state.extend(ATTRIBUTES_ATTACHED.to_le_bytes());
         state.extend(0u32.to_le_bytes());
         debug_assert_eq!(state.len(), LIFO_SLOT_SIZE);
@@ -168,13 +174,13 @@ impl Shared {
     }
 
     /// Publish one sample.
-    fn publish(&self, kernel: &Kernel) {
+    fn publish(&self, kernel: &Kernel, pad: &Pad) {
         let (base, patches) = {
             let mut input = self.input();
             let Some(base) = input.memory else {
                 return;
             };
-            (base, input.next_sample())
+            (base, input.next_sample(pad))
         };
         for (offset, bytes) in patches {
             kernel.write_memory(base + offset as u64, &bytes);
@@ -187,15 +193,18 @@ impl Shared {
             return;
         }
         let (shared, kernel) = (Arc::clone(self), Arc::downgrade(kernel));
-        std::thread::spawn(move || loop {
-            std::thread::sleep(SAMPLE_PERIOD);
-            let Some(kernel) = kernel.upgrade() else {
-                break;
-            };
-            if kernel.exit_state().is_some() {
-                break;
+        std::thread::spawn(move || {
+            let mut gamepad = Gamepad::new();
+            loop {
+                std::thread::sleep(SAMPLE_PERIOD);
+                let Some(kernel) = kernel.upgrade() else {
+                    break;
+                };
+                if kernel.exit_state().is_some() {
+                    break;
+                }
+                shared.publish(&kernel, &input::sample(&mut gamepad));
             }
-            shared.publish(&kernel);
         });
     }
 }
@@ -428,7 +437,7 @@ mod tests {
         let entry = NPAD_BASE + NPAD_HANDHELD_ENTRY * NPAD_ENTRY_SIZE;
         let ask = |input: &mut Input| {
             let mut m = memory.clone();
-            apply(&mut m, &input.next_sample());
+            apply(&mut m, &input.next_sample(&Pad::default()));
             u32_at(&m, entry + NPAD_STYLE_SET)
         };
         // Not activated, not supporting the style, not listing the id: each leaves it unplugged.
@@ -466,7 +475,7 @@ mod tests {
             activated: false,
             ..connected()
         };
-        apply(&mut memory, &input.next_sample());
+        apply(&mut memory, &input.next_sample(&Pad::default()));
         assert_eq!(
             u64_at(&memory, entry + NPAD_HANDHELD_LIFO + 0x18),
             0,
@@ -480,7 +489,7 @@ mod tests {
         let mut input = connected();
         let lifo = NPAD_BASE + NPAD_HANDHELD_ENTRY * NPAD_ENTRY_SIZE + NPAD_HANDHELD_LIFO;
         for sample in 1..=20u64 {
-            apply(&mut memory, &input.next_sample());
+            apply(&mut memory, &input.next_sample(&Pad::default()));
             let (buffers, tail, count) = (
                 u64_at(&memory, lifo + 8),
                 u64_at(&memory, lifo + 0x10),
@@ -505,9 +514,45 @@ mod tests {
     }
 
     #[test]
+    fn a_sample_carries_the_buttons_and_the_sticks_of_the_pad() {
+        use super::super::super::input::{button, STICK_MAX};
+        let mut memory = vec![0u8; SHARED_MEMORY_SIZE as usize];
+        let mut input = connected();
+        let lifo = NPAD_BASE + NPAD_HANDHELD_ENTRY * NPAD_ENTRY_SIZE + NPAD_HANDHELD_LIFO;
+        let newest = |m: &[u8]| {
+            let tail = u64_at(m, lifo + 0x10) as usize;
+            lifo + LIFO_HEADER_SIZE + tail * LIFO_SLOT_SIZE
+        };
+        let i32_at = |m: &[u8], o: usize| i32::from_le_bytes(m[o..o + 4].try_into().unwrap());
+        let held = Pad {
+            buttons: button::A | button::ZR | button::STICK_L_LEFT,
+            left: (-STICK_MAX, 123),
+            right: (-5, STICK_MAX),
+        };
+        apply(&mut memory, &input.next_sample(&held));
+        let slot = newest(&memory);
+        assert_eq!(u64_at(&memory, slot + 0x10), held.buttons);
+        // The left stick's x and y, then the right stick's, each a signed 32-bit word.
+        assert_eq!(i32_at(&memory, slot + 0x18), -STICK_MAX);
+        assert_eq!(i32_at(&memory, slot + 0x1C), 123);
+        assert_eq!(i32_at(&memory, slot + 0x20), -5);
+        assert_eq!(i32_at(&memory, slot + 0x24), STICK_MAX);
+        assert_eq!(u32_at(&memory, slot + 0x28), 0x3F, "still attached");
+        // Letting go is the next sample: all zero again, in a new slot with the next number.
+        apply(&mut memory, &input.next_sample(&Pad::default()));
+        let released = newest(&memory);
+        assert_ne!(released, slot);
+        assert_eq!(u64_at(&memory, released), 2);
+        assert_eq!(u64_at(&memory, released + 0x10), 0);
+        assert_eq!(&memory[released + 0x18..released + 0x28], &[0u8; 16]);
+        // The earlier sample is still in the lifo for a program that reads the history.
+        assert_eq!(u64_at(&memory, slot + 0x10), held.buttons);
+    }
+
+    #[test]
     fn the_entry_says_what_kind_of_controller_it_is() {
         let mut memory = vec![0u8; SHARED_MEMORY_SIZE as usize];
-        apply(&mut memory, &connected().next_sample());
+        apply(&mut memory, &connected().next_sample(&Pad::default()));
         let entry = NPAD_BASE + NPAD_HANDHELD_ENTRY * NPAD_ENTRY_SIZE;
         assert_eq!(u32_at(&memory, entry + NPAD_DEVICE_TYPE), 0b1100);
         let props = u64_at(&memory, entry + NPAD_SYSTEM_PROPERTIES);

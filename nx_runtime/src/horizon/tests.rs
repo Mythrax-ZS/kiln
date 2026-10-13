@@ -2621,6 +2621,47 @@ fn the_handheld_controller_appears_once_the_program_has_asked_for_it() {
         u32::from_le_bytes(slot[0x28..0x2C].try_into().unwrap()),
         0x3F
     );
+    // The keys of the window are the buttons and sticks of the samples that follow. (This is the
+    // only test that presses keys: the keyboard is one per process.)
+    let newest = |e: &Env| {
+        let tail = u64::from_le_bytes(e.read(lifo + 0x10, 8).try_into().unwrap());
+        e.read(lifo + 0x20 + tail * 0x30, 0x30)
+    };
+    let buttons = |s: &[u8]| u64::from_le_bytes(s[0x10..0x18].try_into().unwrap());
+    let stick = |s: &[u8], at: usize| i32::from_le_bytes(s[at..at + 4].try_into().unwrap());
+    let wait_for = |e: &Env, want: &dyn Fn(&[u8]) -> bool| {
+        (0..300).any(|_| {
+            if want(&newest(e)) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        })
+    };
+    assert!(wait_for(&e, &|s| buttons(s) == 0), "nothing pressed yet");
+    super::input::key_event("KeyL", true);
+    super::input::key_event("KeyW", true);
+    assert!(wait_for(&e, &|s| buttons(s) & 1 != 0), "A is down");
+    assert!(
+        wait_for(&e, &|s| stick(s, 0x1C) == 32767),
+        "up on the left stick"
+    );
+    let pressed = newest(&e);
+    assert_eq!(stick(&pressed, 0x18), 0);
+    assert_eq!(
+        buttons(&pressed),
+        1 | 1 << 17,
+        "A, and the button for the stick's up"
+    );
+    super::input::key_event("KeyL", false);
+    assert!(wait_for(&e, &|s| buttons(s) == 1 << 17), "A is up again");
+    // A window that loses the focus lets go of every key at once.
+    super::input::focus_lost();
+    assert!(
+        wait_for(&e, &|s| buttons(s) == 0 && stick(s, 0x1C) == 0),
+        "nothing is pressed"
+    );
+    super::input::focus_gained();
     // The other controllers stay unplugged.
     assert_eq!(e.read(0x7000_0000 + 0x9A00, 4), [0, 0, 0, 0]);
     e.svc(0x14, &[u64::from(memory), 0x7000_0000, 0x4_0000]);

@@ -52,9 +52,16 @@ fn renderer() -> Option<Box<dyn nx_gpu::render::Backend>> {
 
 #[cfg(feature = "vulkan")]
 fn vulkan_renderer() -> Option<Box<dyn nx_gpu::render::Backend>> {
-    Some(Box::new(nx_vulkan::Renderer::new(
-        nx_vulkan::RenderConfig::from_env(),
-    )))
+    use super::super::input;
+    use nx_vulkan::{InputEvent, InputSink};
+    let mut config = nx_vulkan::RenderConfig::from_env();
+    // What the person does in the window is the input of the program (the `hid` service).
+    config.input = Some(InputSink::new(|event| match event {
+        InputEvent::Key { key, down } => input::key_event(key, down),
+        InputEvent::Focus(true) => input::focus_gained(),
+        InputEvent::Focus(false) => input::focus_lost(),
+    }));
+    Some(Box::new(nx_vulkan::Renderer::new(config)))
 }
 
 #[cfg(not(feature = "vulkan"))]
