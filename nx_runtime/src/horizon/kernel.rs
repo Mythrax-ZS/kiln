@@ -154,6 +154,11 @@ pub struct Kernel {
     pub(super) random: Mutex<u64>,
     /// Log every supervisor call (`NX_TRACE_SVC`).
     pub(super) trace: bool,
+    /// Log the supervisor calls that block and took at least this long, with the thread and the
+    /// time (`NX_TRACE_WAITS=<microseconds>`: where the threads of a program wait for each other).
+    pub(super) trace_waits: Option<std::time::Duration>,
+    /// When the kernel was made, for the times `NX_TRACE_WAITS` prints.
+    pub(super) started: std::time::Instant,
     /// Print what the program logs through `lm` (`NX_TRACE_LOG`).
     trace_log: bool,
     /// Things to do once the process has ended (services print their summaries).
@@ -362,6 +367,11 @@ impl Kernel {
             output: Mutex::new(Box::new(std::io::stdout())),
             random: Mutex::new(random_seed()),
             trace: std::env::var_os("NX_TRACE_SVC").is_some(),
+            trace_waits: std::env::var("NX_TRACE_WAITS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(std::time::Duration::from_micros),
+            started: std::time::Instant::now(),
             trace_log: std::env::var_os("NX_TRACE_LOG").is_some(),
             finish_hooks: Mutex::new(Vec::new()),
             monitors: Mutex::new(BTreeMap::new()),

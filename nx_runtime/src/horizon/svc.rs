@@ -204,6 +204,33 @@ impl Kernel {
     /// `NX_TRACE_SVC` in the environment logs every call and its result on standard error.
     pub fn svc(self: &Arc<Kernel>, cpu: &mut NativeCpu, thread: u64, imm: u32) -> Flow {
         if !self.trace {
+            // The calls that can block, with how long they took: sleeps, waits, locks, condition
+            // variables, addresses and requests of services (`NX_TRACE_WAITS`).
+            if let Some(least) = self.trace_waits {
+                if matches!(imm, 0x0B | 0x18 | 0x1A | 0x1C | 0x21 | 0x22 | 0x34) {
+                    let (x0, x1, x2) = (cpu.state.x[0], cpu.state.x[1], cpu.state.x[2]);
+                    let pc = cpu.state.pc.wrapping_sub(4);
+                    let began = std::time::Instant::now();
+                    let flow = self.svc_dispatch(cpu, thread, imm);
+                    let took = began.elapsed();
+                    if took >= least {
+                        let at = began.duration_since(self.started);
+                        let what = match imm {
+                            0x21 | 0x22 => self
+                                .object(x0 as u32, thread)
+                                .map_or(String::new(), |o| format!(" {o:?}")),
+                            _ => String::new(),
+                        };
+                        eprintln!(
+                            "[wait {:.3}] thread {thread} at {pc:#x}: {} for {:.3} ms (x0 {x0:#x} x1 {x1:#x} x2 {x2:#x}){what}",
+                            at.as_secs_f64() * 1000.0,
+                            svc_name(imm).unwrap_or("?"),
+                            took.as_secs_f64() * 1000.0
+                        );
+                    }
+                    return flow;
+                }
+            }
             return self.svc_dispatch(cpu, thread, imm);
         }
         let args = [

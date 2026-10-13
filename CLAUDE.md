@@ -84,6 +84,9 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   and needs no external tool. The homebrew tests in `src/build/e2e_tests.rs` build small NROs
   from assembled words and run them (clang needed). `NX_TRACE_SVC=1` logs every SVC and IPC
   request of a produced program; `NX_TRACE_LOG=1` prints what it logs through `lm`;
+  `NX_TRACE_WAITS=<microseconds>` logs every blocking supervisor call (sleep, wait, lock, condition
+  variable, address, request of a service) that took that long, with the thread and the time in
+  milliseconds since the start, to see which threads wait for which;
   `NX_RANDOM_SEED=<n>` makes the kernel's entropy reproducible; `NX_ROMFS=<dir|image>` names the
   RomFS it reads at run time; `NX_WATCHDOG=<seconds>` says, when no frame has been presented for
   that long (and again every that many seconds), what every guest thread is doing (the supervisor
@@ -128,7 +131,9 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   program through `spirv-opt` first),
   `NX_DEBUG_EQUAL_AS_LEQUAL=1`, `NX_DEBUG_NO_DEPTH_TEST=1`, `NX_DEBUG_FLIP_FRONT=1`,
   `NX_TRACE_TARGETS=1` (each render target configuration, the first time it is drawn to) and
-  `NX_SPIRV_CHECK=1` look at one thing each; `NX_DEBUG_SYNC_DRAWS=<n>` waits for the device after
+  `NX_SPIRV_CHECK=1` look at one thing each; `NX_DEBUG_WAIT_FINISH=1` waits for the device at the end
+  of every submission of the guest (the renderer otherwise lets the device run behind the
+  recording, A-123); `NX_DEBUG_SYNC_DRAWS=<n>` waits for the device after
   every draw (slow), from the first frame with `n` draws on (`NX_DEBUG_SYNC_FROM=<frame>`: from
   that presented frame on), so that the draw that loses the device is named with its state,
   programs and textures, and how long after its submission the device was lost (a hang takes the
