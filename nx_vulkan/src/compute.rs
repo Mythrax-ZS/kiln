@@ -95,7 +95,18 @@ impl Vk {
             let req = self.device.get_buffer_memory_requirements(buffer);
             let wanted =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            let Some(ty) = self.find_memory_type(req.memory_type_bits, wanted) else {
+            // A buffer the device writes and the host reads is made in cached memory where there is
+            // some: the host reads uncached (write-combined) memory about forty times slower.
+            let readback = usage.contains(vk::BufferUsageFlags::TRANSFER_DST).then(|| {
+                self.find_memory_type(
+                    req.memory_type_bits,
+                    wanted | vk::MemoryPropertyFlags::HOST_CACHED,
+                )
+            });
+            let Some(ty) = readback
+                .flatten()
+                .or_else(|| self.find_memory_type(req.memory_type_bits, wanted))
+            else {
                 self.device.destroy_buffer(buffer, None);
                 return Err("no host-visible coherent memory type".to_string());
             };
