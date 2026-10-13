@@ -5,8 +5,10 @@
 //! effect is visible to the program: the memory a semaphore release writes, the code a macro upload
 //! stores. Every other write is recorded and counted, which is what the tracing processor is for.
 
+use crate::compute;
 use crate::event::EventToken;
 use crate::gpu::class;
+use crate::i2m::{self, I2m};
 use crate::mem::GuestMemory;
 use crate::mme;
 use crate::names;
@@ -57,6 +59,11 @@ pub struct Stats {
     pub macro_writes: BTreeMap<(u32, u32), u64>,
     pub draws: DrawStats,
     pub semaphore_releases: u64,
+    /// Inline uploads (data sent in the command stream, written to memory) and their bytes.
+    pub inline_uploads: u64,
+    pub inline_bytes: u64,
+    /// Compute launches.
+    pub compute_launches: u64,
     /// The shader programs the draws used.
     pub shaders: Inventory,
     /// What the renderer could not do (when the run goes on past that): the message and how often.
@@ -107,6 +114,15 @@ impl Stats {
                     names::method_name(*class_num, *offset)
                 ));
             }
+        }
+        if self.inline_uploads > 0 {
+            s.push_str(&format!(
+                "  inline uploads: {} ({} bytes)\n",
+                self.inline_uploads, self.inline_bytes
+            ));
+        }
+        if self.compute_launches > 0 {
+            s.push_str(&format!("  compute launches: {}\n", self.compute_launches));
         }
         let d = &self.draws;
         s.push_str(&format!(
@@ -190,7 +206,7 @@ impl Cx<'_> {
         }
         let count = self.stats.failed.entry(why.clone()).or_default();
         *count += 1;
-        if *count == 1 && self.level >= 1 {
+        if *count == 1 {
             eprintln!("[gpu] {what} could not be rendered: {why}");
         }
         Ok(())
@@ -273,6 +289,79 @@ pub struct Engine {
     instance: u32,
     /// The constant buffers bound to each slot of each binding group.
     pub cbufs: CbufBindings,
+    /// The inline-to-memory engine (the compute and inline-to-memory classes).
+    i2m: I2m,
+}
+
+/// `NX_TRACE_MACRO=<number>[,...]` in the environment: print each call of those macros and what
+/// they write.
+fn traced_macro(id: u32) -> bool {
+    use std::sync::OnceLock;
+    static LIST: OnceLock<Vec<u32>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("NX_TRACE_MACRO")
+            .map(|v| v.split(',').filter_map(|a| a.trim().parse().ok()).collect())
+            .unwrap_or_default()
+    })
+    .contains(&id)
+}
+
+/// `NX_TRACE_REGISTER=<byte offset>[,...]` (hexadecimal) in the environment: print each write to
+/// those methods of the 3D engine, with the number of draws so far.
+fn traced_register(class_num: u32, method: u32) -> bool {
+    use std::sync::OnceLock;
+    static LIST: OnceLock<Vec<u32>> = OnceLock::new();
+    if class_num != class::THREED {
+        return false;
+    }
+    let list = LIST.get_or_init(|| {
+        std::env::var("NX_TRACE_REGISTER")
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|a| u32::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    !list.is_empty() && list.contains(&(method * 4))
+}
+
+/// `NX_TRACE_COMPUTE` in the environment: print every compute launch and its descriptor.
+fn trace_compute() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NX_TRACE_COMPUTE").is_some())
+}
+
+/// `NX_SHADER_DUMP=<dir>`: write the code of each compute program launched, as the bytes from its
+/// address up to what can be read (at most 32 KiB), to `COMPUTE_<address>.bin`.
+fn dump_compute_program(cx: &Cx<'_>, address: u64) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static DONE: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    let Some(dir) = std::env::var_os("NX_SHADER_DUMP") else {
+        return;
+    };
+    let done = DONE.get_or_init(|| Mutex::new(HashSet::new()));
+    if !done
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(address)
+    {
+        return;
+    }
+    let mut code = Vec::new();
+    let mut chunk = [0u8; 0x100];
+    while code.len() < 0x8000
+        && cx
+            .space
+            .read(cx.mem, address + code.len() as u64, &mut chunk)
+    {
+        code.extend_from_slice(&chunk);
+    }
+    let dir = std::path::PathBuf::from(dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join(format!("COMPUTE_{address:x}.bin")), code);
 }
 
 /// The name of a primitive type (`BEGIN`'s operation; the topology field of the combined draws).
@@ -326,7 +415,7 @@ impl mme::Host for MacroHost<'_, '_> {
             .macro_writes
             .entry((class::THREED, method))
             .or_default() += 1;
-        if self.cx.level >= 2 {
+        if self.cx.level >= 2 || traced_macro(self.id) {
             eprintln!(
                 "[gpu]   macro {} writes {} = {data:#x}",
                 self.id,
@@ -361,6 +450,7 @@ impl Engine {
             inline_elements: 0,
             instance: 0,
             cbufs: CbufBindings::default(),
+            i2m: I2m::default(),
         }
     }
 
@@ -386,10 +476,83 @@ impl Engine {
             .get_mut(method as usize)
             .ok_or_else(|| format!("method {method:#x} is outside the engine"))?;
         *slot = data;
+        if traced_register(self.class, method) {
+            eprintln!(
+                "[gpu] {} {} = {data:#x} (draw {} so far{})",
+                names::class_name(self.class),
+                names::method_name(self.class, method * 4),
+                cx.stats.draws.draws(),
+                match self.running {
+                    Some(id) => format!(", macro {id}"),
+                    None => String::new(),
+                }
+            );
+        }
         if self.class == class::THREED {
             self.write_3d(cx, method, data, last)?;
         }
+        if matches!(self.class, class::COMPUTE | class::INLINE_TO_MEMORY) {
+            match method {
+                i2m::reg::LAUNCH_DMA => {
+                    let Engine { regs, i2m, .. } = self;
+                    i2m.launch(|r| regs.get(r as usize).copied().unwrap_or(0), data)?;
+                }
+                i2m::reg::LOAD_INLINE_DATA => self.i2m.data(cx, data)?,
+                _ => {}
+            }
+        }
+        // A launch: the descriptor `SEND_PCAS_A` named is scheduled (bit 1 of the signal; bit 0
+        // only invalidates what was cached of descriptors).
+        if self.class == class::COMPUTE
+            && method == compute::reg::SEND_SIGNALING_PCAS_B
+            && data & 2 != 0
+        {
+            self.launch_compute(cx, data)?;
+        }
         Ok(())
+    }
+
+    /// A compute launch was signalled: read the descriptor and give the launch to the renderer.
+    fn launch_compute(&mut self, cx: &mut Cx<'_>, signal: u32) -> Result<(), String> {
+        let qmd = u64::from(self.reg(compute::reg::SEND_PCAS_A)) << 8;
+        let mut bytes = [0u8; compute::QMD_WORDS * 4];
+        if !cx.space.read(cx.mem, qmd, &mut bytes) {
+            return Err(format!(
+                "a compute launch whose descriptor at GPU address {qmd:#x} is not mapped"
+            ));
+        }
+        let mut words = [0u32; compute::QMD_WORDS];
+        for (w, c) in words.iter_mut().zip(bytes.as_chunks::<4>().0) {
+            *w = u32::from_le_bytes(*c);
+        }
+        let region = u64::from(self.reg(compute::reg::SET_PROGRAM_REGION_A)) << 32
+            | u64::from(self.reg(compute::reg::SET_PROGRAM_REGION_B));
+        let dispatch = compute::Dispatch::decode(qmd, &words, region)?;
+        cx.stats.compute_launches += 1;
+        if cx.level >= 1 || trace_compute() {
+            let text: Vec<String> = words.iter().map(|w| format!("{w:x}")).collect();
+            eprintln!(
+                "[gpu] compute launch {signal:#x}: program {:#x}, grid {:?}, block {:?}; QMD at {qmd:#x}: {}",
+                dispatch.program,
+                dispatch.grid,
+                dispatch.block,
+                text.join(" ")
+            );
+        }
+        dump_compute_program(cx, dispatch.program);
+        let Some(backend) = cx.backend.as_mut() else {
+            return Ok(());
+        };
+        let scene = Scene {
+            regs: Regs(&self.regs),
+            cbufs: &self.cbufs,
+            mem: cx.mem,
+            space: cx.space,
+        };
+        match backend.dispatch(&scene, &dispatch) {
+            Ok(()) => Ok(()),
+            Err(why) => cx.renderer_failed("a compute launch", why),
+        }
     }
 
     fn write_3d(
@@ -648,12 +811,28 @@ impl Engine {
         let Some(start) = self.mme.starts.get(id as usize).copied() else {
             return Err(format!("macro {id} was called and has no start address"));
         };
-        if cx.level >= 2 {
+        if cx.level >= 2 || traced_macro(id) {
             eprintln!(
                 "[gpu]   macro {id} (code at {start:#x}) called with {} parameters: {:x?}",
                 params.len(),
                 &params[..params.len().min(8)]
             );
+        }
+        if traced_macro(id) {
+            use std::collections::HashSet;
+            use std::sync::{Mutex, OnceLock};
+            static LISTED: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+            let first = LISTED
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id);
+            if first {
+                eprintln!(
+                    "[gpu]   macro {id}:\n{}",
+                    mme::listing(&self.mme.code, start as usize, 40)
+                );
+            }
         }
         let code = self.mme.code.clone();
         self.running = Some(id);
@@ -1061,6 +1240,52 @@ mod tests {
     }
 
     #[test]
+    fn inline_data_is_written_to_memory_when_all_of_it_has_come() {
+        for class_num in [class::COMPUTE, class::INLINE_TO_MEMORY] {
+            let ((), mem, stats) = with_cx(|cx| {
+                let mut e = Engine::new(class_num);
+                // Two lines of 6 bytes, 0x20 apart, to GPU address 0x500_0200.
+                e.write(cx, 0x180 / 4, 6, false).unwrap();
+                e.write(cx, 0x184 / 4, 2, false).unwrap();
+                e.write(cx, 0x188 / 4, 0, false).unwrap();
+                e.write(cx, 0x18c / 4, 0x500_0200, false).unwrap();
+                e.write(cx, 0x190 / 4, 0x20, false).unwrap();
+                // The pitch layout, no flush.
+                e.write(cx, 0x1b0 / 4, 0x01, false).unwrap();
+                e.write(cx, 0x1b4 / 4, 0x4433_2211, false).unwrap();
+                e.write(cx, 0x1b4 / 4, 0x8877_6655, false).unwrap();
+                // Nothing is written before the last word.
+                assert_eq!(cx.read_u32(0x500_0200).unwrap(), 0);
+                e.write(cx, 0x1b4 / 4, 0xCCBB_AA99, true).unwrap();
+                // Words that come after the upload is complete belong to no upload.
+                e.write(cx, 0x1b4 / 4, 0xDEAD_BEEF, true).unwrap();
+            });
+            assert_eq!(mem.read_u32(0x1000_0200), Some(0x4433_2211));
+            assert_eq!(mem.read_u32(0x1000_0204), Some(0x6655));
+            assert_eq!(mem.read_u32(0x1000_0220), Some(0xAA99_8877));
+            assert_eq!(mem.read_u32(0x1000_0224), Some(0xCCBB));
+            assert_eq!(
+                (stats.inline_uploads, stats.inline_bytes),
+                (1, 12),
+                "counted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inline_upload_to_unmapped_memory_stops_the_run() {
+        with_cx(|cx| {
+            let mut e = Engine::new(class::COMPUTE);
+            e.write(cx, 0x180 / 4, 4, false).unwrap();
+            e.write(cx, 0x184 / 4, 1, false).unwrap();
+            e.write(cx, 0x18c / 4, 0x700_0000, false).unwrap();
+            e.write(cx, 0x1b0 / 4, 0x01, false).unwrap();
+            let err = e.write(cx, 0x1b4 / 4, 1, true).unwrap_err();
+            assert!(err.contains("not mapped"), "{err}");
+        });
+    }
+
+    #[test]
     fn binding_a_group_records_the_buffer_the_selector_names() {
         with_cx(|cx| {
             let mut e = Engine::new(class::THREED);
@@ -1157,6 +1382,59 @@ mod tests {
         assert!(r.contains("9 x 3D NO_OPERATION"), "{r}");
         assert!(r.contains("3 x 3D CALL_MME_MACRO[0]"), "{r}");
         assert!(r.contains("7 x macro 4 (20 parameters in all)"), "{r}");
+    }
+
+    #[test]
+    fn a_compute_launch_reads_its_descriptor_and_reaches_the_backend() {
+        use crate::render::testing::{Event, Recorder};
+        let mut rec = Recorder::default();
+        let events = rec.events.clone();
+        with_backend(Some(&mut rec), false, |cx| {
+            let mut e = Engine::new(class::COMPUTE);
+            // A descriptor at GPU address 0x500_0100: program offset 0x40, a grid of 2 by 1 by 1,
+            // a workgroup of 32 by 1 by 1 and constant buffer 1.
+            let mut words = [0u32; 64];
+            words[8] = 0x40;
+            words[12] = 2;
+            words[13] = 1 | 1 << 16;
+            words[18] = 32 << 16;
+            words[19] = 1 | 1 << 16;
+            words[20] = 0b10;
+            words[31] = 0x500_0200;
+            words[32] = 0x10 << 15;
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            cx.write(0x500_0100, &bytes).unwrap();
+            // The program region is 0x500_0800.
+            e.write(cx, 0x1608 / 4, 0, false).unwrap();
+            e.write(cx, 0x160c / 4, 0x500_0800, false).unwrap();
+            e.write(cx, 0x2b4 / 4, 0x500_0100 >> 8, false).unwrap();
+            // Only invalidating (bit 0) launches nothing; scheduling (bit 1) does.
+            e.write(cx, 0x2bc / 4, 1, false).unwrap();
+            e.write(cx, 0x2bc / 4, 3, false).unwrap();
+        });
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let Event::Dispatch(d) = &events[0] else {
+            panic!("{events:?}")
+        };
+        assert_eq!((d.qmd, d.program), (0x500_0100, 0x500_0840));
+        assert_eq!((d.grid, d.block), ([2, 1, 1], [32, 1, 1]));
+        assert_eq!(
+            d.cbufs[1].map(|c| (c.address, c.size)),
+            Some((0x500_0200, 0x10))
+        );
+    }
+
+    #[test]
+    fn a_launch_whose_descriptor_is_not_mapped_stops_the_run() {
+        let mut result = Ok(());
+        with_cx(|cx| {
+            let mut e = Engine::new(class::COMPUTE);
+            e.write(cx, 0x2b4 / 4, 0x9000_0000u32 >> 8, false).unwrap();
+            result = e.write(cx, 0x2bc / 4, 2, false);
+        });
+        let e = result.unwrap_err();
+        assert!(e.contains("descriptor") && e.contains("not mapped"), "{e}");
     }
 
     #[test]

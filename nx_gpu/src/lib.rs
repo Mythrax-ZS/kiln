@@ -12,12 +12,14 @@
 //! every choice the public documentation leaves open is recorded in docs/ASSUMPTIONS.md.
 
 pub mod channel;
+pub mod compute;
 pub mod display;
 pub mod draw_state;
 pub mod engine;
 pub mod error;
 pub mod event;
 pub mod gpu;
+pub mod i2m;
 pub mod mem;
 pub mod methods;
 pub mod mme;

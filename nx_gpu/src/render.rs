@@ -7,6 +7,7 @@
 //! interpret the registers a draw uses (a renderer needs a different view of them than a
 //! tracer does), and the registers are read at the moment of the draw.
 
+use crate::compute::Dispatch;
 use crate::mem::GuestMemory;
 use crate::state::{CbufBindings, Regs};
 use crate::vm::AddressSpace;
@@ -135,6 +136,12 @@ pub trait Backend: Send {
 
     /// The title queued a buffer for display.
     fn present(&mut self, present: &Present) -> Result<(), String>;
+
+    /// A compute launch. The scene holds the register file of the compute engine (its texture
+    /// pools) and the memory; what the program writes is in memory when this returns.
+    fn dispatch(&mut self, _scene: &Scene<'_>, _dispatch: &Dispatch) -> Result<(), String> {
+        Err("this renderer does not run compute programs".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -149,6 +156,7 @@ pub mod testing {
         Clear(Clear),
         Finish,
         Present(Present),
+        Dispatch(Dispatch),
     }
 
     /// A backend that remembers its calls (and fails on demand).
@@ -180,6 +188,14 @@ pub mod testing {
 
         fn present(&mut self, present: &Present) -> Result<(), String> {
             self.events.lock().unwrap().push(Event::Present(*present));
+            Ok(())
+        }
+
+        fn dispatch(&mut self, _scene: &Scene<'_>, dispatch: &Dispatch) -> Result<(), String> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(Event::Dispatch(dispatch.clone()));
             Ok(())
         }
     }
