@@ -315,7 +315,8 @@ pub struct Window {
     /// Flip y (bit 4 of `SET_WINDOW_ORIGIN`).
     pub flip_y: bool,
     pub offset: [u32; 2],
-    /// The viewport transform of the registers applies (else clip space is the window).
+    /// `SET_VIEWPORT_SCALE_OFFSET` is set. Only for tracing: a title's draws use the viewport of
+    /// the registers whichever it is (docs/ASSUMPTIONS.md A-112).
     pub transform_enabled: bool,
     /// Clip space z runs from 0 to 1 (else from -1 to 1): bit 0 of `SET_VIEWPORT_CLIP_CONTROL`.
     pub z_zero_to_one: bool,

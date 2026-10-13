@@ -410,7 +410,9 @@ impl Core {
                 d.cmd_bind_vertex_buffers(cmd, binding, &[buffer], &[offset]);
             }
         }
-        self.set_dynamic_state(scene, cmd, &pass, &raster, &regs.depth_stencil(), &blend);
+        if !self.set_dynamic_state(scene, cmd, &pass, &raster, &regs.depth_stencil(), &blend) {
+            return Ok(());
+        }
         let d = &self.vk.device;
         // SAFETY: as above.
         unsafe {
@@ -1069,7 +1071,8 @@ impl Core {
     }
 
     /// Everything that is set per draw: viewport, scissor, culling, depth and stencil, blend
-    /// constants.
+    /// constants. False when the viewport has no area (every vertex lands on a point, so nothing
+    /// is drawn and Vulkan has no such viewport).
     fn set_dynamic_state(
         &self,
         scene: &Scene<'_>,
@@ -1078,27 +1081,20 @@ impl Core {
         raster: &Raster,
         ds: &DepthStencil,
         blend: &Blend,
-    ) {
+    ) -> bool {
         let regs = scene.regs;
         let window = regs.window();
         let v = regs.viewport(0);
         let (w, h) = (pass.extent.0 as f32, pass.extent.1 as f32);
-        let (vx, vy, vw, vh, near, far);
-        if window.transform_enabled {
-            vx = v.offset[0] - v.scale[0];
-            vy = v.offset[1] - v.scale[1];
-            vw = 2.0 * v.scale[0];
-            vh = 2.0 * v.scale[1];
-            if window.z_zero_to_one {
-                near = v.offset[2];
-                far = v.offset[2] + v.scale[2];
-            } else {
-                near = v.offset[2] - v.scale[2];
-                far = v.offset[2] + v.scale[2];
-            }
+        // The viewport of the registers always applies, whatever `SET_VIEWPORT_SCALE_OFFSET`
+        // says (docs/ASSUMPTIONS.md A-112).
+        let (vx, vy) = (v.offset[0] - v.scale[0], v.offset[1] - v.scale[1]);
+        let (vw, vh) = (2.0 * v.scale[0], 2.0 * v.scale[1]);
+        let (near, far) = if window.z_zero_to_one {
+            (v.offset[2], v.offset[2] + v.scale[2])
         } else {
-            (vx, vy, vw, vh, near, far) = (0.0, 0.0, w, h, 0.0, 1.0);
-        }
+            (v.offset[2] - v.scale[2], v.offset[2] + v.scale[2])
+        };
         let viewport = vk::Viewport {
             x: vx,
             y: vy,
@@ -1150,6 +1146,9 @@ impl Core {
         } else {
             (viewport, scissor)
         };
+        if viewport.width.is_nan() || viewport.width <= 0.0 || viewport.height == 0.0 {
+            return false;
+        }
         let d = &self.vk.device;
         let cull = if raster.cull && !self.debug.no_cull {
             match raster.cull_face {
@@ -1222,6 +1221,7 @@ impl Core {
             d.cmd_set_blend_constants(cmd, &blend.constant);
             d.cmd_set_primitive_restart_enable(cmd, false);
         }
+        true
     }
 }
 

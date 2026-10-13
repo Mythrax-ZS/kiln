@@ -280,8 +280,9 @@ pub fn scene(vertex: &[u8], pixel: &[u8], size: u32, target: u64) -> World {
     w.color_target(0, target, size, size, 0xD5);
     w.set(0x037c, 1);
     w.set(0x1a00, 0x1111);
-    // The viewport transform over the whole target; depth 0..1.
-    w.set(0x192c, 1);
+    // The viewport transform over the whole target; depth 0..1. The register that looks like its
+    // enable is 0, as a title's render target macro leaves it (docs/ASSUMPTIONS.md A-112).
+    w.set(0x192c, 0);
     let half = size as f32 / 2.0;
     for (i, v) in [half, half, 0.5, half, half, 0.5].iter().enumerate() {
         w.set(0xa00 + 4 * i as u32, v.to_bits());

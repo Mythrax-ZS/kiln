@@ -83,6 +83,98 @@ fn a_smaller_triangle_covers_part_of_the_target() {
     assert_eq!(at(10, 50), [255, 0, 0, 255]);
 }
 
+/// Draw the red triangle with its right angle at clip (-1, -1), counter-clockwise in clip space
+/// (y up), in a world whose viewport and culling the caller has set; the picture and its width.
+fn red_triangle(w: &mut World, target: u64) -> (Vec<u8>, usize) {
+    let red = [1.0, 0.0, 0.0, 1.0];
+    vertices(
+        w,
+        GPU_BASE + 0x30_0000,
+        &[
+            ([-1.0, -1.0, 0.5, 1.0], red),
+            ([1.0, -1.0, 0.5, 1.0], red),
+            ([-1.0, 1.0, 0.5, 1.0], red),
+        ],
+    );
+    let mut r = Renderer::new(RenderConfig::default());
+    r.draw(
+        &w.scene(),
+        &Draw {
+            source: Source::Arrays { first: 0, count: 3 },
+            topology: 4,
+            instance: 0,
+        },
+    )
+    .unwrap();
+    let (rgba, width, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    (rgba, width as usize)
+}
+
+fn covered(rgba: &[u8]) -> usize {
+    rgba.as_chunks::<4>().0.iter().filter(|p| p[3] != 0).count()
+}
+
+#[test]
+fn a_negative_viewport_scale_puts_clip_y_up_in_the_picture() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = scene(&pass_through_vertex(), &flat_color_pixel(), 64, target);
+    // The viewport of a title that has the window origin at the upper left: scale y is negative.
+    w.set(0xa04, (-32.0f32).to_bits());
+    let (rgba, width) = red_triangle(&mut w, target);
+    let at = |x: usize, y: usize| rgba[(y * width + x) * 4..][..4].to_vec();
+    // Clip y of -1 is the bottom of the picture: the right angle is at the bottom left.
+    assert_eq!(at(2, 61), [255, 0, 0, 255], "near the right angle");
+    assert_eq!(at(10, 50), [255, 0, 0, 255]);
+    assert_eq!(at(60, 2), [0, 0, 0, 0], "the corner away from it is empty");
+    assert_eq!(at(50, 10), [0, 0, 0, 0]);
+}
+
+#[test]
+fn the_front_face_is_judged_on_the_picture_whichever_way_the_viewport_turns_it() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    // The triangle is counter-clockwise in clip space. A negative scale y turns the picture
+    // over (as the picture is read, with y down, it stays counter-clockwise: the title's
+    // quads face front); a positive one makes it clockwise.
+    for (scale_y, front_face, drawn) in [
+        (-32.0f32, 0x901, true),
+        (-32.0, 0x900, false),
+        (32.0, 0x901, false),
+        (32.0, 0x900, true),
+    ] {
+        let mut w = scene(&pass_through_vertex(), &flat_color_pixel(), 64, target);
+        w.set(0xa04, scale_y.to_bits());
+        // Cull the back faces.
+        w.set(0x1918, 1);
+        w.set(0x1920, 0x405);
+        w.set(0x191c, front_face);
+        let (rgba, _) = red_triangle(&mut w, target);
+        let pixels = covered(&rgba);
+        assert_eq!(
+            pixels > 0,
+            drawn,
+            "scale y {scale_y}, front face {front_face:#x}: {pixels} pixels"
+        );
+    }
+}
+
+#[test]
+fn a_viewport_without_width_draws_nothing() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = scene(&pass_through_vertex(), &flat_color_pixel(), 64, target);
+    w.set(0xa00, 0.0f32.to_bits());
+    let (rgba, _) = red_triangle(&mut w, target);
+    assert_eq!(covered(&rgba), 0);
+}
+
 #[test]
 fn indexed_quads_are_drawn_as_two_triangles() {
     if vulkan().is_none() {
