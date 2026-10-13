@@ -157,7 +157,9 @@ impl Toolchain {
         args.push(path_arg(out));
         if cfg!(windows) {
             for l in [
-                "kernel32", "ntdll", "userenv", "ws2_32", "dbghelp", "bcrypt",
+                "kernel32", "ntdll", "userenv", "ws2_32", "dbghelp", "bcrypt", "user32", "gdi32",
+                "shell32", "ole32", "oleaut32", "advapi32", "dwmapi", "comctl32", "uxtheme",
+                "imm32",
             ] {
                 args.push(format!("-l{l}"));
             }
