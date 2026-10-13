@@ -79,6 +79,9 @@ pub struct Config {
     pub debug_names: bool,
     /// Kernel stage: the number of invocations of a workgroup in each dimension.
     pub block: [u32; 3],
+    /// Translate a program whose jumps all go forward with the loop around a `switch` on a program
+    /// counter anyway (a bring-up switch: docs/ASSUMPTIONS.md A-114).
+    pub force_loop: bool,
 }
 
 impl Config {
@@ -91,6 +94,7 @@ impl Config {
             flip_y_height: None,
             debug_names: false,
             block: [1, 1, 1],
+            force_loop: false,
         }
     }
 }

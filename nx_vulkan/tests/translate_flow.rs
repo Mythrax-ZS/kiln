@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{random_states, run, vulkan, State};
+use common::{random_states, run, run_with, vulkan, Extras, State};
 use nx_shader::asm::{bra, brk, exit, mov32i, pbk, ssy, sync, Enc, NOT_P0, P0};
 use nx_shader::inst::{Guard, RZ};
 use nx_shader::ops::Op;
@@ -143,4 +143,54 @@ fn a_guarded_exit_ends_only_the_invocations_it_holds_for() {
     for (inp, got) in inputs.iter().zip(&out) {
         assert_eq!(got.regs[3], if inp.preds & 1 != 0 { 1 } else { 2 });
     }
+}
+
+#[test]
+fn the_loop_free_form_agrees_with_the_loop_on_every_state() {
+    let Some(vk) = vulkan() else { return };
+    // Jumps that only go forward, one on a predicate from the input and one on a comparison, a
+    // join they both reach, and an exit that holds for some invocations only.
+    let program = [
+        // 0: P1 = R1 > R2 (signed).
+        Enc::op(Op::IsetpReg)
+            .ra(1)
+            .rb(2)
+            .field(0, 3, 7)
+            .field(3, 3, 1)
+            .field(49, 3, 4)
+            .bit(48, true)
+            .pred(39, 7, false)
+            .build(),
+        // 1: over the next two when P0.
+        bra(at(1), at(4), P0),
+        Enc::op(Op::IaddReg).rd(3).ra(1).rb(2).build(),
+        // 3: over the next one when P1.
+        bra(at(3), at(5), P1),
+        mov32i(4, 0xAAAA),
+        // 5: the join.
+        Enc::op(Op::IaddReg).rd(5).ra(3).rb(4).build(),
+        exit(NOT_P0),
+        mov32i(6, 7),
+        exit(Guard::ALWAYS),
+    ];
+    let inputs = random_states(256, 11);
+    let loop_free = run_with(&vk, &program, &inputs, &[], Extras::default()).states;
+    let looped = run_with(
+        &vk,
+        &program,
+        &inputs,
+        &[],
+        Extras {
+            force_loop: true,
+            ..Extras::default()
+        },
+    )
+    .states;
+    for (i, (a, b)) in loop_free.iter().zip(&looped).enumerate() {
+        assert_eq!(a.regs, b.regs, "registers of invocation {i}");
+        assert_eq!(a.preds, b.preds, "predicates of invocation {i}");
+    }
+    // And the program did something: the exit held for the invocations without P0.
+    let sevens = loop_free.iter().filter(|s| s.regs[6] == 7).count();
+    assert!(sevens > 0 && sevens < inputs.len());
 }

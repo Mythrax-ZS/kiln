@@ -51,6 +51,8 @@ pub struct Extras<'a> {
     pub patches: Vec<AddressPatch>,
     /// The attribute words each invocation reads with `ALD`/`IPA` (zeros where absent).
     pub attrs_in: Vec<[u32; 64]>,
+    /// Translate with the loop around a `switch` even for a program whose jumps all go forward.
+    pub force_loop: bool,
 }
 
 pub struct Outcome {
@@ -69,7 +71,9 @@ pub fn run_with(
     mut extras: Extras<'_>,
 ) -> Outcome {
     let bytes = assemble(program);
-    let t = translate(Code(&bytes), None, &Config::new(Stage::Compute))
+    let mut config = Config::new(Stage::Compute);
+    config.force_loop = extras.force_loop;
+    let t = translate(Code(&bytes), None, &config)
         .unwrap_or_else(|e| panic!("translation failed: {e}"));
     nx_shader::validate::assert_valid(&t.spirv);
     let n = inputs.len();

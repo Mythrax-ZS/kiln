@@ -1,4 +1,5 @@
-//! Blocks and control flow: the straight-line case, and the dispatch loop for the rest.
+//! Blocks and control flow: the straight-line case, the loop-free form for a program whose jumps
+//! all go forward (A-114), and the dispatch loop for a program with a jump back.
 
 use super::emit::{Tx, R};
 use super::{alu, int, io};
@@ -6,6 +7,7 @@ use crate::cfg::{Block, Cfg, Code, Term};
 use crate::inst::Inst;
 use crate::ops::Op;
 use crate::spirv::{op, storage, Id};
+use std::collections::BTreeMap;
 
 /// Translate the program: the prologue, every block, the epilogue.
 pub(super) fn build(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg) -> R<()> {
@@ -18,6 +20,9 @@ pub(super) fn build(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg) -> R<()> {
         io::epilogue(tx)?;
         tx.f.ret();
         return Ok(());
+    }
+    if !tx.cfg.force_loop && forward_only(graph) {
+        return build_predicated(tx, code, graph);
     }
     tx.info.dispatch_loop = true;
     // The program counter, in bytes from the start of the code.
@@ -57,6 +62,119 @@ pub(super) fn build(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg) -> R<()> {
     io::epilogue(tx)?;
     tx.f.ret();
     Ok(())
+}
+
+/// Is every edge of the graph a jump forward (to a higher address)? Then no loop is needed.
+fn forward_only(graph: &Cfg) -> bool {
+    graph.blocks.iter().all(|(pc, block)| {
+        let successors: [Option<u32>; 2] = match block.term {
+            Term::Fall(next) => [Some(next), None],
+            Term::Jump { target, next, .. } => [Some(target), next],
+            Term::Exit { next, .. } | Term::Kill { next, .. } => [next, None],
+            Term::Unsupported => [None, None],
+        };
+        successors.iter().flatten().all(|s| s > pc)
+    }) && graph.blocks.keys().next() == Some(&graph.entry)
+}
+
+/// The program as a sequence of regions in address order with no loop (for a graph whose edges
+/// all go forward): a block runs when a flag of its own is set, and the blocks before it set the
+/// flags of their successors. The entry runs first, always.
+fn build_predicated(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg) -> R<()> {
+    let b = tx.t.bool_;
+    let bool_ptr = tx.m.ty_pointer(storage::FUNCTION, b);
+    let no = tx.cfalse();
+    let mut flags: BTreeMap<u32, Id> = BTreeMap::new();
+    for pc in graph.blocks.keys().filter(|pc| **pc != graph.entry) {
+        let id = tx.m.id();
+        tx.f.local_with_init(bool_ptr, id, no);
+        flags.insert(*pc, id);
+    }
+    for (pc, block) in &graph.blocks {
+        let guarded = *pc != graph.entry;
+        let after = tx.m.id();
+        if guarded {
+            let run = tx.m.id();
+            let on = tx.f.load(&mut tx.m, b, flags[pc]);
+            tx.f.selection_merge(after);
+            tx.f.branch_conditional(on, run, after);
+            tx.f.label(run);
+        }
+        body(tx, code, graph, block)?;
+        let open = activate(tx, block, &flags)?;
+        if guarded {
+            if open {
+                tx.f.branch(after);
+            }
+            tx.f.label(after);
+        }
+    }
+    io::epilogue(tx)?;
+    tx.f.ret();
+    Ok(())
+}
+
+/// End a block of the predicated form: set the flags of the blocks that can follow it. False when
+/// the block ended with an instruction that ends the control flow (a kill).
+fn activate(tx: &mut Tx<'_>, block: &Block, flags: &BTreeMap<u32, Id>) -> R<bool> {
+    let b = tx.t.bool_;
+    // The flag of `target` is set when `cond` holds (always, without one).
+    let set = |tx: &mut Tx<'_>, target: u32, cond: Option<Id>| {
+        let flag = flags[&target];
+        let value = match cond {
+            None => tx.ctrue(),
+            Some(c) => {
+                let old = tx.f.load(&mut tx.m, b, flag);
+                tx.lor(old, c)
+            }
+        };
+        tx.f.store(flag, value);
+    };
+    match block.term {
+        Term::Fall(next) => set(tx, next, None),
+        Term::Jump {
+            guard,
+            target,
+            next,
+            ..
+        } => match (tx.guard_condition(guard), next) {
+            (None, _) | (Some(_), None) => set(tx, target, None),
+            (Some(cond), Some(next)) => {
+                set(tx, target, Some(cond));
+                let otherwise = tx.lnot(cond);
+                set(tx, next, Some(otherwise));
+            }
+        },
+        Term::Exit { guard, next } => {
+            if let (Some(cond), Some(next)) = (tx.guard_condition(guard), next) {
+                let stay = tx.lnot(cond);
+                set(tx, next, Some(stay));
+            }
+        }
+        Term::Kill { guard, next } => {
+            tx.info.kills = true;
+            match (tx.guard_condition(guard), next) {
+                (None, _) | (Some(_), None) => {
+                    tx.f.emit(op::KILL, &[]);
+                    return Ok(false);
+                }
+                (Some(cond), Some(next)) => {
+                    let die = tx.m.id();
+                    let rest = tx.m.id();
+                    tx.f.selection_merge(rest);
+                    tx.f.branch_conditional(cond, die, rest);
+                    tx.f.label(die);
+                    tx.f.emit(op::KILL, &[]);
+                    tx.f.label(rest);
+                    set(tx, next, None);
+                }
+            }
+        }
+        Term::Unsupported => {
+            return tx.fail("a block that ends in a kind of control flow that is not translated")
+        }
+    }
+    Ok(true)
 }
 
 /// The instructions of a block, without its terminator.
