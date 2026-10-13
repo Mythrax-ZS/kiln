@@ -72,11 +72,25 @@ pub struct Gpu {
     pub lenient: bool,
     /// The trace level from `NX_TRACE_GPU`: 0 none, 1 submissions, 2 every method.
     pub level: u8,
+    /// `NX_TRACE_GPU_WINDOW=<first frame>:<last frame>:<level>`: the trace level while the frames
+    /// between are shown (the level above outside them).
+    window: Option<(u64, u64, u8)>,
+    base_level: u8,
     /// Where submissions go instead of being run by the call that makes them, if anywhere
     /// (A-124).
     pub queue: Option<Arc<dyn Queue>>,
     next_space: u32,
     next_channel: u32,
+}
+
+/// The window `NX_TRACE_GPU_WINDOW` names: `<first frame>:<last frame>:<level>`.
+fn trace_window() -> Option<(u64, u64, u8)> {
+    let text = std::env::var("NX_TRACE_GPU_WINDOW").ok()?;
+    let mut parts = text.split(':');
+    let first = parts.next()?.parse().ok()?;
+    let last = parts.next()?.parse().ok()?;
+    let level = parts.next().and_then(|l| l.parse().ok()).unwrap_or(2);
+    Some((first, last, level))
 }
 
 /// The trace level `NX_TRACE_GPU` asks for: a number, or any other value for 1.
@@ -99,6 +113,8 @@ impl Gpu {
             backend: None,
             lenient: std::env::var("NX_GPU_LENIENT").is_ok_and(|v| v != "0"),
             level: trace_level(),
+            window: trace_window(),
+            base_level: trace_level(),
             queue: None,
             next_space: 1,
             next_channel: 1,
@@ -115,6 +131,18 @@ impl Gpu {
         match self.backend.as_deref_mut() {
             Some(backend) => backend.present(&request),
             None => Ok(()),
+        }
+    }
+
+    /// A buffer is queued for display: the frame number says which trace level the commands run
+    /// from now on get.
+    pub fn note_frame(&mut self, number: u64) {
+        if let Some((first, last, level)) = self.window {
+            self.level = if (first..=last).contains(&number) {
+                level
+            } else {
+                self.base_level
+            };
         }
     }
 

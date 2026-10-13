@@ -276,11 +276,17 @@ impl Shared {
     /// The title queued a buffer for display: tell the renderer (if there is one).
     pub fn present(&self, frame: &nx_gpu::display::Frame) -> Result<(), String> {
         let Some(worker) = &self.worker else {
-            return self.lock().gpu.present(frame);
+            let mut core = self.lock();
+            core.gpu.note_frame(frame.number);
+            return core.gpu.present(frame);
         };
         // The buffer is shown after the commands queued before it have run.
         worker.wait_for_room(true);
-        let request = self.lock().gpu.present_request(frame)?;
+        let request = {
+            let mut core = self.lock();
+            core.gpu.note_frame(frame.number);
+            core.gpu.present_request(frame)?
+        };
         if let Some(request) = request {
             worker.push(Task::Present(request));
         }
