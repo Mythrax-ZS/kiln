@@ -663,6 +663,14 @@ impl Core {
                 keys[0].address.wrapping_sub(cpu)
             );
         }
+        if self.debug.trace_textures {
+            for key in &keys {
+                eprintln!(
+                    "[vulkan] write-back of {key:?}, drawn to {} submissions ago",
+                    self.targets.age(key).unwrap_or(0)
+                );
+            }
+        }
         // The rendering in progress ends, and what was recorded runs, so that the pixels are
         // the ones drawn so far.
         self.end_pass();

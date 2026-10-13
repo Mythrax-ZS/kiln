@@ -484,6 +484,38 @@ fn a_render_target_that_a_texture_reads_through_memory_is_written_to_it_first() 
 }
 
 #[test]
+fn a_render_target_nothing_draws_to_for_long_is_not_written_over_reused_memory() {
+    if vulkan().is_none() {
+        return;
+    }
+    let source = GPU_BASE + 0x50_0000;
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = textured(8, target, header(0x08, 2, 8, 8, source), nearest_sampler());
+    let mut r = Renderer::new(RenderConfig::default());
+    // A 16 by 16 target at the texture's address is drawn to, and nothing reads it...
+    w.color_target(0, source, 16, 16, 0xD5);
+    clear_to(&mut r, &mut w, [1.0, 0.0, 0.0, 1.0], None);
+    assert!(r.picture_at(w.cpu(source)).unwrap().is_some());
+    // ... for a long time, while the title frees that memory and puts something else there.
+    for _ in 0..400 {
+        r.finish().unwrap();
+    }
+    let reused: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    w.put(source, &reused);
+    // A texture made of that memory is sampled. The old target is no longer one of the targets,
+    // so it is not written over the memory (its pixels would overwrite what lives there now).
+    w.color_target(0, target, 8, 8, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let mut memory = vec![0u8; reused.len()];
+    assert!(w.mem.read(w.cpu(source), &mut memory));
+    assert!(
+        memory == reused,
+        "the memory was overwritten by a stale target"
+    );
+    assert!(r.picture_at(w.cpu(source)).unwrap().is_none());
+}
+
+#[test]
 fn a_render_target_that_is_a_part_of_a_texture_is_copied_into_it_on_the_device() {
     if vulkan().is_none() {
         return;

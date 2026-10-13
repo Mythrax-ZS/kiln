@@ -162,6 +162,12 @@ pub struct Targets {
     pub write_backs: WriteBacks,
 }
 
+/// How many submissions a target that was drawn to and not yet written to memory may go without
+/// being drawn to again before [`Targets::retire`] lets it go.
+const DIRTY_LIFETIME: u64 = 300;
+/// The same for a target whose pixels are in memory.
+const CLEAN_LIFETIME: u64 = 3000;
+
 /// What the address index keeps of a target, so that finding the targets of some memory looks at
 /// numbers and not at the map of targets.
 #[derive(Clone, Copy, Debug)]
@@ -431,6 +437,49 @@ impl Targets {
     /// A target already made.
     pub fn existing(&mut self, key: &Key) -> Option<&mut Target> {
         self.map.get_mut(key)
+    }
+
+    /// How many submissions ago the target `key` was drawn to.
+    pub fn age(&self, key: &Key) -> Option<u64> {
+        self.map
+            .get(key)
+            .map(|t| self.submissions.saturating_sub(t.touched))
+    }
+
+    /// Let go of the targets nothing has drawn to for a long time, and say which they were. A
+    /// target that was drawn to and never read keeps its pixels waiting to be written to the
+    /// memory it stands for; when the title frees that memory and puts something else there, a
+    /// texture that happens to overlap it would make the write-back overwrite what lives there
+    /// now (docs/ASSUMPTIONS.md A-118). A target that was written back keeps what it holds for
+    /// much longer, for the title may draw on top of it again.
+    pub fn retire(&mut self, frame: &mut Frame) -> Vec<Key> {
+        let now = self.submissions;
+        let old: Vec<Key> = self
+            .map
+            .values()
+            .filter(|t| {
+                let limit = if t.dirty {
+                    DIRTY_LIFETIME
+                } else {
+                    CLEAN_LIFETIME
+                };
+                now.saturating_sub(t.touched) > limit
+            })
+            .map(|t| t.key)
+            .collect();
+        for key in &old {
+            if let Some(t) = self.map.remove(key) {
+                frame.garbage.push(Garbage::Image(t.image));
+            }
+            if self
+                .by_address
+                .get(&key.address)
+                .is_some_and(|p| p.key == *key)
+            {
+                self.by_address.remove(&key.address);
+            }
+        }
+        old
     }
 
     /// The targets made so far, for messages.

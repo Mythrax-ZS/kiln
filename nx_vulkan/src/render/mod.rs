@@ -695,6 +695,12 @@ impl Core {
         self.end_pass();
         self.frame.submit(&self.vk)?;
         self.targets.submissions += 1;
+        let retired = self.targets.retire(&mut self.frame);
+        if self.debug.trace_textures {
+            for key in retired {
+                eprintln!("[vulkan] the render target {key:?} was let go (nothing drew to it for a long time)");
+            }
+        }
         Ok(())
     }
 }
