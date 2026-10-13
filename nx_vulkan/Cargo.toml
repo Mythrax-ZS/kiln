@@ -1,0 +1,15 @@
+[package]
+name = "nx_vulkan"
+version = "0.1.0"
+edition = "2021"
+description = "Vulkan backend: runs the draws of the GPU model on a host GPU"
+publish = false
+
+[lib]
+name = "nx_vulkan"
+path = "src/lib.rs"
+
+[dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
+nx_gpu = { path = "../nx_gpu" }
+nx_shader = { path = "../nx_shader" }
