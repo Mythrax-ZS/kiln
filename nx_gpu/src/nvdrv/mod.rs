@@ -15,6 +15,7 @@ mod as_gpu;
 mod channel;
 mod ctrl;
 mod ctrl_gpu;
+mod decoder;
 mod nvmap_dev;
 
 use crate::error::NvError;
@@ -40,6 +41,7 @@ enum Node {
     Nvmap,
     AsGpu(u32),
     Gpu(u32),
+    Decoder(decoder::Decoder),
 }
 
 impl Node {
@@ -50,6 +52,7 @@ impl Node {
             Node::Nvmap => "/dev/nvmap",
             Node::AsGpu(_) => "/dev/nvhost-as-gpu",
             Node::Gpu(_) => "/dev/nvhost-gpu",
+            Node::Decoder(d) => d.path,
         }
     }
 }
@@ -98,6 +101,10 @@ impl Nvdrv {
             "/dev/nvmap" => Node::Nvmap,
             "/dev/nvhost-as-gpu" => Node::AsGpu(self.gpu.new_space()),
             "/dev/nvhost-gpu" => Node::Gpu(self.gpu.new_channel()),
+            // The media engines: nodes that accept their work and decode nothing (A-119).
+            "/dev/nvhost-nvdec" => Node::Decoder(decoder::Decoder::new("/dev/nvhost-nvdec")),
+            "/dev/nvhost-nvjpg" => Node::Decoder(decoder::Decoder::new("/dev/nvhost-nvjpg")),
+            "/dev/nvhost-vic" => Node::Decoder(decoder::Decoder::new("/dev/nvhost-vic")),
             other => {
                 return unimplemented(format!(
                     "the program opened the device `{other}`, which this runtime does not implement"
@@ -135,6 +142,11 @@ impl Nvdrv {
             Node::Ctrl { slots } => {
                 for token in slots.iter().flatten() {
                     self.gpu.syncpoints.cancel(*token);
+                }
+            }
+            Node::Decoder(d) => {
+                if let Some(sp) = d.syncpoint() {
+                    self.gpu.syncpoints.release(sp);
                 }
             }
             Node::CtrlGpu | Node::Nvmap => {}
@@ -176,6 +188,7 @@ impl Nvdrv {
                 let channel = *channel;
                 self.channel_ioctl(channel, ioctl, &mut args, extra_in)
             }
+            Some(Node::Decoder(_)) => self.decoder_ioctl(fd, ioctl, &mut args),
             None => Err(Fail::Nv(NvError::BAD_PARAMETER)),
         };
         let error = match outcome {
@@ -249,6 +262,7 @@ impl Nvdrv {
             Node::Nvmap => nvmap_dev::name(code),
             Node::AsGpu(_) => as_gpu::name(code),
             Node::Gpu(_) => channel::name(code),
+            Node::Decoder(_) => decoder::name(code),
         }
     }
 }
@@ -319,10 +333,21 @@ mod tests {
     #[test]
     fn a_device_nobody_implemented_stops_the_run() {
         let (mut nv, _) = nvdrv();
-        let Err(Fail::Unimplemented(why)) = nv.open("/dev/nvhost-nvdec") else {
+        let Err(Fail::Unimplemented(why)) = nv.open("/dev/nvhost-tsec") else {
             panic!("should be unimplemented");
         };
-        assert!(why.contains("/dev/nvhost-nvdec"), "{why}");
+        assert!(why.contains("/dev/nvhost-tsec"), "{why}");
+    }
+
+    #[test]
+    fn the_media_engine_nodes_open() {
+        let (mut nv, _) = nvdrv();
+        for (i, path) in ["/dev/nvhost-nvdec", "/dev/nvhost-nvjpg", "/dev/nvhost-vic"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(nv.open(path), Ok(i as u32 + 1), "{path}");
+        }
     }
 
     #[test]

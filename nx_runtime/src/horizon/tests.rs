@@ -1851,12 +1851,12 @@ fn a_syncpoint_event_comes_through_a_kernel_event_handle() {
 fn a_device_the_driver_does_not_have_stops_the_run() {
     let mut e = Env::new();
     let nv = e.nvdrv();
-    e.write(SCRATCH + 0x800, b"/dev/nvhost-nvdec");
+    e.write(SCRATCH + 0x800, b"/dev/nvhost-tsec");
     let mut open = Message::new(0);
-    open.send = vec![(SCRATCH + 0x800, 17)];
+    open.send = vec![(SCRATCH + 0x800, 16)];
     assert!(e.send(nv, &open.bytes(), false).is_none());
     match e.kernel.exit_state() {
-        Some(Exit::Fatal(m)) => assert!(m.contains("/dev/nvhost-nvdec"), "{m}"),
+        Some(Exit::Fatal(m)) => assert!(m.contains("/dev/nvhost-tsec"), "{m}"),
         other => panic!("{other:?}"),
     }
 }
