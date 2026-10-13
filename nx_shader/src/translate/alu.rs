@@ -6,7 +6,7 @@
 //! an instruction that writes them stops the translation.
 
 use super::emit::{Tx, R};
-use crate::inst::{Inst, PT};
+use crate::inst::{Inst, PT, RZ};
 use crate::ops::{Form, Op};
 use crate::spirv::{glsl, op, Id};
 
@@ -44,6 +44,7 @@ pub(super) fn translate(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<bool> {
         Op::MovReg | Op::MovCbuf | Op::MovImm20 => mov(tx, inst)?,
         Op::Mov32iImm32 => mov32i(tx, inst)?,
         Op::Psetp => psetp(tx, inst)?,
+        Op::CsetpCc => csetp(tx, inst)?,
         Op::Pset => pset(tx, inst)?,
         Op::ImulReg | Op::ImulCbuf | Op::ImulImm20 | Op::Imul32iImm32 => imul(tx, inst, opc)?,
         _ => return Ok(false),
@@ -99,7 +100,11 @@ fn fsat(tx: &mut Tx<'_>, v: Id) -> Id {
 /// Refuse an instruction that writes the condition code (other than integer adds' carry).
 pub(super) fn no_cc(tx: &Tx<'_>, inst: Inst, bit: u32) -> R<()> {
     if inst.bit(bit) {
-        return tx.fail("an instruction that writes the condition code flags");
+        return tx.fail(format!(
+            "{:?} writes the condition code flags",
+            inst.op()
+                .map_or("an unknown instruction".to_string(), |o| format!("{o:?}"))
+        ));
     }
     Ok(())
 }
@@ -547,7 +552,6 @@ fn f2f(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
 }
 
 fn i2i(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
-    no_cc(tx, inst, 47)?;
     // Destination: bits 8..9 size, bit 12 signed; source: bits 10..11 size, bit 13 signed.
     let dsize = inst.bits(8, 2);
     let dsigned = inst.bit(12);
@@ -614,6 +618,11 @@ fn i2i(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
         };
     }
     tx.write(inst, inst.rd(), v);
+    // `.CC`: the zero and sign flags of the result, the carry and overflow flags cleared (the
+    // flags are set even when the result goes nowhere: `I2I.CC RZ, R` tests a register).
+    if inst.bit(47) {
+        tx.set_zero_and_sign(inst, v, true);
+    }
     Ok(())
 }
 
@@ -701,16 +710,43 @@ fn iadd(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
     let (sum, carry) = add_carry(tx, a, b, cin);
     tx.write(inst, inst.rd(), sum);
     if cc {
-        match tx.guard_condition(inst.guard()) {
-            None => tx.f.store(carry_var, carry),
-            Some(g) => {
-                let old = tx.f.load(&mut tx.m, bool_t, carry_var);
-                let merged = tx.select(bool_t, g, carry, old);
-                tx.f.store(carry_var, merged);
-            }
-        }
+        set_add_flags(tx, inst, a, b, sum, carry, x);
     }
     Ok(())
+}
+
+/// The flags of an addition `a + b` that gave `sum` and the carry out `carry`: carry, signed
+/// overflow (the operands have one sign and the sum has the other), zero (for the extended form
+/// only if the words before it were zero too) and sign. (docs/ASSUMPTIONS.md A-107)
+pub(super) fn set_add_flags(
+    tx: &mut Tx<'_>,
+    inst: Inst,
+    a: Id,
+    b: Id,
+    sum: Id,
+    carry: Id,
+    extended: bool,
+) {
+    let flags = tx.flags();
+    tx.write_flag(inst, flags.c, carry);
+    let sum_a = tx.xor(sum, a);
+    let a_b = tx.xor(a, b);
+    let not_a_b = tx.not(a_b);
+    let overflow_bits = tx.and(sum_a, not_a_b);
+    let thirty_one = tx.c32(31);
+    let zero = tx.c32(0);
+    let top = tx.shr(overflow_bits, thirty_one);
+    let overflow = tx.cmp(op::I_NOT_EQUAL, top, zero);
+    tx.write_flag(inst, flags.o, overflow);
+    let mut is_zero = tx.cmp(op::I_EQUAL, sum, zero);
+    if extended {
+        let before = tx.read_flag(flags.z);
+        is_zero = tx.land(is_zero, before);
+    }
+    tx.write_flag(inst, flags.z, is_zero);
+    let sign = tx.shr(sum, thirty_one);
+    let negative = tx.cmp(op::I_NOT_EQUAL, sign, zero);
+    tx.write_flag(inst, flags.s, negative);
 }
 
 fn iscadd(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
@@ -1015,6 +1051,12 @@ fn mov(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
     }
     let v = src_b(tx, inst)?;
     tx.write(inst, inst.rd(), v);
+    // The word the register now holds, for a bindless texture instruction that takes its handle
+    // from it.
+    if inst.form() == Form::Cbuf && inst.guard().is_always() && inst.rd() != RZ {
+        tx.reg_origin
+            .insert(inst.rd(), (inst.cbuf_index(), inst.cbuf_offset() / 4));
+    }
     Ok(())
 }
 
@@ -1038,6 +1080,96 @@ fn psetp(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
     let r2 = bool_op(tx, inst.bits(45, 2), second, c)?;
     tx.write_pred(inst, inst.bits(3, 3) as u8, r1);
     tx.write_pred(inst, inst.bits(0, 3) as u8, r2);
+    Ok(())
+}
+
+/// A test of the condition code flags by the 5-bit code of `CSETP` and the control-flow
+/// instructions (docs/ASSUMPTIONS.md A-107): `S` is the sign (negative) flag, `Z` zero, `C` carry
+/// and `O` overflow. The codes that name states of the hardware's own are refused.
+fn condition(tx: &mut Tx<'_>, code: u64) -> R<Id> {
+    if code == 15 {
+        return Ok(tx.ctrue());
+    }
+    if code == 0 {
+        return Ok(tx.cfalse());
+    }
+    let flags = tx.flags();
+    let (z, s, c, o) = (
+        tx.read_flag(flags.z),
+        tx.read_flag(flags.s),
+        tx.read_flag(flags.c),
+        tx.read_flag(flags.o),
+    );
+    let (nz, ns, nc, no) = (tx.lnot(z), tx.lnot(s), tx.lnot(c), tx.lnot(o));
+    Ok(match code {
+        // LT: negative and not zero, as a signed comparison (overflow flips it).
+        1 => {
+            let lt = tx.land(s, nz);
+            tx.lxor(lt, o)
+        }
+        2 => tx.land(ns, z),
+        3 => {
+            let zo = tx.lor(z, o);
+            tx.lxor(s, zo)
+        }
+        4 => {
+            let so = tx.lxor(s, o);
+            let le = tx.lor(so, z);
+            tx.lnot(le)
+        }
+        5 => nz,
+        6 => {
+            // GE: the sign and the overflow agree.
+            let so = tx.lxor(s, o);
+            tx.lnot(so)
+        }
+        7 => {
+            let nan = tx.land(s, z);
+            tx.lnot(nan)
+        }
+        8 => tx.land(s, z),
+        9 => tx.lxor(s, o),
+        10 => z,
+        11 => {
+            let so = tx.lxor(s, o);
+            tx.lor(so, z)
+        }
+        12 => {
+            let oz = tx.lor(o, z);
+            tx.lxor(ns, oz)
+        }
+        13 => tx.lor(s, nz),
+        14 => {
+            let nsz = tx.lor(ns, z);
+            tx.lxor(nsz, o)
+        }
+        16 => no,
+        17 => nc,
+        18 => ns,
+        19 => tx.lor(z, nc),
+        20 => tx.land(c, nz),
+        21 => s,
+        22 => c,
+        23 => o,
+        30 => tx.lor(s, z),
+        31 => {
+            let sz = tx.lor(s, z);
+            tx.lnot(sz)
+        }
+        _ => return tx.fail(format!("condition code test {code}")),
+    })
+}
+
+/// `CSETP.cc.op Pd, Pq, CC.test, Pc`: `Pd` is the test combined with `Pc` by the boolean
+/// operation and `Pq` the same for the test's negation.
+fn csetp(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
+    let test = condition(tx, inst.bits(8, 5))?;
+    let c = pred_at(tx, inst, 39);
+    let first = bool_op(tx, inst.bits(45, 2), test, c)?;
+    let negated = tx.lnot(test);
+    let second = bool_op(tx, inst.bits(45, 2), negated, c)?;
+    tx.write_pred(inst, inst.bits(3, 3) as u8, first);
+    tx.write_pred(inst, inst.bits(0, 3) as u8, second);
     Ok(())
 }
 

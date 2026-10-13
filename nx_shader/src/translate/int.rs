@@ -6,7 +6,7 @@
 //! the compiler's sequences need; the carry flag forms and a few modes are refused
 //! (docs/ASSUMPTIONS.md).
 
-use super::alu::{add_carry, no_cc, src_b};
+use super::alu::{add_carry, no_cc, set_add_flags, src_b};
 use super::emit::{Tx, R};
 use crate::inst::{Inst, PT};
 use crate::ops::Op;
@@ -17,6 +17,7 @@ pub(super) fn translate(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<bool> {
         Op::XmadReg | Op::Xmad | Op::XmadCbuf_4e00 | Op::XmadCbuf_5100 => xmad(tx, inst, opc)?,
         Op::ImadReg | Op::ImadImm20 | Op::ImadCbuf_4a00 | Op::ImadCbuf_5200 => imad(tx, inst, opc)?,
         Op::LeaReg | Op::LeaCbuf | Op::LeaImm20 => lea(tx, inst)?,
+        Op::Iadd3Reg | Op::Iadd3Cbuf | Op::Iadd3Imm20 => iadd3(tx, inst, opc)?,
         Op::LeaHiReg | Op::LeaHiCbuf => lea_hi(tx, inst, opc)?,
         Op::Lop3LutReg | Op::Lop3LutCbuf | Op::Lop3LutImm20 => lop3(tx, inst, opc)?,
         Op::ShfRReg | Op::ShfR | Op::ShfLReg | Op::ShfLImm20 => shf(tx, inst, opc)?,
@@ -142,20 +143,6 @@ fn imad(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
     Ok(())
 }
 
-/// Store a carry out as the instruction's guard says.
-fn write_carry(tx: &mut Tx<'_>, inst: Inst, carry: Id) {
-    let var = tx.carry_variable();
-    match tx.guard_condition(inst.guard()) {
-        None => tx.f.store(var, carry),
-        Some(g) => {
-            let bool_t = tx.t.bool_;
-            let old = tx.f.load(&mut tx.m, bool_t, var);
-            let merged = tx.select(bool_t, g, carry, old);
-            tx.f.store(var, merged);
-        }
-    }
-}
-
 /// `a + b`, with the carry in (for `.X`) and out (for `.CC`) of the flag the integer adds share.
 fn add_flagged(tx: &mut Tx<'_>, inst: Inst, a: Id, b: Id, x: bool, cc: bool) -> Id {
     if !x && !cc {
@@ -166,7 +153,7 @@ fn add_flagged(tx: &mut Tx<'_>, inst: Inst, a: Id, b: Id, x: bool, cc: bool) -> 
     let previous = x.then(|| tx.f.load(&mut tx.m, bool_t, var));
     let (sum, carry) = add_carry(tx, a, b, previous);
     if cc {
-        write_carry(tx, inst, carry);
+        set_add_flags(tx, inst, a, b, sum, carry, x);
     }
     sum
 }
@@ -410,5 +397,99 @@ fn prmt(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
         result = tx.or(result, placed);
     }
     tx.write(inst, inst.rd(), result);
+    Ok(())
+}
+
+/// A word cut to its low half (selector 1) or its high half (2), else whole.
+fn half_of(tx: &mut Tx<'_>, v: Id, selector: u64) -> Id {
+    match selector {
+        1 => {
+            let mask = tx.c32(0xFFFF);
+            tx.and(v, mask)
+        }
+        2 => {
+            let sixteen = tx.c32(16);
+            tx.shr(v, sixteen)
+        }
+        _ => v,
+    }
+}
+
+/// `IADD3 Rd, [-]Ra, [-]B, [-]Rc`: the sum of three words (negated by bits 51, 50 and 49). In the
+/// register form each word can first be cut to its low (1) or high (2) half (bits 35..36, 33..34
+/// and 31..32 for `Ra`, `B` and `Rc`), and bits 37..38 move the sum of the first two right (1) or
+/// left (2) by 16 before the third is added. `.X` (bit 48) adds the carry flag and `.CC` (bit 47)
+/// sets the carry (any add carried), zero (and, with `.X`, was zero before) and sign flags
+/// (docs/ASSUMPTIONS.md A-107).
+fn iadd3(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
+    let register_form = opc == Op::Iadd3Reg;
+    let mut a = tx.read(inst.ra());
+    let mut b = src_b(tx, inst)?;
+    let mut c = tx.read(inst.rc());
+    if register_form {
+        a = half_of(tx, a, inst.bits(35, 2));
+        b = half_of(tx, b, inst.bits(33, 2));
+        c = half_of(tx, c, inst.bits(31, 2));
+    }
+    if inst.bit(51) {
+        a = tx.ineg(a);
+    }
+    if inst.bit(50) {
+        b = tx.ineg(b);
+    }
+    if inst.bit(49) {
+        c = tx.ineg(c);
+    }
+    let shift = if register_form { inst.bits(37, 2) } else { 0 };
+    let (extended, cc) = (inst.bit(48), inst.bit(47));
+    let sixteen = tx.c32(16);
+    if !extended && !cc {
+        let mut ab = tx.iadd(a, b);
+        ab = match shift {
+            1 => tx.shr(ab, sixteen),
+            2 => tx.shl(ab, sixteen),
+            _ => ab,
+        };
+        let r = tx.iadd(ab, c);
+        tx.write(inst, inst.rd(), r);
+        return Ok(());
+    }
+    let flags = tx.flags();
+    let carry_before = extended.then(|| tx.read_flag(flags.c));
+    let zero_before = extended.then(|| tx.read_flag(flags.z));
+    // A carry out of the first add is lost when the sum is shifted.
+    let (ab, carry0) = match shift {
+        1 | 2 => {
+            let (sum, _) = add_carry(tx, a, b, None);
+            let moved = if shift == 1 {
+                tx.shr(sum, sixteen)
+            } else {
+                tx.shl(sum, sixteen)
+            };
+            (moved, tx.cfalse())
+        }
+        _ => add_carry(tx, a, b, None),
+    };
+    let (abc, carry1) = add_carry(tx, ab, c, None);
+    let zero = tx.c32(0);
+    let (sum, carry2) = match carry_before {
+        Some(before) => add_carry(tx, abc, zero, Some(before)),
+        None => (abc, tx.cfalse()),
+    };
+    tx.write(inst, inst.rd(), sum);
+    if cc {
+        let carried = tx.lor(carry0, carry1);
+        let carried = tx.lor(carried, carry2);
+        tx.write_flag(inst, flags.c, carried);
+        let mut is_zero = tx.cmp(op::I_EQUAL, sum, zero);
+        if let Some(before) = zero_before {
+            is_zero = tx.land(is_zero, before);
+        }
+        tx.write_flag(inst, flags.z, is_zero);
+        let thirty_one = tx.c32(31);
+        let top = tx.shr(sum, thirty_one);
+        let negative = tx.cmp(op::I_NOT_EQUAL, top, zero);
+        tx.write_flag(inst, flags.s, negative);
+    }
     Ok(())
 }

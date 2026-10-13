@@ -9,7 +9,7 @@
 use super::frame::{Frame, Garbage};
 use crate::blocklinear::{deswizzle, Geometry};
 use crate::device::Vk;
-use crate::image::{Image, ImageInfo};
+use crate::image::{aspect_of, Image, ImageInfo};
 use ash::vk;
 use nx_gpu::render::Scene;
 use nx_gpu::shaders::hash_bytes;
@@ -468,6 +468,8 @@ pub fn texture_format(components: u32, data_type: u32, srgb: bool) -> Option<Tex
             bc,
             16,
         ),
+        // ZF32: 32-bit floating point depth, sampled as a depth image.
+        0x2F => (F::D32_SFLOAT, one, 4),
         _ => return None,
     };
     tf(format, block, bytes)
@@ -519,14 +521,164 @@ struct Texture {
     checked: u64,
     hash: u64,
     bytes: u64,
+    /// The value of [`Textures::generation`] when it was compared with memory.
+    generation: u64,
+}
+
+/// How a shader sees a texture: the type of image view the descriptor needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    D2,
+    D2Array,
+    Cube,
+    D3,
+}
+
+/// The image made of a texture header for one way of sampling it: the header says what the memory
+/// holds, the shader what it wants to see (a 2D array header sampled by a 2D instruction is its
+/// first layer, a 2D header sampled as an array is an array of one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Shape {
+    pub kind: Kind,
+    /// Array layers of the image (6 for a cube, 1 for a 3D image or a plain 2D one).
+    pub layers: u32,
+    /// The depth of a 3D image, else 1.
+    pub depth: u32,
+}
+
+/// The shape of the image a shader that samples the texture `tic` as `used` needs.
+pub fn shape_of(tic: &Tic, used: &TextureUse) -> Result<Shape, String> {
+    let ty = tic.texture_type();
+    let wrong = || {
+        format!(
+            "a texture header of type {ty} sampled as a {:?}{} texture (header words {:08x?})",
+            used.dim,
+            if used.arrayed { " array" } else { "" },
+            tic.0
+        )
+    };
+    let shape = |kind, layers, depth| {
+        Ok(Shape {
+            kind,
+            layers,
+            depth,
+        })
+    };
+    match (used.dim, used.arrayed) {
+        // Plain 2D: a 2D texture, or the first layer of an array or of a cube.
+        (Dim::D2, false) if matches!(ty, 1 | 3 | 5 | 7) => shape(Kind::D2, 1, 1),
+        (Dim::D2, true) if matches!(ty, 1 | 7) => shape(Kind::D2Array, 1, 1),
+        (Dim::D2, true) if ty == 5 => shape(Kind::D2Array, tic.depth(), 1),
+        (Dim::Cube, false) if ty == 3 => shape(Kind::Cube, 6, 1),
+        (Dim::D3, false) if ty == 2 => shape(Kind::D3, 1, tic.depth()),
+        _ => Err(wrong()),
+    }
+}
+
+/// Where the bytes of a texture are in memory and what image they make.
+struct Plan {
+    width: u32,
+    height: u32,
+    depth: u32,
+    layers: u32,
+    levels: u32,
+    aspect: vk::ImageAspectFlags,
+    /// The geometry of each mip level of one layer.
+    level_geometry: Vec<Geometry>,
+    /// The distance between layers in bytes.
+    layer_stride: u64,
+    /// The bytes of the whole texture in memory.
+    total: u64,
+}
+
+/// The image `tic` makes for a shader that samples it with `shape`, in `format`, and where its
+/// bytes are.
+fn plan(tic: &Tic, shape: Shape, format: TexFormat) -> Result<Plan, String> {
+    let (width, height) = (tic.width(), tic.height());
+    let volume = shape.kind == Kind::D3;
+    let layers = shape.layers;
+    let depth = if volume { shape.depth } else { 1 };
+    let largest = if volume {
+        width.max(height).max(depth)
+    } else {
+        width.max(height)
+    };
+    let levels = tic.levels().min(32 - largest.leading_zeros());
+    let aspect = aspect_of(format.vk);
+    let elements = (
+        width.div_ceil(format.block.0),
+        height.div_ceil(format.block.1),
+    );
+    let base = if tic.is_block_linear() {
+        let b = tic.block_log2();
+        Geometry {
+            width: elements.0,
+            height: elements.1,
+            depth,
+            bytes_per_element: format.bytes,
+            block_height_log2: b[1],
+            block_depth_log2: if volume { b[2] } else { 0 },
+        }
+    } else if tic.is_pitch() {
+        Geometry {
+            width: elements.0,
+            height: elements.1,
+            depth: 1,
+            bytes_per_element: format.bytes,
+            block_height_log2: 0,
+            block_depth_log2: 0,
+        }
+    } else {
+        return Err(format!("a texture header of version {}", tic.version()));
+    };
+    // Where the bytes are: each mip level after the one before; layers one after another.
+    let level_geometry: Vec<Geometry> = (0..levels)
+        .map(|l| mip_geometry(&base, l, (width, height), format.block))
+        .collect();
+    let layer_size: u64 = if tic.is_block_linear() {
+        level_geometry.iter().map(Geometry::tiled_size).sum()
+    } else {
+        u64::from(tic.pitch()) * u64::from(elements.1)
+    };
+    // The layers of an array or a cube are a whole block apart (the block of level 0).
+    let layer_stride = if tic.is_block_linear() {
+        let b = tic.block_log2();
+        layer_size.next_multiple_of(512 << (b[1] + b[2]))
+    } else {
+        layer_size
+    };
+    Ok(Plan {
+        width,
+        height,
+        depth,
+        layers,
+        levels,
+        aspect,
+        level_geometry,
+        layer_stride,
+        total: layer_stride * u64::from(layers),
+    })
+}
+
+/// How many bytes of memory the texture `tic` takes when a shader samples it as `used`.
+pub fn memory_bytes(tic: &Tic, used: &TextureUse) -> Option<u64> {
+    let shape = shape_of(tic, used).ok()?;
+    let format = texture_format(tic.components(), tic.types()[0], tic.srgb())?;
+    plan(tic, shape, format).ok().map(|p| p.total)
 }
 
 #[derive(Default)]
 pub struct Textures {
-    map: HashMap<Tic, Texture>,
-    samplers: HashMap<Tsc, vk::Sampler>,
+    map: HashMap<(Tic, Shape), Texture>,
+    /// Samplers by header and by whether the shader compares against a depth.
+    samplers: HashMap<(Tsc, bool), vk::Sampler>,
     /// The number of buffers shown so far: a texture is compared with memory once per frame.
     pub frame: u64,
+    /// Say what each new image is made of (`NX_TRACE_TEXTURES`).
+    pub trace: bool,
+    /// Counts the times memory was written by the renderer itself (a render target put into it): a
+    /// texture compared with memory before that is compared again.
+    pub generation: u64,
 }
 
 /// Everything a draw needs of a texture.
@@ -535,35 +687,14 @@ pub struct Bound {
     pub sampler: vk::Sampler,
 }
 
-/// Whether the header `tic` can be sampled as `used` (a 2D texture or array); whether it is an
-/// array.
-fn check_sampled_2d(tic: &Tic, used: &TextureUse) -> Result<bool, String> {
-    let wants_2d = used.dim == Dim::D2 && !used.shadow;
-    if !wants_2d {
-        return Err(format!(
-            "a texture sampled as {:?}{}{}",
-            used.dim,
-            if used.arrayed { " array" } else { "" },
-            if used.shadow {
-                " with depth comparison"
-            } else {
-                ""
-            }
-        ));
-    }
-    let ty = tic.texture_type();
-    let arrayed = matches!(ty, 5);
-    if !matches!(ty, 1 | 5 | 7) || arrayed != used.arrayed {
-        return Err(format!(
-            "a texture header of type {ty} sampled as a 2D texture{} (header words {:08x?})",
-            if used.arrayed { " array" } else { "" },
-            tic.0
-        ));
-    }
-    Ok(arrayed)
-}
-
 impl Textures {
+    pub fn new(trace: bool) -> Textures {
+        Textures {
+            trace,
+            ..Textures::default()
+        }
+    }
+
     /// The view and sampler for the headers `tic` and `tsc` that a shader samples as `used`.
     pub fn bind(
         &mut self,
@@ -574,11 +705,11 @@ impl Textures {
         tsc: Tsc,
         used: &TextureUse,
     ) -> Result<Bound, String> {
-        let arrayed = check_sampled_2d(&tic, used)?;
-        let view = self.texture(vk, frame, scene, tic, arrayed)?;
+        let shape = shape_of(&tic, used)?;
+        let view = self.texture(vk, frame, scene, tic, shape)?;
         Ok(Bound {
             view,
-            sampler: self.sampler(vk, tsc)?,
+            sampler: self.sampler(vk, tsc, used.shadow)?,
         })
     }
 
@@ -592,19 +723,35 @@ impl Textures {
         used: &TextureUse,
         view: vk::ImageView,
     ) -> Result<Bound, String> {
-        check_sampled_2d(tic, used)?;
+        if shape_of(tic, used)?.kind != Kind::D2 {
+            return Err(format!(
+                "a render target sampled as a {:?}{} texture",
+                used.dim,
+                if used.arrayed { " array" } else { "" }
+            ));
+        }
         Ok(Bound {
             view,
-            sampler: self.sampler(vk, tsc)?,
+            sampler: self.sampler(vk, tsc, used.shadow)?,
         })
     }
 
-    fn sampler(&mut self, vk: &Vk, tsc: Tsc) -> Result<vk::Sampler, String> {
-        if let Some(s) = self.samplers.get(&tsc) {
+    /// The sampler of a header. A shader that compares against a depth needs a sampler that does
+    /// (the header's own function when it has one, else less-or-equal), and one that does not must
+    /// have a sampler that does not.
+    fn sampler(&mut self, vk: &Vk, tsc: Tsc, shadow: bool) -> Result<vk::Sampler, String> {
+        if let Some(s) = self.samplers.get(&(tsc, shadow)) {
             return Ok(*s);
         }
         let (info, border) = tsc.sampler_info(vk);
         let mut info = info;
+        if shadow && info.compare_enable == vk::FALSE {
+            info = info
+                .compare_enable(true)
+                .compare_op(vk::CompareOp::LESS_OR_EQUAL);
+        } else if !shadow {
+            info = info.compare_enable(false);
+        }
         let mut custom;
         if vk.caps.custom_border_color
             && info.border_color == vk::BorderColor::FLOAT_OPAQUE_WHITE
@@ -619,7 +766,7 @@ impl Textures {
         // SAFETY: valid create info; the sampler lives as long as the cache.
         let s = unsafe { vk.device.create_sampler(&info, None) }
             .map_err(|e| format!("creating a sampler: {e}"))?;
-        self.samplers.insert(tsc, s);
+        self.samplers.insert((tsc, shadow), s);
         Ok(s)
     }
 
@@ -629,7 +776,7 @@ impl Textures {
         frame: &mut Frame,
         scene: &Scene<'_>,
         tic: Tic,
-        arrayed: bool,
+        shape: Shape,
     ) -> Result<vk::ImageView, String> {
         let types = tic.types();
         let Some(format) = texture_format(tic.components(), types[0], tic.srgb()) else {
@@ -646,49 +793,23 @@ impl Textures {
                 tic.components()
             ));
         }
-        let (width, height) = (tic.width(), tic.height());
-        let layers = if arrayed { tic.depth() } else { 1 };
-        let levels = tic.levels().min(32 - width.max(height).leading_zeros());
-        let elements = (
-            width.div_ceil(format.block.0),
-            height.div_ceil(format.block.1),
-        );
-        let base = if tic.is_block_linear() {
-            let b = tic.block_log2();
-            Geometry {
-                width: elements.0,
-                height: elements.1,
-                depth: 1,
-                bytes_per_element: format.bytes,
-                block_height_log2: b[1],
-                block_depth_log2: b[2],
-            }
-        } else if tic.is_pitch() {
-            Geometry {
-                width: elements.0,
-                height: elements.1,
-                depth: 1,
-                bytes_per_element: format.bytes,
-                block_height_log2: 0,
-                block_depth_log2: 0,
-            }
-        } else {
-            return Err(format!("a texture header of version {}", tic.version()));
-        };
-        // Where the bytes are: each mip level after the one before; layers one after another.
-        let level_geometry: Vec<Geometry> = (0..levels)
-            .map(|l| mip_geometry(&base, l, (width, height), format.block))
-            .collect();
-        let layer_size: u64 = if tic.is_block_linear() {
-            level_geometry.iter().map(Geometry::tiled_size).sum()
-        } else {
-            u64::from(tic.pitch()) * u64::from(elements.1)
-        };
-        let total = layer_size * u64::from(layers);
+        let Plan {
+            width,
+            height,
+            depth,
+            layers,
+            levels,
+            aspect,
+            level_geometry,
+            layer_stride,
+            total,
+            ..
+        } = plan(&tic, shape, format)?;
         // A texture compared with memory in this frame already is not read again.
         let current = self.frame;
-        if let Some(t) = self.map.get(&tic) {
-            if t.checked == current {
+        let key = (tic, shape);
+        if let Some(t) = self.map.get(&key) {
+            if t.checked == current && t.generation == self.generation {
                 return Ok(t.image.view);
             }
         }
@@ -702,13 +823,28 @@ impl Textures {
             ));
         }
         let hash = hash_bytes(&raw);
-        if let Some(t) = self.map.get_mut(&tic) {
-            if t.checked == current || t.hash == hash {
+        let known = self.map.get(&key).is_some_and(|t| t.hash == hash);
+        if self.trace && !known {
+            let filled = raw[..readable.min(raw.len())]
+                .iter()
+                .filter(|b| **b != 0)
+                .count();
+            eprintln!(
+                "[vulkan] a texture at GPU address {:#x}: {:?} {width}x{height} (depth {depth}, {layers} layers, {levels} levels) as {:?}; {filled} of {} bytes are not zero ({readable} could be read)",
+                tic.address(),
+                format.vk,
+                shape.kind,
+                raw.len()
+            );
+        }
+        if let Some(t) = self.map.get_mut(&key) {
+            if (t.checked == current && t.generation == self.generation) || t.hash == hash {
                 t.checked = current;
+                t.generation = self.generation;
                 return Ok(t.image.view);
             }
             // The contents changed: the old image goes once the submission is over.
-            if let Some(old) = self.map.remove(&tic) {
+            if let Some(old) = self.map.remove(&key) {
                 frame.garbage.push(Garbage::Image(old.image));
             }
         }
@@ -717,13 +853,15 @@ impl Textures {
             format: format.vk,
             width,
             height,
+            depth,
             layers,
             levels,
             usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
-            view_type: if arrayed {
-                vk::ImageViewType::TYPE_2D_ARRAY
-            } else {
-                vk::ImageViewType::TYPE_2D
+            view_type: match shape.kind {
+                Kind::D2 => vk::ImageViewType::TYPE_2D,
+                Kind::D2Array => vk::ImageViewType::TYPE_2D_ARRAY,
+                Kind::Cube => vk::ImageViewType::CUBE,
+                Kind::D3 => vk::ImageViewType::TYPE_3D,
             },
             components,
         })?;
@@ -731,7 +869,7 @@ impl Textures {
         let mut packed: Vec<u8> = Vec::new();
         let mut regions = Vec::new();
         for layer in 0..layers {
-            let mut at = u64::from(layer) * layer_size;
+            let mut at = u64::from(layer) * layer_stride;
             for (level, g) in level_geometry.iter().enumerate() {
                 let linear_size = g.linear_size() as usize;
                 let mut linear = vec![0u8; linear_size];
@@ -766,7 +904,7 @@ impl Textures {
                     vk::BufferImageCopy::default()
                         .buffer_offset(offset)
                         .image_subresource(vk::ImageSubresourceLayers {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            aspect_mask: aspect,
                             mip_level: level as u32,
                             base_array_layer: layer,
                             layer_count: 1,
@@ -774,7 +912,7 @@ impl Textures {
                         .image_extent(vk::Extent3D {
                             width: (width >> level).max(1),
                             height: (height >> level).max(1),
-                            depth: 1,
+                            depth: (depth >> level).max(1),
                         }),
                 );
             }
@@ -785,7 +923,7 @@ impl Textures {
         }
         let cmd = frame.upload_cmd(vk)?;
         let range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+            aspect_mask: aspect,
             base_mip_level: 0,
             level_count: levels,
             base_array_layer: 0,
@@ -838,12 +976,13 @@ impl Textures {
         }
         let view = image.view;
         self.map.insert(
-            tic,
+            key,
             Texture {
                 image,
                 checked: current,
                 hash,
                 bytes: total,
+                generation: self.generation,
             },
         );
         Ok(view)

@@ -16,10 +16,18 @@ pub struct Debug {
     /// `NX_TRACE_DRAWS=<frame>`: list every draw and clear of that frame (counting the buffers
     /// shown so far) with its target, programs and outcome.
     pub trace_frame: Option<u64>,
+    /// `NX_TRACE_AFTER_BUSY`: with `NX_DUMP_BUSY`, trace the frame after the busy one as
+    /// `NX_TRACE_DRAWS` does.
+    pub trace_after_busy: bool,
     /// `NX_DUMP_DRAWS=<dir>`: also write the first color target after each of those commands (the
     /// work is run to the end each time, so this is slow); `NX_DUMP_FROM=<n>` skips the first n.
     pub dump_draws: Option<PathBuf>,
     pub dump_from: u64,
+    /// `NX_DUMP_PASSES=<dir>`: with the tracing of a frame, write a picture of each color target
+    /// when the draws move on to another one (the picture of one pass of the frame).
+    pub dump_passes: Option<PathBuf>,
+    /// `NX_DUMP_UNTIL=<n>`: stop at command n (see `NX_DUMP_FROM`).
+    pub dump_until: u64,
     /// `NX_DUMP_TARGETS`: with `NX_DUMP_FRAMES`, also write every color target at each dump.
     pub dump_targets: bool,
     /// `NX_SPIRV_CHECK`: validate the translated programs with `spirv-val` when it is installed.
@@ -30,6 +38,19 @@ pub struct Debug {
     pub full_viewport: bool,
     /// `NX_DEBUG_SOLID_PIXEL`: every pixel program writes magenta (is a primitive covered at all?).
     pub solid_pixel: bool,
+    /// `NX_TRACE_TARGETS`: say each color target configuration the first time it is drawn to.
+    pub trace_targets: bool,
+    /// `NX_DEBUG_EQUAL_AS_LEQUAL`: a depth test for equality passes when the depth is less or equal
+    /// (does a pass after a depth prepass draw nothing only because the depths differ in a bit?).
+    pub equal_as_lequal: bool,
+    /// `NX_DEBUG_NO_DEPTH_TEST`: no draw is depth tested (what do they cover when nothing is
+    /// rejected for its depth?).
+    pub no_depth_test: bool,
+    /// `NX_DEBUG_FLIP_FRONT`: the winding that makes a face a front face is the other one.
+    pub flip_front: bool,
+    /// `NX_DEBUG_SYNC_DRAWS`: run the commands and wait for them after every draw, so that a draw
+    /// that loses the device (a program that never ends, a bad address) is named when it does.
+    pub sync_draws: bool,
 }
 
 impl Debug {
@@ -44,11 +65,19 @@ impl Debug {
             trace_frame: number("NX_TRACE_DRAWS"),
             dump_draws: std::env::var_os("NX_DUMP_DRAWS").map(PathBuf::from),
             dump_from: number("NX_DUMP_FROM").unwrap_or(0),
+            dump_until: number("NX_DUMP_UNTIL").unwrap_or(u64::MAX),
+            dump_passes: std::env::var_os("NX_DUMP_PASSES").map(PathBuf::from),
+            trace_after_busy: set("NX_TRACE_AFTER_BUSY"),
             dump_targets: set("NX_DUMP_TARGETS"),
             spirv_check: set("NX_SPIRV_CHECK"),
             no_cull: set("NX_DEBUG_NO_CULL"),
             full_viewport: set("NX_DEBUG_FULL_VIEWPORT"),
             solid_pixel: set("NX_DEBUG_SOLID_PIXEL"),
+            trace_targets: set("NX_TRACE_TARGETS"),
+            equal_as_lequal: set("NX_DEBUG_EQUAL_AS_LEQUAL"),
+            no_depth_test: set("NX_DEBUG_NO_DEPTH_TEST"),
+            flip_front: set("NX_DEBUG_FLIP_FRONT"),
+            sync_draws: set("NX_DEBUG_SYNC_DRAWS"),
         }
     }
 }

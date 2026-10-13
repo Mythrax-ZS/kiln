@@ -141,6 +141,7 @@ pub fn record(
                     format: target.key.format,
                     width: src_size.0,
                     height: src_size.1,
+                    depth: 1,
                     layers: 1,
                     levels: 1,
                     usage: vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
@@ -374,6 +375,7 @@ mod tests {
             width: 16,
             height: 8,
             layers: 1,
+            tiling: crate::render::targets::Tiling::Block(0),
         };
         targets.get(&vk, &mut frame, key).unwrap();
         // The zero fill of the new target runs before its texels are put there.
@@ -403,6 +405,7 @@ mod tests {
                     format: vk::Format::R8G8B8A8_UNORM,
                     width: size.0,
                     height: size.1,
+                    depth: 1,
                     layers: 1,
                     levels: 1,
                     usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,

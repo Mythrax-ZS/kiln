@@ -12,8 +12,8 @@
 //! * binding `64 * stage + k` for constant buffer slot `k` (0..18): a read-only storage buffer of
 //!   32-bit words holding the buffer's bytes;
 //! * binding `64 * stage + 20`: the global memory map (see [`Info::global_memory`]);
-//! * binding `64 * stage + 24 + t` for the texture the program names with index `t` (0..40): a
-//!   combined image sampler;
+//! * binding `64 * stage + 24 + s` for the `s`-th texture the program names (0..40, see
+//!   [`TextureUse::slot`]): a combined image sampler;
 //! * compute tests (the harness mode) use bindings 100 and up, listed in [`test_bindings`].
 //!
 //! `stage` is [`Stage::index`]: vertex 0, tessellation init 1, tessellation 2, geometry 3, pixel 4,
@@ -38,6 +38,9 @@ pub enum Stage {
     Pixel,
     /// The harness mode: one invocation per element, registers in and out through buffers.
     Compute,
+    /// A compute program as a title launches it: a grid of workgroups of [`Config::block`]
+    /// invocations; the thread and block numbers come from `S2R`, memory is reached by GPU address.
+    Kernel,
 }
 
 impl Stage {
@@ -45,7 +48,7 @@ impl Stage {
         match self {
             Stage::Vertex => 0,
             Stage::Pixel => 4,
-            Stage::Compute => 5,
+            Stage::Compute | Stage::Kernel => 5,
         }
     }
 }
@@ -74,6 +77,8 @@ pub struct Config {
     pub flip_y_height: Option<f32>,
     /// Write a human-readable name for every register variable and block (for `spirv-dis`).
     pub debug_names: bool,
+    /// Kernel stage: the number of invocations of a workgroup in each dimension.
+    pub block: [u32; 3],
 }
 
 impl Config {
@@ -85,6 +90,7 @@ impl Config {
             depth_minus_one_to_one: true,
             flip_y_height: None,
             debug_names: false,
+            block: [1, 1, 1],
         }
     }
 }
@@ -94,6 +100,13 @@ impl Config {
 pub struct TextureUse {
     /// The index in the instruction (the slot of the constant buffer table of handles).
     pub index: u32,
+    /// `Some(slot)`: the handle is not in the table but in word `index` of constant buffer `slot`
+    /// of the stage, where a bindless instruction (`TMML.B`) found it.
+    pub source: Option<u32>,
+    /// The binding of the sampler within the stage (`64 * stage + 24 + slot`): textures are numbered
+    /// in the order the program first names them, so that their indices (which run into the
+    /// thousands) need not be bindings.
+    pub slot: u32,
     pub dim: Dim,
     pub arrayed: bool,
     /// Sampled with a depth reference (a shadow sampler).

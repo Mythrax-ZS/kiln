@@ -42,11 +42,27 @@ pub struct SampledImage<'a> {
     pub format: vk::Format,
     pub width: u32,
     pub height: u32,
+    /// The depth of a 3D image (`SampledKind::D3`), else 1.
+    pub depth: u32,
+    /// Array layers (6 for a cube, 1 for a plain 2D or 3D image).
     pub layers: u32,
-    /// Seen through a 2D array view instead of a plain 2D one.
-    pub arrayed: bool,
-    /// The texels of every layer one after another, rows tightly packed.
+    /// How the image is seen.
+    pub kind: SampledKind,
+    /// Read through a sampler that compares against a depth (less than or equal) instead of the
+    /// plain one.
+    pub compare: bool,
+    /// The texels of every layer one after another, rows tightly packed (a 3D image's slices
+    /// likewise).
     pub texels: &'a [u8],
+}
+
+/// The kind of view a test image is bound through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SampledKind {
+    D2,
+    D2Array,
+    Cube,
+    D3,
 }
 
 /// Before the dispatch, write the device address of buffer `of` (an index into the buffers of the
@@ -183,21 +199,27 @@ impl Vk {
         }
         let mut gpu_images: Vec<Image> = Vec::new();
         let mut sampler = None;
+        let mut compare_sampler = None;
         let prepared = (|| -> Result<(), String> {
-            if !images.is_empty() {
+            if images.iter().any(|i| !i.compare) {
                 sampler = Some(self.create_nearest_sampler()?);
+            }
+            if images.iter().any(|i| i.compare) {
+                compare_sampler = Some(self.create_compare_sampler()?);
             }
             for i in images {
                 let image = self.create_image(ImageInfo {
                     format: i.format,
                     width: i.width,
                     height: i.height,
+                    depth: i.depth,
                     layers: i.layers,
                     usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
-                    view_type: if i.arrayed {
-                        vk::ImageViewType::TYPE_2D_ARRAY
-                    } else {
-                        vk::ImageViewType::TYPE_2D
+                    view_type: match i.kind {
+                        SampledKind::D2 => vk::ImageViewType::TYPE_2D,
+                        SampledKind::D2Array => vk::ImageViewType::TYPE_2D_ARRAY,
+                        SampledKind::Cube => vk::ImageViewType::CUBE,
+                        SampledKind::D3 => vk::ImageViewType::TYPE_3D,
                     },
                     components: vk::ComponentMapping::default(),
                     levels: 1,
@@ -292,9 +314,15 @@ impl Vk {
                     .collect();
                 let image_infos: Vec<[vk::DescriptorImageInfo; 1]> = gpu_images
                     .iter()
-                    .map(|i| {
+                    .zip(images)
+                    .map(|(i, wanted)| {
+                        let chosen = if wanted.compare {
+                            compare_sampler
+                        } else {
+                            sampler
+                        };
                         [vk::DescriptorImageInfo::default()
-                            .sampler(sampler.expect("a sampler exists when there are images"))
+                            .sampler(chosen.expect("a sampler exists for each image"))
                             .image_view(i.view)
                             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
                     })
@@ -359,7 +387,7 @@ impl Vk {
         for i in gpu_images {
             self.destroy_image(i);
         }
-        if let Some(s) = sampler {
+        for s in [sampler, compare_sampler].into_iter().flatten() {
             // SAFETY: the dispatch has finished, so nothing uses the sampler.
             unsafe { d.destroy_sampler(s, None) };
         }

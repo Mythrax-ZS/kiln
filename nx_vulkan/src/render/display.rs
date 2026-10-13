@@ -224,6 +224,17 @@ impl Display {
                 );
             }
             self.retire(vk);
+            if std::env::var_os("NX_TRACE_GPU").is_some() {
+                eprintln!(
+                    "[vulkan] swapchain of {}x{} in {:?} (window {}x{}, buffers {})",
+                    extent.width,
+                    extent.height,
+                    chosen.format,
+                    size.0,
+                    size.1,
+                    if srgb { "sRGB" } else { "linear" }
+                );
+            }
             self.swapchain = Some(Swapchain {
                 handle,
                 format: chosen.format,

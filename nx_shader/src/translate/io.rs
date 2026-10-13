@@ -30,6 +30,9 @@ pub(super) struct Io {
     frag_coord: Option<Id>,
     front_facing: Option<Id>,
     point_coord: Option<Id>,
+    /// Kernel stage: the thread number in its workgroup and the workgroup number (`uvec3` inputs).
+    local_id: Option<Id>,
+    workgroup_id: Option<Id>,
     /// Shadow variables of the words an `AST` wrote, by word address (byte address / 4).
     outs: BTreeMap<u32, Id>,
     /// The harness mode's buffers.
@@ -146,6 +149,7 @@ fn invocation_base(tx: &mut Tx<'_>, words: u32) -> Id {
 pub(super) fn epilogue(tx: &mut Tx<'_>) -> R<()> {
     match tx.cfg.stage {
         Stage::Compute => epilogue_test(tx),
+        Stage::Kernel => Ok(()),
         Stage::Vertex => epilogue_vertex(tx),
         Stage::Pixel => epilogue_pixel(tx),
     }
@@ -211,6 +215,9 @@ fn epilogue_vertex(tx: &mut Tx<'_>) -> R<()> {
         let value = tx.f.emit_result(&mut tx.m, op::COMPOSITE_CONSTRUCT, v4, &c);
         let var = output_variable(tx, v4);
         tx.m.decorate(var, deco::BUILT_IN, &[builtin::POSITION]);
+        // The same inputs and arithmetic give the same position in every program (depth tests that
+        // compare for equality rely on it, docs/ASSUMPTIONS.md A-109).
+        tx.m.decorate(var, deco::INVARIANT, &[]);
         tx.f.store(var, value);
     }
     if let Some(v) = word(&outs, 0x6c) {
@@ -336,6 +343,12 @@ pub(super) fn translate(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<bool> {
         Op::Ldc => ldc(tx, inst)?,
         Op::S2r => s2r(tx, inst)?,
         Op::Texs => super::tex::texs(tx, inst)?,
+        Op::TexBound => super::tex::tex(tx, inst)?,
+        Op::Tld4s => super::tex::tld4s(tx, inst)?,
+        Op::Tld4Bound => super::tex::tld4(tx, inst)?,
+        Op::TxqBound => super::tex::txq(tx, inst)?,
+        Op::TmmlBound => super::tex::tmml(tx, inst, false)?,
+        Op::TmmlBindless => super::tex::tmml(tx, inst, true)?,
         Op::Ldg => super::global::ldg(tx, inst)?,
         Op::Stg => super::global::stg(tx, inst)?,
         _ => return Ok(false),
@@ -572,6 +585,7 @@ fn ipa(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
         }
         Stage::Pixel => interpolated(tx, addr)?,
         Stage::Vertex => return tx.fail("IPA in a vertex shader"),
+        Stage::Kernel => return tx.fail("IPA in a compute program"),
     };
     if mode == 1 {
         let m = tx.read_f(inst.rb());
@@ -728,6 +742,10 @@ fn ldc(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
             }
             tx.write(inst, inst.rd().wrapping_add(w as u8), v);
         }
+        // The word the register now holds, for a bindless texture instruction's handle.
+        if size == 4 && off.is_multiple_of(4) && inst.guard().is_always() && inst.rd() != RZ {
+            tx.reg_origin.insert(inst.rd(), (slot, off / 4));
+        }
     } else {
         let base = tx.read(inst.ra());
         let imm_u = tx.c32(imm as u32);
@@ -802,6 +820,38 @@ fn s2r(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
         (Stage::Compute, 0x22 | 0x23) => {
             let zero = tx.c32(0);
             tx.write(inst, inst.rd(), zero);
+            Ok(())
+        }
+        // SR_TID.X, .Y and .Z (0x21..0x23): the invocation's place in its workgroup;
+        // SR_CTAID.X, .Y and .Z (0x25..0x27): the workgroup's place in the grid.
+        (Stage::Kernel, 0x21..=0x23 | 0x25..=0x27) => {
+            let (var, builtin_id) = if sr < 0x25 {
+                (tx.io.local_id, builtin::LOCAL_INVOCATION_ID)
+            } else {
+                (tx.io.workgroup_id, builtin::WORKGROUP_ID)
+            };
+            let uvec3 = tx.m.ty_vector(tx.t.u32, 3);
+            let var = match var {
+                Some(v) => v,
+                None => {
+                    let ptr = tx.m.ty_pointer(storage::INPUT, uvec3);
+                    let v = tx.m.global_variable(ptr, storage::INPUT);
+                    tx.m.decorate(v, deco::BUILT_IN, &[builtin_id]);
+                    tx.interface.push(v);
+                    if sr < 0x25 {
+                        tx.io.local_id = Some(v);
+                    } else {
+                        tx.io.workgroup_id = Some(v);
+                    }
+                    v
+                }
+            };
+            let all = tx.f.load(&mut tx.m, uvec3, var);
+            let u = tx.t.u32;
+            let component = if sr < 0x25 { sr - 0x21 } else { sr - 0x25 } as u32;
+            let part =
+                tx.f.emit_result(&mut tx.m, op::COMPOSITE_EXTRACT, u, &[all, component]);
+            tx.write(inst, inst.rd(), part);
             Ok(())
         }
         _ => tx.fail(format!("S2R of special register {sr:#x}")),

@@ -10,21 +10,29 @@ fn main() {
     let path = args.get(1).expect("usage: sass <program.bin> [--all]");
     let all = args.iter().any(|a| a == "--all");
     let bytes = std::fs::read(path).expect("readable file");
-    match Sph::parse(&bytes) {
-        Ok(h) => println!(
-            "header: {:?}, kills {}, fp64 {}, local {} B, crs {} B",
-            h.stage(),
-            h.kills_pixels(),
-            h.does_fp64(),
-            h.local_memory_low(),
-            h.crs_size()
-        ),
-        Err(e) => {
-            println!("header: {e}");
-            return;
+    // A compute program has no header: its dump is the code alone (a name that starts COMPUTE).
+    let headerless = std::path::Path::new(path)
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().starts_with("COMPUTE"));
+    if headerless {
+        println!("header: none (a compute program)");
+    } else {
+        match Sph::parse(&bytes) {
+            Ok(h) => println!(
+                "header: {:?}, kills {}, fp64 {}, local {} B, crs {} B",
+                h.stage(),
+                h.kills_pixels(),
+                h.does_fp64(),
+                h.local_memory_low(),
+                h.crs_size()
+            ),
+            Err(e) => {
+                println!("header: {e}");
+                return;
+            }
         }
     }
-    let code = Code(&bytes[SPH_BYTES..]);
+    let code = Code(&bytes[if headerless { 0 } else { SPH_BYTES }..]);
     let cfg = Cfg::discover(code);
     for issue in &cfg.issues {
         println!("issue: {issue}");

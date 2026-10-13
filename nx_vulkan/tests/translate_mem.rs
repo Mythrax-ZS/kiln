@@ -8,7 +8,7 @@ use common::{run_with, vulkan, Extras, Rng, State};
 use nx_shader::asm::{exit, Enc};
 use nx_shader::inst::{Guard, RZ};
 use nx_shader::ops::Op;
-use nx_vulkan::{AddressPatch, SampledImage};
+use nx_vulkan::{AddressPatch, SampledImage, SampledKind};
 
 /// `LDG.E`: `rd` from memory at `(Ra+1 : Ra) + offset`; `size` is 0 u8, 1 s8, 2 u16, 3 s16,
 /// 4 b32, 5 b64 and 6 b128.
@@ -290,8 +290,9 @@ fn texs(rd: u8, ra: u8, rb: u8, r28: u8, index: u64, mask: u64, kind: u64) -> En
 #[test]
 fn texs_samples_with_nearest_filtering_and_scatters_the_components() {
     let Some(vk) = vulkan() else { return };
-    // Texture 5 of the compute stage is binding 64*5 + 24 + 5. R1/R2 are the coordinates.
-    let binding = 64 * 5 + 24 + 5;
+    // The first texture the program names (5, here) is binding 64*5 + 24 of the compute stage.
+    // R1/R2 are the coordinates.
+    let binding = 64 * 5 + 24;
     let texels: Vec<[f32; 4]> = (0..4)
         .flat_map(|y| (0..4).map(move |x| texel(x, y)))
         .collect();
@@ -303,9 +304,9 @@ fn texs_samples_with_nearest_filtering_and_scatters_the_components() {
         texs(8, 1, 2, RZ, 5, 6, 2).build(),
         // Alpha alone (mask 3) to R10.
         texs(10, 1, 2, RZ, 5, 3, 2).build(),
-        // Kind 3: the level in the register after the y coordinate (R3, zero), red and green
-        // (mask 4) to R11, R12.
-        texs(11, 1, 2, RZ, 5, 4, 3).build(),
+        // Kind 3: x and y in R1 and R2, the level in R3 (zero); red and green (mask 4) to R11,
+        // R12.
+        texs(11, 1, 3, RZ, 5, 4, 3).build(),
         exit(Guard::ALWAYS),
     ];
     let mut inputs = Vec::new();
@@ -338,8 +339,10 @@ fn texs_samples_with_nearest_filtering_and_scatters_the_components() {
             format: vk::Format::R32G32B32A32_SFLOAT,
             width: 4,
             height: 4,
+            depth: 1,
             layers: 1,
-            arrayed: false,
+            kind: SampledKind::D2,
+            compare: false,
             texels: &bytes,
         }],
         ..Extras::default()
@@ -369,7 +372,7 @@ fn texs_samples_with_nearest_filtering_and_scatters_the_components() {
 #[test]
 fn texs_of_an_array_takes_the_layer_from_the_first_register() {
     let Some(vk) = vulkan() else { return };
-    let binding = 64 * 5 + 24 + 2;
+    let binding = 64 * 5 + 24;
     // Three layers of 2x2; each texel says where it is.
     let layer_texel = |l: u32, x: u32, y: u32| {
         [
@@ -406,8 +409,10 @@ fn texs_of_an_array_takes_the_layer_from_the_first_register() {
             format: vk::Format::R32G32B32A32_SFLOAT,
             width: 2,
             height: 2,
+            depth: 1,
             layers: 3,
-            arrayed: true,
+            kind: SampledKind::D2Array,
+            compare: false,
             texels: &bytes,
         }],
         ..Extras::default()

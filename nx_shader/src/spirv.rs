@@ -174,6 +174,8 @@ pub mod deco {
     pub const NO_PERSPECTIVE: u32 = 13;
     pub const FLAT: u32 = 14;
     pub const CENTROID: u32 = 16;
+    pub const INVARIANT: u32 = 18;
+    pub const NO_CONTRACTION: u32 = 42;
     pub const ARRAY_STRIDE: u32 = 6;
     pub const LOCATION: u32 = 30;
     pub const COMPONENT: u32 = 31;

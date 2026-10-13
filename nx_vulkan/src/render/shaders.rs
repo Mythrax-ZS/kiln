@@ -57,22 +57,45 @@ struct Entry {
     variations: HashMap<Variation, Arc<Program>>,
 }
 
+/// A compute program found in GPU memory (it has no header), translated for a workgroup size.
+struct KernelEntry {
+    /// Bytes from the start to the end of the last reachable instruction.
+    size: usize,
+    hash: u64,
+    program: Arc<Program>,
+}
+
 pub struct Shaders {
     entries: HashMap<u64, Entry>,
+    /// Compute programs by (address, workgroup size).
+    kernels: HashMap<(u64, [u32; 3]), KernelEntry>,
     next_id: u64,
     /// `NX_SPIRV_CHECK`: validate each translation.
     spirv_check: bool,
     /// `NX_DEBUG_SOLID_PIXEL`: pixel programs write a constant color.
     solid_pixel: bool,
+    /// `NX_DEBUG_SOLID_KEEP=<address>[,<address>...]`: pixel programs at these addresses keep
+    /// their code in spite of `NX_DEBUG_SOLID_PIXEL` (hexadecimal).
+    solid_keep: Vec<u64>,
 }
 
 impl Shaders {
     pub fn new(debug: &super::Debug) -> Shaders {
         Shaders {
             entries: HashMap::new(),
+            kernels: HashMap::new(),
             next_id: 0,
             spirv_check: debug.spirv_check,
             solid_pixel: debug.solid_pixel,
+            solid_keep: std::env::var("NX_DEBUG_SOLID_KEEP")
+                .map(|v| {
+                    v.split(',')
+                        .filter_map(|a| {
+                            u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -130,7 +153,10 @@ impl Shaders {
                 }
                 let size = SPH_BYTES + cfg.extent as usize;
                 let mut code = code[..cfg.extent as usize].to_vec();
-                if self.solid_pixel && slot.kind == StageKind::Pixel {
+                if self.solid_pixel
+                    && slot.kind == StageKind::Pixel
+                    && !self.solid_keep.contains(&slot.address)
+                {
                     // Bring-up switch: every fragment is magenta.
                     use nx_shader::asm::{assemble, exit, mov32i};
                     code = assemble(&[
@@ -183,7 +209,72 @@ impl Shaders {
         Ok(program)
     }
 
+    /// The compute program at `address`, translated for workgroups of `block` invocations.
+    pub fn kernel(
+        &mut self,
+        vk: &Vk,
+        scene: &Scene<'_>,
+        address: u64,
+        block: [u32; 3],
+    ) -> Result<Arc<Program>, String> {
+        // The same program: unchanged if the bytes still hash the same.
+        if let Some(e) = self.kernels.get(&(address, block)) {
+            let mut now = vec![0u8; e.size];
+            if scene.read(address, &mut now) && hash_bytes(&now) == e.hash {
+                return Ok(Arc::clone(&e.program));
+            }
+            self.kernels.remove(&(address, block));
+        }
+        let bytes = read_window(scene, address, WINDOW);
+        let cfg = Cfg::discover(Code(&bytes));
+        if let Some(issue) = cfg.issues.first() {
+            return Err(format!(
+                "the control flow of the compute program at {address:#x}: {issue}"
+            ));
+        }
+        let size = cfg.extent as usize;
+        let mut config = Config::new(Stage::Kernel);
+        config.block = block;
+        let translation = translate(Code(&bytes[..size]), None, &config)
+            .map_err(|e| format!("the compute program at {address:#x}: {e}"))?;
+        if self.spirv_check {
+            if let Err(e) = nx_shader::validate::validate(&translation.spirv) {
+                return Err(format!(
+                    "the compute program at {address:#x} translated to invalid SPIR-V: {e}"
+                ));
+            }
+        }
+        // SAFETY: valid SPIR-V from the translator; the module is destroyed with the cache.
+        let module = unsafe {
+            vk.device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&translation.spirv),
+                None,
+            )
+        }
+        .map_err(|e| format!("creating the module of the compute program: {e}"))?;
+        self.next_id += 1;
+        let program = Arc::new(Program {
+            module,
+            info: translation.info,
+            stage: Stage::Kernel,
+            id: self.next_id,
+        });
+        self.kernels.insert(
+            (address, block),
+            KernelEntry {
+                size,
+                hash: hash_bytes(&bytes[..size]),
+                program: Arc::clone(&program),
+            },
+        );
+        Ok(program)
+    }
+
     pub fn destroy(&mut self, vk: &Vk) {
+        for (_, e) in self.kernels.drain() {
+            // SAFETY: nothing uses the module any more.
+            unsafe { vk.device.destroy_shader_module(e.program.module, None) };
+        }
         for (_, e) in self.entries.drain() {
             for (_, p) in e.variations {
                 // SAFETY: nothing uses the module any more.
@@ -193,12 +284,20 @@ impl Shaders {
     }
 }
 
-/// One descriptor a draw's programs need.
+/// The stage a descriptor is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Visible {
+    Vertex,
+    Fragment,
+    Compute,
+}
+
+/// One descriptor the programs of a draw or a launch need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Binding {
     pub binding: u32,
     pub storage: bool,
-    pub vertex: bool,
+    pub visible: Visible,
 }
 
 /// The descriptors the programs of a draw need, in binding order.
@@ -206,13 +305,17 @@ pub fn bindings_of(programs: &[&Program]) -> Vec<Binding> {
     let mut out = Vec::new();
     for p in programs {
         let base = 64 * p.stage.index();
-        let vertex = p.stage == Stage::Vertex;
+        let visible = match p.stage {
+            Stage::Vertex => Visible::Vertex,
+            Stage::Pixel => Visible::Fragment,
+            Stage::Compute | Stage::Kernel => Visible::Compute,
+        };
         for slot in 0..18 {
             if p.info.cbuf_extent[slot] > 0 || p.info.cbuf_dynamic[slot] {
                 out.push(Binding {
                     binding: base + slot as u32,
                     storage: true,
-                    vertex,
+                    visible,
                 });
             }
         }
@@ -220,14 +323,14 @@ pub fn bindings_of(programs: &[&Program]) -> Vec<Binding> {
             out.push(Binding {
                 binding: base + 20,
                 storage: true,
-                vertex,
+                visible,
             });
         }
         for t in &p.info.textures {
             out.push(Binding {
-                binding: base + 24 + t.index,
+                binding: base + 24 + t.slot,
                 storage: false,
-                vertex,
+                visible,
             });
         }
     }
@@ -261,10 +364,10 @@ impl Layouts {
                         vk::DescriptorType::COMBINED_IMAGE_SAMPLER
                     })
                     .descriptor_count(1)
-                    .stage_flags(if b.vertex {
-                        vk::ShaderStageFlags::VERTEX
-                    } else {
-                        vk::ShaderStageFlags::FRAGMENT
+                    .stage_flags(match b.visible {
+                        Visible::Vertex => vk::ShaderStageFlags::VERTEX,
+                        Visible::Fragment => vk::ShaderStageFlags::FRAGMENT,
+                        Visible::Compute => vk::ShaderStageFlags::COMPUTE,
                     })
             })
             .collect();

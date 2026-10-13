@@ -4,9 +4,18 @@ use super::{Config, Error, Info, Stage, Translation};
 use crate::cfg::{Cfg, Code};
 use crate::inst::{Guard, Inst, PT, RZ};
 use crate::sph::Sph;
-use crate::spirv::{cap, exec, op, storage, Function, Id, Module};
+use crate::spirv::{cap, deco, exec, op, storage, Function, Id, Module};
 
 pub(super) type R<T> = Result<T, Error>;
+
+/// The register `k` places after `base`: a vector operand that starts at `RZ` is all `RZ`.
+pub(super) fn reg_at(base: u8, k: u32) -> u8 {
+    if base == RZ {
+        RZ
+    } else {
+        base.wrapping_add(k as u8)
+    }
+}
 
 pub(super) fn err<T>(message: impl Into<String>) -> R<T> {
     Err(Error {
@@ -22,10 +31,19 @@ pub(super) struct Types {
     pub i32: Id,
     pub f32: Id,
     pub v2f32: Id,
-    pub v3f32: Id,
     pub v4f32: Id,
     pub v4u32: Id,
     pub v4i32: Id,
+}
+
+/// The flags of the condition code: zero, sign (negative), carry and overflow, as function-local
+/// booleans.
+#[derive(Clone, Copy)]
+pub(super) struct Flags {
+    pub z: Id,
+    pub s: Id,
+    pub c: Id,
+    pub o: Id,
 }
 
 pub(super) struct Tx<'a> {
@@ -39,15 +57,20 @@ pub(super) struct Tx<'a> {
     pub regs: [Option<Id>; 256],
     /// A function-local boolean per predicate P0..P6.
     pub preds: [Option<Id>; 7],
-    /// The carry flag the `.CC` and `.X` integer operations pass along.
-    pub carry: Option<Id>,
+    /// The condition code: the flags the `.CC` operations set and `.X`, `CSETP` and the like read.
+    pub flags: Option<Flags>,
     /// The global variables the entry point lists as its interface.
     pub interface: Vec<Id>,
     /// Constant buffer slot variables, created on first use.
     pub cbufs: [Option<Id>; 18],
     pub io: super::io::Io,
     /// Texture slot variables, created on first use.
-    pub textures: std::collections::HashMap<u32, Id>,
+    pub textures: std::collections::HashMap<(u32, Option<u32>), Id>,
+    /// What the texture instructions of the program say about the shape of each texture slot.
+    pub texture_dims: std::collections::HashMap<u32, (super::Dim, bool)>,
+    /// The constant buffer word (slot, word index) a register is known to hold in the block being
+    /// translated: what a bindless texture instruction needs to know about its handle register.
+    pub reg_origin: std::collections::HashMap<u8, (u32, u32)>,
     /// The global memory table variable and the address translation function.
     pub gmap: Option<(Id, Id)>,
     /// The offset of the instruction being translated, for messages.
@@ -64,7 +87,6 @@ impl<'a> Tx<'a> {
         let i32 = m.ty_i32();
         let f32 = m.ty_f32();
         let v2f32 = m.ty_vector(f32, 2);
-        let v3f32 = m.ty_vector(f32, 3);
         let v4f32 = m.ty_vector(f32, 4);
         let v4u32 = m.ty_vector(u32, 4);
         let v4i32 = m.ty_vector(i32, 4);
@@ -82,18 +104,19 @@ impl<'a> Tx<'a> {
                 i32,
                 f32,
                 v2f32,
-                v3f32,
                 v4f32,
                 v4u32,
                 v4i32,
             },
             regs: [None; 256],
             preds: [None; 7],
-            carry: None,
+            flags: None,
             interface: Vec::new(),
             cbufs: [None; 18],
             io: super::io::Io::default(),
             textures: std::collections::HashMap::new(),
+            texture_dims: std::collections::HashMap::new(),
+            reg_origin: std::collections::HashMap::new(),
             gmap: None,
             pc: 0,
         }
@@ -250,14 +273,21 @@ impl<'a> Tx<'a> {
         self.op2(op::LOGICAL_NOT_EQUAL, t, a, b)
     }
 
+    /// The sum of two floats, not to be fused with a multiplication that feeds it: the console
+    /// does what each instruction says, and two programs that compute a position the same way
+    /// must get the same bits (docs/ASSUMPTIONS.md A-109).
     pub fn fadd(&mut self, a: Id, b: Id) -> Id {
         let t = self.t.f32;
-        self.op2(op::F_ADD, t, a, b)
+        let r = self.op2(op::F_ADD, t, a, b);
+        self.m.decorate(r, deco::NO_CONTRACTION, &[]);
+        r
     }
 
     pub fn fmul(&mut self, a: Id, b: Id) -> Id {
         let t = self.t.f32;
-        self.op2(op::F_MUL, t, a, b)
+        let r = self.op2(op::F_MUL, t, a, b);
+        self.m.decorate(r, deco::NO_CONTRACTION, &[]);
+        r
     }
 
     pub fn fneg(&mut self, a: Id) -> Id {
@@ -313,6 +343,7 @@ impl<'a> Tx<'a> {
         if r == RZ {
             return;
         }
+        self.reg_origin.remove(&r);
         let v = self.register_variable(r);
         self.f.store(v, value);
     }
@@ -356,16 +387,71 @@ impl<'a> Tx<'a> {
         self.f.store(v, value);
     }
 
-    pub fn carry_variable(&mut self) -> Id {
-        if let Some(c) = self.carry {
-            return c;
-        }
+    fn flag_variable(&mut self, name: &str) -> Id {
         let f = self.cfalse();
         let ptr = self.m.ty_pointer(storage::FUNCTION, self.t.bool_);
         let id = self.m.id();
         self.f.local_with_init(ptr, id, f);
-        self.carry = Some(id);
+        if self.cfg.debug_names {
+            self.m.name(id, name);
+        }
         id
+    }
+
+    /// The variables of the condition code flags, made on first use (all clear).
+    pub fn flags(&mut self) -> Flags {
+        if let Some(f) = self.flags {
+            return f;
+        }
+        let flags = Flags {
+            z: self.flag_variable("cc_z"),
+            s: self.flag_variable("cc_s"),
+            c: self.flag_variable("cc_c"),
+            o: self.flag_variable("cc_o"),
+        };
+        self.flags = Some(flags);
+        flags
+    }
+
+    pub fn carry_variable(&mut self) -> Id {
+        self.flags().c
+    }
+
+    /// The value of a flag.
+    pub fn read_flag(&mut self, var: Id) -> Id {
+        let t = self.t.bool_;
+        self.f.load(&mut self.m, t, var)
+    }
+
+    /// Set a flag as the instruction's guard says: it keeps its value when the guard is false.
+    pub fn write_flag(&mut self, inst: Inst, var: Id, value: Id) {
+        match self.guard_condition(inst.guard()) {
+            None => self.f.store(var, value),
+            Some(g) => {
+                let t = self.t.bool_;
+                let old = self.f.load(&mut self.m, t, var);
+                let merged = self.select(t, g, value, old);
+                self.f.store(var, merged);
+            }
+        }
+    }
+
+    /// The zero and sign flags of a 32-bit integer result; with `clear_the_rest` the carry and the
+    /// overflow flags are cleared too, as the logic and conversion instructions do.
+    pub fn set_zero_and_sign(&mut self, inst: Inst, result: Id, clear_the_rest: bool) {
+        let flags = self.flags();
+        let zero = self.c32(0);
+        let is_zero = self.cmp(op::I_EQUAL, result, zero);
+        let thirty_one = self.c32(31);
+        let top = self.shr(result, thirty_one);
+        let is_negative = self.cmp(op::I_NOT_EQUAL, top, zero);
+        self.write_flag(inst, flags.z, is_zero);
+        self.write_flag(inst, flags.s, is_negative);
+        if clear_the_rest {
+            let no = self.cfalse();
+            self.write_flag(inst, flags.c, no);
+            self.write_flag(inst, flags.o, no);
+        }
     }
 
     /// The condition of an instruction's guard predicate, `None` when it always executes.
@@ -480,7 +566,7 @@ impl<'a> Tx<'a> {
 /// Translate a program. `sph` is the program header of the graphics stages (the compute harness
 /// has none). The code is everything after the header.
 pub fn translate(code: Code<'_>, sph: Option<&Sph>, cfg: &Config) -> Result<Translation, Error> {
-    if cfg.stage != Stage::Compute && sph.is_none() {
+    if !matches!(cfg.stage, Stage::Compute | Stage::Kernel) && sph.is_none() {
         return Err(Error {
             message: "a graphics stage needs the program header".to_string(),
             at: None,
@@ -494,6 +580,7 @@ pub fn translate(code: Code<'_>, sph: Option<&Sph>, cfg: &Config) -> Result<Tran
         });
     }
     let mut tx = Tx::new(cfg, sph);
+    tx.texture_dims = super::tex::scan_dims(code, &graph);
     super::flow::build(&mut tx, code, &graph)?;
     let Tx {
         mut m,
@@ -509,12 +596,13 @@ pub fn translate(code: Code<'_>, sph: Option<&Sph>, cfg: &Config) -> Result<Tran
     let model = match cfg.stage {
         Stage::Vertex => exec::VERTEX,
         Stage::Pixel => exec::FRAGMENT,
-        Stage::Compute => exec::GL_COMPUTE,
+        Stage::Compute | Stage::Kernel => exec::GL_COMPUTE,
     };
     m.entry_point(model, id, "main", &interface);
     match cfg.stage {
         Stage::Pixel => m.execution_mode(id, exec::ORIGIN_UPPER_LEFT, &[]),
         Stage::Compute => m.execution_mode(id, exec::LOCAL_SIZE, &[1, 1, 1]),
+        Stage::Kernel => m.execution_mode(id, exec::LOCAL_SIZE, &cfg.block),
         Stage::Vertex => {}
     }
     Ok(Translation {

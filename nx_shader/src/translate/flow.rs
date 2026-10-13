@@ -61,6 +61,8 @@ pub(super) fn build(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg) -> R<()> {
 
 /// The instructions of a block, without its terminator.
 fn body(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg, block: &Block) -> R<()> {
+    // What is known of the registers does not carry over from another block.
+    tx.reg_origin.clear();
     let mut insts: Vec<(u32, Inst)> = graph.instructions(code, block).collect();
     if !matches!(block.term, Term::Fall(_)) {
         insts.pop();

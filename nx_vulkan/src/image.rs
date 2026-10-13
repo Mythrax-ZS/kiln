@@ -10,11 +10,14 @@ pub struct ImageInfo {
     pub format: vk::Format,
     pub width: u32,
     pub height: u32,
+    /// The depth of a 3D image (a view type of `TYPE_3D`); 1 for every other.
+    pub depth: u32,
+    /// Array layers (6 for a cube, 1 for a 3D image).
     pub layers: u32,
     /// Mip levels (the base level alone is 1).
     pub levels: u32,
     pub usage: vk::ImageUsageFlags,
-    /// The view type: `TYPE_2D` or `TYPE_2D_ARRAY` for now.
+    /// The view type: `TYPE_2D`, `TYPE_2D_ARRAY`, `CUBE` or `TYPE_3D`.
     pub view_type: vk::ImageViewType,
     /// What the view makes of the components (identity unless a texture says otherwise).
     pub components: vk::ComponentMapping,
@@ -101,21 +104,33 @@ impl Vk {
     /// An image in device-local memory (the layout is undefined until it is first used).
     pub fn create_image(&self, info: ImageInfo) -> Result<Image, String> {
         let d = &self.device;
-        let ci = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
+        let volume = info.view_type == vk::ImageViewType::TYPE_3D;
+        let cube = matches!(
+            info.view_type,
+            vk::ImageViewType::CUBE | vk::ImageViewType::CUBE_ARRAY
+        );
+        let mut ci = vk::ImageCreateInfo::default()
+            .image_type(if volume {
+                vk::ImageType::TYPE_3D
+            } else {
+                vk::ImageType::TYPE_2D
+            })
             .format(info.format)
             .extent(vk::Extent3D {
                 width: info.width,
                 height: info.height,
-                depth: 1,
+                depth: if volume { info.depth } else { 1 },
             })
             .mip_levels(info.levels.max(1))
-            .array_layers(info.layers)
+            .array_layers(if volume { 1 } else { info.layers })
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(info.usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
+        if cube {
+            ci = ci.flags(vk::ImageCreateFlags::CUBE_COMPATIBLE);
+        }
         // SAFETY: valid create info; the handles are destroyed in `destroy_image`.
         unsafe {
             let image = d
@@ -166,7 +181,7 @@ impl Vk {
                             base_mip_level: 0,
                             level_count: info.levels.max(1),
                             base_array_layer: 0,
-                            layer_count: info.layers,
+                            layer_count: if volume { 1 } else { info.layers },
                         }),
                     None,
                 )
@@ -201,6 +216,13 @@ impl Vk {
         }) {
             return Ok(*v);
         }
+        // A view that is sampled reads one aspect: the depth of a depth and stencil image.
+        let aspect = aspect_of(image.info.format);
+        let aspect = if aspect.contains(vk::ImageAspectFlags::DEPTH) {
+            vk::ImageAspectFlags::DEPTH
+        } else {
+            aspect
+        };
         // SAFETY: valid create info over an image that lives as long as the view.
         let view = unsafe {
             self.device.create_image_view(
@@ -210,11 +232,15 @@ impl Vk {
                     .components(components)
                     .format(image.info.format)
                     .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: aspect_of(image.info.format),
+                        aspect_mask: aspect,
                         base_mip_level: 0,
                         level_count: image.info.levels.max(1),
                         base_array_layer: 0,
-                        layer_count: image.info.layers,
+                        layer_count: if image.info.view_type == vk::ImageViewType::TYPE_3D {
+                            1
+                        } else {
+                            image.info.layers
+                        },
                     }),
                 None,
             )
@@ -244,12 +270,14 @@ impl Vk {
             self.create_host_buffer(texels.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC)?;
         staging.as_mut_slice()[..texels.len()].copy_from_slice(texels);
         let aspect = aspect_of(image.info.format);
+        let volume = image.info.view_type == vk::ImageViewType::TYPE_3D;
+        let layers = if volume { 1 } else { image.info.layers };
         let range = vk::ImageSubresourceRange {
             aspect_mask: aspect,
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
-            layer_count: image.info.layers,
+            layer_count: layers,
         };
         let result = self.one_shot(|d, cmd| {
             let to_dst = [vk::ImageMemoryBarrier::default()
@@ -266,12 +294,12 @@ impl Vk {
                     aspect_mask: aspect,
                     mip_level: 0,
                     base_array_layer: 0,
-                    layer_count: image.info.layers,
+                    layer_count: layers,
                 })
                 .image_extent(vk::Extent3D {
                     width: image.info.width,
                     height: image.info.height,
-                    depth: 1,
+                    depth: if volume { image.info.depth } else { 1 },
                 })];
             let to_read = [vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -313,6 +341,24 @@ impl Vk {
         });
         self.destroy_host_buffer(staging);
         result
+    }
+
+    /// As [`Vk::create_nearest_sampler`], comparing the reference of a shadow sample against the
+    /// depth read with "less than or equal".
+    pub fn create_compare_sampler(&self) -> Result<vk::Sampler, String> {
+        let ci = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .compare_enable(true)
+            .compare_op(vk::CompareOp::LESS_OR_EQUAL)
+            .max_lod(0.0);
+        // SAFETY: valid create info; the caller destroys the sampler.
+        unsafe { self.device.create_sampler(&ci, None) }
+            .map_err(|e| format!("creating a comparison sampler: {e}"))
     }
 
     /// A sampler with nearest filtering and clamping to the edge, the plainest one there is.

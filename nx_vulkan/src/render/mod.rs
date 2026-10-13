@@ -7,6 +7,7 @@
 
 #[cfg(feature = "window")]
 mod blit;
+mod compute;
 mod convert;
 mod debug;
 #[cfg(feature = "window")]
@@ -23,10 +24,11 @@ use crate::formats::{color_format, depth_format};
 use ash::vk;
 use debug::Debug;
 use frame::Frame;
+use nx_gpu::compute::Dispatch;
 use nx_gpu::draw_state::Layout;
 use nx_gpu::render::{Backend, Clear, Draw, Present, Scene};
 use std::path::PathBuf;
-use targets::{Key, Targets};
+use targets::{Key, Targets, Tiling};
 
 /// What the renderer is asked to do besides rendering.
 #[derive(Clone, Debug, Default)]
@@ -37,6 +39,9 @@ pub struct Config {
     pub dump_every: u64,
     /// Stop dumping after this many pictures (`NX_DUMP_COUNT`).
     pub dump_limit: Option<u64>,
+    /// Dump the first frame that has this many draws or more, with every render target
+    /// (`NX_DUMP_BUSY`): finds a busy scene whatever frame number it comes at.
+    pub dump_busy: Option<u64>,
     /// Show the displayed buffers in a window of this size in pixels (`NX_WINDOW`, with
     /// `NX_WINDOW_SIZE=<width>x<height>`, 1280x720 by default). Needs the `window` feature.
     pub window: Option<(u32, u32)>,
@@ -61,6 +66,7 @@ impl Config {
             dump_dir: std::env::var_os("NX_DUMP_FRAMES").map(PathBuf::from),
             dump_every: number("NX_DUMP_EVERY").unwrap_or(1).max(1),
             dump_limit: number("NX_DUMP_COUNT"),
+            dump_busy: number("NX_DUMP_BUSY"),
             window,
             window_title: std::env::var("NX_WINDOW_TITLE").unwrap_or_else(|_| "recomp".to_string()),
             input: None,
@@ -85,25 +91,91 @@ struct Core {
     global: global::GlobalMemory,
     layouts: shaders::Layouts,
     pipelines: draw::Pipelines,
+    compute_pipelines: compute::ComputePipelines,
     /// The attachments of the rendering that is begun in the command buffer, if any.
     pass: Option<Pass>,
     dumped: u64,
     debug: Debug,
     /// Commands of the traced frame so far (`NX_TRACE_DRAWS`).
     traced_commands: u64,
+    /// The render target configurations drawn to so far (`NX_TRACE_TARGETS`).
+    seen_targets: std::collections::HashSet<String>,
+    /// The color target (host address, width, height) the traced frame was drawing to.
+    pass_target: Option<(u64, u32, u32)>,
+    /// Where the draws spent their time since the last report.
+    phases: Phases,
     /// The window frames are shown in, when there is one.
     #[cfg(feature = "window")]
     display: Option<display::Display>,
 }
 
+/// The time the draws spent in each of their steps (reported with `NX_TRACE_GPU`).
+#[derive(Clone, Copy, Debug, Default)]
+struct Phases {
+    /// Finding the translated programs (comparing them with memory).
+    programs: std::time::Duration,
+    /// The texture handles, headers, images and samplers.
+    textures: std::time::Duration,
+    /// Beginning the pass (the attachments the registers name).
+    pass: std::time::Duration,
+    /// The vertex attributes, indices and vertex buffers.
+    vertices: std::time::Duration,
+    /// The constant buffers and the descriptor set.
+    descriptors: std::time::Duration,
+    /// The pipeline.
+    pipeline: std::time::Duration,
+    /// The dynamic state and the draw command.
+    record: std::time::Duration,
+}
+
+/// Calls of one kind and the time they took.
+#[derive(Clone, Copy, Debug, Default)]
+struct Lap {
+    calls: u64,
+    time: std::time::Duration,
+}
+
+impl Lap {
+    fn add(&mut self, since: std::time::Instant) {
+        self.calls += 1;
+        self.time += since.elapsed();
+    }
+}
+
+/// Where the renderer spent its time since the last report (`NX_TRACE_GPU` reports every 100
+/// displayed frames), to tell a slow renderer from a slow program.
+#[derive(Clone, Copy, Debug, Default)]
+struct Spent {
+    draw: Lap,
+    /// Draws that failed (and were skipped when the run is lenient).
+    failed: u64,
+    clear: Lap,
+    finish: Lap,
+    present: Lap,
+    dispatch: Lap,
+}
+
 pub struct Renderer {
     config: Config,
     core: Option<Result<Core, String>>,
+    spent: Spent,
+    /// When the last report was made.
+    reported: Option<std::time::Instant>,
+    /// Draws asked for since the last displayed buffer, and whether the busy frame was dumped.
+    frame_draws: u64,
+    busy_dumped: bool,
 }
 
 impl Renderer {
     pub fn new(config: Config) -> Renderer {
-        Renderer { config, core: None }
+        Renderer {
+            config,
+            core: None,
+            spent: Spent::default(),
+            reported: None,
+            frame_draws: 0,
+            busy_dumped: false,
+        }
     }
 
     fn core(&mut self) -> Result<&mut Core, String> {
@@ -150,14 +222,18 @@ impl Renderer {
                     frame,
                     targets: Targets::default(),
                     shaders: shaders::Shaders::new(&debug),
-                    textures: textures::Textures::default(),
+                    textures: textures::Textures::new(debug.trace_textures),
                     global: global::GlobalMemory::new(debug.trace_gpu),
                     layouts: shaders::Layouts::default(),
                     pipelines: draw::Pipelines::default(),
+                    compute_pipelines: compute::ComputePipelines::default(),
                     pass: None,
                     dumped: 0,
                     debug,
                     traced_commands: 0,
+                    seen_targets: std::collections::HashSet::new(),
+                    pass_target: None,
+                    phases: Phases::default(),
                     #[cfg(feature = "window")]
                     display,
                 })
@@ -202,12 +278,63 @@ impl Core {
         self.traced_commands += 1;
         eprintln!("[vulkan] #{n} {said}");
         if let Some(dir) = self.debug.dump_draws.clone() {
-            if n >= self.debug.dump_from {
+            if n >= self.debug.dump_from && n <= self.debug.dump_until {
                 if let Err(e) = self.dump_first_target(scene, &dir, frame, n) {
                     eprintln!("[vulkan] dumping the target after command {n}: {e}");
                 }
             }
         }
+        if let Some(dir) = self.debug.dump_passes.clone() {
+            // The target the draws were on is finished when a command goes to another one.
+            let now = scene
+                .regs
+                .color_targets_in_use()
+                .into_iter()
+                .next()
+                .and_then(|(_, t)| {
+                    scene
+                        .host_address(t.address)
+                        .map(|(a, _)| (a, t.width, t.height))
+                });
+            if now.map(|t| t.0) != self.pass_target.map(|t| t.0) {
+                if let Some((address, width, height)) = self.pass_target.take() {
+                    if let Err(e) = self.dump_pass(&dir, frame, n, address, (width, height)) {
+                        eprintln!("[vulkan] dumping the pass before command {n}: {e}");
+                    }
+                }
+                self.pass_target = now;
+            }
+        }
+    }
+
+    /// Write the color target at `address` as a picture: the pass of the traced frame that ended
+    /// before command `n`.
+    fn dump_pass(
+        &mut self,
+        dir: &std::path::Path,
+        frame: u64,
+        n: u64,
+        address: u64,
+        size: (u32, u32),
+    ) -> Result<(), String> {
+        self.end_pass();
+        let Some(target) = self.targets.at_address(address) else {
+            return Ok(());
+        };
+        let (w, h) = (target.key.width, target.key.height);
+        let format = target.key.format;
+        let rgba = targets::read_rgba(&self.vk, &mut self.frame, target)?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let path = dir.join(format!(
+            "pass_{frame}_before_{n:04}_{address:x}_{}x{}.png",
+            size.0, size.1
+        ));
+        eprintln!(
+            "[vulkan]   the pass before command {n}: target {address:#x} {w}x{h} {format:?}: {}",
+            crate::png::describe(w, h, &rgba)
+        );
+        crate::png::write_opaque_png(&path, w, h, &rgba)
+            .map_err(|e| format!("{}: {e}", path.display()))
     }
 
     /// Write the first color target the registers name as a picture, as of the commands so far.
@@ -237,7 +364,30 @@ impl Core {
             crate::png::describe(w, h, &rgba)
         );
         crate::png::write_opaque_png(&path, w, h, &rgba)
-            .map_err(|e| format!("{}: {e}", path.display()))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        // The depth the draws test against: what it holds, in numbers.
+        if let Some(z) = scene.regs.depth_target() {
+            if let Some((cpu, _)) = scene.host_address(z.address) {
+                match self.targets.depth_at_address(cpu) {
+                    Some(target) => match targets::read_depth(&self.vk, &mut self.frame, target) {
+                        Ok(depths) => {
+                            let finite = depths.iter().copied().filter(|d| d.is_finite());
+                            let (lo, hi) = finite
+                                .fold((f32::MAX, f32::MIN), |(lo, hi), d| (lo.min(d), hi.max(d)));
+                            let below = depths.iter().filter(|d| **d < 1.0).count();
+                            let zero = depths.iter().filter(|d| **d == 0.0).count();
+                            eprintln!(
+                                "[vulkan]   the depth target at {cpu:#x}: from {lo} to {hi}, {below} of {} below 1, {zero} zero",
+                                depths.len()
+                            );
+                        }
+                        Err(e) => eprintln!("[vulkan]   the depth target at {cpu:#x}: {e}"),
+                    },
+                    None => eprintln!("[vulkan]   no depth target was drawn to at {cpu:#x}"),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Leave the rendering that is begun, if there is one.
@@ -332,6 +482,23 @@ impl Core {
                     t.address
                 ));
             };
+            if self.debug.trace_targets {
+                let said = format!(
+                    "[vulkan] a color target {output}: {:#x} {}x{} format {:#x} {:?}, {} {} layer {} of pitch {:#x}",
+                    t.address,
+                    t.width,
+                    t.height,
+                    t.format,
+                    t.layout,
+                    t.depth,
+                    if t.depth_is_size { "deep" } else { "layers" },
+                    t.layer,
+                    t.array_pitch
+                );
+                if self.seen_targets.insert(said.clone()) {
+                    eprintln!("{said}");
+                }
+            }
             let width = match t.layout {
                 Layout::Pitch => t.width / format.bytes,
                 Layout::BlockLinear { .. } => t.width,
@@ -342,6 +509,10 @@ impl Core {
                 width,
                 height: t.height,
                 layers: 1,
+                tiling: match t.layout {
+                    Layout::Pitch => Tiling::Pitch(t.width),
+                    Layout::BlockLinear { block } => Tiling::Block(block[1]),
+                },
             });
         }
         let depth = match scene.regs.depth_target() {
@@ -362,6 +533,10 @@ impl Core {
                     width: z.width,
                     height: z.height,
                     layers: 1,
+                    tiling: match z.layout {
+                        Layout::Pitch => Tiling::Pitch(z.width),
+                        Layout::BlockLinear { block } => Tiling::Block(block[1]),
+                    },
                 })
             }
         };
@@ -503,10 +678,20 @@ impl Core {
     }
 }
 
-impl Backend for Renderer {
-    fn draw(&mut self, scene: &Scene<'_>, draw: &Draw) -> Result<(), String> {
+impl Renderer {
+    fn draw_command(&mut self, scene: &Scene<'_>, draw: &Draw) -> Result<(), String> {
         let core = self.core()?;
-        let result = core.draw(scene, draw);
+        let mut result = core.draw(scene, draw);
+        if core.debug.sync_draws && result.is_ok() {
+            if let Err(e) = core.flush() {
+                // What was submitted up to this draw failed, and this was the last to join it.
+                eprintln!("[vulkan] the commands up to this draw failed: {e}");
+                for line in describe_draw(scene, draw) {
+                    eprintln!("[vulkan]     {line}");
+                }
+                result = Err(e);
+            }
+        }
         if let Some(frame) = core.traced() {
             let regs = scene.regs;
             let stages: Vec<String> = regs
@@ -536,7 +721,7 @@ impl Backend for Renderer {
         result
     }
 
-    fn clear(&mut self, scene: &Scene<'_>, clear: &Clear) -> Result<(), String> {
+    fn clear_command(&mut self, scene: &Scene<'_>, clear: &Clear) -> Result<(), String> {
         let core = self.core()?;
         let result = core.clear(scene, clear);
         if let Some(frame) = core.traced() {
@@ -561,19 +746,78 @@ impl Backend for Renderer {
         result
     }
 
-    fn finish(&mut self) -> Result<(), String> {
+    fn finish_command(&mut self) -> Result<(), String> {
         match self.core.as_mut() {
             Some(Ok(core)) => core.flush(),
             _ => Ok(()),
         }
     }
 
-    fn present(&mut self, p: &Present) -> Result<(), String> {
+    /// Show a displayed buffer, and every 100th say where the time of the last 100 went.
+    fn present_command(&mut self, p: &Present) -> Result<(), String> {
+        let entered = std::time::Instant::now();
+        let result = self.present_frame(p);
+        self.frame_draws = 0;
+        self.spent.present.add(entered);
+        if let Some(Ok(core)) = self.core.as_mut() {
+            if core.debug.trace_gpu && p.frame.is_multiple_of(100) {
+                let now = std::time::Instant::now();
+                let wall = self.reported.map(|t| now.duration_since(t));
+                self.reported = Some(now);
+                let ph = std::mem::take(&mut core.phases);
+                eprintln!(
+                    "[vulkan] frame {}: the draws spent {:?} on programs, {:?} on textures, {:?} \
+                     on the pass, {:?} on vertices, {:?} on descriptors, {:?} on the pipeline, \
+                     {:?} on recording",
+                    p.frame,
+                    ph.programs,
+                    ph.textures,
+                    ph.pass,
+                    ph.vertices,
+                    ph.descriptors,
+                    ph.pipeline,
+                    ph.record
+                );
+                let s = std::mem::take(&mut self.spent);
+                let renderer =
+                    s.draw.time + s.clear.time + s.finish.time + s.present.time + s.dispatch.time;
+                eprintln!(
+                    "[vulkan] frame {}: the last 100 took {wall:?}, {renderer:?} of it in the \
+                     renderer: draw {} calls ({} failed) {:?}, clear {} calls {:?}, finish {} \
+                     calls {:?}, present {:?}, compute {} launches {:?}",
+                    p.frame,
+                    s.draw.calls,
+                    s.failed,
+                    s.draw.time,
+                    s.clear.calls,
+                    s.clear.time,
+                    s.finish.calls,
+                    s.finish.time,
+                    s.present.time,
+                    s.dispatch.calls,
+                    s.dispatch.time
+                );
+            }
+        }
+        result
+    }
+
+    /// Show a displayed buffer (in the window and as a picture, as configured).
+    fn present_frame(&mut self, p: &Present) -> Result<(), String> {
         let config = self.config.clone();
+        // The first frame with enough draws (`NX_DUMP_BUSY`) is dumped whatever its number.
+        let busy = !self.busy_dumped && config.dump_busy.is_some_and(|n| self.frame_draws >= n);
+        if busy {
+            self.busy_dumped = true;
+        }
         let core = self.core()?;
         core.flush()?;
         // A displayed buffer ends a frame: textures are compared with memory again in the next.
         core.textures.frame += 1;
+        if busy && core.debug.trace_after_busy {
+            core.debug.trace_frame = Some(core.textures.frame);
+            core.traced_commands = 0;
+        }
         #[cfg(feature = "window")]
         if let Some(display) = core.display.as_mut() {
             if let Some(target) = core.targets.at_address(p.address) {
@@ -589,7 +833,7 @@ impl Backend for Renderer {
         let Some(dir) = config.dump_dir.as_ref() else {
             return Ok(());
         };
-        if !p.frame.is_multiple_of(config.dump_every) && p.frame != 1 {
+        if !busy && !p.frame.is_multiple_of(config.dump_every) && p.frame != 1 {
             return Ok(());
         }
         if config.dump_limit.is_some_and(|n| core.dumped >= n) {
@@ -622,7 +866,8 @@ impl Backend for Renderer {
         crate::png::write_opaque_png(&path, w, h, &rgba)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         core.dumped += 1;
-        if core.debug.dump_targets {
+        if core.debug.dump_targets || busy {
+            let trace = core.debug.trace_gpu;
             let Core {
                 vk, frame, targets, ..
             } = core;
@@ -632,6 +877,16 @@ impl Backend for Renderer {
                 };
                 match targets::read_rgba(vk, frame, t) {
                     Ok(rgba) => {
+                        if trace {
+                            eprintln!(
+                                "[vulkan] target {:#x} {}x{} {:?}: {}",
+                                key.address,
+                                key.width,
+                                key.height,
+                                key.format,
+                                crate::png::describe(key.width, key.height, &rgba)
+                            );
+                        }
                         let name = format!(
                             "target_{:x}_{}x{}_{:05}.png",
                             key.address, key.width, key.height, p.frame
@@ -648,6 +903,47 @@ impl Backend for Renderer {
             }
         }
         Ok(())
+    }
+}
+
+impl Backend for Renderer {
+    fn draw(&mut self, scene: &Scene<'_>, draw: &Draw) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let result = self.draw_command(scene, draw);
+        self.spent.draw.add(started);
+        self.frame_draws += 1;
+        if result.is_err() {
+            self.spent.failed += 1;
+        }
+        result
+    }
+
+    fn clear(&mut self, scene: &Scene<'_>, clear: &Clear) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let result = self.clear_command(scene, clear);
+        self.spent.clear.add(started);
+        result
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let result = self.finish_command();
+        self.spent.finish.add(started);
+        result
+    }
+
+    fn present(&mut self, p: &Present) -> Result<(), String> {
+        self.present_command(p)
+    }
+
+    fn dispatch(&mut self, scene: &Scene<'_>, dispatch: &Dispatch) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let result = self.core().and_then(|core| core.dispatch(scene, dispatch));
+        self.spent.dispatch.add(started);
+        if result.is_err() {
+            self.spent.failed += 1;
+        }
+        result
     }
 }
 
@@ -668,6 +964,7 @@ impl Drop for Renderer {
                 display.destroy(&core.vk);
             }
             core.pipelines.destroy(&core.vk);
+            core.compute_pipelines.destroy(&core.vk);
             core.layouts.destroy(&core.vk);
             core.shaders.destroy(&core.vk);
             core.textures.destroy(&core.vk);
@@ -703,12 +1000,19 @@ fn describe_draw(scene: &Scene<'_>, draw: &Draw) -> Vec<String> {
             regs.viewport(0),
             regs.scissor(0)
         ),
-        format!("window {:?}", regs.window()),
+        format!(
+            "window {:?}; SET_VIEWPORT_SCALE_OFFSET {:#x}, SET_VIEWPORT_CLIP_CONTROL {:#x}, SET_WINDOW_ORIGIN {:#x}",
+            regs.window(),
+            regs.word(0x192c),
+            regs.word(0x193c),
+            regs.word(0x13ac)
+        ),
         format!("raster {:?}", regs.raster()),
         format!(
-            "depth {:?}; target {:?}",
-            regs.depth_stencil().depth_test,
-            regs.depth_target()
+            "depth and stencil {:?}; target {:?}; clear values {:?}",
+            regs.depth_stencil(),
+            regs.depth_target(),
+            regs.clear_values()
         ),
         {
             let b = regs.blend();
@@ -754,6 +1058,20 @@ fn describe_draw(scene: &Scene<'_>, draw: &Draw) -> Vec<String> {
             })
             .unwrap_or_else(|| "unreadable".to_string());
         lines.push(format!("index buffer {ib:?}: {idx}"));
+        // The range of all the indices, and the registers that offset them.
+        if let Some(all) = scene.read_vec(ib.address, count as usize * ib.size as usize) {
+            let value = |c: &[u8]| {
+                c.iter()
+                    .rev()
+                    .fold(0u32, |acc, byte| acc << 8 | u32::from(*byte))
+            };
+            let indices = all.chunks_exact(ib.size as usize).map(value);
+            let (lo, hi) = indices.fold((u32::MAX, 0), |(lo, hi), i| (lo.min(i), hi.max(i)));
+            lines.push(format!(
+                "indices run from {lo} to {hi}; bases (vertex, instance, id) {:?}",
+                regs.bases()
+            ));
+        }
     }
     for s in 0..16 {
         let st = regs.vertex_stream(s);

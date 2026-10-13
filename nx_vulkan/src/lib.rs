@@ -15,7 +15,7 @@ pub mod render;
 #[cfg(feature = "window")]
 pub mod window;
 
-pub use compute::{AddressPatch, SampledImage};
+pub use compute::{AddressPatch, SampledImage, SampledKind};
 pub use device::{Capabilities, Options, Vk};
 pub use input::{InputEvent, InputSink};
 pub use render::{Config as RenderConfig, Renderer};

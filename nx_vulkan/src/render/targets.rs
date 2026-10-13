@@ -2,10 +2,21 @@
 //! for in the guest, and read back as pictures.
 
 use super::frame::{Frame, Garbage};
+use crate::blocklinear::{swizzle, Geometry};
 use crate::device::Vk;
 use crate::image::{aspect_of, Image, ImageInfo};
 use ash::vk;
+use nx_gpu::mem::GuestMemory;
 use std::collections::HashMap;
+
+/// How the memory a target stands for is laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Tiling {
+    /// Rows `pitch` bytes apart.
+    Pitch(u32),
+    /// Blocks of GOBs, a block being `1 << log2` GOBs high.
+    Block(u32),
+}
 
 /// What identifies a render target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -16,6 +27,30 @@ pub struct Key {
     pub width: u32,
     pub height: u32,
     pub layers: u32,
+    pub tiling: Tiling,
+}
+
+impl Key {
+    /// How many bytes of memory the surface (one layer) takes, for a color format whose texel size
+    /// is known.
+    pub fn memory_bytes(&self) -> Option<u64> {
+        let bytes = pixel_bytes(self.format)?;
+        Some(match self.tiling {
+            Tiling::Pitch(pitch) => u64::from(pitch) * u64::from(self.height),
+            Tiling::Block(log2) => self.geometry(bytes, log2).tiled_size(),
+        })
+    }
+
+    fn geometry(&self, bytes: u32, block_height_log2: u32) -> Geometry {
+        Geometry {
+            width: self.width,
+            height: self.height,
+            depth: 1,
+            bytes_per_element: bytes,
+            block_height_log2,
+            block_depth_log2: 0,
+        }
+    }
 }
 
 pub struct Target {
@@ -24,6 +59,11 @@ pub struct Target {
     pub layout: vk::ImageLayout,
     /// The submission counter when the target was last drawn to.
     pub touched: u64,
+    /// Drawn to since its pixels were last put into the memory it stands for.
+    pub dirty: bool,
+    /// The order in which targets were last drawn to (the later one wins where two stand for the
+    /// same memory).
+    pub serial: u64,
 }
 
 impl Target {
@@ -110,6 +150,8 @@ pub struct Targets {
     map: HashMap<Key, Target>,
     /// How many submissions have run, to age targets by.
     pub submissions: u64,
+    /// Counts the draws to targets, for [`Target::serial`].
+    next_serial: u64,
 }
 
 impl Targets {
@@ -142,6 +184,7 @@ impl Targets {
                 format: key.format,
                 width: key.width,
                 height: key.height,
+                depth: 1,
                 layers: key.layers,
                 usage,
                 view_type: if key.layers > 1 {
@@ -157,6 +200,8 @@ impl Targets {
                 image,
                 layout: vk::ImageLayout::UNDEFINED,
                 touched: 0,
+                dirty: false,
+                serial: 0,
             };
             match frame.cmd(vk) {
                 Ok(cmd) => target.zero(vk, cmd),
@@ -168,8 +213,12 @@ impl Targets {
             self.map.insert(key, target);
         }
         let submissions = self.submissions;
+        self.next_serial += 1;
+        let serial = self.next_serial;
         let target = self.map.get_mut(&key).expect("just inserted");
         target.touched = submissions;
+        target.dirty = true;
+        target.serial = serial;
         Ok(target)
     }
 
@@ -181,6 +230,128 @@ impl Targets {
                 t.key.address == address && aspect_of(t.key.format) == vk::ImageAspectFlags::COLOR
             })
             .max_by_key(|t| t.touched)
+    }
+
+    /// The depth target standing for the guest memory at `address`, if one was drawn to.
+    pub fn depth_at_address(&mut self, address: u64) -> Option<&mut Target> {
+        self.map
+            .values_mut()
+            .filter(|t| {
+                t.key.address == address && aspect_of(t.key.format) != vk::ImageAspectFlags::COLOR
+            })
+            .max_by_key(|t| t.touched)
+    }
+
+    /// The keys of the color targets drawn to since their pixels were last put into memory whose
+    /// bytes overlap `[start, end)` (addresses in the guest process).
+    pub fn dirty_in(&self, start: u64, end: u64) -> Vec<Key> {
+        let mut found: Vec<(u64, Key)> = self
+            .map
+            .values()
+            .filter(|t| t.dirty && aspect_of(t.key.format) == vk::ImageAspectFlags::COLOR)
+            .filter_map(|t| {
+                let bytes = t.key.memory_bytes()?;
+                (t.key.address < end && t.key.address + bytes > start).then_some((t.serial, t.key))
+            })
+            .collect();
+        // Written in the order they were drawn to: where two stand for the same memory (the title
+        // reuses memory for targets of different shapes), the later one is what stays.
+        found.sort_by_key(|(serial, _)| *serial);
+        found.into_iter().map(|(_, key)| key).collect()
+    }
+
+    /// Put the pixels of the color targets `keys` into the memory they stand for, in the layout
+    /// the registers gave them (what the commands recorded so far did is in them first), so that
+    /// a texture made from that memory sees what was drawn (docs/ASSUMPTIONS.md A-111).
+    pub fn write_back(
+        &mut self,
+        vk: &Vk,
+        frame: &mut Frame,
+        mem: &dyn GuestMemory,
+        keys: &[Key],
+    ) -> Result<(), String> {
+        // Every copy is recorded, then one submission runs them.
+        let mut staged: Vec<(Key, crate::compute::HostBuffer)> = Vec::new();
+        let cmd = frame.cmd(vk)?;
+        for key in keys {
+            let (Some(target), Some(bpp)) = (self.map.get_mut(key), pixel_bytes(key.format)) else {
+                continue;
+            };
+            let size = u64::from(key.width) * u64::from(key.height) * u64::from(bpp);
+            let staging = vk.create_host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
+            target.transition(vk, cmd, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            let region = [vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: key.width,
+                    height: key.height,
+                    depth: 1,
+                })];
+            // SAFETY: the command buffer is recording outside a rendering; the image is in the
+            // transfer layout.
+            unsafe {
+                vk.device.cmd_copy_image_to_buffer(
+                    cmd,
+                    target.image.image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    staging.buffer,
+                    &region,
+                );
+            }
+            staged.push((*key, staging));
+        }
+        let barrier = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)];
+        // SAFETY: the command buffer is recording.
+        unsafe {
+            vk.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &barrier,
+                &[],
+                &[],
+            );
+        }
+        let submitted = frame.submit(vk);
+        for (key, staging) in staged {
+            if submitted.is_ok() {
+                let bpp = pixel_bytes(key.format).unwrap_or(4);
+                let row = key.width as usize * bpp as usize;
+                let linear = &staging.as_slice()[..row * key.height as usize];
+                let tiled = match key.tiling {
+                    Tiling::Block(log2) => {
+                        let g = key.geometry(bpp, log2);
+                        let mut tiled = vec![0u8; g.tiled_size() as usize];
+                        swizzle(&g, linear, &mut tiled);
+                        tiled
+                    }
+                    Tiling::Pitch(pitch) => {
+                        let pitch = pitch as usize;
+                        let mut tiled = vec![0u8; pitch * key.height as usize];
+                        for y in 0..key.height as usize {
+                            let n = row.min(pitch);
+                            tiled[y * pitch..y * pitch + n]
+                                .copy_from_slice(&linear[y * row..y * row + n]);
+                        }
+                        tiled
+                    }
+                };
+                mem.write(key.address, &tiled);
+                if let Some(t) = self.map.get_mut(&key) {
+                    t.dirty = false;
+                }
+            }
+            vk.destroy_host_buffer(staging);
+        }
+        submitted
     }
 
     /// The keys of the color targets made so far.
@@ -236,8 +407,15 @@ fn pixel_bytes(format: vk::Format) -> Option<u32> {
         | vk::Format::B8G8R8A8_SRGB
         | vk::Format::A2B10G10R10_UNORM_PACK32
         | vk::Format::A2R10G10B10_UNORM_PACK32 => 4,
+        vk::Format::B10G11R11_UFLOAT_PACK32
+        | vk::Format::R32_SFLOAT
+        | vk::Format::R16G16_SFLOAT => 4,
         vk::Format::R16G16B16A16_SFLOAT | vk::Format::R16G16B16A16_UNORM => 8,
-        vk::Format::R5G6B5_UNORM_PACK16 | vk::Format::R8G8_UNORM => 2,
+        vk::Format::R32G32B32A32_SFLOAT => 16,
+        vk::Format::R5G6B5_UNORM_PACK16
+        | vk::Format::R8G8_UNORM
+        | vk::Format::R16_SFLOAT
+        | vk::Format::R16_UNORM => 2,
         vk::Format::R8_UNORM => 1,
         _ => return None,
     })
@@ -308,6 +486,49 @@ pub fn to_rgba8(format: vk::Format, data: &[u8], width: u32, height: u32) -> Opt
             }
             vk::Format::R8G8_UNORM => [px[0], px[1], 0, 255],
             vk::Format::R8_UNORM => [px[0], px[0], px[0], 255],
+            vk::Format::B10G11R11_UFLOAT_PACK32 => {
+                // Unsigned floats of five bits of exponent: 11 bits for red and green (six of
+                // mantissa) and 10 for blue (five).
+                let w = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+                let small_float = |bits: u32, mantissa_bits: u32| -> f32 {
+                    let exp = (bits >> mantissa_bits) & 0x1F;
+                    let frac =
+                        (bits & ((1 << mantissa_bits) - 1)) as f32 / (1 << mantissa_bits) as f32;
+                    match exp {
+                        0 => frac * 2f32.powi(-14),
+                        31 => f32::INFINITY,
+                        _ => (1.0 + frac) * 2f32.powi(exp as i32 - 15),
+                    }
+                };
+                [
+                    to_byte(small_float(w & 0x7FF, 6)),
+                    to_byte(small_float(w >> 11 & 0x7FF, 6)),
+                    to_byte(small_float(w >> 22 & 0x3FF, 5)),
+                    255,
+                ]
+            }
+            vk::Format::R32_SFLOAT => {
+                let v = f32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+                [to_byte(v), to_byte(v), to_byte(v), 255]
+            }
+            vk::Format::R32G32B32A32_SFLOAT => {
+                let c = |i: usize| {
+                    f32::from_le_bytes([px[4 * i], px[4 * i + 1], px[4 * i + 2], px[4 * i + 3]])
+                };
+                [to_byte(c(0)), to_byte(c(1)), to_byte(c(2)), to_byte(c(3))]
+            }
+            vk::Format::R16_SFLOAT => {
+                let v = half_to_f32(u16::from_le_bytes([px[0], px[1]]));
+                [to_byte(v), to_byte(v), to_byte(v), 255]
+            }
+            vk::Format::R16_UNORM => {
+                let v = (u16::from_le_bytes([px[0], px[1]]) >> 8) as u8;
+                [v, v, v, 255]
+            }
+            vk::Format::R16G16_SFLOAT => {
+                let c = |i: usize| half_to_f32(u16::from_le_bytes([px[2 * i], px[2 * i + 1]]));
+                [to_byte(c(0)), to_byte(c(1)), 0, 255]
+            }
             _ => return None,
         };
         out.extend_from_slice(&rgba);
@@ -330,6 +551,68 @@ pub fn crop_rgba(rgba: &[u8], width: u32, height: u32, crop: [i32; 4]) -> (Vec<u
         out.extend_from_slice(&rgba[row + left as usize * 4..row + right as usize * 4]);
     }
     (out, right - left, bottom - top)
+}
+
+/// The depth of every pixel of a `D32_SFLOAT` depth target, as of the commands recorded so far
+/// (they are run first), for looking at what a pass left in it.
+pub fn read_depth(vk: &Vk, frame: &mut Frame, target: &mut Target) -> Result<Vec<f32>, String> {
+    let key = target.key;
+    if key.format != vk::Format::D32_SFLOAT {
+        return Err(format!(
+            "the depth of a {:?} target is not read",
+            key.format
+        ));
+    }
+    let size = u64::from(key.width) * u64::from(key.height) * 4;
+    let staging = vk.create_host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
+    let cmd = frame.cmd(vk)?;
+    target.transition(vk, cmd, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+    let region = [vk::BufferImageCopy::default()
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::DEPTH,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_extent(vk::Extent3D {
+            width: key.width,
+            height: key.height,
+            depth: 1,
+        })];
+    // SAFETY: the command buffer is recording outside a rendering; the image is in the transfer
+    // layout.
+    unsafe {
+        vk.device.cmd_copy_image_to_buffer(
+            cmd,
+            target.image.image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            staging.buffer,
+            &region,
+        );
+        let barrier = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)];
+        vk.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &barrier,
+            &[],
+            &[],
+        );
+    }
+    let submitted = frame.submit(vk);
+    let depths: Vec<f32> = staging
+        .as_slice()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .take((key.width * key.height) as usize)
+        .map(|c| f32::from_le_bytes(*c))
+        .collect();
+    vk.destroy_host_buffer(staging);
+    submitted.map(|()| depths)
 }
 
 /// Read a color target back as RGBA bytes: its contents as of the commands recorded so far (they

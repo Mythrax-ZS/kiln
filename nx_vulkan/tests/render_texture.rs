@@ -444,3 +444,40 @@ fn an_astc_texture_is_decoded_on_the_host_and_sampled() {
         }
     }
 }
+
+#[test]
+fn a_render_target_that_a_texture_reads_through_memory_is_written_to_it_first() {
+    if vulkan().is_none() {
+        return;
+    }
+    let source = GPU_BASE + 0x50_0000;
+    let target = GPU_BASE + 0x20_0000;
+    // The texture is 8 by 8 texels over a 16 by 16 target: not the target's picture (the sizes
+    // differ), so it is made from memory, which must hold what was drawn.
+    let mut w = textured(8, target, header(0x08, 2, 8, 8, source), nearest_sampler());
+    let mut r = Renderer::new(RenderConfig::default());
+    w.color_target(0, source, 16, 16, 0xD5);
+    clear_to(&mut r, &mut w, [0.0, 1.0, 0.0, 1.0], None);
+    clear_to(&mut r, &mut w, [1.0, 0.0, 0.0, 1.0], Some((0, 8, 0, 16)));
+    w.color_target(0, target, 8, 8, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let (rgba, width, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    for y in 0..8usize {
+        for x in 0..8usize {
+            assert_eq!(
+                &rgba[(y * width as usize + x) * 4..][..4],
+                [255, 0, 0, 255],
+                "({x}, {y})"
+            );
+        }
+    }
+    // Drawn to again, it is written again before the next read.
+    w.color_target(0, source, 16, 16, 0xD5);
+    clear_to(&mut r, &mut w, [0.0, 0.0, 1.0, 1.0], None);
+    w.color_target(0, target, 8, 8, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    for px in rgba.as_chunks::<4>().0 {
+        assert_eq!(px, &[0, 0, 255, 255]);
+    }
+}
