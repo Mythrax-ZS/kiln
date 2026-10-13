@@ -630,14 +630,29 @@ impl Core {
             return Ok(Vec::new());
         }
         let mut overlays = Vec::new();
-        let mut keys = Vec::new();
+        let mut dirty = Vec::new();
         for c in covering {
             match super::textures::overlay_of(tic, used, cpu, &c.key, c.serial) {
                 Some(overlay) => overlays.push(overlay),
-                None if c.dirty => keys.push(c.key),
+                None if c.dirty => dirty.push(c),
                 None => {}
             }
         }
+        // A target drawn to before the overlays that hold the whole texture lies under them: what
+        // it drew is not in the texture, and putting it in memory would cost a wait for the
+        // device and the layout of every pixel for nothing (A-121).
+        let keys: Vec<_> = dirty
+            .into_iter()
+            .filter(|c| {
+                let newer: Vec<_> = overlays
+                    .iter()
+                    .filter(|o| o.serial > c.serial)
+                    .copied()
+                    .collect();
+                !super::textures::overlays_cover(tic, used, &newer)
+            })
+            .map(|c| c.key)
+            .collect();
         if keys.is_empty() {
             return Ok(overlays);
         }

@@ -605,6 +605,47 @@ pub fn overlay_of(
     None
 }
 
+/// Do the `overlays` of the texture `tic` (sampled as `used`) together hold every texel of every
+/// layer and level of it? Then the image the texture is has all its pixels from them, and
+/// whatever the memory under it holds, or a target drawn to before them would put there, is never
+/// seen (docs/ASSUMPTIONS.md A-121).
+pub fn overlays_cover(tic: &Tic, used: &TextureUse, overlays: &[Overlay]) -> bool {
+    let Ok(shape) = shape_of(tic, used) else {
+        return false;
+    };
+    let Some(format) = texture_format(tic.components(), tic.types()[0], tic.srgb()) else {
+        return false;
+    };
+    let Ok(plan) = plan(tic, shape, format) else {
+        return false;
+    };
+    if shape.kind == Kind::D3 || overlays.is_empty() {
+        return false;
+    }
+    for layer in 0..plan.layers {
+        for (level, g) in plan.level_geometry.iter().enumerate() {
+            // The rows of the level the overlays have in full width, in order from the top.
+            let mut rows: Vec<(u32, u32)> = overlays
+                .iter()
+                .filter(|o| o.layer == layer && o.level == level as u32 && o.width >= g.width)
+                .map(|o| (o.y, o.y + o.height))
+                .collect();
+            rows.sort_unstable();
+            let mut covered = 0u32;
+            for (from, to) in rows {
+                if from > covered {
+                    break;
+                }
+                covered = covered.max(to);
+            }
+            if covered < g.height {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// A texture on the device.
 struct Texture {
     image: Image,

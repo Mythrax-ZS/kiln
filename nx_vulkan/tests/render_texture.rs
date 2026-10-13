@@ -563,3 +563,82 @@ fn a_render_target_that_is_a_part_of_a_texture_is_copied_into_it_on_the_device()
     assert!(w.mem.read(w.cpu(source), &mut memory));
     assert!(memory.iter().all(|b| *b == 0), "still no write-back");
 }
+
+/// A texture of 8 by 8 texels read from memory that two color targets cover: a green one of 64 by
+/// 64 whose memory runs from before the texture to after it, and a red one at the texture's
+/// address, `red_height` rows of 16 pixels (the texture's rows lie in its left half, so it is the
+/// texture's rows from the top down). `red_last` says which of them is drawn to last. Returns what
+/// the memory of the texture holds afterwards and the 8 by 8 picture of a draw that samples it.
+fn two_targets_over_a_texture(red_last: bool, red_height: u32) -> (Vec<u8>, Vec<[u8; 4]>) {
+    let source = GPU_BASE + 0x50_0000;
+    let target = GPU_BASE + 0x20_0000;
+    let under = source - 0x2000;
+    let mut w = textured(8, target, header(0x08, 2, 8, 8, source), nearest_sampler());
+    let mut r = Renderer::new(RenderConfig::default());
+    let green = |r: &mut Renderer, w: &mut World| {
+        w.color_target_blocks(0, under, 64, 64, 0xD5, 0);
+        clear_to(r, w, [0.0, 1.0, 0.0, 1.0], None);
+    };
+    let red = |r: &mut Renderer, w: &mut World| {
+        w.color_target_blocks(0, source, 16, red_height, 0xD5, 0);
+        clear_to(r, w, [1.0, 0.0, 0.0, 1.0], None);
+    };
+    if red_last {
+        green(&mut r, &mut w);
+        red(&mut r, &mut w);
+    } else {
+        red(&mut r, &mut w);
+        green(&mut r, &mut w);
+    }
+    w.color_target(0, target, 8, 8, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let mut memory = vec![0u8; 512];
+    assert!(w.mem.read(w.cpu(source), &mut memory));
+    let (rgba, width, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    let mut pixels = Vec::new();
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let at = (y * width as usize + x) * 4;
+            pixels.push([rgba[at], rgba[at + 1], rgba[at + 2], rgba[at + 3]]);
+        }
+    }
+    (memory, pixels)
+}
+
+#[test]
+fn a_target_drawn_before_the_targets_that_make_a_texture_is_not_written_to_its_memory() {
+    if vulkan().is_none() {
+        return;
+    }
+    let (memory, pixels) = two_targets_over_a_texture(true, 8);
+    assert!(pixels.iter().all(|p| *p == [255, 0, 0, 255]), "{pixels:?}");
+    // The green target lies under the red one that is the whole texture: it cost no write-back.
+    assert!(
+        memory.iter().all(|b| *b == 0),
+        "the older target was written"
+    );
+}
+
+#[test]
+fn a_target_that_a_texture_is_not_wholly_made_of_is_still_written_under_it() {
+    if vulkan().is_none() {
+        return;
+    }
+    // The red target is the texture's top half only: the green one shows below it.
+    let (memory, pixels) = two_targets_over_a_texture(true, 4);
+    assert!(memory.iter().any(|b| *b != 0), "no write-back");
+    for (i, p) in pixels.iter().enumerate() {
+        let want = if i / 8 < 4 {
+            [255, 0, 0, 255]
+        } else {
+            [0, 255, 0, 255]
+        };
+        assert_eq!(*p, want, "pixel {i}");
+    }
+    // A target drawn to after the one that is the whole texture is not under it.
+    let (memory, _) = two_targets_over_a_texture(false, 8);
+    assert!(
+        memory.iter().any(|b| *b != 0),
+        "the later target was not written"
+    );
+}
