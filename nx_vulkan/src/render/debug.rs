@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 #[derive(Clone, Debug, Default)]
 pub struct Debug {
-    /// `NX_TRACE_GPU`: say which device is used and how much was imported, cached and written.
+    /// `NX_TRACE_GPU` (or `NX_TRACE_PERF`, which leaves out what the command processor prints): say
+    /// which device is used and how much was imported, cached and written, and every 100 frames
+    /// where the time went.
     pub trace_gpu: bool,
     /// `NX_TRACE_TEXTURES`: the texture handles, headers and samplers of every draw.
     pub trace_textures: bool,
@@ -69,7 +71,7 @@ impl Debug {
         let set = |name: &str| std::env::var_os(name).is_some();
         let number = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
         Debug {
-            trace_gpu: set("NX_TRACE_GPU"),
+            trace_gpu: set("NX_TRACE_GPU") || set("NX_TRACE_PERF"),
             trace_textures: set("NX_TRACE_TEXTURES"),
             trace_cbufs: set("NX_TRACE_CBUFS"),
             trace_state: set("NX_TRACE_STATE"),
