@@ -161,9 +161,14 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   `RECOMP_LINK_MAP=<file>` makes the link write a map of the executable, and on Windows
   `pwsh -File tools/sample_threads.ps1 -Map <file>` samples where every thread of the running
   program is (a generated function `f_<guest address>`, a Rust function of the runtime, a module
-  of the process) to say what it is busy with. `NX_CENSUS=<file>` counts the floating-point and
-  SIMD instruction words that reach the runtime (`nx_vec`, `nx_vecmem`), the words the lifter left
-  to the interpreter and the addresses the slow path interprets, and rewrites the file every ten
-  seconds, most frequent first, with the decoded instruction: what to lower to native code next.
+  of the process) to say what it is busy with, and `pwsh -File tools/guest_memory.ps1 -Map <file>
+  -Ranges "<address>:<length>,..." [-Words]` reads the guest memory of the running program from
+  outside (it walks the page table the map names, `nx_mem_l1`; a frame's saved registers on the
+  stack and the objects they point to answer what a stuck loop is looping on).
+  `NX_HOLD_ON_STOP=1` keeps the process alive after a stop, so that its memory can still be read.
+  `NX_CENSUS=<file>` counts the floating-point and SIMD instruction words that reach the runtime
+  (`nx_vec`, `nx_vecmem`), the words the lifter left to the interpreter and the addresses the slow
+  path interprets, and rewrites the file every ten seconds, most frequent first, with the decoded
+  instruction: what to lower to native code next.
 - Unicorn (AArch64 oracle): `UNICORN_DLL`, else `.venv` (`py -m venv .venv`, then
   `.venv\Scripts\pip install unicorn`). The shared library is loaded with `libloading`.

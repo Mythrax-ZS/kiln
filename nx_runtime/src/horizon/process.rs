@@ -271,6 +271,13 @@ pub unsafe fn run_module(m: &crate::rt::host::ModuleDesc) -> i32 {
         Exit::Code(code) => code,
         Exit::Fatal(report) => {
             eprintln!("recomp runtime: {report}");
+            // For looking at the memory of a stopped program from outside (tools/guest_memory.ps1).
+            if std::env::var_os("NX_HOLD_ON_STOP").is_some() {
+                eprintln!("recomp runtime: NX_HOLD_ON_STOP: the process stays until it is killed");
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(3600));
+                }
+            }
             STOPPED_EXIT_CODE
         }
     }
