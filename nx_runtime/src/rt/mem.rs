@@ -244,6 +244,31 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// The host address of the guest byte at `addr` and how many bytes from there, at most `max`,
+    /// are contiguous in host memory (neighbouring pages of one allocation). `None` when `addr`
+    /// is not mapped. Host pages stay where they are until the process ends (see the module
+    /// comment), so the address can be handed to a device.
+    pub fn host_run(&self, addr: u64, max: u64) -> Option<(*mut u8, u64)> {
+        let e = self.entry(addr);
+        if e & PRESENT == 0 {
+            return None;
+        }
+        let mut host = e & !FLAGS;
+        let start = host.wrapping_add(addr & (PAGE_SIZE - 1)) as *mut u8;
+        let mut len = PAGE_SIZE - (addr & (PAGE_SIZE - 1));
+        let mut at = (addr | (PAGE_SIZE - 1)) + 1;
+        while len < max {
+            let next = self.entry(at);
+            if next & PRESENT == 0 || next & !FLAGS != host + PAGE_SIZE {
+                break;
+            }
+            host += PAGE_SIZE;
+            len += PAGE_SIZE;
+            at += PAGE_SIZE;
+        }
+        Some((start, len.min(max)))
+    }
+
     /// Is every page of the range mapped?
     pub fn is_mapped(&self, addr: u64, size: u64) -> bool {
         let first = addr & !(PAGE_SIZE - 1);

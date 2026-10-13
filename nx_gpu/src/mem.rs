@@ -29,6 +29,16 @@ pub trait GuestMemory: Send + Sync {
     fn write_u64(&self, addr: u64, v: u64) -> bool {
         self.write(addr, &v.to_le_bytes())
     }
+
+    /// The address in this process of the bytes of guest address `addr`, and how many bytes
+    /// from there (at most `max`) are contiguous in host memory; `None` where the memory is
+    /// not mapped or cannot be reached by address. A device that is to read the memory itself
+    /// (not through [`GuestMemory::read`]) needs this; the bytes stay at that address for as
+    /// long as the process runs.
+    fn host_run(&self, addr: u64, max: u64) -> Option<(*mut u8, u64)> {
+        let _ = (addr, max);
+        None
+    }
 }
 
 /// Memory for tests: a few mapped ranges backed by vectors.

@@ -25,6 +25,10 @@ impl GuestMemory for ProcessMemory {
     fn write(&self, addr: u64, data: &[u8]) -> bool {
         rt().mem.write_bytes(addr, data, false).is_ok()
     }
+
+    fn host_run(&self, addr: u64, max: u64) -> Option<(*mut u8, u64)> {
+        rt().mem.host_run(addr, max)
+    }
 }
 
 /// The driver and the events behind its tokens, shared by every connection of the process.
