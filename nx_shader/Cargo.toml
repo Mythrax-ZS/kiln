@@ -1,0 +1,10 @@
+[package]
+name = "nx_shader"
+version = "0.1.0"
+edition = "2021"
+description = "Maxwell (SM50) shader binaries: header, decoder, control flow and translation to SPIR-V"
+publish = false
+
+[lib]
+name = "nx_shader"
+path = "src/lib.rs"

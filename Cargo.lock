@@ -75,6 +75,9 @@ dependencies = [
 [[package]]
 name = "nx_gpu"
 version = "0.1.0"
+dependencies = [
+ "nx_shader",
+]
 
 [[package]]
 name = "nx_runtime"
@@ -84,6 +87,10 @@ dependencies = [
  "nx_gpu",
  "nx_runtime",
 ]
+
+[[package]]
+name = "nx_shader"
+version = "0.1.0"
 
 [[package]]
 name = "recomp"
