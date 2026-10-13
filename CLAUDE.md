@@ -100,6 +100,14 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   `NX_SPIRV_CHECK=1` look at one thing each; `NX_VULKAN_VALIDATE=1` turns the validation layer on;
   `NX_SHADER_DUMP=<dir>` writes the programs draws use (read them with `cargo run --release -p
   nx_shader --example sass -- <file>`). Never `NX_DUMP_FRAMES` without `NX_DUMP_EVERY` for a long run.
+- Window and input: `NX_WINDOW=1` (with `NX_RENDERER=vulkan`) shows the frames in a window
+  (`NX_WINDOW_SIZE=<w>x<h>`, `NX_WINDOW_TITLE`, `NX_PRESENT_MODE=fifo|mailbox|immediate`); no test
+  opens one. The keyboard and an XInput gamepad are the handheld controls of `hid`: `NX_KEYMAP=<file>`
+  rebinds keys, `NX_TRACE_KEYS=1` prints the keys and button changes, `NX_GAMEPAD=0` and
+  `NX_GAMEPAD_LABELS=1` (docs/ASSUMPTIONS.md A-104). To drive a window from a script, post key messages
+  to the game's own window and capture only that window (`PrintWindow`), never the screen, and bind
+  keys nobody types (an `NX_KEYMAP` using F13 and up) so that the person at the keyboard cannot
+  disturb the run; delete the trace logs afterwards, they hold the keys pressed.
 - ASTC decoder: `nx_vulkan/tests/astc_reference.rs` compares it with ARM's `astcenc`
   (`RECOMP_ASTCENC=<path>`, or `astcenc` on the `PATH`; the tool may be unpacked from a distribution
   package without installing it); `RECOMP_ASTC_BATCHES` (default 4, 4,096 blocks each) scales it and

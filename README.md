@@ -26,15 +26,43 @@ cryptographic extension was added on the way), M8 (the GPU front, `nx_gpu`: the 
 its device nodes, the display and buffer queue, a Maxwell command processor with a macro engine
 that traces what a title sends; the same title now runs its main loop and submits draw calls), M9
 (shader translation, `nx_shader`: the Maxwell programs the title binds translate to SPIR-V and are
-compared with Rust arithmetic by tests on a GPU) and M10 up to the window (the Vulkan backend: `nx_vulkan` draws
-what the command processor decodes, with ASTC textures decoded on the host).
+compared with Rust arithmetic by tests on a GPU) and M10 (the Vulkan backend: `nx_vulkan` draws
+what the command processor decodes, with ASTC textures decoded on the host, shows the frames in a
+window, and takes keyboard and gamepad input).
 
-**First frames, no window.** Over its first 1,500 presented frames the title's 380,376 draws and
+**First frames.** Over its first 1,500 presented frames the title's 380,376 draws and
 1,499 clears run on a Vulkan device and none fails; the frames, dumped as PNG files and looked at,
 show its first screens (an introduction screen with photographs, a logo and text, then a menu with
-artwork), in 23 s of wall clock on an RTX 5070 Ti (`docs/reports/M10-vulkan-backend.md`). There is
-no window yet, no sound, no input reaches the title from a person, and screens beyond those have
-not been tried. Nothing here is a claim that a game is playable.
+artwork), in 23 s of wall clock on an RTX 5070 Ti (`docs/reports/M10-vulkan-backend.md`). With
+`NX_WINDOW=1` the same frames appear in a window, and the keyboard (or an XInput gamepad) reaches
+the title: the keys that stand for the directional pad and for the left stick moved the selection
+of its menu, and confirming it started the title's introduction. After that the picture stayed
+black for the 45 s that were watched, and why has not been looked into. There is no sound, and no
+screen past the menu has been drawn. Nothing here is a claim that a game is playable.
+
+### Keys
+
+With the window focused, the keyboard is the console's handheld controls (the keys are the
+physical ones, so the layout of the keyboard does not matter):
+
+| Control | Key |
+|---|---|
+| Left stick | W A S D (click: Left Shift) |
+| Right stick | Arrow keys (click: Right Shift) |
+| A, B, X, Y | L, K, I, J (X above, Y left, B below, A right) |
+| Directional pad | T up, F left, G down, H right |
+| L, R | Q, E |
+| ZL, ZR | Z, C |
+| Plus, Minus | Enter, Backspace |
+
+`NX_KEYMAP=<file>` rebinds them: one `Action=Key` line per binding (`A=Space`, `LeftStickUp=KeyW`;
+more lines for one action add keys; the actions are `A B X Y L3 R3 L R ZL ZR Plus Minus DpadLeft
+DpadUp DpadRight DpadDown` and `LeftStick`/`RightStick` with `Left Right Up Down`; keys are named
+as `KeyW`, `Digit1`, `ArrowUp`, `Space`, `Numpad4`, `F5`, in any case). `NX_TRACE_KEYS=1` prints
+the name of each key pressed, which is how to find the names. An Xbox-style (XInput) gamepad on Windows works
+without setup, with its face buttons by position (the bottom one is B, as on the console;
+`NX_GAMEPAD_LABELS=1` keeps the names instead), and `NX_GAMEPAD=0` leaves it out. Only the
+handheld controls exist, so a title that does not support the handheld mode sees no controller.
 
 ## Using it
 
@@ -97,6 +125,14 @@ processor counted (`NX_GPU_TOP=<n>` sets how many of the busiest methods it list
 after `n` presented frames; `NX_SAVE_DIR=<dir>` is where a program's save data goes (default
 `./nx_save`). `recomp symbols --exefs <dir> [--match <text>] [<address>...]` names the function
 around an address (the return addresses a stop report ends with), which is how a stop is read.
+
+To draw, run a produced program with `NX_RENDERER=vulkan` (it needs a Vulkan 1.1 device).
+`NX_WINDOW=1` shows the frames in a window (`NX_WINDOW_SIZE=<width>x<height>` sets its size,
+1280x720 by default, `NX_WINDOW_TITLE=<text>` its title, and `NX_PRESENT_MODE=mailbox` or
+`immediate` replaces the vertical sync that paces the program); closing the window ends the
+program. `NX_DUMP_FRAMES=<dir>` with `NX_DUMP_EVERY=<n>` writes every n-th frame as a PNG file
+instead of, or as well. `NX_VULKAN_VALIDATE=1` turns the validation layer on. The keys are listed
+above, under "Keys".
 
 ## What "accuracy" means here
 

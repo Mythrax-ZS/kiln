@@ -202,17 +202,20 @@ Plainly:
 - Cycle timing, GPU timing, audio timing and any real-time behavior beyond the 60 Hz and 200 Hz
   threads.
 - **Whether a title would be *playable***: its first screens are drawn (the dumped frames were
-  looked at), but there is no window, no sound and no input from a person, and nothing past those
-  screens was tried. Frame times were measured only for those screens.
+  looked at), shown in a window, and its first menu answers the keyboard (looked at in captures of
+  the window); the picture after confirming that menu stayed black for the 45 s watched, there is
+  no sound, and a gamepad was never tried with a controller. Frame times were measured only for
+  the first screens and that stretch.
 
 ## The next work
 
 The owner approved shader translation and the Vulkan backend on 2026-10-13. Shader translation
 (M9) is done as far as it can be checked without drawing, and the backend (M10) draws the title's
-first screens (`docs/reports/M10-vulkan-backend.md`). What is left of M10 is a window to present
-frames in, with settings for it in the GUI; after that the draws of later screens (more shader
-instructions, other texture types) as they stop the run, input from a real device, audio output,
-and the 22 services of the title's list that are not implemented.
+first screens in a window and takes keyboard (and, untried, gamepad) input
+(`docs/reports/M10-vulkan-backend.md`). What is left of M10 is settings for the window and the
+input in the GUI and finding out why the picture after the first menu is black; after that the
+draws of later screens (more shader instructions, other texture types) as they stop the run,
+audio output, and the 22 services of the title's list that are not implemented.
 
 ## Repository state
 

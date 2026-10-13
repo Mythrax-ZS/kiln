@@ -1,7 +1,8 @@
 # M10: the Vulkan backend (`nx_vulkan` renderer)
 
-Status: the title's first screens are rendered and dumped as pictures; the milestone is open at the
-window (see "What is not done"). Date: 2026-10-13.
+Status: the title's first screens are rendered, shown in a window, and the keyboard reaches the
+title; the milestone is open at what comes after its first menu, and at sound (see "What is not
+done"). Date: 2026-10-13.
 
 The task (owner approval of 2026-10-13, "begin the shader translation and Vulkan backend"): turn
 what the command processor of `nx_gpu` decodes into pictures with the translated programs, on a
@@ -28,7 +29,19 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
   pictures, and its own render target, 1280 x 720, for the last pass), instanced draws, one global
   memory program, alpha blending, 1600 x 900 swapchain-size targets presented with a 1280 x 720
   crop.
-- **No sound, no input, no window.** Nothing here is a claim that the title is playable.
+- **A window, and the keyboard.** With `NX_WINDOW=1` the frames appear in a window (letterboxed
+  to its shape, vertical sync), and keys reach the title through `hid` (A-104, A-105). Looked at in
+  captures of the window: the menu the title stops at moved its selection down and up again with
+  the keys that stand for the directional pad, and again with the keys that stand for the left
+  stick (a button appears in the samples within 5 ms of its key; the picture followed within
+  300 ms); confirming it made the screen fade and the title's introduction text appear, after
+  which the picture stayed black for the 45 s that were watched, at about 10 to 13 frames a second
+  (the menu itself ran at 57 to 71, by the dump times of every 120th frame), and why has not been
+  looked into. The window was resized to a wide, a tall and a normal shape (equal black bars on
+  the two sides that need them) and minimized and restored (the title kept running and answered
+  the next key).
+- **No sound, and no gamepad was tried** (the conversion of XInput states is unit-tested; no
+  controller was connected). Nothing here is a claim that the title is playable.
 
 ## What was built
 
@@ -42,6 +55,8 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
 | `render::global` | Global memory: the table of GPU address ranges, and the guest's own memory imported into the device in place (`VK_EXT_external_memory_host`). |
 | `astc` | An ASTC decoder (low dynamic range profile, all 14 footprints, multi-partition, dual plane, void extent), threaded for large textures. |
 | `render::debug` | The switches for looking: `NX_TRACE_DRAWS=<frame>`, `NX_TRACE_STATE`, `NX_TRACE_TEXTURES`, `NX_TRACE_CBUFS`, `NX_DUMP_FRAMES` (with `NX_DUMP_EVERY`, `NX_DUMP_COUNT`, `NX_DUMP_TARGETS`), `NX_DUMP_DRAWS=<dir>` with `NX_DUMP_FROM` (a picture of the target after each command of the traced frame), `NX_DEBUG_NO_CULL`, `NX_DEBUG_FULL_VIEWPORT`, `NX_DEBUG_SOLID_PIXEL`, `NX_SPIRV_CHECK`, `NX_VULKAN_VALIDATE`. `NX_RENDERER=vulkan` turns the renderer on in a produced program. |
+| `window`, `render::display`, `render::blit` | A winit window on a thread of its own (feature `window`, on by default in the runtime): the raw handles for a surface, its size, close-to-exit, and the keys and focus handed to an `InputSink`. The display makes the swapchain (sRGB when the buffers are, FIFO unless `NX_PRESENT_MODE` says otherwise), and the blit copies the shown crop of a buffer into the swapchain image, fitted with black bars. |
+| `nx_runtime` `horizon::input`, `horizon::gamepad` | Keys by physical name, the key map (standard, or `NX_KEYMAP`), stick directions from keys, the XInput gamepad (loaded at run time, positional face buttons, dead zones), merging, and the trace (`NX_TRACE_KEYS`). `hid` writes the merged state into its samples every 5 ms. |
 
 ## What the tests cover
 
@@ -68,6 +83,28 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
 - **Mutation checks done by hand**: with the render-target path switched off the two matching
   tests fail with the memory's zeros; with the instance counter fixed at 0 the instance test fails
   at the second draw.
+- **The window and its blit**: three unit tests of the blit (the shown part of a buffer, the fitted
+  rectangle with its bars for several shapes, and one on the device that blits a cropped, fitted
+  picture and reads it back pixel by pixel), the packing of the window's size and the names of the
+  keys. The whole `nx_vulkan` suite was run with the validation layer on (`NX_VULKAN_VALIDATE=1`),
+  which found three mistakes in the new code and its tests (the depth offsets of a blit region, an image view
+  of an image made for transfers only, a test that tore down while a command was still being
+  recorded), all fixed. No test opens a window; it was run by hand (below).
+- **Input**: eight unit tests of the key map (the standard keys, no key bound twice, stick keys
+  and their diagonals, the direction buttons of a tilted stick, merging, a keymap file and its
+  mistakes, the gamepad counting only while the window has the focus), five of the XInput
+  conversion (buttons by place and by name, triggers, dead zones and the rim, the layout of its
+  state) and one that asks for a gamepad where there may be none; `hid` has a test that a sample
+  carries the buttons and both sticks (and that releasing is the next sample), and the existing
+  test of the sampling thread now presses keys through the same entry the window uses, sees A and
+  the stick appear in the shared memory, and sees a lost focus let go of them.
+- **By hand, on the title** (frames of the window captured with `PrintWindow`, only the game's
+  own window; keys posted to that window; a keymap file using only keys nobody types, so that the
+  person at the keyboard could not disturb the run): the menu selection moves with the
+  directional pad keys and with the stick keys, as above. A first set of captures showed part of
+  the window only, because the capturing program was not DPI aware and the display was scaled;
+  the widths of the black bars matched the full window exactly, and a second set taken DPI aware
+  shows the whole picture.
 
 ## Bugs that looking at the frames found
 
@@ -93,8 +130,19 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
 
 ## What is not done, and what is not checked
 
-- **No window.** Frames are PNG files (`NX_DUMP_FRAMES`); nothing is presented live, and there is
-  no vertical sync or frame pacing. Input and sound do not reach the title.
+- **What follows the first menu.** After the menu is confirmed the title shows its introduction
+  text and then a black picture for as long as it was watched (45 s, at about 10 to 13 frames a
+  second). Whether that is a scene that does not draw yet (an untranslated instruction would stop
+  the run and say so; none did), a load that takes longer, or something else has not been
+  looked into. Nothing past it has been seen.
+- **Sound** does not exist yet. **The gamepad** was never tried with a controller. Only the
+  handheld controls exist (one player; touch, mouse, motion and rumble are absent), so a title
+  that does not support the handheld style sees no controller (A-104). There is no gamepad on
+  Linux (only the keyboard).
+- **The window was run on one machine** (Windows 11, one NVIDIA GPU): it was compiled and its
+  blit tested on Linux, but no window was opened there, and neither a display that is not 60 Hz,
+  nor several monitors, nor fullscreen were tried. FIFO presenting and the guest's own 60 Hz
+  thread both pace the title; how they interact on other refresh rates is unmeasured (A-105).
 - **Shader instructions not translated** still stop the draw with the instruction and its
   address, as in M9 (`TEX`, `TLD`, `TLD4`, `TXQ`, half-precision, local and shared memory,
   atomics and others): the 10 programs of these screens did not need them. The next screens will.
@@ -118,5 +166,7 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
 ## Files
 
 `nx_vulkan/src/astc.rs`, `nx_vulkan/src/render/` (`mod`, `draw`, `frame`, `shaders`, `textures`,
-`targets`, `global`, `convert`, `debug`), `nx_vulkan/tests/render_*.rs` and `astc_reference.rs`,
-`nx_gpu/src/{render,draw_state}.rs`, `docs/ASSUMPTIONS.md` A-092 to A-103.
+`targets`, `global`, `convert`, `debug`, `display`, `blit`), `nx_vulkan/src/{window,input}.rs`,
+`nx_vulkan/tests/render_*.rs` and `astc_reference.rs`, `nx_gpu/src/{render,draw_state}.rs`,
+`nx_runtime/src/horizon/{input,gamepad}.rs` and `services/hid.rs`, `docs/ASSUMPTIONS.md` A-092 to
+A-105.

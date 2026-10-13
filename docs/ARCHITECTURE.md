@@ -92,6 +92,10 @@ results there as the Switchbrew SVC pages lay them out, and the generated code r
   address space the program cannot see, writes its pages there, and gives the program a handle;
   `MapSharedMemory` puts the same pages into the program (`hid` publishes input this way, `pl:u`
   the fonts).
+- **Input** (`horizon/input.rs`, `horizon/gamepad.rs`): the keys of the window (named by physical
+  key, bound to buttons and stick directions by a keymap) and an XInput gamepad are merged into one
+  state of the controls, which the sampling thread of `hid` writes into the handheld Npad every
+  5 ms (docs/ASSUMPTIONS.md A-104).
 - **Lent memory**: `CreateTransferMemory` reprotects a range of the program's heap and marks it
   locked until the handle is closed (`memobj.rs`); the services, which run in the process, read
   and write it through the same addresses.
@@ -164,6 +168,11 @@ constant buffers, vertices, indices ─▶ upload ring ─▶ one command buffer
 - **Looking** (`debug.rs`, `png.rs`): frames, every render target, and the target after each
   command of one frame can be written as PNG, with a line of statistics; the draws, state, texture
   headers and constant buffers of a frame can be traced (`docs/reports/M10-vulkan-backend.md`).
+- **Showing** (`window.rs`, `render/display.rs`, `render/blit.rs`): with `NX_WINDOW=1` a window on
+  a thread of its own (winit) gets the shown part of each displayed buffer, blitted into a swapchain
+  image with black bars to keep its shape (FIFO presenting, so the guest runs at the display's
+  refresh rate); the same window hands the keys and the keyboard focus to the runtime
+  (`InputSink`, `input.rs`). Closing it ends the process.
 
 ## Guest memory
 
