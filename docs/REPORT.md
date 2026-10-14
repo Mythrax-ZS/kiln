@@ -108,7 +108,7 @@ NPDM service list allows the name (`0x1015` otherwise). Implemented, with the co
 | `hid` | the handheld Npad connected with idle input; six-axis start and stop; vibration devices |
 | `time:u` | the user, network and local clocks, the steady clock, a UTC time zone |
 | `nifm:u`, `bsd:u`, `ssl`, `prepo:u`, `nfp:user`, `friend:u` | offline: no network, no sockets or TLS contexts, reports discarded, no amiibo, no friends |
-| `pl:u` | six stand-in system fonts (blank glyphs) in a shared memory |
+| `pl:u` | six stand-in system fonts (Latin letters in a dot-matrix alphabet, every other glyph blank) in a shared memory |
 | `audren:u` | an audio renderer (voices decoded, mixed and played; no effects, A-125) and an audio device |
 
 20 of the 42 services in the title's list are implemented; the other 22 (`audin:u`, `audout:u`,
