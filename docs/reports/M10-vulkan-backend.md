@@ -1,10 +1,12 @@
 # M10: the Vulkan backend (`nx_vulkan` renderer)
 
 Status: the title's first screens, its opening cutscene (after the first menu) and its first
-stage are rendered, shown in a window, and the keyboard reaches the title; the milestone is open
-at speed (about 28 frames a second in the stage), at what the stage does past its first prompt,
-at an early stop that happens in about one run in 30, and at sound (see "What is not done").
-Date: 2026-10-14.
+stage are rendered, shown in a window, and the keyboard reaches the title; the first stage is
+played with scripted input (the camera turns, the character stands up and runs) at 40 to 60
+frames a second, and its music and sounds are mixed and played (A-125, never listened to by a person, only
+dumped and measured); the milestone is open at speed in the heaviest scene seen (49 frames a
+second, see "What is not done"), at what the game does past its first area, at two early stops
+that are rare (see below) and at the effects of the sound. Date: 2026-10-14.
 
 The task (owner approval of 2026-10-13, "begin the shader translation and Vulkan backend"): turn
 what the command processor of `nx_gpu` decodes into pictures with the translated programs, on a
@@ -258,19 +260,22 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
   nothing (A-119). The scene waits for the right stick; after scripted presses of it the camera
   was seen to orbit. That the left stick walks the character, that the stage can be played
   through, and that it stays up for long are not checked: the longest run was 16,000 frames.
-- **Speed.** The stage runs at about 28 frames a second (frames 10,658 to 11,929 took 44 s, on
-  an NVIDIA RTX 5070 Ti, untraced); the title's own pace is 60, so its logic runs slower than on
-  the console. The render thread is the limit: per 100 frames it spends about 2.1 s in the draw
-  path (1.4 s on textures, of which 1.0 s writing one render target of 320 x 360 back to memory
-  every frame, A-111: half of it waiting for the device, half laying the pixels out), 0.5 s on
-  the one compute launch of each frame (a wait for the device), 0.2 s finishing the frame, 0.2 s
-  on vertices and 0.2 s on descriptors. The guest's own code was made faster by native lowering
-  of the hot floating-point and vector forms, fast paths for memory accesses and a lock-free
-  function table, and by analysis that resolves the jump tables of loops (the interpreter ran
-  2.1 billion instructions of one cutscene before, and 150 million of 16,000 frames of the stage
-  without hints now). A step-by-step account is printed every 100 frames with `NX_TRACE_GPU`.
-  Nothing here is a claim about speed on other hardware or other scenes (A-102: every submission
-  still waits for the device).
+- **Speed.** On an NVIDIA RTX 5070 Ti, 100 frames take (printed every 100 frames with
+  `NX_TRACE_PERF=1`): 1.6 s in the first scenes of the stage (about 61 a second), 2.05 s in the
+  heaviest scene seen (Mario standing in the fog of the first area: 1,575 draws and 19 compute
+  launches a frame; 49 a second) and 3.4 s in the opening cutscene (2,800 draws a frame; 27 a
+  second); the title's own pace is 60. The heavy scene took 3.52 s (28 a second) before
+  today's profiling, from three causes the thread sampler (`tools/sample_threads.ps1`, with
+  `-Callers`) found: the guest's main thread spent 67% of its time in the bit-by-bit software
+  square root of the floating-point core (an ordinary positive number is now rooted by the host,
+  which rounds like the architecture, with the inexact flag told by squaring the root back:
+  3.52 s to 2.42 s); the render thread spent 27% of its time hashing 106 MB of texture memory a
+  frame (Windows write tracking, A-126: 2.42 s to 2.05 s); and it read the clock about twenty
+  times a draw (the steps are timed only when a report is asked for). What is left is the render
+  thread at 98% of a frame (about 10 microseconds a draw, of which the driver's work at each
+  change of render pass is 3 ms a frame, textures 2.2, vertices 1.8, descriptors 1.7,
+  recording 1.7, the compute launches 2.5 and the end of each submission 1.3); the guest's main
+  thread is 32% busy. Nothing here is a claim about speed on other hardware or other scenes.
 - **A run that stops answering.** `NX_WATCHDOG` caught one in about four runs of the cutscene:
   the main thread waiting for a mutex that another thread held while it was inside a request to
   a service (the command submission), with the command processor handling no methods and the GPU
@@ -285,7 +290,20 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
   priorities, which the console's scheduler does not do (a thread keeps its core until it blocks,
   and equal-priority threads on a core never overlap); `NX_CORES=per-core` (A-115) is a first
   model of the cores, and whether it removes the stop has not been measured.
-- **Sound** does not exist yet. **The gamepad** was never tried with a controller. Only the
+  A second early stop was seen once, at the move from the title menu to the game (frame about
+  5,200): a read of address 8 by `al::AcLSoundHandle::setMainSend`, called from
+  `AudioBusSendController::update` while a thread of the title deletes the menu scene. The title's
+  `update` walks a list of requests and clears each after applying it with no lock, the main thread
+  calls it every frame from `AudioSystem::update`, and the scene's deletion calls it from its own
+  thread; the entry the stop reported was found cleared in every field. It is the title's race
+  (the console has it too, with other timing: here services run on the calling thread and the
+  second thread meets the first more closely, a guess). 58 repeated runs of the same transition
+  did not show it again, so it happens in under about one run in 20; the stop report now prints
+  the whole thread table (it used to be cut off when the process ended) in case it does.
+- **Sound** is mixed and played (A-125) but only measured, never listened to; the effects (reverb,
+  delay, auxiliary buses, the limiter) and the filters of voices are not applied, so the music
+  lacks whatever the title adds with them, and a mix section of a layout this code does not
+  know plays nothing. **The gamepad** was never tried with a controller. Only the
   handheld controls exist (one player; touch, mouse, motion and rumble are absent), so a title
   that does not support the handheld style sees no controller (A-104). There is no gamepad on
   Linux (only the keyboard).
@@ -321,5 +339,6 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
 `targets`, `global`, `compute`, `convert`, `debug`, `display`, `blit`),
 `nx_vulkan/src/{window,input}.rs`, `nx_vulkan/tests/render_*.rs`, `translate_*.rs` and
 `astc_reference.rs`, `nx_gpu/src/{render,draw_state,compute,i2m,vm,lib}.rs` (`lib` has the progress counters),
-`nx_shader/src/translate/` and `tests/{tmml,control_flow}.rs`, `nx_runtime/src/horizon/{input,gamepad,watchdog,cores}.rs`
-and `services/hid.rs`, `docs/ASSUMPTIONS.md` A-092 to A-116.
+`nx_shader/src/translate/` and `tests/{tmml,control_flow}.rs`, `nx_runtime/src/horizon/{input,gamepad,watchdog,cores,audio_out}.rs`,
+`services/hid.rs` and `services/audren/` (`adpcm`, `voice`, `mixer`), `nx_runtime/src/rt/mem.rs` (write
+tracking), `docs/ASSUMPTIONS.md` A-092 to A-126.
