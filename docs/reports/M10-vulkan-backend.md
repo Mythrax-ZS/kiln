@@ -227,7 +227,7 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
 - **What the stage asked for next.** `IApplicationFunctions::GetDisplayVersion` (A-117); the media
   engines (A-119: refusing to open `nvhost-nvdec` made the title's movie thread use the null it
   got, so the nodes open, take the host1x channel ioctls and decode nothing); the clock manager
-  `mm:u` (A-120). With them the title loads its first stage: the frames show Mario, the
+  `mm:u` (A-120). With them the title loads its first stage: the frames show the player's character, the
   tutorial prompt "Look Around" and a panel for the tutorial's video, which stays empty.
 - **Things the scene needed that the first screens did not** (all found by the draws that
   failed, each with its program's address): texture instructions beyond `TEXS` (`TEX`, `TLD4S`,
@@ -258,7 +258,7 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
   outside with `tools/guest_memory.ps1` (now with `-Find`, which lists where a value is in the
   guest's memory: the sequence object was found by the address of its table of virtual
   functions) gave the state: the game's sequence was in its "destroy" state, running the scene
-  deletion state, which had been in its `exeFinalizeAudio` step for 475,000 steps, and the
+  deletion state, which had been in its audio finalizing step for 475,000 steps, and the
   thread that deletes the scene had finished. That step asks the audio director to finalize,
   which switches off the scene's effects and waits for the renderer to say that each is removed;
   the renderer's answer for an effect was zeros (in use) for ever. It now keeps the books of its
@@ -280,7 +280,7 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
   through, and that it stays up for long are not checked: the longest run was 16,000 frames.
 - **Speed.** On an NVIDIA RTX 5070 Ti, 100 frames take (printed every 100 frames with
   `NX_TRACE_PERF=1`): 1.6 s in the first scenes of the stage (about 61 a second), 2.05 s in the
-  heaviest scene seen (Mario standing in the fog of the first area: 1,575 draws and 19 compute
+  heaviest scene seen (the character standing in the fog of the first area: 1,575 draws and 19 compute
   launches a frame; 49 a second) and 3.4 s in the opening cutscene (2,800 draws a frame; 27 a
   second); the title's own pace is 60. The heavy scene took 3.52 s (28 a second) before
   today's profiling, from three causes the thread sampler (`tools/sample_threads.ps1`, with
@@ -300,7 +300,7 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
   idle; it was not seen again after the watchdog learned to say more, and its cause is not known.
   An intermittent early stop of the title is also open: about one run in 30 with the renderer
   and none headless (0 in 88), more often while the machine is busy, it ends in one of two ways
-  while the title loads resources on several threads, both in `al::ResourceSystem::createResource`:
+  while the title loads resources on several threads, both in the title's resource loader:
   a jump into the heap from the destructor of a temporary heap, or the heap's allocation-failed
   callback for a 136-byte block of an ExpHeap of 755 MB that has one free block left (the dump the
   stop report now prints shows the heap's own fields). It is not tied to `NX_RANDOM_SEED`. The
@@ -309,8 +309,8 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
   and equal-priority threads on a core never overlap); `NX_CORES=per-core` (A-115) is a first
   model of the cores, and whether it removes the stop has not been measured.
   A second early stop was seen once, at the move from the title menu to the game (frame about
-  5,200): a read of address 8 by `al::AcLSoundHandle::setMainSend`, called from
-  `AudioBusSendController::update` while a thread of the title deletes the menu scene. The title's
+  5,200): a read of address 8 by the title's code that sets the main send of a sound handle, called from
+  its audio bus update while a thread of the title deletes the menu scene. The title's
   `update` walks a list of requests and clears each after applying it with no lock, the main thread
   calls it every frame from `AudioSystem::update`, and the scene's deletion calls it from its own
   thread; the entry the stop reported was found cleared in every field. It is the title's race
