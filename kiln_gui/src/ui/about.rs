@@ -53,10 +53,11 @@ impl App {
                     ui.add_space(4.0);
                     paragraph(
                         ui,
-                        "Recompiled games start, run their code and talk to the emulated services, \
-                         and their graphics commands are decoded. Drawing them on screen and playing \
-                         their sound are still being built, so a game that runs is not a game that \
-                         can be played yet. Measured results are in the reports in docs/reports.",
+                        "Recompiled games start, run their code and talk to the emulated services. \
+                         Played from here they are drawn with Vulkan in a window of their own, take \
+                         the keyboard or a gamepad as their controls and have their sound mixed and \
+                         sent to the sound device. None of that says a game can be played: how far \
+                         each one gets is measured in the reports in docs/reports.",
                     );
                 });
                 ui.add_space(14.0);
