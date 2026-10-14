@@ -182,8 +182,10 @@ clang and Unicorn.
   makes `recomp-<version>-<commit>-windows-x64.zip` from `recomp-gui.exe`, `recomp.exe` and
   `nx_runtime.lib` with a README, `doctor.cmd` and `selftest.cmd` (it compiles and runs a tiny
   synthetic program, no game needed), and the job unpacks the zip somewhere else, with no `cargo`
-  on the machine, and runs the self-test. The zip is the run's artifact `recomp-windows-x64`;
-  pushing a tag `v*` also attaches it to a draft release.
+  on the machine, and runs the self-test. The zip (with `SHA256SUMS.txt`) is the run's artifact
+  `recomp-windows-x64`, kept 30 days. A push to `main` that passes also keeps it for good: the
+  release makes a tag `build-<run number>-<commit>` on that commit and a pre-release with the zip
+  (never marked "latest"); pushing a tag `v*` by hand makes a normal release of it instead.
 
 What no runner has: a Vulkan device (the renderer's tests print `SKIPPED` and pass), `spirv-val`
 and `astcenc`, and any game. The bundle holds no game, key or firmware; a person who gets it

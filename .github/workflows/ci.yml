@@ -2,7 +2,8 @@ name: ci
 
 # The gate of CLAUDE.md (fmt, lint, test) on Windows and on Linux, and the Windows bundle: the
 # three files a person needs to recompile a game of their own (recomp-gui.exe, recomp.exe and
-# nx_runtime.lib) with a short README and a self-test, tested as a person would get them.
+# nx_runtime.lib) with a short README and a self-test, tested as a person would get them. Every
+# push to `main` that passes is kept as a tag and a pre-release holding that bundle.
 #
 # What no runner has: a Vulkan device (the renderer's tests print SKIPPED and pass), spirv-val and
 # astcenc (the translator's and the ASTC decoder's oracles, the same), and any game: nothing here
@@ -15,9 +16,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A newer push to a pull request replaces the run of the older one; a push to `main` is never
+# cancelled halfway, because every one of them is saved as a release (see the end of `bundle`).
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -135,7 +138,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     permissions:
-      # Only to attach the bundle to a draft release when a tag `v*` is pushed.
+      # To make a tag and a release of the bundle (pushes to `main`, and tags `v*`).
       contents: write
     steps:
       - uses: actions/checkout@v4
@@ -195,16 +198,57 @@ jobs:
           & "$($root.FullName)\selftest.cmd" /ci
           if ($LASTEXITCODE -ne 0) { throw "the self-test of the bundle failed ($LASTEXITCODE)" }
 
+      - name: Checksums and the name of this build
+        id: build
+        shell: pwsh
+        env:
+          SHA: ${{ github.sha }}
+          RUN: ${{ github.run_number }}
+        run: |
+          Get-ChildItem dist-out -Filter *.zip | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
+          } | Out-File -Encoding ascii dist-out/SHA256SUMS.txt
+          Get-Content dist-out/SHA256SUMS.txt
+          $short = $env:SHA.Substring(0, 7)
+          "short=$short" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "tag=build-$env:RUN-$short" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+
+      # Every run keeps its bundle for 30 days, pull requests included.
       - uses: actions/upload-artifact@v4
         with:
           name: recomp-windows-x64
-          path: dist-out/*.zip
+          path: |
+            dist-out/*.zip
+            dist-out/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
 
-      - name: Attach to a draft release
+      # Every push to `main` that gets this far is kept for good: a tag `build-<run>-<commit>` on
+      # that commit and a pre-release (never the "latest" release) holding the bundle. The tag is
+      # made by the release, so nothing has to be pushed for it.
+      - name: Save the build as a pre-release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.build.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Build ${{ github.run_number }} (${{ steps.build.outputs.short }})
+          body: |
+            The Windows x64 bundle that CI run ${{ github.run_number }} made from commit ${{ github.sha }}
+            after the checks passed. Unzip it, read README.txt and run selftest.cmd. It holds no
+            game: bring the extracted ExeFS and RomFS of a game of your own.
+          files: |
+            dist-out/*.zip
+            dist-out/SHA256SUMS.txt
+          prerelease: true
+          make_latest: "false"
+
+      # A version somebody tagged on purpose (`git tag v0.1.0; git push origin v0.1.0`).
+      - name: Release a tagged version
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist-out/*.zip
-          draft: true
+          files: |
+            dist-out/*.zip
+            dist-out/SHA256SUMS.txt
+          generate_release_notes: true
