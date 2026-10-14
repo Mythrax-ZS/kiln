@@ -45,6 +45,7 @@ const MEMPOOL_OUT: usize = 0x10;
 const VOICE_IN: usize = 0x170;
 const VOICE_OUT: usize = 0x10;
 const CHANNEL_IN: usize = CHANNEL_SIZE;
+const EFFECT_IN: usize = 0xC0;
 const EFFECT_OUT: usize = 0x10;
 const SINK_OUT: usize = 0x20;
 const PERFORMANCE_OUT: usize = 0x10;
@@ -116,11 +117,28 @@ impl Parameters {
     }
 }
 
+/// Where an effect is in its life as the renderer sees it (`libnx` documents no effect, the names
+/// and the way the states follow are those of the console's renderer as other emulators describe
+/// it, docs/ASSUMPTIONS.md A-127).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EffectUse {
+    /// The slot holds no effect.
+    Invalid,
+    /// An effect the program has just made: reported as in use.
+    New,
+    Enabled,
+    /// An effect the program switched off: reported as removed, which is what it waits for.
+    Disabled,
+}
+
 /// The state of the renderer and the processing of one update.
 #[derive(Debug)]
 struct Core {
     params: Parameters,
     voices: Vec<Voice>,
+    /// What the renderer has done with each effect so far (an `EffectUse`): effects are not run,
+    /// but a program that removes one waits for the renderer to say it is gone.
+    effects: Vec<EffectUse>,
     mixer: Mixer,
     /// The interleaved stereo samples of the last frame, and whether it made any (it needs mixes
     /// and a device sink to play through).
@@ -156,6 +174,7 @@ impl Core {
         Core {
             params,
             voices: (0..params.voice_count).map(|_| Voice::default()).collect(),
+            effects: vec![EffectUse::Invalid; params.effect_count as usize],
             mixer: Mixer::default(),
             audio: Vec::new(),
             sounding: false,
@@ -167,8 +186,14 @@ impl Core {
     }
 
     /// Process an update buffer and return the output buffer; `mem` reads the program's memory
-    /// (the wave buffers). An `Err` names a layout this code does not know.
-    fn update(&mut self, input: &[u8], mem: ReadMemory<'_>) -> Result<Vec<u8>, String> {
+    /// (the wave buffers), `active` says whether the renderer has been started. An `Err` names a
+    /// layout this code does not know.
+    fn update(
+        &mut self,
+        input: &[u8],
+        mem: ReadMemory<'_>,
+        active: bool,
+    ) -> Result<Vec<u8>, String> {
         if input.len() < HEADER_SIZE {
             return Err(format!(
                 "an audio renderer update of {} bytes, which has no header",
@@ -344,6 +369,39 @@ impl Core {
             out[at..at + 8].copy_from_slice(&voice.played.to_le_bytes());
             put(&mut out, at + 8, voice.consumed);
             at += VOICE_OUT;
+        }
+        // Effects: not run, but kept in the books. The answer for an effect is what the renderer
+        // made of it in the frame before (a program that switches an effect off sees it used for
+        // one more update, then removed), and the frame this update starts makes it enabled, or
+        // disabled if the program does not want it.
+        let effects_at = voices_at + voices;
+        let effect_entries = if effects_at + effects <= total {
+            (effects / EFFECT_IN).min(self.effects.len())
+        } else {
+            0
+        };
+        for i in 0..effect_entries {
+            let entry = &input[effects_at + i * EFFECT_IN..effects_at + (i + 1) * EFFECT_IN];
+            let (kind, is_new, enabled) = (entry[0], entry[1] != 0, entry[2] != 0);
+            let usage = &mut self.effects[i];
+            if kind == 0 {
+                *usage = EffectUse::Invalid;
+            } else if is_new || *usage == EffectUse::Invalid {
+                *usage = EffectUse::New;
+            }
+            let removed = if active {
+                *usage == EffectUse::Disabled
+            } else {
+                *usage != EffectUse::New
+            };
+            out[at + i * EFFECT_OUT] = u8::from(removed);
+            if active && *usage != EffectUse::Invalid {
+                *usage = if enabled {
+                    EffectUse::Enabled
+                } else {
+                    EffectUse::Disabled
+                };
+            }
         }
         self.sounding = self.mixer.has_graph() && self.mixer.finish(&mut self.audio);
         self.seen.updates += 1;
@@ -622,7 +680,7 @@ impl Service for Renderer {
                     return Err(Stop("the audio update buffer is not readable".into()));
                 };
                 let mem = |addr: u64, out: &mut [u8]| kernel.read_memory(addr, out);
-                let out = self.core.update(&data, &mem).map_err(Stop)?;
+                let out = self.core.update(&data, &mem, self.started).map_err(Stop)?;
                 if self.started && self.core.sounding {
                     self.outputs.write(&self.core.audio);
                 }
@@ -671,7 +729,7 @@ mod tests {
     impl Core {
         /// An update that can read no memory.
         fn run(&mut self, input: &[u8]) -> Result<Vec<u8>, String> {
-            self.update(input, &|_, _| false)
+            self.update(input, &|_, _| false, true)
         }
     }
 
@@ -784,6 +842,81 @@ mod tests {
             out.len(),
             HEADER_SIZE + 3 * 0x10 + 2 * 0x10 + 3 * 0x10 + 0x20 + 0x10 + 0xB0
         );
+    }
+
+    /// `base` with the effect entries `(type, new, enabled)` after its voices.
+    fn with_effects(mut base: Vec<u8>, entries: &[(u8, bool, bool)]) -> Vec<u8> {
+        let at = HEADER_SIZE
+            + u32_at(&base, 0x04) as usize
+            + u32_at(&base, 0x08) as usize
+            + u32_at(&base, 0x10) as usize
+            + u32_at(&base, 0x0C) as usize;
+        let mut bytes = Vec::new();
+        for (kind, new, enabled) in entries {
+            let mut e = vec![0u8; EFFECT_IN];
+            e[0] = *kind;
+            e[1] = u8::from(*new);
+            e[2] = u8::from(*enabled);
+            bytes.extend(e);
+        }
+        base.splice(at..at, bytes.iter().copied());
+        let total = base.len() as u32;
+        base[0x14..0x18].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        base[0x3C..0x40].copy_from_slice(&total.to_le_bytes());
+        base
+    }
+
+    /// The state the answer gives for effect `i` (renderers with 3 pools and 2 voices).
+    fn effect_state(out: &[u8], i: usize) -> u8 {
+        out[HEADER_SIZE + 3 * MEMPOOL_OUT + 2 * VOICE_OUT + i * EFFECT_OUT]
+    }
+
+    #[test]
+    fn an_effect_the_program_switches_off_is_reported_removed_an_update_later() {
+        let mut core = Core::new(params());
+        let base = update(0x3556_4552, &[0; 3], &[voice(vec![]), voice(vec![])]);
+        let on = with_effects(
+            base.clone(),
+            &[(4, true, true), (0, false, false), (0, false, false)],
+        );
+        let off = with_effects(
+            base,
+            &[(4, false, false), (0, false, false), (0, false, false)],
+        );
+        // In use, and an empty slot is not reported removed.
+        let out = core.run(&on).unwrap();
+        assert_eq!([effect_state(&out, 0), effect_state(&out, 1)], [0, 0]);
+        assert_eq!(effect_state(&core.run(&on).unwrap(), 0), 0);
+        // Switched off: the frame before still had it, the next says it is gone.
+        assert_eq!(effect_state(&core.run(&off).unwrap(), 0), 0);
+        assert_eq!(effect_state(&core.run(&off).unwrap(), 0), 1);
+        assert_eq!(
+            effect_state(&core.run(&off).unwrap(), 0),
+            1,
+            "and it stays gone"
+        );
+    }
+
+    #[test]
+    fn a_renderer_that_was_not_started_runs_nothing_so_a_new_effect_stays_in_use() {
+        let mut core = Core::new(params());
+        let base = update(0x3556_4552, &[0; 3], &[voice(vec![]), voice(vec![])]);
+        let fresh = with_effects(
+            base.clone(),
+            &[(4, true, true), (0, false, false), (0, false, false)],
+        );
+        let out = core.update(&fresh, &|_, _| false, false).unwrap();
+        assert_eq!(effect_state(&out, 0), 0, "a new effect is in use");
+        // The program switches it off, but without the DSP running nothing makes it removed.
+        let off = with_effects(
+            base,
+            &[(4, false, false), (0, false, false), (0, false, false)],
+        );
+        let out = core.update(&off, &|_, _| false, false).unwrap();
+        assert_eq!(effect_state(&out, 0), 0);
+        // Started, the update after the next one says it is gone.
+        assert_eq!(effect_state(&core.run(&off).unwrap(), 0), 0);
+        assert_eq!(effect_state(&core.run(&off).unwrap(), 0), 1);
     }
 
     #[test]
