@@ -32,6 +32,9 @@ const PRESENT: u64 = 1 << 3;
 const READ: u64 = 1;
 const WRITE: u64 = 2;
 const EXEC: u64 = 4;
+/// The page is one `NX_TRAP_WRITES` asks about: it is writable but its entry does not say so, so
+/// that every write takes the checked path, which reports it ([`super::trap`]).
+const TRAP: u64 = 1 << 4;
 const FLAGS: u64 = 0xFFF;
 
 type L2 = [AtomicU64; L2_ENTRIES];
@@ -99,6 +102,7 @@ pub struct GuestMemory {
     l1: Box<[AtomicPtr<L2>]>,
     blocks: Mutex<Vec<Block>>,
     writes: Mutex<Writes>,
+    traps: super::trap::Traps,
 }
 
 /// The smallest block of memory whose writes are tracked: the memory of textures is in large
@@ -240,6 +244,11 @@ fn flags_of(p: u32) -> u64 {
 
 impl GuestMemory {
     pub fn new() -> GuestMemory {
+        Self::with_traps(super::trap::Traps::from_env())
+    }
+
+    /// Memory that reports the writes to the ranges of `traps`.
+    pub(crate) fn with_traps(traps: super::trap::Traps) -> GuestMemory {
         let l1: Vec<AtomicPtr<L2>> = std::iter::repeat_with(|| AtomicPtr::new(ptr::null_mut()))
             .take(L1_ENTRIES)
             .collect();
@@ -250,6 +259,17 @@ impl GuestMemory {
                 epoch: 1,
                 ..Writes::default()
             }),
+            traps,
+        }
+    }
+
+    /// The flags of the entry of the page at `addr` that is to have `flags`: a writable page that a
+    /// trap covers is made a trapped one.
+    fn entry_flags(&self, addr: u64, flags: u64) -> u64 {
+        if flags & WRITE != 0 && !self.traps.is_empty() && self.traps.covers(addr) {
+            (flags & !WRITE) | TRAP
+        } else {
+            flags
         }
     }
 
@@ -349,7 +369,8 @@ impl GuestMemory {
             let a = addr + page * PAGE_SIZE;
             // SAFETY: inside the block just allocated.
             let p = unsafe { host.add((page * PAGE_SIZE) as usize) } as u64;
-            self.l2_for_map(a)[((a >> 12) & 511) as usize].store(p | flags, Ordering::Release);
+            self.l2_for_map(a)[((a >> 12) & 511) as usize]
+                .store(p | self.entry_flags(a, flags), Ordering::Release);
         }
         Ok(())
     }
@@ -377,7 +398,8 @@ impl GuestMemory {
         for page in 0..size / PAGE_SIZE {
             let host = self.entry(src + page * PAGE_SIZE) & !FLAGS;
             let a = dst + page * PAGE_SIZE;
-            self.l2_for_map(a)[((a >> 12) & 511) as usize].store(host | flags, Ordering::Release);
+            self.l2_for_map(a)[((a >> 12) & 511) as usize]
+                .store(host | self.entry_flags(a, flags), Ordering::Release);
         }
         Ok(())
     }
@@ -408,7 +430,10 @@ impl GuestMemory {
             let t = self.l2(a).expect("checked");
             let slot = &t[((a >> 12) & 511) as usize];
             let old = slot.load(Ordering::Relaxed);
-            slot.store((old & !FLAGS) | flags, Ordering::Release);
+            slot.store(
+                (old & !FLAGS) | self.entry_flags(a, flags),
+                Ordering::Release,
+            );
         }
         Ok(())
     }
@@ -523,14 +548,25 @@ impl GuestMemory {
             .all(|a| self.entry(a) & PRESENT != 0)
     }
 
-    /// Host pointer for `bytes` bytes at `addr` inside one page, if the access is allowed.
-    fn page_ptr(&self, addr: u64, bytes: usize, write: bool) -> Result<*mut u8, FaultKind> {
+    /// Host pointer for `bytes` bytes at `addr` inside one page, if the access is allowed. A write
+    /// to a trapped page is allowed and reported (with `value`, when it is a store of a value).
+    fn page_ptr(
+        &self,
+        addr: u64,
+        bytes: usize,
+        write: bool,
+        value: Option<u128>,
+    ) -> Result<*mut u8, FaultKind> {
         let e = self.entry(addr);
         if e & PRESENT == 0 {
             return Err(FaultKind::Unmapped);
         }
         if e & if write { WRITE } else { READ } == 0 {
-            return Err(FaultKind::Permission);
+            if write && e & TRAP != 0 {
+                self.traps.hit(addr, bytes, value);
+            } else {
+                return Err(FaultKind::Permission);
+            }
         }
         let off = (addr & (PAGE_SIZE - 1)) as usize;
         debug_assert!(off + bytes <= PAGE_SIZE as usize);
@@ -542,7 +578,7 @@ impl GuestMemory {
     pub fn read(&self, addr: u64, size: u8, order: Ordering) -> Result<u128, FaultKind> {
         let n = usize::from(size);
         if (addr & (PAGE_SIZE - 1)) as usize + n <= PAGE_SIZE as usize {
-            let p = self.page_ptr(addr, n, false)?;
+            let p = self.page_ptr(addr, n, false, None)?;
             // SAFETY: `p` points at `n` readable bytes inside one page.
             return Ok(unsafe { load(p, size, order) });
         }
@@ -562,7 +598,7 @@ impl GuestMemory {
     ) -> Result<(), FaultKind> {
         let n = usize::from(size);
         if (addr & (PAGE_SIZE - 1)) as usize + n <= PAGE_SIZE as usize {
-            let p = self.page_ptr(addr, n, true)?;
+            let p = self.page_ptr(addr, n, true, Some(value))?;
             // SAFETY: `p` points at `n` writable bytes inside one page.
             unsafe { store(p, size, value, order) };
             return Ok(());
@@ -572,7 +608,7 @@ impl GuestMemory {
         let last = addr.checked_add(n as u64 - 1).ok_or(FaultKind::Unmapped)?;
         let mut at = addr;
         loop {
-            self.page_ptr(at, 0, true)?;
+            self.page_ptr(at, 0, true, None)?;
             let next = (at | (PAGE_SIZE - 1)) + 1;
             if next > last {
                 break;
@@ -616,8 +652,11 @@ impl GuestMemory {
             if e & PRESENT == 0 {
                 return Err(FaultKind::Unmapped);
             }
-            if check && e & WRITE == 0 {
+            if check && e & (WRITE | TRAP) == 0 {
                 return Err(FaultKind::Permission);
+            }
+            if e & TRAP != 0 {
+                self.traps.hit(at, n, None);
             }
             let dst = ((e & !FLAGS) as *mut u8).wrapping_add((at & (PAGE_SIZE - 1)) as usize);
             // SAFETY: `dst..dst + n` is inside a live page.
@@ -638,7 +677,7 @@ impl GuestMemory {
         new: u64,
         order: Ordering,
     ) -> Result<bool, FaultKind> {
-        let p = self.page_ptr(addr, usize::from(size), true)?;
+        let p = self.page_ptr(addr, usize::from(size), true, Some(u128::from(new)))?;
         // SAFETY: aligned, inside one writable page.
         let ok = unsafe {
             match size {
@@ -1056,6 +1095,52 @@ mod tests {
     }
 
     /// A block too small to be tracked is not answered for.
+    #[test]
+    fn writes_to_a_trapped_page_are_reported_and_still_done() {
+        use crate::rt::trap::Traps;
+        let m = GuestMemory::with_traps(Traps::parse("12000:1000"));
+        m.map(0x10000, 4 * PAGE_SIZE, perm::R | perm::W).unwrap();
+        // The page is writable as far as the guest can tell, but its entry says otherwise.
+        assert_eq!(m.entry(0x12000) & (WRITE | TRAP), TRAP);
+        assert_eq!(m.entry(0x11000) & (WRITE | TRAP), WRITE);
+        assert_eq!(m.entry(0x13000) & (WRITE | TRAP), WRITE);
+        // A write elsewhere is not reported.
+        m.write(0x11008, 8, 7, Ordering::Relaxed).unwrap();
+        assert_eq!(m.traps.hits(), 0);
+        // A write to the page is, whatever way it is made, and it is done.
+        m.write(0x12008, 4, 0xDEAD_BEEF, Ordering::Relaxed).unwrap();
+        assert_eq!(m.traps.hits(), 1);
+        m.write_bytes(0x12010, &[1, 2, 3], true).unwrap();
+        assert_eq!(m.traps.hits(), 2);
+        m.compare_exchange(0x12008, 4, 0xDEAD_BEEF, 5, Ordering::Relaxed)
+            .unwrap();
+        assert_eq!(m.traps.hits(), 3);
+        assert_eq!(m.read(0x12008, 4, Ordering::Relaxed).unwrap(), 5);
+        let mut back = [0u8; 3];
+        m.read_bytes(0x12010, &mut back, true).unwrap();
+        assert_eq!(back, [1, 2, 3]);
+        // Reads are not reported.
+        assert_eq!(m.traps.hits(), 3);
+        // Taking the page's write permission away and giving it back keeps it trapped.
+        m.protect(0x12000, PAGE_SIZE, perm::R).unwrap();
+        assert!(m.write(0x12008, 4, 1, Ordering::Relaxed).is_err());
+        m.protect(0x12000, PAGE_SIZE, perm::R | perm::W).unwrap();
+        assert_eq!(m.entry(0x12000) & (WRITE | TRAP), TRAP);
+    }
+
+    #[test]
+    fn a_trap_does_not_make_a_read_only_page_writable() {
+        use crate::rt::trap::Traps;
+        let m = GuestMemory::with_traps(Traps::parse("20000:2000"));
+        m.map(0x20000, PAGE_SIZE, perm::R).unwrap();
+        assert_eq!(m.entry(0x20000) & TRAP, 0);
+        assert_eq!(
+            m.write(0x20000, 4, 1, Ordering::Relaxed),
+            Err(FaultKind::Permission)
+        );
+        assert_eq!(m.traps.hits(), 0);
+    }
+
     #[test]
     fn small_blocks_are_not_tracked() {
         let mem = GuestMemory::new();
