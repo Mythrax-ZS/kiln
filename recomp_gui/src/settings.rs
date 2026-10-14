@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -36,9 +38,72 @@ impl Default for Settings {
     }
 }
 
-/// `games` beside the program (a portable layout), or in the user's home when that is not writable.
+/// `games` beside the program (a portable layout), or in the user's data folder when the program's
+/// own folder is not one a game can be written to (an AppImage is a read-only mount, and so can be
+/// a folder under `Program Files`).
 pub fn default_games_dir() -> PathBuf {
-    exe_dir().map_or_else(|| PathBuf::from("games"), |d| d.join("games"))
+    // Found once: finding it writes a file, and the answer must be the same every time.
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        games_dir_for(
+            exe_dir().as_deref(),
+            writable,
+            user_data_dir(),
+            // The AppImage runtime sets `APPIMAGE` whether it mounts the image or, without FUSE,
+            // unpacks it into a temporary folder that is gone when the program ends.
+            std::env::var_os("APPIMAGE").is_some(),
+        )
+    })
+    .clone()
+}
+
+/// The choice of [`default_games_dir`]: `games` in `program` when `can_write` says that folder (or
+/// `games` itself, once it exists) takes files, else `data/games`; always `data/games` in an
+/// AppImage.
+fn games_dir_for(
+    program: Option<&Path>,
+    can_write: impl Fn(&Path) -> bool,
+    data: PathBuf,
+    in_appimage: bool,
+) -> PathBuf {
+    if in_appimage {
+        return data.join("games");
+    }
+    match program {
+        Some(dir) => {
+            let games = dir.join("games");
+            if can_write(if games.is_dir() { &games } else { dir }) {
+                games
+            } else {
+                data.join("games")
+            }
+        }
+        None => PathBuf::from("games"),
+    }
+}
+
+/// Does a file get written in `dir`? (One is made and removed to find out.)
+fn writable(dir: &Path) -> bool {
+    static PROBES: AtomicU64 = AtomicU64::new(0);
+    let probe = dir.join(format!(
+        ".recomp-gui-write-test-{}-{}",
+        std::process::id(),
+        PROBES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let ok = std::fs::write(&probe, b"").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
+/// The folder a program keeps what it makes in: `%LOCALAPPDATA%\recomp-gui`,
+/// `$XDG_DATA_HOME/recomp-gui` or `~/.local/share/recomp-gui`.
+fn user_data_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("XDG_DATA_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("recomp-gui")
 }
 
 pub fn exe_dir() -> Option<PathBuf> {
@@ -104,6 +169,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn games_go_beside_the_program_unless_that_folder_takes_no_files() {
+        let program = Path::new("/mnt/app/usr/bin");
+        let data = PathBuf::from("/home/me/.local/share/recomp-gui");
+        assert_eq!(
+            games_dir_for(Some(program), |_| true, data.clone(), false),
+            program.join("games")
+        );
+        // A folder that takes no files (a read-only mount, Program Files): the user's data folder.
+        assert_eq!(
+            games_dir_for(Some(program), |_| false, data.clone(), false),
+            data.join("games")
+        );
+        // An AppImage, even one unpacked into a folder that takes files (it is temporary).
+        assert_eq!(
+            games_dir_for(Some(program), |_| true, data.clone(), true),
+            data.join("games")
+        );
+        // Where the program is is not known: a relative folder, as before.
+        assert_eq!(
+            games_dir_for(None, |_| false, data, false),
+            PathBuf::from("games")
+        );
+        // The real check: a folder we made takes files, one that does not exist does not.
+        let dir = temp("writable");
+        assert!(writable(&dir));
+        assert!(!writable(&dir.join("not-there")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
