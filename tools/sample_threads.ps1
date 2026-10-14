@@ -4,17 +4,20 @@
 # runtime's functions have their Rust names) or a module of the process (a driver, ntdll).
 #
 # usage: pwsh -File tools/sample_threads.ps1 -Map <map file> [-Process title] [-Samples 40]
-#            [-IntervalMs 50] [-Top 25] [-OnlyRunning]
+#            [-IntervalMs 50] [-Top 25] [-OnlyRunning] [-Callers]
 #
 # -OnlyRunning leaves out the threads the system says are waiting. The first column is how many
-# samples found a thread at the place, then the thread's id, then the place.
+# samples found a thread at the place, then the thread's id, then the place. -Callers adds, to a
+# sample that is outside the program (a system library), the first place of the program that a word
+# near the top of the thread's stack points into: usually who called it.
 param(
     [Parameter(Mandatory = $true)][string]$Map,
     [string]$Process = "title",
     [int]$Samples = 40,
     [int]$IntervalMs = 50,
     [int]$Top = 25,
-    [switch]$OnlyRunning
+    [switch]$OnlyRunning,
+    [switch]$Callers
 )
 Add-Type -TypeDefinition @"
 using System;
@@ -25,8 +28,15 @@ public static class ThreadIp {
     [DllImport("kernel32.dll")] static extern int ResumeThread(IntPtr h);
     [DllImport("kernel32.dll")] static extern bool GetThreadContext(IntPtr h, IntPtr ctx);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, IntPtr size, out IntPtr read);
+    static IntPtr process = IntPtr.Zero;
+    // The words at the top of a thread's stack, as of the last call of Rip (null when there are none).
+    public static ulong[] Stack;
     // The instruction pointer of a thread of this (64-bit) process, or 0 when it cannot be read.
-    public static ulong Rip(uint tid) {
+    // With words > 0 the words at the top of its stack are left in Stack.
+    public static ulong Rip(uint tid, uint pid, int words) {
+        Stack = null;
         // THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION
         IntPtr h = OpenThread(0x0002 | 0x0008 | 0x0040, false, tid);
         if (h == IntPtr.Zero) return 0;
@@ -39,7 +49,30 @@ public static class ThreadIp {
         Marshal.WriteInt32(ctx, 0x30, 0x100001);
         ulong rip = 0;
         if (SuspendThread(h) != 0xFFFFFFFF) {
-            if (GetThreadContext(h, ctx)) rip = (ulong)Marshal.ReadInt64(ctx, 0xF8);
+            if (GetThreadContext(h, ctx)) {
+                rip = (ulong)Marshal.ReadInt64(ctx, 0xF8);
+                if (words > 0) {
+                    ulong rsp = (ulong)Marshal.ReadInt64(ctx, 0x98);
+                    if (process == IntPtr.Zero) process = OpenProcess(0x10, false, pid);
+                    // Read page by page: the top of a stack is near the end of its memory, and a
+                    // read that reaches past it gets nothing at all.
+                    byte[] buf = new byte[words * 8];
+                    int have = 0;
+                    while (process != IntPtr.Zero && have < buf.Length) {
+                        ulong at = rsp + (ulong)have;
+                        int n = Math.Min(buf.Length - have, 4096 - (int)(at & 4095));
+                        byte[] part = new byte[n];
+                        IntPtr got;
+                        if (!ReadProcessMemory(process, (IntPtr)(long)at, part, (IntPtr)n, out got)) break;
+                        Array.Copy(part, 0, buf, have, n);
+                        have += n;
+                    }
+                    if (have >= 8) {
+                        Stack = new ulong[have / 8];
+                        for (int i = 0; i < Stack.Length; i++) Stack[i] = BitConverter.ToUInt64(buf, i * 8);
+                    }
+                }
+            }
             ResumeThread(h);
         }
         Marshal.FreeHGlobal(raw);
@@ -93,7 +126,14 @@ for ($n = 0; $n -lt $Samples; $n++) {
     $p.Refresh()
     foreach ($t in $p.Threads) {
         if ($OnlyRunning -and $t.ThreadState -ne "Running") { continue }
-        $key = "{0}  {1}" -f $t.Id, (Where-Is ([ThreadIp]::Rip([uint32]$t.Id)))
+        $rip = [ThreadIp]::Rip([uint32]$t.Id, [uint32]$p.Id, $(if ($Callers) { 1536 } else { 0 }))
+        $where = Where-Is $rip
+        if ($Callers -and $rip -ne 0 -and ($rip -lt $base -or $rip -ge $base + 0x20000000) -and [ThreadIp]::Stack) {
+            foreach ($w in [ThreadIp]::Stack) {
+                if ($w -ge $base -and $w -lt $base + 0x20000000) { $where += "  <- " + (Where-Is $w); break }
+            }
+        }
+        $key = "{0}  {1}" -f $t.Id, $where
         if ($counts.ContainsKey($key)) { $counts[$key]++ } else { $counts[$key] = 1 }
     }
     Start-Sleep -Milliseconds $IntervalMs
