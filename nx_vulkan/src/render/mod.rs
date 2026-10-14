@@ -177,10 +177,24 @@ struct Lap {
 }
 
 impl Lap {
-    fn add(&mut self, since: std::time::Instant) {
-        self.calls += 1;
-        self.time += since.elapsed();
+    fn add(&mut self, since: Option<std::time::Instant>) {
+        if let Some(since) = since {
+            self.calls += 1;
+            self.time += since.elapsed();
+        }
     }
+}
+
+/// Whether the time of the steps is measured (`NX_TRACE_GPU`, `NX_TRACE_PERF`). Reading the clock
+/// costs tens of nanoseconds and a draw reads it twenty times, so it is read only when a report
+/// will say what it found.
+static TIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The time now, if the steps are being measured.
+fn stopwatch() -> Option<std::time::Instant> {
+    TIMING
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(std::time::Instant::now)
 }
 
 /// Where the renderer spent its time since the last report (`NX_TRACE_GPU` reports every 100
@@ -222,6 +236,7 @@ impl Renderer {
     fn core(&mut self) -> Result<&mut Core, String> {
         if self.core.is_none() {
             let debug = Debug::from_env();
+            TIMING.store(debug.trace_gpu, std::sync::atomic::Ordering::Relaxed);
             // A window comes first: the device is made with what presenting to it needs.
             #[cfg(feature = "window")]
             let window = self.config.window.and_then(|(w, h)| {
@@ -861,7 +876,7 @@ impl Renderer {
     /// Show a displayed buffer, and every 100th say where the time of the last 100 went.
     fn present_command(&mut self, p: &Present) -> Result<(), String> {
         let _phase = nx_gpu::progress::enter(nx_gpu::progress::PRESENTING);
-        let entered = std::time::Instant::now();
+        let entered = stopwatch();
         let result = self.present_frame(p);
         self.frame_draws = 0;
         self.spent.present.add(entered);
@@ -1074,7 +1089,7 @@ impl Renderer {
 
 impl Backend for Renderer {
     fn draw(&mut self, scene: &Scene<'_>, draw: &Draw) -> Result<(), String> {
-        let started = std::time::Instant::now();
+        let started = stopwatch();
         let result = self.draw_command(scene, draw);
         self.spent.draw.add(started);
         self.frame_draws += 1;
@@ -1085,14 +1100,14 @@ impl Backend for Renderer {
     }
 
     fn clear(&mut self, scene: &Scene<'_>, clear: &Clear) -> Result<(), String> {
-        let started = std::time::Instant::now();
+        let started = stopwatch();
         let result = self.clear_command(scene, clear);
         self.spent.clear.add(started);
         result
     }
 
     fn finish(&mut self) -> Result<(), String> {
-        let started = std::time::Instant::now();
+        let started = stopwatch();
         let result = self.finish_command();
         self.spent.finish.add(started);
         result
@@ -1103,7 +1118,7 @@ impl Backend for Renderer {
     }
 
     fn dispatch(&mut self, scene: &Scene<'_>, dispatch: &Dispatch) -> Result<(), String> {
-        let started = std::time::Instant::now();
+        let started = stopwatch();
         let result = self.core().and_then(|core| core.dispatch(scene, dispatch));
         self.spent.dispatch.add(started);
         if result.is_err() {

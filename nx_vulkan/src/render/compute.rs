@@ -34,11 +34,13 @@ impl ComputePipelines {
 
 impl Core {
     pub(super) fn dispatch(&mut self, scene: &Scene<'_>, d: &Dispatch) -> Result<(), String> {
-        let mut mark = Instant::now();
+        let mut mark = super::stopwatch();
         let mut lap = |into: &mut std::time::Duration| {
-            let now = Instant::now();
-            *into += now - mark;
-            mark = now;
+            if let Some(mark) = &mut mark {
+                let now = Instant::now();
+                *into += now - *mark;
+                *mark = now;
+            }
         };
         let program =
             self.shaders

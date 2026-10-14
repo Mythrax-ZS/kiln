@@ -15,10 +15,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Add the time since `mark` to `into` and start the next step.
-fn lap(mark: &mut Instant, into: &mut Duration, _step: &'static str) {
-    let now = Instant::now();
-    *into += now - *mark;
-    *mark = now;
+fn lap(mark: &mut Option<Instant>, into: &mut Duration, _step: &'static str) {
+    if let Some(mark) = mark {
+        let now = Instant::now();
+        *into += now - *mark;
+        *mark = now;
+    }
     #[cfg(feature = "alloc_stats")]
     crate::alloc_stats::lap(_step);
 }
@@ -214,7 +216,7 @@ impl Core {
             },
             depth_minus_one_to_one: !window.z_zero_to_one,
         };
-        let mut mark = Instant::now();
+        let mut mark = super::stopwatch();
         let vs = self.shaders.program(
             &self.vk,
             scene,
@@ -639,7 +641,7 @@ impl Core {
                     pools.header_count, pools.sampler_count
                 ));
             }
-            let mut mark = Instant::now();
+            let mut mark = super::stopwatch();
             let mut tic_bytes = [0u8; 32];
             self.read_exact(
                 scene,
