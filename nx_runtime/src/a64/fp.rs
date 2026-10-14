@@ -541,7 +541,61 @@ pub fn div(env: &mut Env, fmt: Fmt, a: u64, b: u64) -> u64 {
 }
 
 /// `FPSqrt`.
+///
+/// A positive normal number, with rounding to nearest, is done by the host: its square root is
+/// correctly rounded like the architecture's, and the only flag it can raise is "inexact", which
+/// is told by checking whether the root squared is the operand. The bit-by-bit root of the general
+/// path took over two thirds of the time of the title's main thread in a scene.
 pub fn sqrt(env: &mut Env, fmt: Fmt, a: u64) -> u64 {
+    if env.rounding() == Rounding::Nearest {
+        match fmt {
+            Fmt::S => {
+                let x = f32::from_bits(a as u32);
+                if x.is_normal() && x > 0.0 {
+                    let r = x.sqrt();
+                    // A root of 24 bits squared is exact in a double.
+                    let wide = f64::from(r);
+                    if wide * wide != f64::from(x) {
+                        env.raise(IXC);
+                    }
+                    return u64::from(r.to_bits());
+                }
+            }
+            Fmt::D => {
+                let x = f64::from_bits(a);
+                if x.is_normal() && x > 0.0 {
+                    let r = x.sqrt();
+                    if !square_is_exact(r, x) {
+                        env.raise(IXC);
+                    }
+                    return r.to_bits();
+                }
+            }
+            Fmt::H => {}
+        }
+    }
+    sqrt_general(env, fmt, a)
+}
+
+/// Is `r * r == x` exactly, for normal positive `r` and `x`?
+fn square_is_exact(r: f64, x: f64) -> bool {
+    // A normal number is `m * 2^e` with `m` of 53 bits.
+    let parts = |v: f64| -> (u128, i32) {
+        let bits = v.to_bits();
+        (
+            u128::from((bits & ((1 << 52) - 1)) | (1 << 52)),
+            ((bits >> 52) & 0x7FF) as i32 - 1075,
+        )
+    };
+    let (mr, er) = parts(r);
+    let (mx, ex) = parts(x);
+    // `mr * mr` has 105 or 106 bits and `mx` 53: they can only meet by shifting `mx` up.
+    let shift = ex - 2 * er;
+    (0..=60).contains(&shift) && mr * mr == mx << shift
+}
+
+/// `FPSqrt` by the exact path, for every operand.
+fn sqrt_general(env: &mut Env, fmt: Fmt, a: u64) -> u64 {
     let ua = unpack(env, fmt, a);
     if ua.is_nan() {
         return process_nan(env, fmt, &ua);

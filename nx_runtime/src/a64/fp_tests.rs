@@ -390,6 +390,38 @@ fn add_sub_mul_div_match_the_hardware_in_every_rounding_mode() {
 }
 
 #[test]
+fn square_root_is_inexact_exactly_when_the_root_is_not_a_whole_binary_fraction() {
+    let mut rng = Rng::new(0x5128);
+    for _ in 0..20_000 {
+        // The squares of numbers of up to 26 bits (24 for singles) are exact, and a square
+        // plus one is not, in either width and at any scale.
+        let k = rng.next_u64() & ((1 << 26) - 1) | 1;
+        let scale = (rng.next_u64() % 120) as i32 - 60;
+        let x = (k * k) as f64 * 2f64.powi(2 * scale);
+        let y = ((k * k + 1) as f64) * 2f64.powi(2 * scale);
+        let mut env = Env::new(0, 0);
+        let r = sqrt(&mut env, Fmt::D, x.to_bits());
+        assert_eq!(f64::from_bits(r), k as f64 * 2f64.powi(scale), "{x}");
+        assert_eq!(env.fpsr, 0, "sqrt of {x} is exact");
+        let mut env = Env::new(0, 0);
+        sqrt(&mut env, Fmt::D, y.to_bits());
+        assert_eq!(env.fpsr, IXC, "sqrt of {y} is not");
+
+        let k = k & ((1 << 12) - 1) | 1;
+        let scale = scale / 4;
+        let x = (k * k) as f32 * 2f32.powi(2 * scale);
+        let y = ((k * k + 1) as f32) * 2f32.powi(2 * scale);
+        let mut env = Env::new(0, 0);
+        let r = sqrt(&mut env, Fmt::S, u64::from(x.to_bits()));
+        assert_eq!(f32::from_bits(r as u32), k as f32 * 2f32.powi(scale), "{x}");
+        assert_eq!(env.fpsr, 0, "sqrt of {x} is exact");
+        let mut env = Env::new(0, 0);
+        sqrt(&mut env, Fmt::S, u64::from(y.to_bits()));
+        assert_eq!(env.fpsr, IXC, "sqrt of {y} is not");
+    }
+}
+
+#[test]
 fn square_root_matches_the_hardware() {
     let mut rng = Rng::new(0x5127);
     for mode in MODES {
