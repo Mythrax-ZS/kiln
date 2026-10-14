@@ -15,6 +15,8 @@ What is in this folder
   recomp.exe       the recompiler (the front end runs it; you can use it from a terminal too)
   nx_runtime.lib   the runtime every recompiled game links with (keep it beside recomp.exe)
   doctor.cmd       shows what this PC has for a build (the compiler, the runtime library)
+  setup-toolchain.cmd  installs the compiler and the Windows libraries a build needs, if this PC
+                   has none (it starts Microsoft's own installer; see below)
   selftest.cmd     builds and runs a tiny program that is part of the bundle, with no game:
                    it proves that the compiler and the linking work on this PC
   VERSION.txt      what version this is and where it came from
@@ -24,11 +26,15 @@ What your PC needs
 1. Windows 10 or 11 (64-bit) and a graphics card and driver with Vulkan 1.3. It has only been
    run on one NVIDIA GeForce RTX 5070 Ti; AMD and Intel cards are untested. Plan on 8 GB of RAM
    or more (the running game uses about 4 GB).
-2. clang and lld, and the Windows SDK libraries, to compile and link what recomp generates. The
-   simplest way is "Build Tools for Visual Studio" (free from Microsoft): in its installer tick
-   "Desktop development with C++" and, among the optional parts on the right, "C++ Clang tools
-   for Windows". recomp finds the clang inside it by itself. With another clang, put it on the
-   PATH or give its path in the Settings screen of recomp-gui.
+2. clang and lld, and the Windows SDK libraries, to compile and link what recomp generates.
+   They are not in this folder. Double-click setup-toolchain.cmd: if recomp finds no clang it
+   offers to install "Build Tools for Visual Studio 2022" (free, from Microsoft; a few GB, 10 to 20
+   minutes, Windows asks for permission) with the C++ workload and the C++ Clang compiler.
+   By hand it is the same: in the installer of Build Tools for Visual Studio tick "Desktop
+   development with C++" and, among the optional parts on the right, "C++ Clang tools for
+   Windows". recomp finds the clang inside it by itself. With another clang, put it on the PATH
+   or give its path in the Settings screen of recomp-gui. (The script has not been run on a PC
+   that had nothing: if it fails, do it by hand.)
    If recomp-gui.exe or a built game will not start because a vcruntime140 file is missing,
    install "Microsoft Visual C++ Redistributable 2015-2022 (x64)" (Build Tools installs it too).
 3. The extracted ExeFS and RomFS of the game, from your own copy: a folder or an image for each.
@@ -36,7 +42,8 @@ What your PC needs
 
 First run
 ---------
-1. Double-click doctor.cmd. It should name a clang and the runtime library (nx_runtime.lib).
+1. Double-click doctor.cmd. It should name a clang and the runtime library (nx_runtime.lib);
+   if it says clang: not found, run setup-toolchain.cmd first.
 2. Double-click selftest.cmd. It should end with "selftest passed".
 3. Run recomp-gui.exe. Choose the folder that holds the game's exefs and romfs folders (or drop
    it on the window) and press Recompile; the output of the build streams into the window. The

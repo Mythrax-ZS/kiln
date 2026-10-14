@@ -180,12 +180,14 @@ clang and Unicorn.
   runtime on Linux).
 - **bundle** (after **windows**): `cargo build --release --workspace`, then `tools/bundle.ps1`
   makes `recomp-<version>-<commit>-windows-x64.zip` from `recomp-gui.exe`, `recomp.exe` and
-  `nx_runtime.lib` with a README, `doctor.cmd` and `selftest.cmd` (it compiles and runs a tiny
-  synthetic program, no game needed), and the job unpacks the zip somewhere else, with no `cargo`
-  on the machine, and runs the self-test. The zip (with `SHA256SUMS.txt`) is the run's artifact
-  `recomp-windows-x64`, kept 30 days. A push to `main` that passes also keeps it for good: the
-  release makes a tag `build-<run number>-<commit>` on that commit and a pre-release with the zip
-  (never marked "latest"); pushing a tag `v*` by hand makes a normal release of it instead.
+  `nx_runtime.lib` with a README, `doctor.cmd`, `selftest.cmd` (it compiles and runs a tiny
+  synthetic program, no game needed) and `setup-toolchain.cmd` (it starts Microsoft's installer
+  for the clang and the Windows libraries a build needs; clang is not in the bundle), and the job unpacks the zip somewhere else, with no `cargo`
+  on the machine, and runs the self-test. A push to `main` that passes keeps the zip (with
+  `SHA256SUMS.txt`) for good: the release makes a tag `build-<run number>-<commit>` on that commit
+  and a pre-release (never marked "latest"); pushing a tag `v*` by hand makes a normal release of
+  it instead. A pull request or a manual run keeps it as the artifact `recomp-windows-x64` for 30
+  days.
 
 What no runner has: a Vulkan device (the renderer's tests print `SKIPPED` and pass), `spirv-val`
 and `astcenc`, and any game. The bundle holds no game, key or firmware; a person who gets it

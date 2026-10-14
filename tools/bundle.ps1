@@ -10,7 +10,7 @@
 #   `selftest.cmd`. A bundle without one is refused unless -NoSelftest says so.
 #
 # The bundle holds recomp-gui.exe, recomp.exe and nx_runtime.lib from target\release, the README,
-# doctor.cmd and selftest.cmd of `dist\`, and VERSION.txt. No game data, keys or firmware: nothing
+# doctor.cmd, selftest.cmd and setup-toolchain.cmd of `dist\`, and VERSION.txt. No game data, keys or firmware: nothing
 # is read from anywhere but target\release, dist\ and -Selftest.
 param(
     [string]$Out = "dist-out",
@@ -52,7 +52,10 @@ $name = "recomp-$version-$sha-windows-x64"
 
 $outDir = Join-Path $repo $Out
 $stage = Join-Path $outDir $name
-if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+if (Test-Path $stage) {
+    try { Remove-Item -Recurse -Force $stage }
+    catch { throw "cannot clear $stage ($($_.Exception.Message)): is a program running from it? Close it or give another -Out" }
+}
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
 foreach ($f in $files) {
@@ -70,6 +73,7 @@ function Copy-Text($from, $to) {
 Copy-Text (Join-Path $repo "dist\README.txt") (Join-Path $stage "README.txt")
 Copy-Text (Join-Path $repo "dist\doctor.cmd") (Join-Path $stage "doctor.cmd")
 Copy-Text (Join-Path $repo "dist\selftest.cmd") (Join-Path $stage "selftest.cmd")
+Copy-Text (Join-Path $repo "dist\setup-toolchain.cmd") (Join-Path $stage "setup-toolchain.cmd")
 
 if (-not $NoSelftest) {
     $target = Join-Path $stage "selftest\exefs"

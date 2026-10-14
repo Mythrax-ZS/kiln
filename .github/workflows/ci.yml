@@ -213,8 +213,11 @@ jobs:
           "short=$short" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
           "tag=build-$env:RUN-$short" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
 
-      # Every run keeps its bundle for 30 days, pull requests included.
+      # A pull request or a manual run keeps its bundle as an artifact for 30 days; a push to
+      # `main` or a tag keeps it in a release instead (artifacts count against the repository's
+      # storage allowance, a release does not).
       - uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
         with:
           name: recomp-windows-x64
           path: |
