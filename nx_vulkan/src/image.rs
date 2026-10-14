@@ -17,7 +17,7 @@ pub struct ImageInfo {
     /// Mip levels (the base level alone is 1).
     pub levels: u32,
     pub usage: vk::ImageUsageFlags,
-    /// The view type: `TYPE_2D`, `TYPE_2D_ARRAY`, `CUBE` or `TYPE_3D`.
+    /// The view type: `TYPE_1D`, `TYPE_2D`, `TYPE_2D_ARRAY`, `CUBE` or `TYPE_3D`.
     pub view_type: vk::ImageViewType,
     /// What the view makes of the components (identity unless a texture says otherwise).
     pub components: vk::ComponentMapping,
@@ -105,6 +105,10 @@ impl Vk {
     pub fn create_image(&self, info: ImageInfo) -> Result<Image, String> {
         let d = &self.device;
         let volume = info.view_type == vk::ImageViewType::TYPE_3D;
+        let line = matches!(
+            info.view_type,
+            vk::ImageViewType::TYPE_1D | vk::ImageViewType::TYPE_1D_ARRAY
+        );
         let cube = matches!(
             info.view_type,
             vk::ImageViewType::CUBE | vk::ImageViewType::CUBE_ARRAY
@@ -112,13 +116,16 @@ impl Vk {
         let mut ci = vk::ImageCreateInfo::default()
             .image_type(if volume {
                 vk::ImageType::TYPE_3D
+            } else if line {
+                vk::ImageType::TYPE_1D
             } else {
                 vk::ImageType::TYPE_2D
             })
             .format(info.format)
             .extent(vk::Extent3D {
                 width: info.width,
-                height: info.height,
+                // A 1D image is one texel tall.
+                height: if line { 1 } else { info.height },
                 depth: if volume { info.depth } else { 1 },
             })
             .mip_levels(info.levels.max(1))

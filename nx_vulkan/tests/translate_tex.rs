@@ -428,6 +428,59 @@ fn tex_reads_its_operands_from_ra_and_the_register_after_rb() {
 }
 
 #[test]
+fn tex_and_texs_of_a_1d_texture_read_texels_by_the_x_coordinate() {
+    let Some(vk) = vulkan() else { return };
+    // Four texels in a row; a texel says where it is.
+    let texel = |x: u32| [x as f32, 10.0 + x as f32, 20.0 + x as f32, 30.0 + x as f32];
+    let texels: Vec<[f32; 4]> = (0..4).map(texel).collect();
+    let bytes = floats(&texels);
+    // `TEX` of dimension 0 (x in R1, level zero) into R4..R7; `TEXS` of kind 0 (x in `Ra`)
+    // into R8..R11 and, alone, the alpha into R12.
+    let program = [
+        tex(4, 1, RZ, 0, 0xF, 1, false).build(),
+        texs(8, 1, RZ, 10, 4, 0, true).build(),
+        texs(12, 1, RZ, RZ, 3, 0, true).build(),
+        exit(Guard::ALWAYS),
+    ];
+    // The middle of each texel, and past both ends (clamped to the edge).
+    let points: [(f32, u32); 6] = [
+        ((0.0 + 0.5) / 4.0, 0),
+        ((1.0 + 0.5) / 4.0, 1),
+        ((2.0 + 0.5) / 4.0, 2),
+        ((3.0 + 0.5) / 4.0, 3),
+        (-0.25, 0),
+        (1.25, 3),
+    ];
+    let inputs: Vec<State> = points.iter().map(|(u, _)| regs(&[(1, *u)])).collect();
+    let extras = Extras {
+        images: vec![image(
+            SampledKind::D1,
+            vk::Format::R32G32B32A32_SFLOAT,
+            (4, 1, 1),
+            1,
+            false,
+            &bytes,
+        )],
+        ..Extras::default()
+    };
+    let out = run_with(&vk, &program, &inputs, &[], extras);
+    for (i, (got, (_, x))) in out.states.iter().zip(&points).enumerate() {
+        let want = texel(*x);
+        assert_eq!(
+            [f(got, 4), f(got, 5), f(got, 6), f(got, 7)],
+            want,
+            "TEX sample {i}"
+        );
+        assert_eq!(
+            [f(got, 8), f(got, 9), f(got, 10), f(got, 11)],
+            want,
+            "TEXS sample {i}"
+        );
+        assert_eq!(f(got, 12), want[3], "alpha alone, sample {i}");
+    }
+}
+
+#[test]
 fn tex_of_an_array_a_volume_and_a_cube() {
     let Some(vk) = vulkan() else { return };
     // An array of three 2x2 layers.

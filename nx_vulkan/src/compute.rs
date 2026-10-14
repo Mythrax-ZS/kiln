@@ -59,6 +59,7 @@ pub struct SampledImage<'a> {
 /// The kind of view a test image is bound through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampledKind {
+    D1,
     D2,
     D2Array,
     Cube,
@@ -296,6 +297,7 @@ impl Vk {
                     layers: i.layers,
                     usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
                     view_type: match i.kind {
+                        SampledKind::D1 => vk::ImageViewType::TYPE_1D,
                         SampledKind::D2 => vk::ImageViewType::TYPE_2D,
                         SampledKind::D2Array => vk::ImageViewType::TYPE_2D_ARRAY,
                         SampledKind::Cube => vk::ImageViewType::CUBE,

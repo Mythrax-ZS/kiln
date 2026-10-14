@@ -669,6 +669,7 @@ struct Texture {
 /// How a shader sees a texture: the type of image view the descriptor needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
+    D1,
     D2,
     D2Array,
     Cube,
@@ -706,6 +707,9 @@ pub fn shape_of(tic: &Tic, used: &TextureUse) -> Result<Shape, String> {
         })
     };
     match (used.dim, used.arrayed) {
+        // Plain 1D: a 1D texture, or the first layer of a 1D array. (A 1D array is not sampled:
+        // the translator refuses `TEX` of one.)
+        (Dim::D1, false) if matches!(ty, 0 | 4) => shape(Kind::D1, 1, 1),
         // Plain 2D: a 2D texture, or the first layer of an array or of a cube.
         (Dim::D2, false) if matches!(ty, 1 | 3 | 5 | 7) => shape(Kind::D2, 1, 1),
         (Dim::D2, true) if matches!(ty, 1 | 7) => shape(Kind::D2Array, 1, 1),
@@ -1038,6 +1042,7 @@ impl Textures {
             levels,
             usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
             view_type: match shape.kind {
+                Kind::D1 => vk::ImageViewType::TYPE_1D,
                 Kind::D2 => vk::ImageViewType::TYPE_2D,
                 Kind::D2Array => vk::ImageViewType::TYPE_2D_ARRAY,
                 Kind::Cube => vk::ImageViewType::CUBE,
@@ -1447,6 +1452,34 @@ mod tests {
             layers: 1,
             tiling: Tiling::Block(block),
         }
+    }
+
+    #[test]
+    fn a_1d_header_is_a_1d_image_when_a_shader_samples_it_as_one() {
+        let line = TextureUse {
+            dim: Dim::D1,
+            ..plain_2d()
+        };
+        // A 1D texture (type 0), and the first layer of a 1D array (type 4): 256 texels in a row.
+        for ty in [0, 4] {
+            let (tic, _) = header_of(ty, (256, 1), 1, 1, 0);
+            let shape = shape_of(&tic, &line).unwrap();
+            assert_eq!((shape.kind, shape.layers, shape.depth), (Kind::D1, 1, 1));
+            let format = texture_format(tic.components(), tic.types()[0], tic.srgb()).unwrap();
+            let plan = plan(&tic, shape, format).unwrap();
+            assert_eq!((plan.width, plan.height, plan.layers), (256, 1, 1));
+        }
+        // A 2D header sampled as 1D and a 1D header sampled as 2D are refused, and so is a 1D
+        // array sampled as one (the translator does not make that program).
+        let (flat, _) = header_of(1, (256, 1), 1, 1, 0);
+        assert!(shape_of(&flat, &line).is_err());
+        let (tic, _) = header_of(0, (256, 1), 1, 1, 0);
+        assert!(shape_of(&tic, &plain_2d()).is_err());
+        let array = TextureUse {
+            arrayed: true,
+            ..line
+        };
+        assert!(shape_of(&tic, &array).is_err());
     }
 
     #[test]
