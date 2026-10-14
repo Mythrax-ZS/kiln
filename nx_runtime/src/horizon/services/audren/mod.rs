@@ -1,19 +1,28 @@
 //! `audren:u`, the audio renderer (Switchbrew, "Audio services"; the layouts of the update buffers
 //! are those `libnx` documents for the revisions 1 to 6 of the renderer).
 //!
-//! Nothing is mixed and nothing is played (docs/ASSUMPTIONS.md A-075). The renderer is the
-//! bookkeeping a program can see: it answers each update with the state of its memory pools, voices
-//! and sinks, lets the voices consume their wave buffers in the time those samples would take, and
-//! sets the system event once per audio frame (5 ms) so the program's audio thread goes on. A
-//! layout this code does not know stops the run.
+//! The renderer is what a program can see of the console's audio DSP (docs/ASSUMPTIONS.md A-075,
+//! A-125). Each update is answered with the state of the memory pools, voices and sinks, and plays
+//! one audio frame (`sample_count` output samples, 5 ms) of the voices' wave buffers: the samples
+//! are decoded, mixed through the mixes to the device sink and handed to the sound device (see
+//! [`super::super::audio_out`]). The system event is set once per audio frame so the program's
+//! audio thread goes on. Effects and the filters of voices are not applied. A layout this code
+//! does not know stops the run.
 
+mod adpcm;
+mod mixer;
+mod voice;
+
+use super::super::audio_out::Outputs;
 use super::super::kernel::Kernel;
 use super::super::object::KObject;
 use super::super::result::ResultCode;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
+use mixer::{Channel, Mixer, CHANNEL_SIZE, MIX_SIZE, SINK_SIZE};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+use voice::{Format, ReadMemory, Voice, VoiceIn};
 
 /// The audio frame: 5 ms (200 per second), whatever the sample rate (Switchbrew; `libnx`).
 const FRAME_PERIOD: Duration = Duration::from_millis(5);
@@ -35,7 +44,7 @@ const MEMPOOL_IN: usize = 0x20;
 const MEMPOOL_OUT: usize = 0x10;
 const VOICE_IN: usize = 0x170;
 const VOICE_OUT: usize = 0x10;
-const CHANNEL_IN: usize = 0x70;
+const CHANNEL_IN: usize = CHANNEL_SIZE;
 const EFFECT_OUT: usize = 0x10;
 const SINK_OUT: usize = 0x20;
 const PERFORMANCE_OUT: usize = 0x10;
@@ -47,14 +56,6 @@ const POOL_REQUEST_DETACH: u32 = 2;
 const POOL_DETACHED: u32 = 3;
 const POOL_REQUEST_ATTACH: u32 = 4;
 const POOL_ATTACHED: u32 = 5;
-
-/// Voice play state: started (`AudioRendererVoicePlayState_Started`).
-const VOICE_STARTED: u8 = 0;
-
-/// The wave buffers of a voice: a ring of four.
-const WAVE_BUFFERS: usize = 4;
-const WAVE_BUFFER_SIZE: usize = 0x38;
-const WAVE_BUFFERS_AT: usize = 0x60;
 
 /// The parameters a renderer was opened with (`libnx`: `AudioRendererParameter`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -75,7 +76,6 @@ fn u32_at(b: &[u8], o: usize) -> u32 {
         .map_or(0, |s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
-#[cfg(test)]
 fn u64_at(b: &[u8], o: usize) -> u64 {
     u64::from(u32_at(b, o)) | (u64::from(u32_at(b, o + 4)) << 32)
 }
@@ -116,37 +116,59 @@ impl Parameters {
     }
 }
 
-/// What the renderer keeps for one voice between updates.
-#[derive(Clone, Copy, Debug, Default)]
-struct Voice {
-    /// Wave buffers finished since the voice began: the number the program reads back.
-    consumed: u32,
-    /// Samples played since the voice began.
-    played: u64,
-    /// Samples already played of the wave buffer at the head of the ring.
-    position: u64,
-    /// The part of a sample the pitch left over at the end of the last frame.
-    fraction: f64,
-}
-
 /// The state of the renderer and the processing of one update.
 #[derive(Debug)]
 struct Core {
     params: Parameters,
     voices: Vec<Voice>,
+    mixer: Mixer,
+    /// The interleaved stereo samples of the last frame, and whether it made any (it needs mixes
+    /// and a device sink to play through).
+    audio: Vec<i16>,
+    sounding: bool,
+    /// What has been said already, so that it is said once.
+    said_header: bool,
+    said_formats: u32,
+    /// `NX_TRACE_AUDIO`: say every second (200 updates) what the voices did.
+    trace: bool,
+    seen: Seen,
+}
+
+/// What the voices did since the last line of `NX_TRACE_AUDIO`.
+#[derive(Debug, Default)]
+struct Seen {
+    updates: u32,
+    /// Voice-updates in which a voice was used, started, and made samples.
+    used: u32,
+    started: u32,
+    made: u32,
+    /// Started voices by sample format: ADPCM, 16-bit PCM, others.
+    adpcm: u32,
+    pcm16: u32,
+    other: u32,
+    /// Updates that were mixed to the sink, and the largest sample of those.
+    sounding: u32,
+    peak: i32,
 }
 
 impl Core {
     fn new(params: Parameters) -> Core {
         Core {
             params,
-            voices: vec![Voice::default(); params.voice_count as usize],
+            voices: (0..params.voice_count).map(|_| Voice::default()).collect(),
+            mixer: Mixer::default(),
+            audio: Vec::new(),
+            sounding: false,
+            said_header: false,
+            said_formats: 0,
+            trace: std::env::var_os("NX_TRACE_AUDIO").is_some(),
+            seen: Seen::default(),
         }
     }
 
-    /// Process an update buffer and return the output buffer. An `Err` names a layout this code
-    /// does not know.
-    fn update(&mut self, input: &[u8]) -> Result<Vec<u8>, String> {
+    /// Process an update buffer and return the output buffer; `mem` reads the program's memory
+    /// (the wave buffers). An `Err` names a layout this code does not know.
+    fn update(&mut self, input: &[u8], mem: ReadMemory<'_>) -> Result<Vec<u8>, String> {
         if input.len() < HEADER_SIZE {
             return Err(format!(
                 "an audio renderer update of {} bytes, which has no header",
@@ -163,7 +185,21 @@ impl Core {
         let pools = u32_at(input, 0x08) as usize;
         let voices = u32_at(input, 0x0C) as usize;
         let channels = u32_at(input, 0x10) as usize;
+        let effects = u32_at(input, 0x14) as usize;
+        let mixes = u32_at(input, 0x18) as usize;
+        let sinks = u32_at(input, 0x1C) as usize;
         let total = u32_at(input, 0x3C) as usize;
+        if !self.said_header && std::env::var_os("NX_TRACE_SVC").is_some() {
+            self.said_header = true;
+            let words: Vec<String> = (0..16)
+                .map(|i| format!("{:#x}", u32_at(input, i * 4)))
+                .collect();
+            eprintln!(
+                "[audren] the first update has {:#x} bytes, header {}",
+                input.len(),
+                words.join(" ")
+            );
+        }
         if behavior != BEHAVIOR_IN
             || !pools.is_multiple_of(MEMPOOL_IN)
             || !voices.is_multiple_of(VOICE_IN)
@@ -188,14 +224,20 @@ impl Core {
             ));
         }
         let pools_at = HEADER_SIZE + behavior;
-        let voices_at = pools_at + pools + channels;
+        let channels_at = pools_at + pools;
+        let voices_at = channels_at + channels;
 
-        let effects = self.params.effect_count as usize * EFFECT_OUT;
-        let sinks = self.params.sink_count as usize * SINK_OUT;
+        let effect_out = self.params.effect_count as usize * EFFECT_OUT;
+        let sinks_out = self.params.sink_count as usize * SINK_OUT;
         let out_pools = pool_count * MEMPOOL_OUT;
         let out_voices = voice_count * VOICE_OUT;
-        let size =
-            HEADER_SIZE + out_pools + out_voices + effects + sinks + PERFORMANCE_OUT + BEHAVIOR_OUT;
+        let size = HEADER_SIZE
+            + out_pools
+            + out_voices
+            + effect_out
+            + sinks_out
+            + PERFORMANCE_OUT
+            + BEHAVIOR_OUT;
         let mut out = vec![0u8; size];
         let put =
             |out: &mut [u8], o: usize, v: u32| out[o..o + 4].copy_from_slice(&v.to_le_bytes());
@@ -203,8 +245,8 @@ impl Core {
         put(&mut out, 0x04, BEHAVIOR_OUT as u32);
         put(&mut out, 0x08, out_pools as u32);
         put(&mut out, 0x0C, out_voices as u32);
-        put(&mut out, 0x14, effects as u32);
-        put(&mut out, 0x1C, sinks as u32);
+        put(&mut out, 0x14, effect_out as u32);
+        put(&mut out, 0x1C, sinks_out as u32);
         put(&mut out, 0x20, PERFORMANCE_OUT as u32);
         put(&mut out, 0x3C, size as u32);
 
@@ -222,67 +264,111 @@ impl Core {
             at += MEMPOOL_OUT;
         }
 
-        // Voices: one audio frame of the wave buffers of every voice that is playing.
+        // The mixes and the sinks follow the voices and the effects in the input (and whatever
+        // the splitters take); a layout that does not add up plays nothing.
+        let splitters = u32_at(input, 0x24) as usize;
+        let mixes_at = voices_at + voices + effects + splitters;
+        let sinks_at = mixes_at + mixes;
+        let graph = mixes.is_multiple_of(MIX_SIZE)
+            && sinks.is_multiple_of(SINK_SIZE)
+            && mixes > 0
+            && sinks > 0
+            && sinks_at + sinks <= total;
+        let frame = self.params.sample_count as usize;
+        if graph {
+            self.mixer.read_graph(
+                &input[mixes_at..sinks_at],
+                &input[sinks_at..sinks_at + sinks],
+                self.params.mix_buffer_count as usize,
+                frame,
+            );
+        } else {
+            self.mixer.clear();
+        }
+        let resources: Vec<Channel> = input[channels_at..voices_at]
+            .as_chunks::<CHANNEL_SIZE>()
+            .0
+            .iter()
+            .map(|entry| Channel::parse(entry))
+            .collect();
+
+        // Voices: one audio frame of the wave buffers of every voice that is playing, mixed.
         for i in 0..voice_count {
             let base = voices_at + i * VOICE_IN;
-            self.play_frame(i, &input[base..base + VOICE_IN]);
-            let v = &self.voices[i];
-            out[at..at + 8].copy_from_slice(&v.played.to_le_bytes());
-            put(&mut out, at + 8, v.consumed);
+            let v = VoiceIn::parse(&input[base..base + VOICE_IN]);
+            if v.used && v.format == Format::Unsupported && self.said_formats & (1 << (i % 32)) == 0
+            {
+                self.said_formats |= 1 << (i % 32);
+                eprintln!(
+                    "[audren] voice {i} uses sample format {}, which is not decoded: it is silent",
+                    input[base + 0x0B]
+                );
+            }
+            let voice = &mut self.voices[i];
+            let made = voice.play_frame(&v, self.params.sample_rate, frame, mem);
+            self.seen.used += u32::from(v.used);
+            self.seen.started += u32::from(v.used && v.started);
+            self.seen.made += u32::from(made);
+            if v.used && v.started {
+                match v.format {
+                    Format::Adpcm => self.seen.adpcm += 1,
+                    Format::Pcm16 => self.seen.pcm16 += 1,
+                    _ => self.seen.other += 1,
+                }
+            }
+            if made && self.mixer.has_graph() {
+                for c in 0..v.channels {
+                    if voice.out[c].is_empty() {
+                        continue;
+                    }
+                    let mut target = [0.0f32; voice::MAX_MIX_BUFFERS];
+                    if let Some(res) = resources.get(v.channel_ids[c] as usize).filter(|r| r.used) {
+                        for (t, g) in target.iter_mut().zip(res.mix) {
+                            *t = g * v.volume;
+                        }
+                    }
+                    let mut from = target;
+                    if voice.gains_set {
+                        from.copy_from_slice(
+                            &voice.gains
+                                [c * voice::MAX_MIX_BUFFERS..(c + 1) * voice::MAX_MIX_BUFFERS],
+                        );
+                    }
+                    self.mixer
+                        .add_voice_channel(v.dest_mix, &voice.out[c], &from, &target);
+                    voice.gains[c * voice::MAX_MIX_BUFFERS..(c + 1) * voice::MAX_MIX_BUFFERS]
+                        .copy_from_slice(&target);
+                }
+                voice.gains_set = true;
+            }
+            out[at..at + 8].copy_from_slice(&voice.played.to_le_bytes());
+            put(&mut out, at + 8, voice.consumed);
             at += VOICE_OUT;
         }
+        self.sounding = self.mixer.has_graph() && self.mixer.finish(&mut self.audio);
+        self.seen.updates += 1;
+        if self.sounding {
+            self.seen.sounding += 1;
+            let peak = self.audio.iter().map(|s| i32::from(*s).abs()).max();
+            self.seen.peak = self.seen.peak.max(peak.unwrap_or(0));
+        }
+        if self.trace && self.seen.updates >= 200 {
+            let n = &self.seen;
+            eprintln!(
+                "[audio] last {} updates: voices used {:.1}, started {:.1} (ADPCM {:.1}, PCM16 {:.1}, others {:.1}), made samples {:.1} on average; {} frames mixed to the sink, loudest sample {}",
+                n.updates,
+                f64::from(n.used) / f64::from(n.updates),
+                f64::from(n.started) / f64::from(n.updates),
+                f64::from(n.adpcm) / f64::from(n.updates),
+                f64::from(n.pcm16) / f64::from(n.updates),
+                f64::from(n.other) / f64::from(n.updates),
+                f64::from(n.made) / f64::from(n.updates),
+                n.sounding,
+                n.peak
+            );
+            self.seen = Seen::default();
+        }
         Ok(out)
-    }
-
-    /// Advance voice `index` by one frame. `info` is its entry of the input.
-    fn play_frame(&mut self, index: usize, info: &[u8]) {
-        let is_new = info[0x08] != 0;
-        let is_used = info[0x09] != 0;
-        let state = info[0x0A];
-        let voice = &mut self.voices[index];
-        if is_new || !is_used {
-            *voice = Voice::default();
-        }
-        if !is_used || state != VOICE_STARTED {
-            return;
-        }
-        let output_rate = f64::from(self.params.sample_rate.max(1));
-        let pitch = f64::from(f32_at(info, 0x1C)).max(0.0);
-        let rate = f64::from(u32_at(info, 0x0C));
-        let frame = f64::from(self.params.sample_count);
-        let mut budget = frame * rate / output_rate * pitch + voice.fraction;
-        let queued = (u32_at(info, 0x3C) as usize).min(WAVE_BUFFERS);
-        let head = (u16::from_le_bytes([info[0x40], info[0x41]]) as usize) % WAVE_BUFFERS;
-        let mut finished = 0;
-        while finished < queued && budget >= 1.0 {
-            let wave = WAVE_BUFFERS_AT + ((head + finished) % WAVE_BUFFERS) * WAVE_BUFFER_SIZE;
-            let start = i64::from(u32_at(info, wave + 0x10) as i32);
-            let end = i64::from(u32_at(info, wave + 0x14) as i32);
-            let looping = info[wave + 0x18] != 0;
-            let length = (end - start).max(0) as u64;
-            let remaining = length.saturating_sub(voice.position);
-            let step = budget.floor() as u64;
-            if step >= remaining {
-                budget -= remaining as f64;
-                voice.played += remaining;
-                voice.position = 0;
-                if looping && length > 0 {
-                    // Played again from the start; the voice never finishes this buffer.
-                    continue;
-                }
-                voice.consumed = voice.consumed.wrapping_add(1);
-                finished += 1;
-            } else {
-                budget -= step as f64;
-                voice.played += step;
-                voice.position += step;
-            }
-        }
-        voice.fraction = if finished < queued {
-            budget.fract()
-        } else {
-            0.0
-        };
     }
 }
 
@@ -472,6 +558,8 @@ struct Renderer {
     time_limit: u32,
     /// Ends the frame timer when the renderer is closed.
     stop: Arc<AtomicBool>,
+    /// Where the samples go.
+    outputs: Outputs,
 }
 
 impl Renderer {
@@ -496,6 +584,7 @@ impl Renderer {
             started: false,
             time_limit: 80,
             stop,
+            outputs: Outputs::open(params.sample_rate),
         }
     }
 }
@@ -532,7 +621,11 @@ impl Service for Renderer {
                 let Some(data) = kernel.read_buffer(input, 0x40_0000) else {
                     return Err(Stop("the audio update buffer is not readable".into()));
                 };
-                let out = self.core.update(&data).map_err(Stop)?;
+                let mem = |addr: u64, out: &mut [u8]| kernel.read_memory(addr, out);
+                let out = self.core.update(&data, &mem).map_err(Stop)?;
+                if self.started && self.core.sounding {
+                    self.outputs.write(&self.core.audio);
+                }
                 if out.len() as u64 > output.size {
                     return Err(Stop(format!(
                         "the audio update answer ({:#x} bytes) does not fit the output buffer \
@@ -572,7 +665,18 @@ impl Service for Renderer {
 
 #[cfg(test)]
 mod tests {
+    use super::voice::{VOICE_STARTED, WAVE_BUFFERS};
     use super::*;
+
+    impl Core {
+        /// An update that can read no memory.
+        fn run(&mut self, input: &[u8]) -> Result<Vec<u8>, String> {
+            self.update(input, &|_, _| false)
+        }
+    }
+
+    const WAVE_BUFFER_SIZE: usize = 0x38;
+    const WAVE_BUFFERS_AT: usize = 0x60;
 
     fn params() -> Parameters {
         Parameters {
@@ -663,7 +767,7 @@ mod tests {
     fn the_answer_has_the_sections_the_program_checks() {
         let mut core = Core::new(params());
         let input = update(0x3556_4552, &[0, 0, 0], &[voice(vec![]), voice(vec![])]);
-        let out = core.update(&input).unwrap();
+        let out = core.run(&input).unwrap();
         assert_eq!(u32_at(&out, 0), 0x3556_4552, "the revision is echoed");
         assert_eq!(u32_at(&out, 0x04), BEHAVIOR_OUT as u32);
         assert_eq!(u32_at(&out, 0x08), 3 * MEMPOOL_OUT as u32);
@@ -696,7 +800,7 @@ mod tests {
             ],
             &[voice(vec![]), voice(vec![])],
         );
-        let out = core.update(&input).unwrap();
+        let out = core.run(&input).unwrap();
         let state = |i: usize| u32_at(&out, HEADER_SIZE + i * MEMPOOL_OUT);
         assert_eq!(state(0), POOL_ATTACHED);
         assert_eq!(state(1), POOL_DETACHED);
@@ -718,7 +822,7 @@ mod tests {
         };
         let mut seen = Vec::new();
         for _ in 0..3 {
-            seen.push(voice_out(&core.update(&playing()).unwrap(), 3, 0));
+            seen.push(voice_out(&core.run(&playing()).unwrap(), 3, 0));
         }
         assert_eq!(seen[0], (240, 0));
         assert_eq!(seen[1], (480, 0));
@@ -729,9 +833,9 @@ mod tests {
         );
         // The client has taken the buffer off its ring by now: nothing queued, nothing played.
         let idle = update(0x3556_4552, &[0; 3], &[voice(vec![]), voice(vec![])]);
-        assert_eq!(voice_out(&core.update(&idle).unwrap(), 3, 0), (600, 1));
+        assert_eq!(voice_out(&core.run(&idle).unwrap(), 3, 0), (600, 1));
         assert_eq!(
-            voice_out(&core.update(&idle).unwrap(), 3, 1),
+            voice_out(&core.run(&idle).unwrap(), 3, 1),
             (0, 0),
             "the other voice is idle"
         );
@@ -749,7 +853,7 @@ mod tests {
             ],
         );
         // 100 + 60 samples finish two buffers, and the remaining 80 start the third.
-        assert_eq!(voice_out(&core.update(&input).unwrap(), 3, 0), (240, 2));
+        assert_eq!(voice_out(&core.run(&input).unwrap(), 3, 0), (240, 2));
     }
 
     #[test]
@@ -762,7 +866,7 @@ mod tests {
         );
         for frame in 1..=5u64 {
             assert_eq!(
-                voice_out(&core.update(&input).unwrap(), 3, 0),
+                voice_out(&core.run(&input).unwrap(), 3, 0),
                 (240 * frame, 0)
             );
         }
@@ -775,14 +879,14 @@ mod tests {
         v.sample_rate = 24_000; // half the output rate
         v.pitch = 2.0; // twice as fast again
         let input = update(0x3556_4552, &[0; 3], &[v, voice(vec![])]);
-        assert_eq!(voice_out(&core.update(&input).unwrap(), 3, 0), (240, 0));
+        assert_eq!(voice_out(&core.run(&input).unwrap(), 3, 0), (240, 0));
         // A voice at 32 kHz plays two thirds of 240 samples a frame, carrying the fraction.
         let mut core = Core::new(params());
         let mut v = voice(vec![(0, 100_000, false)]);
         v.sample_rate = 32_000;
         let input = update(0x3556_4552, &[0; 3], &[v, voice(vec![])]);
         let played: Vec<u64> = (0..3)
-            .map(|_| voice_out(&core.update(&input).unwrap(), 3, 0).0)
+            .map(|_| voice_out(&core.run(&input).unwrap(), 3, 0).0)
             .collect();
         assert_eq!(played, vec![160, 320, 480]);
     }
@@ -795,16 +899,16 @@ mod tests {
             &[0; 3],
             &[voice(vec![(0, 100_000, false)]), voice(vec![])],
         );
-        core.update(&play).unwrap();
+        core.run(&play).unwrap();
         let mut stopped = voice(vec![(0, 100_000, false)]);
         stopped.state = 1;
         let still = update(0x3556_4552, &[0; 3], &[stopped, voice(vec![])]);
-        assert_eq!(voice_out(&core.update(&still).unwrap(), 3, 0), (240, 0));
+        assert_eq!(voice_out(&core.run(&still).unwrap(), 3, 0), (240, 0));
         let mut fresh = voice(vec![(0, 100_000, false)]);
         fresh.is_new = true;
         let again = update(0x3556_4552, &[0; 3], &[fresh, voice(vec![])]);
         assert_eq!(
-            voice_out(&core.update(&again).unwrap(), 3, 0),
+            voice_out(&core.run(&again).unwrap(), 3, 0),
             (240, 0),
             "counted from zero"
         );
@@ -815,13 +919,13 @@ mod tests {
         let mut core = Core::new(params());
         let mut input = update(0x3556_4552, &[0; 3], &[voice(vec![]), voice(vec![])]);
         input[0x0C..0x10].copy_from_slice(&0x171u32.to_le_bytes());
-        let e = core.update(&input).unwrap_err();
+        let e = core.run(&input).unwrap_err();
         assert!(e.contains("do not have the sizes"), "{e}");
-        let e = core.update(&[0; 8]).unwrap_err();
+        let e = core.run(&[0; 8]).unwrap_err();
         assert!(e.contains("no header"), "{e}");
         let mut bad = update(0x3556_4552, &[0; 3], &[voice(vec![]), voice(vec![])]);
         bad[0..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
-        assert!(core.update(&bad).unwrap_err().contains("revision"));
+        assert!(core.run(&bad).unwrap_err().contains("revision"));
     }
 
     #[test]
