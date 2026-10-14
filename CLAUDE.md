@@ -116,7 +116,9 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   `SKIPPED` without one) and `spirv-val` for the translator's. `NX_RENDERER=vulkan` makes a
   produced program draw; `NX_TRACE_PERF=1` has the renderer say every 100 frames how long they took
   and where the time went (what `NX_TRACE_GPU` does too, without the line for every submission,
-  which slows a run by about a third); `NX_DUMP_FRAMES=<dir>` writes each displayed frame as a PNG (opaque, cropped
+  which slows a run by about a third; a build with `--features alloc_stats` on `nx_runtime` counts
+  the allocations of the draws' steps and the guest's calls too, and says how often memory was
+  hashed); `NX_DUMP_FRAMES=<dir>` writes each displayed frame as a PNG (opaque, cropped
   to what is shown; `NX_DUMP_EVERY=<n>`, `NX_DUMP_COUNT=<n>`, `NX_DUMP_TARGETS=1` for every render
   target too: a PNG is uncompressed, so dump every n-th frame); `NX_TRACE_DRAWS=<frame>` lists the
   draws and clears of one frame (with `NX_TRACE_STATE=1` their state and vertices, `NX_DUMP_DRAWS=<dir>`

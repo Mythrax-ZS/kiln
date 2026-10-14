@@ -3,6 +3,8 @@
 //! Runs on a host GPU what the GPU model decoded: the compute harness the shader translator is
 //! tested with, and (in later modules) the draws themselves.
 
+#[cfg(feature = "alloc_stats")]
+pub mod alloc_stats;
 pub mod astc;
 pub mod blocklinear;
 pub mod compute;

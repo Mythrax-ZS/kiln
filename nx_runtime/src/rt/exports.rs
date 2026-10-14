@@ -189,10 +189,33 @@ pub extern "C" fn nx_dczva(p: *mut NativeCpu, addr: u64, pc: u64) {
     }
 }
 
+#[cfg(not(feature = "alloc_stats"))]
 #[no_mangle]
 pub extern "C" fn nx_counter() -> u64 {
     rt().counter()
 }
+
+/// The diagnostic build counts the reads and the cycles they take.
+#[cfg(feature = "alloc_stats")]
+#[no_mangle]
+pub extern "C" fn nx_counter() -> u64 {
+    COUNTER_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: reading the time stamp counter has no preconditions.
+    let began = unsafe { core::arch::x86_64::_rdtsc() };
+    let value = rt().counter();
+    // SAFETY: as above.
+    let took = unsafe { core::arch::x86_64::_rdtsc() } - began;
+    COUNTER_CYCLES.fetch_add(took, std::sync::atomic::Ordering::Relaxed);
+    value
+}
+
+/// The cycles those reads took.
+#[cfg(feature = "alloc_stats")]
+pub static COUNTER_CYCLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times the guest read the system counter (for the report of the diagnostic build).
+#[cfg(feature = "alloc_stats")]
+pub static COUNTER_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[no_mangle]
 pub extern "C" fn nx_crc32(acc: u32, data: u64, size: u32, castagnoli: u32) -> u32 {

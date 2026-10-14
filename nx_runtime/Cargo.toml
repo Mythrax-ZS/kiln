@@ -14,6 +14,8 @@ crate-type = ["rlib", "staticlib"]
 default = ["vulkan", "window"]
 # Test-only helpers (temp dirs, PRNG, A64 assembler) used to build synthetic fixtures.
 testing = []
+# Count the allocations of each thread (`NX_TRACE_PERF` says them for the renderer's thread).
+alloc_stats = ["nx_vulkan?/alloc_stats"]
 # The Vulkan renderer (`NX_RENDERER=vulkan` at run time). It loads Vulkan when the program first
 # draws, so a machine without a driver still runs programs that never do.
 vulkan = ["dep:nx_vulkan"]

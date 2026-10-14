@@ -102,6 +102,17 @@ fn valid_page_size(p: u32) -> bool {
     p.is_power_of_two() && (SMALL_PAGE..=2 * BIG_PAGE).contains(&p)
 }
 
+/// How many times and over how many bytes memory was hashed since the last [`hash_counts`]: what
+/// comparing textures and programs with memory costs (`NX_TRACE_PERF`).
+static HASHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HASHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The calls of [`AddressSpace::hash`] and the bytes they covered since the last call.
+pub fn hash_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (HASHES.swap(0, Relaxed), HASHED.swap(0, Relaxed))
+}
+
 impl AddressSpace {
     pub fn new() -> AddressSpace {
         AddressSpace {
@@ -417,6 +428,8 @@ impl AddressSpace {
     /// would otherwise copy megabytes. The same memory hashes the same as long as the mappings
     /// under it stay as they are, which is all a comparison with an earlier call needs.
     pub fn hash(&self, mem: &dyn GuestMemory, mut va: u64, len: u64) -> (u64, u64) {
+        HASHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        HASHED.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
         const K: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut h = K;
         let mut done = 0u64;

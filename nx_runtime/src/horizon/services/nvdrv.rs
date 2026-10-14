@@ -336,6 +336,8 @@ fn run_worker(shared: Weak<Shared>, worker: Arc<Worker>) {
     let mut spent = [Duration::ZERO; 4];
     let (mut steps, mut yields, mut tasks_run) = (0u64, 0u64, 0u64);
     let mut calls_before = 0u64;
+    #[cfg(feature = "alloc_stats")]
+    let mut allocs_before = (0u64, 0u64);
     let mut reported = std::time::Instant::now();
     loop {
         let waiting = std::time::Instant::now();
@@ -399,6 +401,46 @@ fn run_worker(shared: Weak<Shared>, worker: Arc<Worker>) {
                 spent[3].as_secs_f64() * 1000.0,
                 shared.calls.load(Ordering::Relaxed) - calls_before
             );
+            #[cfg(feature = "alloc_stats")]
+            {
+                {
+                    let counts: Vec<String> = super::super::svc::SVC_COUNTS
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, c)| {
+                            let n = c.swap(0, std::sync::atomic::Ordering::Relaxed);
+                            (n > 0).then(|| {
+                                format!(
+                                    "{} {n}",
+                                    super::super::svc::svc_name(i as u32).unwrap_or("?")
+                                )
+                            })
+                        })
+                        .collect();
+                    eprintln!(
+                        "[gpu thread] supervisor calls since the last report: {}",
+                        counts.join(", ")
+                    );
+                }
+                {
+                    let reads = crate::rt::exports::COUNTER_READS
+                        .swap(0, std::sync::atomic::Ordering::Relaxed);
+                    let cycles = crate::rt::exports::COUNTER_CYCLES
+                        .swap(0, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "[gpu thread] the guest read the system counter {reads} times, {} cycles a read",
+                        cycles / reads.max(1)
+                    );
+                }
+                let (n, bytes) = nx_vulkan::alloc_stats::this_thread();
+                eprintln!(
+                    "[gpu thread] allocations since the last report: {} ({:.1} MB), {} a task",
+                    n - allocs_before.0,
+                    (bytes - allocs_before.1) as f64 / 1e6,
+                    (n - allocs_before.0) / tasks_run.max(1)
+                );
+                allocs_before = (n, bytes);
+            }
             spent = [Duration::ZERO; 4];
             (steps, yields, tasks_run) = (0, 0, 0);
             calls_before = shared.calls.load(Ordering::Relaxed);

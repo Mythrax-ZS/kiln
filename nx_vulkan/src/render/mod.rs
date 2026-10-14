@@ -889,6 +889,24 @@ impl Renderer {
                     ph.texture_write_back,
                     ph.texture_bind
                 );
+                #[cfg(feature = "alloc_stats")]
+                {
+                    let laps: Vec<String> = crate::alloc_stats::take_laps()
+                        .iter()
+                        .map(|(name, n)| format!("{name} {n}"))
+                        .collect();
+                    eprintln!(
+                        "[vulkan] frame {}: allocations by the draws' steps over these 100 frames: {}",
+                        p.frame,
+                        laps.join(", ")
+                    );
+                }
+                let (hashes, hashed) = nx_gpu::vm::hash_counts();
+                eprintln!(
+                    "[vulkan] frame {}: memory was hashed {hashes} times over {:.1} MB (textures and programs are compared with memory once a frame)",
+                    p.frame,
+                    hashed as f64 / 1e6
+                );
                 let wb = std::mem::take(&mut core.targets.write_backs);
                 let mut causes: Vec<(u64, (u64, usize, String))> =
                     std::mem::take(&mut core.write_back_causes)

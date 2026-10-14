@@ -19,6 +19,8 @@ fn lap(mark: &mut Instant, into: &mut Duration, _step: &'static str) {
     let now = Instant::now();
     *into += now - *mark;
     *mark = now;
+    #[cfg(feature = "alloc_stats")]
+    crate::alloc_stats::lap(_step);
 }
 
 /// The fixed state of a pipeline (the rest is set when drawing).
@@ -139,6 +141,8 @@ fn logic_op(func: u32) -> vk::LogicOp {
 
 impl Core {
     pub(super) fn draw(&mut self, scene: &Scene<'_>, draw: &Draw) -> Result<(), String> {
+        #[cfg(feature = "alloc_stats")]
+        crate::alloc_stats::lap("outside the draws");
         self.last_textures.clear();
         let regs = scene.regs;
         let raster = regs.raster();

@@ -149,6 +149,11 @@ fn result(cpu: &mut NativeCpu, r: ResultCode) {
     cpu.state.x[0] = u64::from(r.0);
 }
 
+/// How many times each supervisor call was made (for the report of the diagnostic build).
+#[cfg(feature = "alloc_stats")]
+pub static SVC_COUNTS: [std::sync::atomic::AtomicU64; 256] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 256];
+
 impl Kernel {
     /// Stop the run for a reason that is the program's or this runtime's, with the report.
     fn stop_run(&self, cpu: &mut NativeCpu, message: String) -> Flow {
@@ -203,6 +208,8 @@ impl Kernel {
     /// Execute `SVC #imm` for `thread`. On entry `cpu.state.pc` is the instruction after it.
     /// `NX_TRACE_SVC` in the environment logs every call and its result on standard error.
     pub fn svc(self: &Arc<Kernel>, cpu: &mut NativeCpu, thread: u64, imm: u32) -> Flow {
+        #[cfg(feature = "alloc_stats")]
+        SVC_COUNTS[(imm & 0xFF) as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !self.trace {
             // The calls that can block, with how long they took: sleeps, waits, locks, condition
             // variables, addresses and requests of services (`NX_TRACE_WAITS`).

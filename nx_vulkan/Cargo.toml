@@ -12,6 +12,9 @@ path = "src/lib.rs"
 [features]
 # Presenting frames in a window of its own (`NX_WINDOW=1` at run time).
 window = ["dep:winit", "dep:ash-window", "dep:raw-window-handle"]
+# Count the allocations of each thread (a counting global allocator), to measure what a hot path
+# asks of the heap (`NX_TRACE_PERF`).
+alloc_stats = []
 
 [dependencies]
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
