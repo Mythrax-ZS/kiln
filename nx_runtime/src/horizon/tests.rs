@@ -22,6 +22,19 @@ use std::time::{Duration, Instant};
 
 static LOCK: Mutex<()> = Mutex::new(());
 
+/// Wait until nothing but `kernel` refers to the kernel. The threads a test starts (guest
+/// threads, the audio renderer's frame clock) hold it for a moment after the test is over, and
+/// what it mapped (the main stack, at the same address for every kernel) is unmapped only when the
+/// last of them lets go: a test that gives up the lock before that leaves its stack mapped for the
+/// next one, which then cannot prepare its own (a kernel that ran out of memory, in a test that
+/// took no memory).
+fn wait_until_alone(kernel: &Arc<Kernel>) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while Arc::strong_count(kernel) > 1 && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// A scratch region of guest memory the tests use for buffers.
 const SCRATCH: u64 = 0x4000_0000;
 const SCRATCH_SIZE: u64 = 0x10_000;
@@ -136,6 +149,8 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
+        // The kernel is dropped after this (it is the first field) and the lock last.
+        wait_until_alone(&self.kernel);
         let _ = rt().mem.unmap(SCRATCH, SCRATCH_SIZE);
     }
 }
@@ -1341,6 +1356,7 @@ fn an_nro_is_entered_with_the_loader_configuration_and_its_return_value_is_the_e
     assert!(hint & 1 << 6 != 0 && hint & 1 << 0x27 != 0 && hint & 1 << 0x2A == 0);
     let _ = rt().mem.unmap(SCRATCH, SCRATCH_SIZE);
     let _ = rt().mem.read(ENV_BASE, 1, Relaxed);
+    wait_until_alone(&kernel);
     drop(kernel);
     assert!(
         rt().mem.read(ENV_BASE, 1, Relaxed).is_err(),
@@ -1379,6 +1395,7 @@ fn a_fault_in_any_thread_ends_the_process_with_a_report() {
         ),
         other => panic!("{other:?}"),
     }
+    wait_until_alone(&kernel);
     drop(kernel);
     drop(guard);
 }
@@ -1424,6 +1441,7 @@ fn the_main_thread_can_start_another_and_wait_for_it() {
     });
     // The worker stored 0x1000 + the first word of its (zeroed) thread-local region.
     assert_eq!(exit, Exit::Code(0x1000));
+    wait_until_alone(&kernel);
     drop(kernel);
     drop(guard);
 }
