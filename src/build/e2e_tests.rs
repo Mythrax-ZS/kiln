@@ -145,7 +145,12 @@ fn a_program_that_stops_says_why_and_exits_nonzero() {
     let dir = TempDir::new("e2e-stop");
     let report = build(&program, &tc, &BuildOptions::new(dir.path(), "stopper")).unwrap();
     let out = run(&report.exe);
-    assert_eq!(out.status.code(), Some(101));
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains("SVC 0x2a is not implemented (SVC at 0x8000184)"),

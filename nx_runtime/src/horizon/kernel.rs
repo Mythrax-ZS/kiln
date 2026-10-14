@@ -575,22 +575,16 @@ impl Kernel {
 
     /// Block until the process has ended.
     pub fn wait_for_exit(&self) -> Exit {
-        let st = self.lock();
-        let (_st, out) =
-            self.wait_until(
-                st,
-                None,
-                |st| {
-                    if st.reporting {
-                        None
-                    } else {
-                        st.exit.clone()
-                    }
-                },
-            );
-        match out {
-            Waited::Ready(e) => e,
-            _ => unreachable!("waiting for the exit cannot end another way"),
+        let mut st = self.lock();
+        loop {
+            // The process has ended once it has an exit and nobody is telling the story of a
+            // stop any more (`wait_until` cannot be used: it gives up as soon as there is an exit).
+            if let Some(e) = &st.exit {
+                if !st.reporting {
+                    return e.clone();
+                }
+            }
+            st = self.wake.wait(st).unwrap_or_else(|e| e.into_inner());
         }
     }
 
