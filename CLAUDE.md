@@ -33,6 +33,10 @@ cargo lint            # alias for: cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+`.github/workflows/ci.yml` runs this gate on Windows and (without `recomp_gui`) on Linux for every
+push and pull request, and builds the Windows bundle (`tools/bundle.ps1`, `dist/`); see the README.
+The workflow pins the Rust version (`RUST_VERSION`) and Unicorn: move them on purpose.
+
 ## Commits
 
 Small chunks. Title at most 50 characters. No body. No attribution lines of any kind.
@@ -52,12 +56,12 @@ Small chunks. Title at most 50 characters. No body. No attribution lines of any 
   (`nvdrv` and its device nodes, the display and buffer-queue path, a tracing command processor
   with a macro engine). The owner approved shader translation (Maxwell SASS to SPIR-V, crate
   `nx_shader`, M9) and the Vulkan backend (`ash`, crate `nx_vulkan`, M10) on 2026-10-13; M9
-  passed the same day, and M10 draws the title's first screens and its opening cutscene (frames
-  dumped and looked at), shows them in a window and takes keyboard input; it runs at about 15
-  frames a second there, and nothing past the cutscene has been seen (open, see
-  `docs/reports/M10-vulkan-backend.md`). Never describe the output as playable before frames are
-  measured; saying what a frame shows needs the frame itself (a dumped image looked at), not a
-  count.
+  passed the same day, and M10 draws the title's menu, its opening cutscene and its first area
+  (frames dumped and looked at), shows them in a window and takes keyboard and gamepad input; in
+  the first area it runs at 40 to 60 frames a second on one RTX 5070 Ti, and what is past that
+  area has not been tried (open, see `docs/reports/M10-vulkan-backend.md`). Never describe the
+  output as playable before frames are measured; saying what a frame shows needs the frame
+  itself (a dumped image looked at), not a count.
 - Out of scope: online services, account checks, licensing checks, AArch32 (detect and error).
 
 ## External tools used by tests
@@ -164,7 +168,8 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   needs the press 15 times later). Never `NX_DUMP_FRAMES` without `NX_DUMP_EVERY` for a long run.
 - Window and input: `NX_WINDOW=1` (with `NX_RENDERER=vulkan`) shows the frames in a window
   (`NX_WINDOW_SIZE=<w>x<h>`, `NX_WINDOW_TITLE`, `NX_PRESENT_MODE=fifo|mailbox|immediate`); no test
-  opens one. The keyboard and an XInput gamepad are the handheld controls of `hid`: `NX_KEYMAP=<file>`
+  opens one. The window opens when the program starts (not when it first draws, seconds later),
+  comes to the front and is painted black until the first frame is presented. The keyboard and an XInput gamepad are the handheld controls of `hid`: `NX_KEYMAP=<file>`
   rebinds keys, `NX_TRACE_KEYS=1` prints the keys and button changes, `NX_GAMEPAD=0` and
   `NX_GAMEPAD_LABELS=1` (docs/ASSUMPTIONS.md A-104). To drive a window from a script, post key messages
   to the game's own window and capture only that window (`PrintWindow`), never the screen, and bind
@@ -188,6 +193,12 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   `-Find` lists where a 64-bit value is, scanning 3 GB in about 6 s: an object is found by the
   address of its table of virtual functions, its fields then say what state a game is in).
   `NX_HOLD_ON_STOP=1` keeps the process alive after a stop, so that its memory can still be read.
+  `NX_TRAP_WRITES=<address>:<length>[,...]` (guest addresses, hexadecimal) says who writes into
+  those pages: every guest write to them is reported once per call chain (and again at the 10th,
+  100th... time) with the thread, the address, the value and the return addresses as offsets in
+  the image, which the link map (`RECOMP_LINK_MAP`) names (`f_<guest address>` is a generated
+  function). A page nobody writes says nothing; a page the guest writes through another address
+  (an alias) is not seen.
   `pwsh -File tools/game_window.ps1 -ProcessId <pid> [-Capture <png>] [-Keys "F13:200,..."]` takes a
   picture of the program's own window (never of the screen) and posts keys to its message queue;
   run the program with an `NX_KEYMAP` that binds F13 and up so that nobody's typing disturbs it.

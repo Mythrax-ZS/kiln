@@ -329,10 +329,29 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
   blit tested on Linux, but no window was opened there, and neither a display that is not 60 Hz,
   nor several monitors, nor fullscreen were tried. FIFO presenting and the guest's own 60 Hz
   thread both pace the title; how they interact on other refresh rates is unmeasured (A-105).
+- **A thin white bar at the top left of the first area's picture has no explanation.** It is two
+  white pieces, together 230 by 8 pixels, tilted by 3 degrees, with a rounded left end, in the
+  1280 by 720 interface target; it is there from the first frame of the area and never moves.
+  Each piece is four quads of one pair of layout programs (the pair that also draws parts of the
+  life gauge; one 8 by 8 BC4 texture) whose constant buffer holds a rotation of 3 degrees, so the
+  tilt is the layout's own. Right before each piece come four draws of two other layout programs
+  that change no pixel of the picture (looked at after every draw of one frame), and that sample
+  R8 textures of 64 by 64 and 128 by 128 texels that hold only zeros in guest memory: the guest
+  never wrote them (`NX_TRAP_WRITES` over six of those textures, from the start of a run to frame
+  12,300, reported no write). It looked like the underline of a label whose glyphs are blank
+  because the stand-in system fonts had none (A-073); with an alphabet drawn in them (Latin
+  letters) no text appeared by the bar and the textures stayed zero, so that is not what it is.
+  What the console draws there was not shown. (Numbers of draws differ between runs of the same
+  frame, so a draw found in one run has to be looked at, traced and measured in that same run.)
+- **The sizes of the scene's targets are the title's own choice with the console in handheld
+  mode, which this runtime reports** (its light buffers are 320 by 360, its HDR scene 640 by
+  720 and the picture 1280 by 720), and that is why edges look blocky. Reporting the docked mode
+  (`ICommonStateGetter::GetOperationMode`) would ask for more and was not tried; the controls of
+  the docked mode also need other kinds of controller than the handheld one this runtime has.
 - **Shader instructions not translated** still stop the draw with the instruction and its
   address (`nx_shader --example audit` lists what the translator lacks: `TLD`, `TLDS`, `TXD`, the
-  bindless forms of `TEX`, `TLD4` and `TXQ`, half-precision arithmetic, local and shared memory, atomics
-  and others); the programs of the screens and the cutscene seen so far did not need them.
+  bindless forms of `TEX`, `TLD4` and `TXQ`, half-precision arithmetic, local and shared memory,
+  atomics and others); the programs of the screens and the cutscene seen so far did not need them.
 - **Textures:** 2D, 2D array, cube, 3D and depth textures are sampled now, with BC, ASTC LDR and
   the plain color formats; 1D and stencil textures, texture views of other formats (an sRGB view
   of a linear target) and mip chains of render targets other than through the write-back are
