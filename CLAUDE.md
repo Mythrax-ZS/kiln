@@ -102,6 +102,11 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   hold a core to run guest code and give it up at a supervisor call that can block or reschedule,
   threads waiting for a core being served in order (a model of the console's cores, off by
   default; priorities are not modelled).
+- Audio: `NX_AUDIO=0` leaves the sound device out; `NX_AUDIO_DUMP=<file>` writes every sample the
+  audio renderer mixes to a 16-bit stereo WAV file (kept readable while the program runs, so a killed
+  program leaves a good file); `NX_TRACE_AUDIO=1` says every second how many voices played, in which
+  formats, and how loud the mix was. The device test of `audio_out` feeds the machine's sound device
+  silence, and prints `SKIPPED` without a device.
 - GPU front: `nx_gpu`'s unit tests need no external tool. `NX_TRACE_GPU=1` prints every submission
   of a produced program and, when it ends, what the command processor counted (`NX_GPU_TOP=<n>` is
   how many of the busiest methods it lists, 0 for all); `NX_TRACE_GPU=2` prints every method write
@@ -116,7 +121,7 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   `SKIPPED` without one) and `spirv-val` for the translator's. `NX_RENDERER=vulkan` makes a
   produced program draw; `NX_TRACE_PERF=1` has the renderer say every 100 frames how long they took
   and where the time went (what `NX_TRACE_GPU` does too, without the line for every submission,
-  which slows a run by about a third; a build with `--features alloc_stats` on `nx_runtime` counts
+  which slows a run by about a third; the steps of a draw are timed only when one of them is set; a build with `--features alloc_stats` on `nx_runtime` counts
   the allocations of the draws' steps and the guest's calls too, and says how often memory was
   hashed); `NX_DUMP_FRAMES=<dir>` writes each displayed frame as a PNG (opaque, cropped
   to what is shown; `NX_DUMP_EVERY=<n>`, `NX_DUMP_COUNT=<n>`, `NX_DUMP_TARGETS=1` for every render
@@ -175,7 +180,8 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   `RECOMP_LINK_MAP=<file>` makes the link write a map of the executable, and on Windows
   `pwsh -File tools/sample_threads.ps1 -Map <file>` samples where every thread of the running
   program is (a generated function `f_<guest address>`, a Rust function of the runtime, a module
-  of the process) to say what it is busy with, and `pwsh -File tools/guest_memory.ps1 -Map <file>
+  of the process) to say what it is busy with (`-Callers` adds, to a sample in a system library,
+  the place of the program that its stack points into), and `pwsh -File tools/guest_memory.ps1 -Map <file>
   -Ranges "<address>:<length>,..." [-Words]` reads the guest memory of the running program from
   outside (it walks the page table the map names, `nx_mem_l1`; a frame's saved registers on the
   stack and the objects they point to answer what a stuck loop is looping on).
