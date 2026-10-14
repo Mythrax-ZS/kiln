@@ -1717,6 +1717,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "kiln"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "nx_runtime",
+ "sha2",
+]
+
+[[package]]
+name = "kiln_gui"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "rfd",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kurbo"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2702,25 +2721,6 @@ dependencies = [
  "bytemuck",
  "font-types",
  "once_cell",
-]
-
-[[package]]
-name = "recomp"
-version = "0.1.0"
-dependencies = [
- "libloading",
- "nx_runtime",
- "sha2",
-]
-
-[[package]]
-name = "recomp_gui"
-version = "0.1.0"
-dependencies = [
- "eframe",
- "rfd",
- "serde",
- "serde_json",
 ]
 
 [[package]]

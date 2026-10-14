@@ -1,4 +1,4 @@
-# recomp: final report
+# Kiln: final report
 
 Ten milestones, written down in `docs/reports/` (the tenth is open at the window). This page
 collects what the brief asks the final report to say: what is implemented, every interpreter
@@ -8,7 +8,7 @@ milestone they belong to.
 
 ## Where it stands
 
-`recomp` reads the **already extracted** ExeFS and RomFS of a Nintendo Switch title (or a homebrew
+`kiln` reads the **already extracted** ExeFS and RomFS of a Nintendo Switch title (or a homebrew
 NRO) and produces a native x86-64 executable (PE on Windows, ELF on Linux) and, on request, a shared
 library, both linked against `nx_runtime`, which holds the guest CPU model and the Horizon emulation
 layer. It never touches keys, NSPs or NCAs.
@@ -85,7 +85,7 @@ A call the program's NPDM does not enable stops the run as if it were unimplemen
 NPDM enables 47 SVCs; **the ones among them that are not implemented** are 0x20, 0x22 and 0x23 (the light
 and user-buffer IPC calls), 0x28 (`ReturnFromException`),
 0x2C and 0x2D (physical memory), 0x2F, 0x32, 0x33 (thread activity and context) and 0x5F (cache
-flush). `recomp inspect` prints this list, and the services not implemented, for any title. Also not implemented: the server side of IPC (`CreateSession`, `AcceptSession`,
+flush). `kiln inspect` prints this list, and the services not implemented, for any title. Also not implemented: the server side of IPC (`CreateSession`, `AcceptSession`,
 `ReplyAndReceive*`: 0x40-0x44), `SignalToAddress` type 2, and `GetInfo` types 9, 19, 20, 24 to 28.
 
 ## Services
@@ -155,7 +155,7 @@ source and its status. The ones with the widest effect:
 ## Tests, in short
 
 - Windows: 125 `nx_gpu` unit tests, 298 `nx_runtime` unit tests, 30 Unicorn differential tests, 85
-  `recomp` tests, and the opt-in real-title tests (`RECOMP_TITLE_DIR`). Linux (WSL, Ubuntu, clang
+  `kiln` tests, and the opt-in real-title tests (`KILN_TITLE_DIR`). Linux (WSL, Ubuntu, clang
   21): see `docs/reports/M8-gpu-front.md`.
 - Layers compared with an independent oracle: the decoder with LLVM's assembler; the soft-float with
   the host FPU; the interpreter with Unicorn (tens of millions of cases and millions of random words,

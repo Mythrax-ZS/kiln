@@ -9,9 +9,9 @@ pub mod unicorn;
 
 use harness::{describe, diff, Case, Harness, Outcome};
 
-/// How many random cases each differential test runs. `RECOMP_DIFF_CASES` scales them.
+/// How many random cases each differential test runs. `KILN_DIFF_CASES` scales them.
 pub fn case_count(default: usize) -> usize {
-    std::env::var("RECOMP_DIFF_CASES")
+    std::env::var("KILN_DIFF_CASES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
@@ -26,8 +26,8 @@ pub fn unicorn_or_skip() -> Option<unicorn::Api> {
             Some(api)
         }
         None => {
-            if std::env::var_os("RECOMP_REQUIRE_EXTERNAL").is_some() {
-                panic!("Unicorn was not found and RECOMP_REQUIRE_EXTERNAL is set");
+            if std::env::var_os("KILN_REQUIRE_EXTERNAL").is_some() {
+                panic!("Unicorn was not found and KILN_REQUIRE_EXTERNAL is set");
             }
             eprintln!("SKIPPED: Unicorn not found (set UNICORN_DLL or `pip install unicorn` into .venv); differential tests did not run");
             None

@@ -1,4 +1,4 @@
-//! recomp: static recompiler from Horizon OS AArch64 programs to native x86_64.
+//! kiln: static recompiler from Horizon OS AArch64 programs to native x86_64.
 //!
 //! The library holds the input layer, loader, analysis, lifter and code generator. The guest CPU
 //! model and Horizon emulation layer live in the `nx_runtime` crate, which every produced binary

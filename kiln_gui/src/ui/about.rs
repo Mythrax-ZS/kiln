@@ -15,21 +15,21 @@ impl App {
                         theme::logo(ui, 64.0);
                         ui.vertical(|ui| {
                             ui.add_space(6.0);
-                            ui.label(theme::bold("recomp", 28.0));
+                            ui.label(theme::bold("Kiln", 28.0));
                             ui.label(theme::muted(format!(
                                 "GUI {}{}",
                                 env!("CARGO_PKG_VERSION"),
                                 self.toolchain
-                                    .recomp_version
+                                    .kiln_version
                                     .as_ref()
-                                    .map_or(String::new(), |v| format!(" - recomp {v}"))
+                                    .map_or(String::new(), |v| format!(" - kiln {v}"))
                             )));
                         });
                     });
                     ui.add_space(10.0);
                     paragraph(
                         ui,
-                        "recomp turns the programs of Nintendo Switch games into native programs for \
+                        "Kiln turns the programs of Nintendo Switch games into native programs for \
                          this computer. It reads the game's AArch64 code ahead of time, lifts it to \
                          LLVM IR and compiles it with clang; the runtime that every produced program \
                          links stands in for the console's operating system.",

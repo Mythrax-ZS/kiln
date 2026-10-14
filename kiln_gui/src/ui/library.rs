@@ -151,10 +151,10 @@ impl App {
                             game.meta.opt,
                             game::human_size(game.exe_size),
                             game::human_date(game.meta.built_at),
-                            if game.meta.recomp_version.is_empty() {
-                                "recomp".to_string()
+                            if game.meta.kiln_version.is_empty() {
+                                "kiln".to_string()
                             } else {
-                                format!("recomp {}", game.meta.recomp_version)
+                                format!("kiln {}", game.meta.kiln_version)
                             }
                         )));
                     });

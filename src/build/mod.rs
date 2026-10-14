@@ -1,8 +1,8 @@
 //! Turning generated LLVM IR into executables and shared libraries with clang.
 //!
-//! clang is found through `RECOMP_CLANG`, then `PATH`, then the LLVM that ships with Visual Studio
+//! clang is found through `KILN_CLANG`, then `PATH`, then the LLVM that ships with Visual Studio
 //! (Windows) or the usual install locations (Linux). Objects link against the `nx_runtime`
-//! static library, found through `RECOMP_RUNTIME_LIB` or next to the running binary.
+//! static library, found through `KILN_RUNTIME_LIB` or next to the running binary.
 
 #[cfg(test)]
 mod e2e_tests;
@@ -31,13 +31,13 @@ fn tool_error(what: &str, out: &std::process::Output) -> Error {
 impl Toolchain {
     /// Locate clang.
     pub fn discover() -> Result<Toolchain> {
-        if let Some(p) = std::env::var_os("RECOMP_CLANG") {
+        if let Some(p) = std::env::var_os("KILN_CLANG") {
             let p = PathBuf::from(p);
             return if p.is_file() {
                 Ok(Toolchain { clang: p })
             } else {
                 Err(Error::Toolchain(format!(
-                    "RECOMP_CLANG={} is not a file",
+                    "KILN_CLANG={} is not a file",
                     p.display()
                 )))
             };
@@ -82,7 +82,7 @@ impl Toolchain {
             .map(|clang| Toolchain { clang })
             .ok_or_else(|| {
                 Error::Toolchain(
-                    "clang not found: set RECOMP_CLANG, put it on PATH, or install the LLVM \
+                    "clang not found: set KILN_CLANG, put it on PATH, or install the LLVM \
                      component of Visual Studio"
                         .into(),
                 )
@@ -167,8 +167,8 @@ impl Toolchain {
                 args.push(format!("-Wl,/EXPORT:{e}"));
             }
             // A map of the linked image (where each function is), for finding what a host thread
-            // is running from its instruction pointer: `RECOMP_LINK_MAP=<file>`.
-            if let Some(map) = std::env::var_os("RECOMP_LINK_MAP") {
+            // is running from its instruction pointer: `KILN_LINK_MAP=<file>`.
+            if let Some(map) = std::env::var_os("KILN_LINK_MAP") {
                 args.push(format!("-Wl,/MAP:{}", path_arg(Path::new(&map))));
             }
         } else {
@@ -222,11 +222,11 @@ fn static_lib_name() -> &'static str {
     }
 }
 
-/// Where the runtime library is, without building anything: `RECOMP_RUNTIME_LIB`, the file next to
+/// Where the runtime library is, without building anything: `KILN_RUNTIME_LIB`, the file next to
 /// the running binary (or up to two directories above it, for binaries in `deps/`), or the one an
 /// earlier build in this checkout made. `None` when there is no such file.
 pub fn runtime_lib_location() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("RECOMP_RUNTIME_LIB") {
+    if let Some(p) = std::env::var_os("KILN_RUNTIME_LIB") {
         let p = PathBuf::from(p);
         return p.is_file().then_some(p);
     }
@@ -248,17 +248,17 @@ pub fn runtime_lib_location() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// The `nx_runtime` static library. `RECOMP_RUNTIME_LIB` wins; otherwise the file next to the
+/// The `nx_runtime` static library. `KILN_RUNTIME_LIB` wins; otherwise the file next to the
 /// running binary (or one directory up, for test binaries in `deps/`); otherwise it is built with
 /// cargo from the workspace this crate came from.
 pub fn runtime_lib() -> Result<PathBuf> {
-    if let Some(p) = std::env::var_os("RECOMP_RUNTIME_LIB") {
+    if let Some(p) = std::env::var_os("KILN_RUNTIME_LIB") {
         return Ok(PathBuf::from(p));
     }
     let name = static_lib_name();
     let not_found = || {
         Error::Toolchain(format!(
-            "{name} not found; build it with `cargo build -p nx_runtime` or set RECOMP_RUNTIME_LIB"
+            "{name} not found; build it with `cargo build -p nx_runtime` or set KILN_RUNTIME_LIB"
         ))
     };
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));

@@ -16,16 +16,16 @@ written first and deleted before any commit.
 | Piece | Where | Notes |
 |-------|-------|-------|
 | Storage abstraction (`Storage`, in-memory, file, sub-range) | `nx_runtime::storage` | Positioned reads, bounds checked. |
-| PFS0 reader | `recomp::container::pfs0` | For an ExeFS given as a PFS0 image. |
-| ExeFS | `recomp::container::exefs` | Directory (or a game folder containing `exefs/`) or PFS0 image. Lists NSOs in loader order: rtld, main, subsdk0-9, sdk. Requires `main`; `main.npdm` is optional at this layer. |
+| PFS0 reader | `kiln::container::pfs0` | For an ExeFS given as a PFS0 image. |
+| ExeFS | `kiln::container::exefs` | Directory (or a game folder containing `exefs/`) or PFS0 image. Lists NSOs in loader order: rtld, main, subsdk0-9, sdk. Requires `main`; `main.npdm` is optional at this layer. |
 | RomFS image parser | `nx_runtime::romfs::RomFs` | Walks the directory and file tables, validates every link, parent, name, and data range. Hash tables are not used for parsing. |
 | RomFS builder | `nx_runtime::romfs::{plan, build_image}` | Lays out header, hash tables, entry tables, and file data for a list of paths and sizes. |
 | Directory image | `nx_runtime::romfs::DirImage` | Presents an extracted RomFS directory as a flat image through `Storage`. Metadata is in memory and file data is read from the host files on demand, so multi-gigabyte trees cost no memory. The runtime serves this to the guest. |
-| CLI | `recomp inspect --exefs <dir\|pfs0> [--romfs <dir\|image>]` | Prints the file list, NSO load order, and RomFS totals. |
+| CLI | `kiln inspect --exefs <dir\|pfs0> [--romfs <dir\|image>]` | Prints the file list, NSO load order, and RomFS totals. |
 
 ## Tests
 
-`cargo test`: 22 tests in `nx_runtime`, 14 in `recomp`; all pass. `cargo fmt --all --check` and
+`cargo test`: 22 tests in `nx_runtime`, 14 in `kiln`; all pass. `cargo fmt --all --check` and
 `cargo clippy --all-targets -- -D warnings` are clean.
 
 - PFS0: valid and empty partitions, padded and unpadded string tables, bad magic, truncated tables,

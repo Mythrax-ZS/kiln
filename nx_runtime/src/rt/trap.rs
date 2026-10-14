@@ -6,7 +6,7 @@
 //! the guest to them goes through the checked path of [`super::mem::GuestMemory`], which reports it
 //! here before it is done. A report names the thread, the address, the value (for a store of up
 //! to eight bytes) and the call chain as offsets in the program's image (`+0x1234`): look them up
-//! in the link map (`RECOMP_LINK_MAP`, which is what `recomp relink` writes next to the program) to
+//! in the link map (`KILN_LINK_MAP`, which is what `kiln relink` writes next to the program) to
 //! get the names of the functions. A call chain is reported the first time it is seen and again
 //! when it has been seen 10, 100, 1000... times, so a loop that fills a page is one line.
 

@@ -608,7 +608,7 @@ fn division_edge_cases() {
 #[test]
 fn random_control_flow_matches_the_interpreter() {
     let mut g = Gen::new(0xC0FFEE);
-    let programs: usize = std::env::var("RECOMP_LIFT_PROGRAMS")
+    let programs: usize = std::env::var("KILN_LIFT_PROGRAMS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1500);

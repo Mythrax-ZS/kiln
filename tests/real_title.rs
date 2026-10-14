@@ -1,24 +1,24 @@
 //! Opt-in checks against a real, owner-supplied, already extracted title.
 //!
-//! Set `RECOMP_TITLE_DIR` to a folder holding `exefs/` and `romfs/`. Without it these tests print
-//! a `SKIPPED` line and pass; with `RECOMP_REQUIRE_EXTERNAL=1` a missing title is a failure. The
+//! Set `KILN_TITLE_DIR` to a folder holding `exefs/` and `romfs/`. Without it these tests print
+//! a `SKIPPED` line and pass; with `KILN_REQUIRE_EXTERNAL=1` a missing title is a failure. The
 //! tests assert structural properties only and print aggregate numbers; nothing from the title
 //! is stored, copied or written anywhere.
 
-use recomp::container::exefs::ExeFs;
-use recomp::loader::module::GUEST_BASE;
-use recomp::loader::nso;
-use recomp::romfs::{self, RomFs};
+use kiln::container::exefs::ExeFs;
+use kiln::loader::module::GUEST_BASE;
+use kiln::loader::nso;
+use kiln::romfs::{self, RomFs};
 use std::path::PathBuf;
 
 fn title_dir() -> Option<PathBuf> {
-    match std::env::var_os("RECOMP_TITLE_DIR") {
+    match std::env::var_os("KILN_TITLE_DIR") {
         Some(p) => Some(PathBuf::from(p)),
         None => {
-            if std::env::var_os("RECOMP_REQUIRE_EXTERNAL").is_some() {
-                panic!("RECOMP_TITLE_DIR is not set and RECOMP_REQUIRE_EXTERNAL is");
+            if std::env::var_os("KILN_REQUIRE_EXTERNAL").is_some() {
+                panic!("KILN_TITLE_DIR is not set and KILN_REQUIRE_EXTERNAL is");
             }
-            eprintln!("SKIPPED: RECOMP_TITLE_DIR is not set; real-title checks did not run");
+            eprintln!("SKIPPED: KILN_TITLE_DIR is not set; real-title checks did not run");
             None
         }
     }
@@ -87,7 +87,7 @@ fn npdm_parses_and_is_aarch64() {
     let Some(dir) = title_dir() else { return };
     let fs = ExeFs::open(&dir).expect("ExeFS opens");
     let bytes = fs.npdm().unwrap().expect("retail titles have main.npdm");
-    let n = recomp::npdm::Npdm::parse(&bytes).expect("main.npdm parses");
+    let n = kiln::npdm::Npdm::parse(&bytes).expect("main.npdm parses");
     n.require_aarch64().expect("64-bit program");
     assert!(!n.services.is_empty());
     assert!(n.kernel.svcs.count() > 0);

@@ -18,7 +18,7 @@ fn toolchain_or_skip() -> Option<Toolchain> {
     match Toolchain::discover() {
         Ok(t) => Some(t),
         Err(e) => {
-            if std::env::var_os("RECOMP_REQUIRE_EXTERNAL").is_some() {
+            if std::env::var_os("KILN_REQUIRE_EXTERNAL").is_some() {
                 panic!("clang is required: {e}");
             }
             eprintln!("SKIPPED (no clang): {e}");
@@ -65,13 +65,13 @@ fn write_selftest_program(dir: &Path) {
     std::fs::write(exefs.join("main"), bytes).unwrap();
 }
 
-/// Writes the self-test program into the folder `RECOMP_SELFTEST_FIXTURE` names: the build of the
+/// Writes the self-test program into the folder `KILN_SELFTEST_FIXTURE` names: the build of the
 /// bundle runs this test (`tools/bundle.ps1` puts what it wrote in the zip).
 #[test]
-#[ignore = "writes the bundle's self-test program into RECOMP_SELFTEST_FIXTURE"]
+#[ignore = "writes the bundle's self-test program into KILN_SELFTEST_FIXTURE"]
 fn writes_the_selftest_program() {
-    let dir = std::env::var_os("RECOMP_SELFTEST_FIXTURE")
-        .expect("RECOMP_SELFTEST_FIXTURE names the folder to write into");
+    let dir = std::env::var_os("KILN_SELFTEST_FIXTURE")
+        .expect("KILN_SELFTEST_FIXTURE names the folder to write into");
     write_selftest_program(Path::new(&dir));
 }
 

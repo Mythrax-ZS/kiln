@@ -31,24 +31,24 @@ impl App {
             ui.spacing_mut().item_spacing.y = 16.0;
             setting_row(
                 ui,
-                "recomp",
+                "kiln",
                 "The program that does the recompiling. Empty finds it beside this one.",
                 |ui| {
                     ui.horizontal(|ui| {
-                        if theme::text_field(ui, &mut self.settings.recomp_exe, "Automatic", 380.0)
+                        if theme::text_field(ui, &mut self.settings.kiln_exe, "Automatic", 380.0)
                             .changed()
                         {
                             changed = true;
                         }
                         if theme::button(ui, None, "...").clicked() {
-                            browse = Some(Target::RecompExe);
+                            browse = Some(Target::KilnExe);
                         }
                     });
                     status_line(
                         ui,
-                        match (&t.recomp_exe, &t.recomp_version, &t.error) {
+                        match (&t.kiln_exe, &t.kiln_version, &t.error) {
                             (Some(p), Some(v), _) => {
-                                Some((Status::Good, format!("recomp {v} at {}", p.display())))
+                                Some((Status::Good, format!("kiln {v} at {}", p.display())))
                             }
                             (_, _, Some(e)) => Some((Status::Bad, e.clone())),
                             _ => None,
@@ -59,7 +59,7 @@ impl App {
             setting_row(
                 ui,
                 "C compiler",
-                "clang, used to compile what recomp produces. Empty uses the one recomp finds.",
+                "clang, used to compile what kiln produces. Empty uses the one kiln finds.",
                 |ui| {
                     ui.horizontal(|ui| {
                         if theme::text_field(ui, &mut self.settings.clang, "Automatic", 380.0)
@@ -76,7 +76,7 @@ impl App {
                         match (&t.clang_path, &t.clang_version) {
                             (Some(p), Some(v)) => Some((Status::Good, format!("{v}\n{p}"))),
                             (Some(p), None) => Some((Status::Good, p.clone())),
-                            (None, _) if t.recomp_exe.is_some() => {
+                            (None, _) if t.kiln_exe.is_some() => {
                                 Some((Status::Bad, "clang was not found.".to_string()))
                             }
                             _ => None,
@@ -87,7 +87,7 @@ impl App {
             setting_row(
                 ui,
                 "Runtime library",
-                "The library every recompiled program links. Empty uses the one recomp finds.",
+                "The library every recompiled program links. Empty uses the one kiln finds.",
                 |ui| {
                     ui.horizontal(|ui| {
                         if theme::text_field(ui, &mut self.settings.runtime_lib, "Automatic", 380.0)
@@ -101,7 +101,7 @@ impl App {
                     });
                     status_line(
                     ui,
-                    match (&t.runtime, t.recomp_exe.is_some()) {
+                    match (&t.runtime, t.kiln_exe.is_some()) {
                         (Some(p), _) => Some((Status::Good, p.clone())),
                         (None, true) => Some((
                             Status::Warn,
@@ -122,7 +122,7 @@ impl App {
         }
         if let Some(t) = browse {
             match t {
-                Target::RecompExe => self.pick_file(t, "Programs", &[]),
+                Target::KilnExe => self.pick_file(t, "Programs", &[]),
                 Target::Clang => self.pick_file(t, "Programs", &[]),
                 _ => self.pick_file(t, "Libraries", &["lib", "a"]),
             }

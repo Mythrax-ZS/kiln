@@ -6,18 +6,18 @@ Status: complete. Date: 2026-10-12.
 
 | Piece | Where | Notes |
 |-------|-------|-------|
-| LZ4 block decoder | `recomp::loader::lz4` | Bounds-checked; rejects zero or out-of-range offsets, runaway lengths and size mismatches. |
-| NSO0 loader | `recomp::loader::nso` | Header, per-segment LZ4, SHA-256 check of each segment whose header flag asks for it, layout of text, rodata, data and bss at a fixed guest base. The zstd-based (ZBIC) flag is reported as unsupported. |
-| NRO0 loader | `recomp::loader::nro` | Header at 0x10, flat segments, bss, optional `ASET` asset section (icon, NACP, embedded RomFS offsets). |
-| MOD0 and relocations | `recomp::loader::module` | Follows MOD0 to `.dynamic`; applies RELA and PLT RELA tables (RELATIVE, ABS64, GLOB_DAT, JUMP_SLOT); collects exports, init and fini arrays, `DT_INIT`/`DT_FINI`. Imports no loaded module defines are zeroed and listed. |
-| `.eh_frame_hdr` reader | `recomp::loader::ehframe` | Exact function starts and lengths from the unwind table; also RELATIVE-relocation targets in text as likely indirect-call entries. These feed function discovery in M4. |
+| LZ4 block decoder | `kiln::loader::lz4` | Bounds-checked; rejects zero or out-of-range offsets, runaway lengths and size mismatches. |
+| NSO0 loader | `kiln::loader::nso` | Header, per-segment LZ4, SHA-256 check of each segment whose header flag asks for it, layout of text, rodata, data and bss at a fixed guest base. The zstd-based (ZBIC) flag is reported as unsupported. |
+| NRO0 loader | `kiln::loader::nro` | Header at 0x10, flat segments, bss, optional `ASET` asset section (icon, NACP, embedded RomFS offsets). |
+| MOD0 and relocations | `kiln::loader::module` | Follows MOD0 to `.dynamic`; applies RELA and PLT RELA tables (RELATIVE, ABS64, GLOB_DAT, JUMP_SLOT); collects exports, init and fini arrays, `DT_INIT`/`DT_FINI`. Imports no loaded module defines are zeroed and listed. |
+| `.eh_frame_hdr` reader | `kiln::loader::ehframe` | Exact function starts and lengths from the unwind table; also RELATIVE-relocation targets in text as likely indirect-call entries. These feed function discovery in M4. |
 | NPDM parser | `nx_runtime::npdm` | META, ACID, ACI0; service access list with glob matching and the server bit; kernel capabilities including the enabled-SVC mask. The runtime will enforce the service list and SVC mask. |
 | AArch32 detection | NPDM `Is64BitInstruction` and address space (authoritative), plus a first-instruction heuristic | Stops with `Error::Aarch32`. |
-| CLI | `recomp inspect` | Now describes every NSO, MOD0, relocation counts, exports, `.eh_frame` coverage and the NPDM. |
+| CLI | `kiln inspect` | Now describes every NSO, MOD0, relocation counts, exports, `.eh_frame` coverage and the NPDM. |
 
 ## Tests
 
-`cargo test`: 31 tests in `nx_runtime`, 42 in `recomp`, plus 4 opt-in real-title tests; all pass.
+`cargo test`: 31 tests in `nx_runtime`, 42 in `kiln`, plus 4 opt-in real-title tests; all pass.
 `cargo fmt --all --check` and `cargo clippy --all-targets -- -D warnings` are clean.
 
 - LZ4: eight blocks produced by the reference implementation (the `lz4` Python package,
@@ -44,7 +44,7 @@ Status: complete. Date: 2026-10-12.
 
 The owner supplied one extracted retail 64-bit application title. It is read in place; nothing
 from it is stored in the repository, and it is not named here. `tests/real_title.rs` runs when
-`RECOMP_TITLE_DIR` points at a folder holding `exefs/` and `romfs/`, and otherwise skips loudly.
+`KILN_TITLE_DIR` points at a folder holding `exefs/` and `romfs/`, and otherwise skips loudly.
 Measured results:
 
 - `main`: all three segments LZ4-compressed; all three SHA-256 hashes match the header, which

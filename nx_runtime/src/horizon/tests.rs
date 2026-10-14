@@ -2156,7 +2156,7 @@ fn the_account_service_has_one_open_user_listed_through_a_pointer_buffer() {
     let profile = u64::from(e.call(acc, &profile).moved[0]);
     let base = e.call(profile, &Message::new(1)).data;
     assert_eq!(&base[..16], &uid[..]);
-    assert_eq!(&base[0x18..0x1E], b"recomp");
+    assert_eq!(&base[0x18..0x1C], b"Kiln");
     let mut get = Message::new(0);
     get.recv_list = vec![(SCRATCH + 0x800, 0x80)];
     let r = e.call(profile, &get);

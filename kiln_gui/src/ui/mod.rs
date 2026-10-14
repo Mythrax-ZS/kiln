@@ -73,7 +73,7 @@ impl App {
                 ui.horizontal_centered(|ui| {
                     theme::logo(ui, 38.0);
                     ui.add_space(4.0);
-                    ui.label(theme::bold("recomp", 25.0));
+                    ui.label(theme::bold("Kiln", 25.0));
                     ui.add_space(22.0);
                     for (tab, label) in [
                         (Tab::Recompile, "Recompile"),
@@ -90,7 +90,7 @@ impl App {
                         let t = self.toolchain.clone();
                         let (text, status, tip) = match &t.runtime {
                             Some(p) => ("runtime".to_string(), Status::Good, p.clone()),
-                            None if t.recomp_exe.is_some() => (
+                            None if t.kiln_exe.is_some() => (
                                 "runtime missing".to_string(),
                                 Status::Warn,
                                 "The runtime library programs link was not found: build it with \
@@ -107,29 +107,27 @@ impl App {
                                 p.clone().unwrap_or_default(),
                             ),
                             (None, Some(p)) => ("clang".to_string(), Status::Good, p.clone()),
-                            (None, None) if t.recomp_exe.is_some() => (
+                            (None, None) if t.kiln_exe.is_some() => (
                                 "clang missing".to_string(),
                                 Status::Bad,
-                                "recomp needs clang to compile: install LLVM or choose it in \
+                                "Kiln needs clang to compile: install LLVM or choose it in \
                                  Settings."
                                     .to_string(),
                             ),
                             _ => ("clang".to_string(), Status::Unknown, String::new()),
                         };
                         theme::chip(ui, &text, status).on_hover_text(tip);
-                        let (text, status, tip) = match (&t.recomp_version, &t.error) {
+                        let (text, status, tip) = match (&t.kiln_version, &t.error) {
                             (Some(v), _) => (
-                                format!("recomp {v}"),
+                                format!("kiln {v}"),
                                 Status::Good,
-                                t.recomp_exe
+                                t.kiln_exe
                                     .as_ref()
                                     .map(|p| p.to_string_lossy().into_owned())
                                     .unwrap_or_default(),
                             ),
-                            (None, Some(e)) => {
-                                ("recomp missing".to_string(), Status::Bad, e.clone())
-                            }
-                            (None, None) => ("recomp".to_string(), Status::Unknown, String::new()),
+                            (None, Some(e)) => ("kiln missing".to_string(), Status::Bad, e.clone()),
+                            (None, None) => ("kiln".to_string(), Status::Unknown, String::new()),
                         };
                         theme::chip(ui, &text, status).on_hover_text(tip);
                     });
@@ -164,7 +162,7 @@ impl App {
                     }
                     theme::right(ui, |ui| {
                         ui.label(theme::muted(format!(
-                            "recomp GUI {}",
+                            "Kiln GUI {}",
                             env!("CARGO_PKG_VERSION")
                         )));
                     });

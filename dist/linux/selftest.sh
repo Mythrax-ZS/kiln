@@ -3,7 +3,7 @@
 # lld and the runtime library) and no game. The program computes the tenth Fibonacci number and
 # exits with it, 55.
 here="$(cd "$(dirname "$0")" && pwd)"
-out="${TMPDIR:-/tmp}/recomp-selftest-$$"
+out="${TMPDIR:-/tmp}/kiln-selftest-$$"
 rm -rf "$out"
 
 failed() {
@@ -13,10 +13,10 @@ failed() {
     exit 1
 }
 
-"$here/recomp" doctor
+"$here/kiln" doctor
 echo
 echo "building the self-test program..."
-"$here/recomp" build --exefs "$here/selftest/exefs" --out "$out" --name selftest || failed
+"$here/kiln" build --exefs "$here/selftest/exefs" --out "$out" --name selftest || failed
 "$out/selftest"
 code=$?
 if [ "$code" != 55 ]; then

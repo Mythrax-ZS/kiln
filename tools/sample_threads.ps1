@@ -1,6 +1,6 @@
 # What is a produced Windows program busy with? Samples the instruction pointer of every thread now and
-# then and names where it is: a function of the program (from the link map that `recomp build` or
-# `recomp relink` writes when RECOMP_LINK_MAP=<file> is set: generated code is `f_<guest address>`, the
+# then and names where it is: a function of the program (from the link map that `kiln build` or
+# `kiln relink` writes when KILN_LINK_MAP=<file> is set: generated code is `f_<guest address>`, the
 # runtime's functions have their Rust names) or a module of the process (a driver, ntdll).
 #
 # usage: pwsh -File tools/sample_threads.ps1 -Map <map file> [-Process title] [-Samples 40]

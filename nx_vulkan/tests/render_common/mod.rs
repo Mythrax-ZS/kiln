@@ -22,8 +22,8 @@ pub fn vulkan() -> Option<Vk> {
     match Vk::new() {
         Ok(v) => Some(v),
         Err(e) => {
-            if std::env::var("RECOMP_REQUIRE_EXTERNAL").is_ok_and(|v| v == "1") {
-                panic!("no Vulkan device and RECOMP_REQUIRE_EXTERNAL=1: {e}");
+            if std::env::var("KILN_REQUIRE_EXTERNAL").is_ok_and(|v| v == "1") {
+                panic!("no Vulkan device and KILN_REQUIRE_EXTERNAL=1: {e}");
             }
             eprintln!("SKIPPED: no Vulkan device: {e}");
             None

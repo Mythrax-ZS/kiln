@@ -1,6 +1,6 @@
 //! The C-ABI functions generated code calls (`nx_*`) and the entry points a host program uses
 //! (`nx_rt_*`). Names and signatures are the contract with the code generator
-//! (`recomp::codegen`); the declarations it emits are checked against this list by a test.
+//! (`kiln::codegen`); the declarations it emits are checked against this list by a test.
 //!
 //! Memory functions return the loaded value (zero after a failure) or nothing, and report a
 //! failure by recording it in the thread's [`Ctl`](super::abi::Ctl) and setting `fault_flag`,

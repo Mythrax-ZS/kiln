@@ -1,5 +1,5 @@
 //! Opt-in: lifted native code against the interpreter on real functions of an owner-supplied,
-//! already extracted title (`RECOMP_TITLE_DIR`, a folder holding `exefs/`). Needs clang.
+//! already extracted title (`KILN_TITLE_DIR`, a folder holding `exefs/`). Needs clang.
 //!
 //! The title's `main` is recompiled into a shared library. Sampled functions are then run twice
 //! from the same random registers and the same memory, once in the interpreter and once as native
@@ -7,19 +7,19 @@
 //! and the contents of all writable memory. Nothing from the title is stored or printed except
 //! aggregate numbers; the library is built in a temporary directory that is removed afterwards.
 //!
-//! `RECOMP_REAL_FUNCTIONS` (default 600) functions, `RECOMP_REAL_STATES` (default 3) states each,
-//! `RECOMP_REAL_OPT` (default 1) clang optimisation level, `RECOMP_REAL_STEPS` (default 300000)
+//! `KILN_REAL_FUNCTIONS` (default 600) functions, `KILN_REAL_STATES` (default 3) states each,
+//! `KILN_REAL_OPT` (default 1) clang optimisation level, `KILN_REAL_STEPS` (default 300000)
 //! interpreter instruction budget per run.
 
+use kiln::build::pipeline::{analysis_inputs, build, BuildOptions};
+use kiln::build::Toolchain;
+use kiln::lift::discover::discover;
+use kiln::lift::ModuleCode;
+use kiln::program::Program;
 use libloading::{Library, Symbol};
 use nx_runtime::rt::abi::{perm, stop, NativeCpu, EXIT_PC};
 use nx_runtime::rt::host::ModuleDesc;
 use nx_runtime::testing::{Rng, TempDir};
-use recomp::build::pipeline::{analysis_inputs, build, BuildOptions};
-use recomp::build::Toolchain;
-use recomp::lift::discover::discover;
-use recomp::lift::ModuleCode;
-use recomp::program::Program;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -31,7 +31,7 @@ fn env_count(name: &str, default: usize) -> usize {
 }
 
 fn skip_or_fail(why: &str) {
-    if std::env::var_os("RECOMP_REQUIRE_EXTERNAL").is_some() {
+    if std::env::var_os("KILN_REQUIRE_EXTERNAL").is_some() {
         panic!("{why}");
     }
     eprintln!("SKIPPED: {why}");
@@ -161,8 +161,8 @@ fn describe_difference(a: &Run, b: &Run) -> Option<String> {
 
 #[test]
 fn real_functions_run_the_same_natively_and_interpreted() {
-    let Some(dir) = std::env::var_os("RECOMP_TITLE_DIR").map(PathBuf::from) else {
-        skip_or_fail("RECOMP_TITLE_DIR is not set; the real-code comparison did not run");
+    let Some(dir) = std::env::var_os("KILN_TITLE_DIR").map(PathBuf::from) else {
+        skip_or_fail("KILN_TITLE_DIR is not set; the real-code comparison did not run");
         return;
     };
     let tc = match Toolchain::discover() {
@@ -178,7 +178,7 @@ fn real_functions_run_the_same_natively_and_interpreted() {
     opts.shared = true;
     // The functions are called directly, with no runtime linker to relocate the image.
     opts.pre_relocated = true;
-    opts.opt_level = env_count("RECOMP_REAL_OPT", 1) as u8;
+    opts.opt_level = env_count("KILN_REAL_OPT", 1) as u8;
     let report = build(&program, &tc, &opts).expect("the title recompiles");
     eprintln!(
         "real code: {} functions, {} guest instructions, built in {:.1}s",
@@ -260,15 +260,15 @@ fn real_functions_run_the_same_natively_and_interpreted() {
     let interpret: Symbol<unsafe extern "C" fn(*mut NativeCpu, u64, u64) -> u32> =
         l.sym("nx_rt_interpret");
     let set_counter: Symbol<unsafe extern "C" fn(u64)> = l.sym("nx_rt_set_counter");
-    let steps = env_count("RECOMP_REAL_STEPS", 300_000) as u64;
+    let steps = env_count("KILN_REAL_STEPS", 300_000) as u64;
 
-    let all = std::env::var_os("RECOMP_REAL_ALL").is_some();
+    let all = std::env::var_os("KILN_REAL_ALL").is_some();
     let functions = if all {
         entries.len()
     } else {
-        env_count("RECOMP_REAL_FUNCTIONS", 600)
+        env_count("KILN_REAL_FUNCTIONS", 600)
     };
-    let states = env_count("RECOMP_REAL_STATES", 3);
+    let states = env_count("KILN_REAL_STATES", 3);
     let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut failures = Vec::new();
     let data_lo = m.base;

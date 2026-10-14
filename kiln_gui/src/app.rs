@@ -30,7 +30,7 @@ pub enum Target {
     Hints,
     RomfsOverride,
     GamesDir,
-    RecompExe,
+    KilnExe,
     Clang,
     RuntimeLib,
     SaveDir,
@@ -206,8 +206,8 @@ impl App {
         if let Some(e) = &self.toolchain.error {
             return Err(e.clone());
         }
-        if self.toolchain.recomp_exe.is_none() {
-            return Err("Looking for recomp...".to_string());
+        if self.toolchain.kiln_exe.is_none() {
+            return Err("Looking for kiln...".to_string());
         }
         if self.toolchain.clang_path.is_none() {
             return Err("clang was not found: install LLVM or choose it in Settings.".to_string());
@@ -259,8 +259,8 @@ impl App {
                 self.save_settings();
                 self.rescan();
             }
-            Target::RecompExe => {
-                self.settings.recomp_exe = s;
+            Target::KilnExe => {
+                self.settings.kiln_exe = s;
                 self.save_settings();
                 self.probe_toolchain();
             }
@@ -388,7 +388,7 @@ impl App {
 
     pub fn start_build(&mut self) {
         let Some(plan) = self.plan() else { return };
-        let Some(exe) = self.toolchain.recomp_exe.clone() else {
+        let Some(exe) = self.toolchain.kiln_exe.clone() else {
             return;
         };
         if let Err(e) = std::fs::create_dir_all(&plan.out_root) {
@@ -402,7 +402,7 @@ impl App {
         self.build_console.clear();
         self.outcome = None;
         self.build_console.info(format!(
-            "$ recomp {}",
+            "$ kiln {}",
             args.iter()
                 .map(|a| if a.contains(' ') {
                     format!("\"{a}\"")
@@ -424,8 +424,8 @@ impl App {
             Ok(run) => self.build = Some(BuildRun { run, plan }),
             Err(e) => {
                 self.build_console
-                    .error(format!("could not start recomp: {e}"));
-                self.tell(format!("Could not start recomp: {e}"), Status::Bad);
+                    .error(format!("could not start kiln: {e}"));
+                self.tell(format!("Could not start kiln: {e}"), Status::Bad);
             }
         }
     }
@@ -437,13 +437,13 @@ impl App {
         }
     }
 
-    /// Show what `recomp inspect` makes of the chosen ExeFS and RomFS.
+    /// Show what `kiln inspect` makes of the chosen ExeFS and RomFS.
     pub fn inspect(&mut self) {
         let Some(Ok(d)) = &self.detected else { return };
         let Input::Exefs { exefs, romfs } = self.effective_input(d) else {
             return;
         };
-        let Some(exe) = self.toolchain.recomp_exe.clone() else {
+        let Some(exe) = self.toolchain.kiln_exe.clone() else {
             return;
         };
         let mut args = vec![
@@ -461,7 +461,7 @@ impl App {
         cmd.args(&args);
         process::hide_window(&mut cmd);
         self.build_console
-            .info(format!("$ recomp {}", args.join(" ")));
+            .info(format!("$ kiln {}", args.join(" ")));
         match cmd.output() {
             Ok(out) => {
                 for l in String::from_utf8_lossy(&out.stdout).lines() {
@@ -477,9 +477,7 @@ impl App {
                     });
                 }
             }
-            Err(e) => self
-                .build_console
-                .error(format!("could not run recomp: {e}")),
+            Err(e) => self.build_console.error(format!("could not run kiln: {e}")),
         }
     }
 
@@ -516,7 +514,7 @@ impl App {
                 source,
                 romfs,
                 flags: plan.flags(),
-                recomp_version: self.toolchain.recomp_version.clone().unwrap_or_default(),
+                kiln_version: self.toolchain.kiln_version.clone().unwrap_or_default(),
                 build_seconds: seconds as u32,
                 run: previous,
             };
@@ -537,8 +535,8 @@ impl App {
             self.tell(format!("{} was recompiled.", plan.name), Status::Good);
         } else {
             let message = match code {
-                Some(c) => format!("recomp stopped with code {c}."),
-                None => "recomp was stopped.".to_string(),
+                Some(c) => format!("kiln stopped with code {c}."),
+                None => "kiln was stopped.".to_string(),
             };
             self.build_console.error(message.clone());
             self.outcome = Some(BuildOutcome {
@@ -645,8 +643,8 @@ impl App {
         let Some(g) = self.games.iter().find(|g| g.dir == dir).cloned() else {
             return;
         };
-        let Some(exe) = self.toolchain.recomp_exe.clone() else {
-            self.tell("recomp was not found.", Status::Bad);
+        let Some(exe) = self.toolchain.kiln_exe.clone() else {
+            self.tell("kiln was not found.", Status::Bad);
             return;
         };
         let out_root = dir.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -661,7 +659,7 @@ impl App {
         self.build_console.clear();
         self.outcome = None;
         self.build_console
-            .info(format!("$ recomp {}", args.join(" ")));
+            .info(format!("$ kiln {}", args.join(" ")));
         let settings = self.settings.clone();
         match process::spawn(
             &exe,
@@ -687,7 +685,7 @@ impl App {
                 self.build = Some(BuildRun { run, plan });
                 self.tab = Tab::Recompile;
             }
-            Err(e) => self.tell(format!("Could not start recomp: {e}"), Status::Bad),
+            Err(e) => self.tell(format!("Could not start kiln: {e}"), Status::Bad),
         }
     }
 
@@ -736,7 +734,7 @@ impl App {
                             self.play(&dir);
                         }
                     }
-                    other => eprintln!("unknown RECOMP_GUI_ACTION {other}"),
+                    other => eprintln!("unknown KILN_GUI_ACTION {other}"),
                 }
             }
         }
@@ -944,16 +942,15 @@ mod tests {
     fn isolate_config() {
         static DIR: OnceLock<PathBuf> = OnceLock::new();
         let dir = DIR.get_or_init(|| {
-            let d = std::env::temp_dir().join(format!("recomp_gui_cfg_{}", std::process::id()));
+            let d = std::env::temp_dir().join(format!("kiln_gui_cfg_{}", std::process::id()));
             std::fs::create_dir_all(&d).unwrap();
             d
         });
-        std::env::set_var("RECOMP_GUI_CONFIG_DIR", dir);
+        std::env::set_var("KILN_GUI_CONFIG_DIR", dir);
     }
 
     fn temp(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("recomp_gui_app_{}_{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kiln_gui_app_{}_{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1066,7 +1063,7 @@ mod tests {
         assert!(app
             .build_console
             .text()
-            .contains("error: recomp stopped with code 3"));
+            .contains("error: kiln stopped with code 3"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1151,7 +1148,7 @@ mod tests {
         app.tab = Tab::Recompile;
         app.set_game_path(good.to_string_lossy().into_owned());
         app.advanced_open = true;
-        app.build_console.info("$ recomp build");
+        app.build_console.info("$ kiln build");
         app.build_console.error("something broke");
         app.tell("A message", Status::Good);
         frame(&mut app);

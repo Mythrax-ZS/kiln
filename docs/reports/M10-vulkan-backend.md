@@ -115,7 +115,7 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
   grid, a workgroup of more than 1,024 invocations), and a launch that reaches the backend with
   what its descriptor says or stops the run when the descriptor is not mapped (A-110).
 - **The ASTC decoder against ARM's reference decoder** (`tests/astc_reference.rs`, needs `astcenc`
-  named by `RECOMP_ASTCENC`; the decoder was written from the Khronos specification and not from
+  named by `KILN_ASTCENC`; the decoder was written from the Khronos specification and not from
   the reference code): 16,384 random blocks for each of the 14 footprints in linear mode and for
   five of them in sRGB mode, 45,197 legal blocks in all, **0 texels differ and every block the
   reference refuses is refused here** (A-099). A second test builds dual-plane blocks by hand and

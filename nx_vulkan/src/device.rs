@@ -110,7 +110,7 @@ impl Vk {
         let validate = std::env::var("NX_VULKAN_VALIDATE").is_ok_and(|v| v != "0");
 
         let app = vk::ApplicationInfo::default()
-            .application_name(c"recomp")
+            .application_name(c"kiln")
             .api_version(vk::API_VERSION_1_3);
         let mut layers: Vec<*const c_char> = Vec::new();
         let mut extensions: Vec<*const c_char> = Vec::new();

@@ -159,7 +159,7 @@ mod tests {
         };
         assert_eq!(color_of(&line(Stream::Err, "error: nope")), theme::BAD);
         assert_eq!(color_of(&line(Stream::Out, "  Warning: hm")), theme::WARN);
-        assert_eq!(color_of(&line(Stream::Info, "$ recomp")), theme::ACCENT);
+        assert_eq!(color_of(&line(Stream::Info, "$ kiln")), theme::ACCENT);
         assert_eq!(color_of(&line(Stream::Out, "fine")), theme::TEXT);
         let mut c = Console::default();
         c.error("boom");

@@ -1,6 +1,6 @@
 //! nx_runtime: guest CPU model and Horizon OS emulation layer.
 //!
-//! Recompiled programs and the `recomp` tool both link against this crate.
+//! Recompiled programs and the `kiln` tool both link against this crate.
 //! It is built as an `rlib` for Rust consumers and as a `staticlib` for the
 //! native executables and shared libraries that clang produces.
 

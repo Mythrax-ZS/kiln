@@ -10,11 +10,11 @@ use std::sync::OnceLock;
 pub struct Settings {
     /// Where recompiled games are put, one folder each.
     pub games_dir: String,
-    /// The `recomp` program; empty finds it beside this one or on the `PATH`.
-    pub recomp_exe: String,
-    /// A C compiler to use instead of the one `recomp` finds (`RECOMP_CLANG`).
+    /// The `kiln` program; empty finds it beside this one or on the `PATH`.
+    pub kiln_exe: String,
+    /// A C compiler to use instead of the one `kiln` finds (`KILN_CLANG`).
     pub clang: String,
-    /// The runtime library to link instead of the one `recomp` finds (`RECOMP_RUNTIME_LIB`).
+    /// The runtime library to link instead of the one `kiln` finds (`KILN_RUNTIME_LIB`).
     pub runtime_lib: String,
     /// The optimization level a new recompile starts with (0 to 3).
     pub default_opt: u8,
@@ -28,7 +28,7 @@ impl Default for Settings {
     fn default() -> Settings {
         Settings {
             games_dir: default_games_dir().to_string_lossy().into_owned(),
-            recomp_exe: String::new(),
+            kiln_exe: String::new(),
             clang: String::new(),
             runtime_lib: String::new(),
             default_opt: 1,
@@ -86,7 +86,7 @@ fn games_dir_for(
 fn writable(dir: &Path) -> bool {
     static PROBES: AtomicU64 = AtomicU64::new(0);
     let probe = dir.join(format!(
-        ".recomp-gui-write-test-{}-{}",
+        ".kiln-gui-write-test-{}-{}",
         std::process::id(),
         PROBES.fetch_add(1, Ordering::Relaxed)
     ));
@@ -95,15 +95,15 @@ fn writable(dir: &Path) -> bool {
     ok
 }
 
-/// The folder a program keeps what it makes in: `%LOCALAPPDATA%\recomp-gui`,
-/// `$XDG_DATA_HOME/recomp-gui` or `~/.local/share/recomp-gui`.
+/// The folder a program keeps what it makes in: `%LOCALAPPDATA%\kiln`, `$XDG_DATA_HOME/kiln` or
+/// `~/.local/share/kiln`.
 fn user_data_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_DATA_HOME"))
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("recomp-gui")
+    base.join("kiln")
 }
 
 pub fn exe_dir() -> Option<PathBuf> {
@@ -112,18 +112,29 @@ pub fn exe_dir() -> Option<PathBuf> {
         .and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
-/// The folder settings live in: `%APPDATA%\recomp-gui`, `$XDG_CONFIG_HOME/recomp-gui` or
-/// `~/.config/recomp-gui`.
+/// The folder settings live in: `%APPDATA%\kiln`, `$XDG_CONFIG_HOME/kiln` or `~/.config/kiln`.
 pub fn config_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("RECOMP_GUI_CONFIG_DIR") {
+    if let Some(d) = std::env::var_os("KILN_GUI_CONFIG_DIR") {
         return PathBuf::from(d);
     }
-    let base = std::env::var_os("APPDATA")
+    config_base().join("kiln")
+}
+
+fn config_base() -> PathBuf {
+    std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("recomp-gui")
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The settings file of the program's first name (`recomp-gui`), read once when there is no file
+/// of the new one yet.
+fn legacy_file() -> Option<PathBuf> {
+    if std::env::var_os("KILN_GUI_CONFIG_DIR").is_some() {
+        return None;
+    }
+    Some(config_base().join("recomp-gui").join("settings.json"))
 }
 
 fn file() -> PathBuf {
@@ -132,7 +143,16 @@ fn file() -> PathBuf {
 
 impl Settings {
     pub fn load() -> Settings {
-        Settings::load_from(&file())
+        Settings::load_with(&file(), legacy_file().as_deref())
+    }
+
+    /// The settings in `path`; where there is no such file, those in `legacy` (the file of the
+    /// program's first name), if it has one.
+    fn load_with(path: &Path, legacy: Option<&Path>) -> Settings {
+        match legacy {
+            Some(old) if !path.is_file() && old.is_file() => Settings::load_from(old),
+            _ => Settings::load_from(path),
+        }
     }
 
     /// Read settings; a missing or unreadable file gives the defaults (and is not an error).
@@ -165,7 +185,7 @@ mod tests {
     use super::*;
 
     fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("recomp_gui_{}_{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kiln_gui_{}_{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -174,7 +194,7 @@ mod tests {
     #[test]
     fn games_go_beside_the_program_unless_that_folder_takes_no_files() {
         let program = Path::new("/mnt/app/usr/bin");
-        let data = PathBuf::from("/home/me/.local/share/recomp-gui");
+        let data = PathBuf::from("/home/me/.local/share/kiln");
         assert_eq!(
             games_dir_for(Some(program), |_| true, data.clone(), false),
             program.join("games")
@@ -214,6 +234,36 @@ mod tests {
         };
         s.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_settings_of_the_first_name_are_read_until_there_are_new_ones() {
+        let dir = temp("first_name_settings");
+        let new = dir.join("kiln").join("settings.json");
+        let old = dir.join("recomp-gui").join("settings.json");
+        // Neither file: the defaults.
+        assert_eq!(Settings::load_with(&new, Some(&old)), Settings::default());
+        // Only the old one: what it says, except the path of a program that no longer exists.
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(
+            &old,
+            r#"{ "default_opt": 3, "recomp_exe": "C:\\gone\\recomp.exe" }"#,
+        )
+        .unwrap();
+        let s = Settings::load_with(&new, Some(&old));
+        assert_eq!(s.default_opt, 3);
+        assert_eq!(s.kiln_exe, "");
+        // Once the new one exists it wins.
+        Settings {
+            default_opt: 2,
+            ..Settings::default()
+        }
+        .save_to(&new)
+        .unwrap();
+        assert_eq!(Settings::load_with(&new, Some(&old)).default_opt, 2);
+        // No old file to look at (KILN_GUI_CONFIG_DIR names the folder): the new one alone.
+        assert_eq!(Settings::load_with(&new, None).default_opt, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

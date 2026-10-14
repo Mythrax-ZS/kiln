@@ -4,13 +4,13 @@ rem Builds the small program in the selftest folder and runs it. It needs what a
 rem (clang and the runtime library) and no game. The program computes the tenth Fibonacci number
 rem and exits with it, 55.
 set "HERE=%~dp0"
-set "OUT=%TEMP%\recomp-selftest"
+set "OUT=%TEMP%\kiln-selftest"
 if exist "%OUT%" rmdir /s /q "%OUT%"
 
-"%HERE%recomp.exe" doctor
+"%HERE%kiln.exe" doctor
 echo.
 echo building the self-test program...
-"%HERE%recomp.exe" build --exefs "%HERE%selftest\exefs" --out "%OUT%" --name selftest
+"%HERE%kiln.exe" build --exefs "%HERE%selftest\exefs" --out "%OUT%" --name selftest
 if errorlevel 1 goto failed
 
 "%OUT%\selftest.exe"

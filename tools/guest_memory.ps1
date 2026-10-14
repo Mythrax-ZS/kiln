@@ -1,5 +1,5 @@
 # Reads the guest memory of a produced Windows program that is running, from outside: walks the
-# program's page table (the `nx_mem_l1` symbol of its link map, see `RECOMP_LINK_MAP`) with
+# program's page table (the `nx_mem_l1` symbol of its link map, see `KILN_LINK_MAP`) with
 # ReadProcessMemory. Nothing in the program has to be prepared, and the program is not stopped, so
 # a value that is changing may be read torn.
 #

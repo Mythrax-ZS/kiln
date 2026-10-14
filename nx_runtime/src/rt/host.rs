@@ -209,7 +209,7 @@ pub unsafe extern "C" fn nx_rt_main(
 ) -> i32 {
     let m = &*m;
     if let Err(e) = load_module(m) {
-        eprintln!("recomp runtime: {e}");
+        eprintln!("kiln runtime: {e}");
         return STOPPED_EXIT_CODE;
     }
     if m.kind != kind::PLAIN {
@@ -218,7 +218,7 @@ pub unsafe extern "C" fn nx_rt_main(
     match start_main_thread(m.entry, argc) {
         Ok(x0) => x0 as i32,
         Err(why) => {
-            eprintln!("recomp runtime: {why}");
+            eprintln!("kiln runtime: {why}");
             STOPPED_EXIT_CODE
         }
     }
@@ -233,7 +233,7 @@ pub unsafe extern "C" fn nx_rt_load(m: *const ModuleDesc) -> i32 {
     match load_module(&*m) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("recomp runtime: {e}");
+            eprintln!("kiln runtime: {e}");
             1
         }
     }
@@ -268,7 +268,7 @@ pub unsafe extern "C" fn nx_rt_call(addr: u64, args: *const u64, nargs: u32) -> 
         .map(top - STACK_SIZE, STACK_SIZE, perm::R | perm::W)
         .is_err()
     {
-        eprintln!("recomp runtime: cannot map a stack for the call");
+        eprintln!("kiln runtime: cannot map a stack for the call");
         return u64::MAX;
     }
     let mut cpu = Box::new(NativeCpu::new(rt().new_thread_id()));
@@ -277,7 +277,7 @@ pub unsafe extern "C" fn nx_rt_call(addr: u64, args: *const u64, nargs: u32) -> 
         cpu.state.x[i] = *a;
     }
     if run(&mut *cpu, addr) != 0 {
-        eprintln!("recomp runtime: {}", describe_stop(&cpu));
+        eprintln!("kiln runtime: {}", describe_stop(&cpu));
         return u64::MAX;
     }
     cpu.state.x[0]

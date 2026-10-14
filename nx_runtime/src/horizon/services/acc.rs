@@ -9,11 +9,12 @@ use super::super::kernel::Kernel;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
 use std::sync::Weak;
 
-/// The user's id: a 128-bit value as two 64-bit words, neither zero.
+/// The user's id: a 128-bit value as two 64-bit words, neither zero. It spells the program's first
+/// name ("recomp-user-0001") and stays as it is: a game may have stored it.
 pub const USER_ID: [u64; 2] = [0x7265_636f_6d70_2d75, 0x7365_722d_3030_3031];
 
 /// The nickname of the user.
-const NICKNAME: &[u8] = b"recomp";
+const NICKNAME: &[u8] = b"Kiln";
 
 /// How many users a list holds: `libnx` reads eight and counts the ones that are not zero.
 const LIST_SIZE: usize = 8;

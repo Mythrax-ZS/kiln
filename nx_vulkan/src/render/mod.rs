@@ -68,7 +68,7 @@ impl Config {
             dump_limit: number("NX_DUMP_COUNT"),
             dump_busy: number("NX_DUMP_BUSY"),
             window,
-            window_title: std::env::var("NX_WINDOW_TITLE").unwrap_or_else(|_| "recomp".to_string()),
+            window_title: std::env::var("NX_WINDOW_TITLE").unwrap_or_else(|_| "kiln".to_string()),
             input: None,
         }
     }

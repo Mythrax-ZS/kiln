@@ -353,7 +353,7 @@ impl BinderDriver {
         if let Some(limit) = self.shared.frame_limit {
             let frames = self.shared.comp().frames_presented();
             if code == nx_gpu::display::code::QUEUE_BUFFER && frames >= limit {
-                eprintln!("recomp runtime: NX_MAX_FRAMES reached after {frames} presented frames");
+                eprintln!("kiln runtime: NX_MAX_FRAMES reached after {frames} presented frames");
                 kernel.exit_process(0);
             }
         }

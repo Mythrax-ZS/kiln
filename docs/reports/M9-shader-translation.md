@@ -23,7 +23,7 @@ for being valid SPIR-V until the Vulkan backend (M10) runs draws. No picture exi
 - **36 GPU tests run the translated programs on the device** and compare with Rust arithmetic
   (`cargo test -p nx_vulkan`), plus 23 unit tests of the decoder, control flow graph, header
   parser and SPIR-V builder. A test prints `SKIPPED` and passes when there is no Vulkan device or
-  no `spirv-val`; `RECOMP_REQUIRE_EXTERNAL=1` makes either a failure.
+  no `spirv-val`; `KILN_REQUIRE_EXTERNAL=1` makes either a failure.
 - **149 of the 296 rows of the instruction table have a translation** (`example coverage`).
   The other 147 stop the translation with the name of the instruction and its code offset (an
   unknown instruction never becomes a made-up result).
@@ -37,7 +37,7 @@ for being valid SPIR-V until the Vulkan backend (M10) runs draws. No picture exi
 | `cfg` | The control flow graph of a program, with `SSY`/`PBK`/`PCNT` stacks resolved per path (A-079). |
 | `spirv` | A SPIR-V module builder (types, constants, functions, structured control flow, decorations). |
 | `translate` | Instruction translation: `alu` (float, integer, comparison, conversion), `int` (`XMAD`, `IMAD`, `LEA`, `LOP3`, `SHF`, `PRMT`), `io` (attributes, constant buffers, special registers, stage prologues and epilogues), `tex` (`TEXS`), `global` (`LDG`/`STG`), `flow` (blocks and the dispatch loop). |
-| `validate` | Finds `spirv-val` and `spirv-dis` (`RECOMP_SPIRV_TOOLS`, `PATH`, `VULKAN_SDK`, `C:\VulkanSDK`) and runs them. |
+| `validate` | Finds `spirv-val` and `spirv-dis` (`KILN_SPIRV_TOOLS`, `PATH`, `VULKAN_SDK`, `C:\VulkanSDK`) and runs them. |
 | `nx_vulkan` | The Vulkan device (extension and feature selection, the discrete GPU first), host-visible buffers, images with staging upload, and a one-shot compute dispatch with textures and device-address patching: the harness. |
 
 ## What the GPU tests cover

@@ -1,12 +1,12 @@
 #!/bin/sh
-# Installs what recomp needs on a PC that has no clang or lld, with the package manager of the
+# Installs what kiln needs on a PC that has no clang or lld, with the package manager of the
 # distribution (it asks first, and uses sudo). `setup-toolchain.sh --dry` says what it would run.
 here="$(cd "$(dirname "$0")" && pwd)"
-recomp="$here/recomp"
-[ -x "$recomp" ] || recomp="$(command -v recomp 2>/dev/null)"
+kiln="$here/kiln"
+[ -x "$kiln" ] || kiln="$(command -v kiln 2>/dev/null)"
 
 have_clang=1
-if [ -n "$recomp" ] && "$recomp" doctor 2>/dev/null | grep -q '^clang: not found'; then
+if [ -n "$kiln" ] && "$kiln" doctor 2>/dev/null | grep -q '^clang: not found'; then
     have_clang=0
 fi
 have_lld=1
@@ -15,7 +15,7 @@ if ! command -v ld.lld >/dev/null 2>&1 && ! command -v lld >/dev/null 2>&1; then
 fi
 if [ "$have_clang" = 1 ] && [ "$have_lld" = 1 ]; then
     echo "clang and lld are already on this PC."
-    [ -n "$recomp" ] && "$recomp" doctor
+    [ -n "$kiln" ] && "$kiln" doctor
     exit 0
 fi
 
@@ -33,7 +33,7 @@ else
     exit 1
 fi
 
-echo "recomp needs clang and lld, and this PC is missing one of them. This would run:"
+echo "kiln needs clang and lld, and this PC is missing one of them. This would run:"
 echo "    $cmd"
 if [ "${1:-}" = "--dry" ]; then
     exit 0

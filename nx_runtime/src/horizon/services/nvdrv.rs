@@ -168,7 +168,7 @@ fn renderer() -> Option<Box<dyn nx_gpu::render::Backend>> {
         Ok("vulkan") => vulkan_renderer(),
         Ok("none") | Ok("") | Err(_) => None,
         Ok(other) => {
-            eprintln!("recomp runtime: NX_RENDERER={other} is not a renderer (vulkan, none)");
+            eprintln!("kiln runtime: NX_RENDERER={other} is not a renderer (vulkan, none)");
             None
         }
     }
@@ -192,7 +192,7 @@ fn vulkan_renderer() -> Option<Box<dyn nx_gpu::render::Backend>> {
 
 #[cfg(not(feature = "vulkan"))]
 fn vulkan_renderer() -> Option<Box<dyn nx_gpu::render::Backend>> {
-    eprintln!("recomp runtime: NX_RENDERER=vulkan, and this runtime was built without it");
+    eprintln!("kiln runtime: NX_RENDERER=vulkan, and this runtime was built without it");
     None
 }
 
@@ -277,7 +277,7 @@ impl Shared {
         match kernel {
             Some(kernel) => kernel.fatal(what),
             None => {
-                eprintln!("recomp runtime: {what}");
+                eprintln!("kiln runtime: {what}");
                 std::process::exit(1);
             }
         }

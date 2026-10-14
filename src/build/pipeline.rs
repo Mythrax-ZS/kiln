@@ -221,7 +221,7 @@ pub(crate) fn ranges_of(map: &BTreeMap<u64, &'static str>) -> Vec<(u64, u64, &'s
 fn write_report(r: &BuildReport, program: &Program, path: &Path) -> Result<()> {
     let a = &r.analysis;
     let mut s = String::new();
-    let _ = writeln!(s, "recomp build report: {}", program.name);
+    let _ = writeln!(s, "kiln build report: {}", program.name);
     for m in &program.modules {
         let _ = writeln!(
             s,
@@ -437,7 +437,7 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
         lib_objs.push(lib_obj);
         let mut exports: Vec<&str> = RUNTIME_EXPORTS.to_vec();
         exports.extend([
-            "recomp_main",
+            "kiln_main",
             "nx_module",
             "nx_rt_load",
             "nx_rt_find_export",

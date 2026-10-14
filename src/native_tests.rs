@@ -2,9 +2,9 @@
 //! compared with the interpreter.
 //!
 //! A batch lifts many programs, compiles them together with the runtime into one library, and runs
-//! each case natively. Needs clang; skips loudly without it (`RECOMP_REQUIRE_EXTERNAL=1` makes a
-//! skip a failure). Sizes: `RECOMP_NATIVE_WORDS` instructions per encoding group (default 40),
-//! `RECOMP_NATIVE_STATES` random states per instruction (default 4), `RECOMP_NATIVE_PROGRAMS`
+//! each case natively. Needs clang; skips loudly without it (`KILN_REQUIRE_EXTERNAL=1` makes a
+//! skip a failure). Sizes: `KILN_NATIVE_WORDS` instructions per encoding group (default 40),
+//! `KILN_NATIVE_STATES` random states per instruction (default 4), `KILN_NATIVE_PROGRAMS`
 //! random control-flow programs (default 150).
 
 use crate::build::{runtime_lib, write_units, Toolchain, RUNTIME_EXPORTS};
@@ -40,7 +40,7 @@ fn toolchain_or_skip() -> Option<Toolchain> {
     match Toolchain::discover() {
         Ok(t) => Some(t),
         Err(e) => {
-            if std::env::var_os("RECOMP_REQUIRE_EXTERNAL").is_some() {
+            if std::env::var_os("KILN_REQUIRE_EXTERNAL").is_some() {
                 panic!("clang is required: {e}");
             }
             eprintln!("SKIPPED (no clang): {e}");
@@ -380,8 +380,8 @@ fn every_group_matches_the_interpreter_natively() {
     let Some(tc) = toolchain_or_skip() else {
         return;
     };
-    let per_group = env_count("RECOMP_NATIVE_WORDS", 40);
-    let states = env_count("RECOMP_NATIVE_STATES", 4);
+    let per_group = env_count("KILN_NATIVE_WORDS", 40);
+    let states = env_count("KILN_NATIVE_STATES", 4);
     let mut g = Gen::new(0x4A71);
     let mut programs = Vec::new();
     let mut names = Vec::new();
@@ -455,7 +455,7 @@ fn control_flow_programs_match_the_interpreter_natively() {
     }
     let mut programs = rebuilt;
     let mut g = Gen::new(0xF10);
-    let randoms = env_count("RECOMP_NATIVE_PROGRAMS", 150);
+    let randoms = env_count("KILN_NATIVE_PROGRAMS", 150);
     for n in 0..randoms {
         let base = FIRST + SLOT * programs.len() as u64;
         programs.push(Program::new(random_program(&mut g, base)));
@@ -618,7 +618,7 @@ fn single_precision_arithmetic_and_compares_match_the_interpreter_natively() {
             words.push(0x1E20_2000 | rm << 16 | rn << 5 | opcode2);
         }
     }
-    let states = env_count("RECOMP_FLOAT_STATES", 600);
+    let states = env_count("KILN_FLOAT_STATES", 600);
     check_float_words(&words, states, 0xF10A7);
 }
 
@@ -667,7 +667,7 @@ fn register_moves_selects_and_bit_operations_match_the_interpreter_natively() {
         words.push(0x0EA2_1C21 | q << 30); // orr v1, v1, v2 (mov-like)
         words.push(0x0EA1_1C20 | q << 30); // orr v0, v1, v1 (mov v0, v1)
     }
-    let states = env_count("RECOMP_FLOAT_STATES", 600) / 4;
+    let states = env_count("KILN_FLOAT_STATES", 600) / 4;
     check_float_words(&words, states.max(20), 0xB175);
 }
 
@@ -688,7 +688,7 @@ fn vector_loads_and_stores_of_one_or_two_registers_match_the_interpreter_nativel
             }
         }
     }
-    let states = env_count("RECOMP_FLOAT_STATES", 600) / 4;
+    let states = env_count("KILN_FLOAT_STATES", 600) / 4;
     check_float_words(&words, states.max(20), 0x7E5);
 }
 
@@ -798,7 +798,7 @@ fn vector_single_precision_arithmetic_matches_the_interpreter_natively() {
         words.push(0x1E22_0000 | u << 16 | 1 << 5 | 2);
         words.push(0x1E38_0000 | u << 16 | 1 << 5 | 2);
     }
-    let states = env_count("RECOMP_FLOAT_STATES", 600);
+    let states = env_count("KILN_FLOAT_STATES", 600);
     check_lane_words(&words, states, 0x5EC7);
 }
 
@@ -845,6 +845,6 @@ fn lane_moves_and_permutes_match_the_interpreter_natively() {
             words.push(0x6E00_0400 | imm5 << 16 | imm4 << 11 | rn << 5 | rd);
         }
     }
-    let states = env_count("RECOMP_FLOAT_STATES", 600) / 2;
+    let states = env_count("KILN_FLOAT_STATES", 600) / 2;
     check_lane_words(&words, states.max(20), 0xA27E);
 }

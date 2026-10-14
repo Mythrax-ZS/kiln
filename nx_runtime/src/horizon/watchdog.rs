@@ -4,7 +4,7 @@
 //! thread is doing (inside which supervisor call and for how long, or running guest code, with the
 //! return addresses as of its last call: generated code keeps its registers in variables and
 //! stores them in the CPU structure at calls) and how far the command processor has got, then
-//! again every `seconds` while the run stays stuck. `recomp symbols` names the addresses.
+//! again every `seconds` while the run stays stuck. `kiln symbols` names the addresses.
 //! `NX_WATCHDOG_ALWAYS=1` makes it report every `seconds` whether frames come or not, for a title
 //! that presents the frames of a loading screen for ever.
 

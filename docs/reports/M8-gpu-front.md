@@ -21,7 +21,7 @@ frames to our display layer until the run is stopped on purpose:
 
 ```
 $ NX_MAX_FRAMES=600 NX_TRACE_GPU=1 ./title
-recomp runtime: NX_MAX_FRAMES reached after 600 presented frames
+kiln runtime: NX_MAX_FRAMES reached after 600 presented frames
 GPU commands: 1201 submissions, 6003 pushbuffer entries, 749770 words, 630488 method writes, 4228 semaphore releases
   macro calls: 30641 calls of 11 different macros
   macros ran 1616820 instructions and wrote 606861 methods
@@ -127,7 +127,7 @@ return addresses of the stopped thread's frame-pointer chain.
 
 ### Tools for iterating on a title
 
-- `recomp symbols --exefs <dir> [--match <text>] [<address>...]` names the function around an
+- `kiln symbols --exefs <dir> [--match <text>] [<address>...]` names the function around an
   address in any module with a symbol table (the title's SDK has one), which turns the return
   addresses of a stop report into a call stack.
 - `NX_TRACE_SVC=1` now also lists what each `WaitSynchronization` waits on and when an event is
@@ -166,8 +166,8 @@ The last stop was none: the title runs.
 
 `cargo test` on Windows (fmt and clippy clean, the exit status of each step checked): 125 `nx_gpu`
 unit tests, 298 `nx_runtime` unit tests (of which 110 are in the kernel layer and its services, driven through real IPC
-messages and real host threads), 30 Unicorn differential tests, 85 `recomp` tests, and the opt-in
-real-title tests (skipped without `RECOMP_TITLE_DIR`).
+messages and real host threads), 30 Unicorn differential tests, 85 `kiln` tests, and the opt-in
+real-title tests (skipped without `KILN_TITLE_DIR`).
 
 | Layer | Test | Result |
 |-------|------|--------|
@@ -203,8 +203,8 @@ One mutation did not compile and three did not apply.
 ### Linux
 
 On Linux (WSL, Ubuntu 26.04, clang 21.1.8), on the commit that adds the mutation-driven tests: fmt
-and clippy clean; `cargo test --workspace` passes (125 `nx_gpu`, 298 `nx_runtime`, 85 `recomp`
-tests), and the 85 `recomp` tests also pass with `RECOMP_REQUIRE_EXTERNAL=1`, so every end-to-end
+and clippy clean; `cargo test --workspace` passes (125 `nx_gpu`, 298 `nx_runtime`, 85 `kiln`
+tests), and the 85 `kiln` tests also pass with `KILN_REQUIRE_EXTERNAL=1`, so every end-to-end
 program was built and run there. The Unicorn tests skip (the library is not installed in that
 environment), so those results come from Windows.
 

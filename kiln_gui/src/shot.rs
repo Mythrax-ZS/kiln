@@ -1,6 +1,6 @@
 //! Saving the window as a PNG, for looking at the interface without a screen: with
-//! `RECOMP_GUI_SCREENSHOT=file.png` the program draws a few frames, writes the picture and exits.
-//! `RECOMP_GUI_TAB` (recompile, library, settings, about) picks the screen and `RECOMP_GUI_GAME`
+//! `KILN_GUI_SCREENSHOT=file.png` the program draws a few frames, writes the picture and exits.
+//! `KILN_GUI_TAB` (recompile, library, settings, about) picks the screen and `KILN_GUI_GAME`
 //! a game path to start with. A small PNG writer lives here so no image library is needed.
 
 use std::path::{Path, PathBuf};
@@ -98,14 +98,14 @@ pub struct Hooks {
 impl Hooks {
     pub fn from_env() -> Hooks {
         Hooks {
-            screenshot: std::env::var_os("RECOMP_GUI_SCREENSHOT").map(PathBuf::from),
-            tab: std::env::var("RECOMP_GUI_TAB").ok(),
-            game: std::env::var("RECOMP_GUI_GAME").ok(),
-            action: std::env::var("RECOMP_GUI_ACTION").ok(),
-            frames: std::env::var("RECOMP_GUI_FRAMES")
+            screenshot: std::env::var_os("KILN_GUI_SCREENSHOT").map(PathBuf::from),
+            tab: std::env::var("KILN_GUI_TAB").ok(),
+            game: std::env::var("KILN_GUI_GAME").ok(),
+            action: std::env::var("KILN_GUI_ACTION").ok(),
+            frames: std::env::var("KILN_GUI_FRAMES")
                 .ok()
                 .and_then(|v| v.parse().ok()),
-            open: std::env::var("RECOMP_GUI_OPEN")
+            open: std::env::var("KILN_GUI_OPEN")
                 .map(|v| v.split(',').map(str::to_string).collect())
                 .unwrap_or_default(),
         }

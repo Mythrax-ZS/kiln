@@ -413,7 +413,7 @@ fn configured_keymap() -> Keymap {
         Ok(map) => map,
         Err(e) => {
             eprintln!(
-                "recomp runtime: NX_KEYMAP {}: {e}; the standard keys are used",
+                "kiln runtime: NX_KEYMAP {}: {e}; the standard keys are used",
                 std::path::Path::new(&path).display()
             );
             Keymap::standard()
@@ -502,7 +502,7 @@ fn script() -> &'static Script {
             text
         };
         Script::parse(&text).unwrap_or_else(|e| {
-            eprintln!("recomp runtime: NX_INPUT_SCRIPT: {e}; it is not used");
+            eprintln!("kiln runtime: NX_INPUT_SCRIPT: {e}; it is not used");
             Script::default()
         })
     })

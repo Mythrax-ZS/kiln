@@ -56,7 +56,7 @@ interpreter and the generated code (`docs/ARCHITECTURE.md`, "Floating point and 
 ## Tests
 
 `cargo test --workspace` (fmt and clippy clean): 183 `nx_runtime` unit tests, 29 Unicorn
-differential tests (14 integer, 7 floating point, 8 SIMD), 75 `recomp` tests, plus the opt-in
+differential tests (14 integer, 7 floating point, 8 SIMD), 75 `kiln` tests, plus the opt-in
 real-title tests.
 
 | Layer | Test | Result |

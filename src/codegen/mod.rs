@@ -22,7 +22,7 @@ pub fn host_triple() -> &'static str {
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         "x86_64-unknown-linux-gnu"
     } else {
-        panic!("recomp produces x86_64 code for Windows and Linux hosts only")
+        panic!("kiln produces x86_64 code for Windows and Linux hosts only")
     }
 }
 

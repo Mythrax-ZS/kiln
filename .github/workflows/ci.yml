@@ -1,7 +1,7 @@
 name: ci
 
 # The gate of CLAUDE.md (fmt, lint, test) on Windows and on Linux, and the Windows bundle: the
-# three files a person needs to recompile a game of their own (recomp-gui.exe, recomp.exe and
+# three files a person needs to recompile a game of their own (kiln-gui.exe, kiln.exe and
 # nx_runtime.lib) with a short README and a self-test, tested as a person would get them. Every
 # push to `main` that passes is kept as a tag and a pre-release holding that bundle.
 #
@@ -64,7 +64,7 @@ jobs:
             $clang = 'C:\Program Files\LLVM\bin\clang.exe'
           }
           & $clang --version
-          "RECOMP_CLANG=$clang" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "KILN_CLANG=$clang" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       # The oracle of the instruction tests (a differential test against Unicorn).
       - name: Unicorn
@@ -86,9 +86,9 @@ jobs:
 
       # The tests that need clang say SKIPPED and pass without it; here it must have been there.
       - name: library tests with the external tools required
-        run: cargo test -p recomp --lib
+        run: cargo test -p kiln --lib
         env:
-          RECOMP_REQUIRE_EXTERNAL: "1"
+          KILN_REQUIRE_EXTERNAL: "1"
 
   linux:
     name: linux (lint, test)
@@ -122,15 +122,15 @@ jobs:
       # The desktop front end is built for Windows (see the bundle); the rest of the workspace is
       # what the Linux build is for: the ELF output and the runtime on Linux.
       - name: lint
-        run: cargo clippy --workspace --exclude recomp_gui --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude kiln_gui --all-targets -- -D warnings
 
       - name: test
-        run: cargo test --workspace --exclude recomp_gui
+        run: cargo test --workspace --exclude kiln_gui
 
       - name: library tests with the external tools required
-        run: cargo test -p recomp --lib
+        run: cargo test -p kiln --lib
         env:
-          RECOMP_REQUIRE_EXTERNAL: "1"
+          KILN_REQUIRE_EXTERNAL: "1"
 
   bundle:
     name: bundle (windows x64)
@@ -164,7 +164,7 @@ jobs:
             $clang = 'C:\Program Files\LLVM\bin\clang.exe'
           }
           & $clang --version
-          "RECOMP_CLANG=$clang" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "KILN_CLANG=$clang" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - name: Build (release)
         run: cargo build --release --workspace
@@ -174,8 +174,8 @@ jobs:
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'selftest-fixture'
-          $env:RECOMP_SELFTEST_FIXTURE = $dir
-          cargo test -p recomp --lib -- --ignored --exact build::e2e_tests::writes_the_selftest_program
+          $env:KILN_SELFTEST_FIXTURE = $dir
+          cargo test -p kiln --lib -- --ignored --exact build::e2e_tests::writes_the_selftest_program
           if (-not (Test-Path (Join-Path $dir 'exefs\main'))) { throw "the self-test program was not written" }
           "SELFTEST_FIXTURE=$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
@@ -184,7 +184,7 @@ jobs:
         run: ./tools/bundle.ps1 -Out dist-out -Selftest $env:SELFTEST_FIXTURE
 
       # The bundle as a person gets it: unpacked somewhere else, on a machine with no Rust (a cargo
-      # that does not exist), compiling and running the self-test with the library beside recomp.
+      # that does not exist), compiling and running the self-test with the library beside kiln.
       - name: Test the bundle
         shell: pwsh
         run: |
@@ -194,7 +194,7 @@ jobs:
           $root = Get-ChildItem $where -Directory | Select-Object -First 1
           Get-ChildItem $root.FullName -Recurse | ForEach-Object { $_.FullName.Substring($root.FullName.Length) }
           $env:CARGO = 'C:\does-not-exist\cargo.exe'
-          Remove-Item Env:RECOMP_RUNTIME_LIB -ErrorAction SilentlyContinue
+          Remove-Item Env:KILN_RUNTIME_LIB -ErrorAction SilentlyContinue
           & "$($root.FullName)\selftest.cmd" /ci
           if ($LASTEXITCODE -ne 0) { throw "the self-test of the bundle failed ($LASTEXITCODE)" }
 
@@ -219,7 +219,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
         with:
-          name: recomp-windows-x64
+          name: kiln-windows-x64
           path: |
             dist-out/*.zip
             dist-out/SHA256SUMS.txt
@@ -301,7 +301,7 @@ jobs:
       - name: Make the self-test program
         run: |
           dir="$RUNNER_TEMP/selftest-fixture"
-          RECOMP_SELFTEST_FIXTURE="$dir" cargo test -p recomp --lib -- --ignored --exact build::e2e_tests::writes_the_selftest_program
+          KILN_SELFTEST_FIXTURE="$dir" cargo test -p kiln --lib -- --ignored --exact build::e2e_tests::writes_the_selftest_program
           test -f "$dir/exefs/main"
           echo "SELFTEST_FIXTURE=$dir" >> "$GITHUB_ENV"
 
@@ -322,23 +322,23 @@ jobs:
             --appimagetool "$APPIMAGE_TOOLS/appimagetool" --runtime "$APPIMAGE_TOOLS/runtime"
 
       # The bundle as a person gets it: unpacked somewhere else, on a machine with no Rust (a cargo
-      # that does not exist), compiling and running the self-test with the library beside recomp,
+      # that does not exist), compiling and running the self-test with the library beside kiln,
       # first from the tarball and then with the command line tool inside the AppImage.
       - name: Test the bundle
         run: |
           export CARGO=/does-not-exist/cargo
-          unset RECOMP_RUNTIME_LIB
+          unset KILN_RUNTIME_LIB
           where="$RUNNER_TEMP/bundle-check"
           mkdir -p "$where"
           tar -C "$where" -xzf dist-out/*.tar.gz
-          root="$(ls -d "$where"/recomp-*)"
+          root="$(ls -d "$where"/kiln-*)"
           ls -la "$root"
           "$root/selftest.sh"
           "$root/setup-toolchain.sh" --dry
           appimage="$(ls dist-out/*.AppImage)"
-          "$appimage" --appimage-extract-and-run recomp doctor
+          "$appimage" --appimage-extract-and-run kiln doctor
           rm -rf "$RUNNER_TEMP/appimage-out"
-          "$appimage" --appimage-extract-and-run recomp build --exefs "$SELFTEST_FIXTURE/exefs" --out "$RUNNER_TEMP/appimage-out" --name selftest
+          "$appimage" --appimage-extract-and-run kiln build --exefs "$SELFTEST_FIXTURE/exefs" --out "$RUNNER_TEMP/appimage-out" --name selftest
           set +e
           "$RUNNER_TEMP/appimage-out/selftest"
           code=$?
@@ -359,7 +359,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
         with:
-          name: recomp-linux-x86_64
+          name: kiln-linux-x86_64
           path: |
             dist-out/*.tar.gz
             dist-out/*.AppImage

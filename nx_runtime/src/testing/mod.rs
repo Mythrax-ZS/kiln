@@ -21,8 +21,7 @@ pub struct TempDir {
 impl TempDir {
     pub fn new(tag: &str) -> TempDir {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("recomp-{}-{}-{}", std::process::id(), n, tag));
+        let path = std::env::temp_dir().join(format!("kiln-{}-{}-{}", std::process::id(), n, tag));
         std::fs::create_dir_all(&path).expect("create temp dir");
         TempDir { path }
     }

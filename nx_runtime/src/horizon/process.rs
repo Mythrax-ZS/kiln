@@ -231,7 +231,7 @@ pub unsafe fn run_module(m: &crate::rt::host::ModuleDesc) -> i32 {
         match Npdm::parse(npdm_bytes) {
             Ok(n) => Some(n),
             Err(e) => {
-                eprintln!("recomp runtime: the embedded NPDM does not parse: {e}");
+                eprintln!("kiln runtime: the embedded NPDM does not parse: {e}");
                 return STOPPED_EXIT_CODE;
             }
         }
@@ -270,10 +270,10 @@ pub unsafe fn run_module(m: &crate::rt::host::ModuleDesc) -> i32 {
     match kernel.run_process(&cfg) {
         Exit::Code(code) => code,
         Exit::Fatal(report) => {
-            eprintln!("recomp runtime: {report}");
+            eprintln!("kiln runtime: {report}");
             // For looking at the memory of a stopped program from outside (tools/guest_memory.ps1).
             if std::env::var_os("NX_HOLD_ON_STOP").is_some() {
-                eprintln!("recomp runtime: NX_HOLD_ON_STOP: the process stays until it is killed");
+                eprintln!("kiln runtime: NX_HOLD_ON_STOP: the process stays until it is killed");
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(3600));
                 }

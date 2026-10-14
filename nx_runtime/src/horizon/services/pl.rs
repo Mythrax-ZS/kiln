@@ -294,12 +294,12 @@ pub fn stand_in_font(name: &str) -> Vec<u8> {
 
 /// The names the six stand-ins carry.
 const NAMES: [&str; FONT_TYPES] = [
-    "recomp standard",
-    "recomp chinese simplified",
-    "recomp extended chinese simplified",
-    "recomp chinese traditional",
-    "recomp korean",
-    "recomp nintendo extended",
+    "kiln standard",
+    "kiln chinese simplified",
+    "kiln extended chinese simplified",
+    "kiln chinese traditional",
+    "kiln korean",
+    "kiln nintendo extended",
 ];
 
 /// The six fonts, made once.
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn the_stand_in_is_a_well_formed_truetype_file() {
-        let f = stand_in_font("recomp standard");
+        let f = stand_in_font("kiln standard");
         assert_eq!(u32_at(&f, 0), 0x0001_0000);
         let n = u16_at(&f, 4) as usize;
         assert_eq!(n, 10);

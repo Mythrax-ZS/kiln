@@ -9,7 +9,8 @@ use super::super::service::{Request, Response, Service, ServiceResult, Stop};
 use std::sync::{OnceLock, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// The id of the one steady clock (the source id of every time point).
+/// The id of the one steady clock (the source id of every time point). It spells the program's
+/// first name and stays as it is: a game may have stored a time point with it.
 const CLOCK_SOURCE_ID: [u8; 16] = *b"recomp-steady-01";
 
 /// `TimeZoneRule` is 0x4000 bytes; ours holds the name of the zone and nothing else.

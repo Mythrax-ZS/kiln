@@ -195,15 +195,15 @@ mod tests {
         let (program, args) = if cfg!(windows) {
             (
                 std::path::PathBuf::from("cmd"),
-                vec!["/C".to_string(), "echo %RECOMP_GUI_TEST%&& cd".to_string()],
+                vec!["/C".to_string(), "echo %KILN_GUI_TEST%&& cd".to_string()],
             )
         } else {
             (
                 std::path::PathBuf::from("sh"),
-                vec!["-c".to_string(), "echo $RECOMP_GUI_TEST; pwd".to_string()],
+                vec!["-c".to_string(), "echo $KILN_GUI_TEST; pwd".to_string()],
             )
         };
-        let envs = [("RECOMP_GUI_TEST".to_string(), "hello-gui".to_string())];
+        let envs = [("KILN_GUI_TEST".to_string(), "hello-gui".to_string())];
         let mut run = spawn(&program, &args, &envs, Some(&dir), |_| {}, &ctx).unwrap();
         let mut lines = Vec::new();
         loop {

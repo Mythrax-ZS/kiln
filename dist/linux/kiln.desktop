@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=recomp
+Name=Kiln
 Comment=Recompile the program of a game you dumped yourself, and run it
-Exec=recomp-gui
-Icon=recomp
+Exec=kiln-gui
+Icon=kiln
 Terminal=false
 Categories=Development;

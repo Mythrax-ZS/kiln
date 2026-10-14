@@ -313,7 +313,7 @@ fn straight_line(inst: &Inst) -> bool {
 }
 
 fn cases() -> usize {
-    std::env::var("RECOMP_LIFT_CASES")
+    std::env::var("KILN_LIFT_CASES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(60_000)

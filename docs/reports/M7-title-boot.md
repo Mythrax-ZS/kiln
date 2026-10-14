@@ -28,7 +28,7 @@ layer, through the same steps a console takes:
 program stops there and says, on standard error and with exit status 101:
 
 ```
-recomp runtime: the program asked the service manager (sm: command 1, GetServiceHandle) for
+kiln runtime: the program asked the service manager (sm: command 1, GetServiceHandle) for
 `nvdrv`, which it may use and which this runtime does not implement (SVC at 0xad10d94)
 ```
 
@@ -50,7 +50,7 @@ the 52 `SendSyncRequest` calls carry the IPC requests to the services listed bel
   from `0x0800_0000`; the program starts in the first. The analysis reads all of them as one
   address space (`ProcessCode`), the image the produced program embeds is the *unrelocated* one
   that the title's `rtld` then relocates (`Module::unrelocated_image`, built from what every
-  relocation overwrote), and the descriptor lists every module's segments. `recomp build` and
+  relocation overwrote), and the descriptor lists every module's segments. `kiln build` and
   `analyze` take all NSOs of an ExeFS; `--main-only` restores the single-module behavior that the
   earlier reports measured.
 - **Services** (`nx_runtime/src/horizon/services/`): `lm`, `apm`, `appletOE`, `aoc:u`, `pctl`,
@@ -83,7 +83,7 @@ the 52 `SendSyncRequest` calls carry the IPC requests to the services listed bel
 - **Tools for iterating on a title**: `NX_TRACE_SVC=1` now also logs every IPC request with the
   service name, the command and the result, the service names asked of `sm:` and whether the NPDM
   allowed them, and marks calls that may block when they start (so a hang shows where it waits);
-  `NX_TRACE_LOG=1` prints what the program logs through `lm`; `recomp relink` links the objects of
+  `NX_TRACE_LOG=1` prints what the program logs through `lm`; `kiln relink` links the objects of
   an earlier build against the current runtime in seconds, and `--reuse-objects` rebuilds the
   descriptor and the image without recompiling the code.
 - A **latent bug in the jump-table analysis**: a vector load (`LDR Q`) in the straight-line code in
@@ -107,7 +107,7 @@ the 52 `SendSyncRequest` calls carry the IPC requests to the services listed bel
 ## Tests
 
 `cargo test --workspace` on Windows (fmt and clippy clean, exit status of each step checked): 249
-`nx_runtime` unit tests, 30 Unicorn differential tests (14 integer, 7 floating point, 9 SIMD and crypto), 84 `recomp` tests.
+`nx_runtime` unit tests, 30 Unicorn differential tests (14 integer, 7 floating point, 9 SIMD and crypto), 84 `kiln` tests.
 
 | Layer | Test | Result |
 |-------|------|--------|
@@ -131,7 +131,7 @@ the 52 `SendSyncRequest` calls carry the IPC requests to the services listed bel
 
 The same checks on Linux (WSL, Ubuntu, clang 21), on the commit that corrected the result codes
 (after the cryptographic extension): fmt and clippy clean, 249 `nx_runtime` unit tests and 84
-`recomp` tests pass, and the 84 `recomp` library tests also pass with `RECOMP_REQUIRE_EXTERNAL=1`
+`kiln` tests pass, and the 84 `kiln` library tests also pass with `KILN_REQUIRE_EXTERNAL=1`
 (so every end-to-end program, the two-module program included, was built and run there). The
 Unicorn tests skip there (the library is not installed in that environment), so those results come
 from Windows.

@@ -278,7 +278,7 @@ impl BuildPlan {
         self.out_root.join(&self.name)
     }
 
-    /// The arguments of `recomp` for this build.
+    /// The arguments of `kiln` for this build.
     pub fn args(&self) -> Vec<String> {
         let s = |p: &Path| p.to_string_lossy().into_owned();
         let mut a = vec!["build".to_string()];
@@ -510,7 +510,7 @@ impl RunSettings {
     }
 }
 
-/// What the library knows of a recompiled game; kept in `recomp-gui.json` in the game's folder.
+/// What the library knows of a recompiled game; kept in `kiln.json` in the game's folder.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GameMeta {
@@ -524,17 +524,24 @@ pub struct GameMeta {
     pub source: String,
     pub romfs: String,
     pub flags: Vec<String>,
-    pub recomp_version: String,
+    #[serde(alias = "recomp_version")]
+    pub kiln_version: String,
     pub build_seconds: u32,
     pub run: RunSettings,
 }
 
-pub const META_FILE: &str = "recomp-gui.json";
+pub const META_FILE: &str = "kiln.json";
+
+/// The name the file had when the program was called recomp: still read, and replaced by the new
+/// one when a game's settings are written.
+const LEGACY_META_FILE: &str = "recomp-gui.json";
 
 pub fn write_meta(dir: &Path, meta: &GameMeta) -> Result<(), String> {
     let text = serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?;
     std::fs::write(dir.join(META_FILE), text)
-        .map_err(|e| format!("writing {}: {e}", dir.join(META_FILE).display()))
+        .map_err(|e| format!("writing {}: {e}", dir.join(META_FILE).display()))?;
+    let _ = std::fs::remove_file(dir.join(LEGACY_META_FILE));
+    Ok(())
 }
 
 /// A game of the library.
@@ -564,7 +571,7 @@ pub fn now() -> u64 {
     unix_now()
 }
 
-/// Find the games in `root`: every folder with a `recomp-gui.json`, or with a program named like
+/// Find the games in `root`: every folder with a `kiln.json`, or with a program named like
 /// the folder. Newest first.
 pub fn scan(root: &Path) -> Vec<Game> {
     let mut games = Vec::new();
@@ -577,7 +584,9 @@ pub fn scan(root: &Path) -> Vec<Game> {
             continue;
         }
         let folder = folder_name(&dir);
-        let meta_text = std::fs::read_to_string(dir.join(META_FILE)).ok();
+        let meta_text = std::fs::read_to_string(dir.join(META_FILE))
+            .or_else(|_| std::fs::read_to_string(dir.join(LEGACY_META_FILE)))
+            .ok();
         let mut meta: GameMeta = meta_text
             .as_deref()
             .and_then(|t| serde_json::from_str(t).ok())
@@ -677,7 +686,7 @@ mod tests {
     use super::*;
 
     fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("recomp_gui_{}_{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kiln_gui_{}_{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -939,6 +948,29 @@ mod tests {
         assert_eq!(names[0], "Beta");
         assert_eq!(games[1].meta.opt, 2);
         assert_eq!(games[1].run_dir(), a.join("run"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_game_recorded_under_the_first_name_is_still_found_and_the_record_moves() {
+        let dir = temp("first_name_games");
+        let a = dir.join("Alpha");
+        touch(&a.join("Alpha.exe"));
+        // What the program wrote when it was called recomp: the old file name and the old field.
+        std::fs::write(
+            a.join(LEGACY_META_FILE),
+            r#"{ "name": "Alpha", "exe": "Alpha.exe", "built_at": 5, "opt": 3, "recomp_version": "0.0.9" }"#,
+        )
+        .unwrap();
+        let games = scan(&dir);
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].meta.opt, 3);
+        assert_eq!(games[0].meta.kiln_version, "0.0.9");
+        // Writing the record puts it in the new file and takes the old one away.
+        write_meta(&a, &games[0].meta).unwrap();
+        assert!(a.join(META_FILE).is_file());
+        assert!(!a.join(LEGACY_META_FILE).exists());
+        assert_eq!(scan(&dir)[0].meta, games[0].meta);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

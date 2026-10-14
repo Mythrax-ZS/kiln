@@ -5,11 +5,11 @@
 #
 # * -Out is where the staging folder and the zip go (default `dist-out`, which is ignored by git).
 # * -Selftest is the folder that the ignored test `build::e2e_tests::writes_the_selftest_program`
-#   wrote (`RECOMP_SELFTEST_FIXTURE=<folder> cargo test -p recomp --lib -- --ignored --exact
+#   wrote (`KILN_SELFTEST_FIXTURE=<folder> cargo test -p kiln --lib -- --ignored --exact
 #   build::e2e_tests::writes_the_selftest_program`); its `exefs` goes in the bundle for
 #   `selftest.cmd`. A bundle without one is refused unless -NoSelftest says so.
 #
-# The bundle holds recomp-gui.exe, recomp.exe and nx_runtime.lib from target\release, the README,
+# The bundle holds kiln-gui.exe, kiln.exe and nx_runtime.lib from target\release, the README,
 # doctor.cmd, selftest.cmd and setup-toolchain.cmd of `dist\`, and VERSION.txt. No game data, keys or firmware: nothing
 # is read from anywhere but target\release, dist\ and -Selftest.
 param(
@@ -23,7 +23,7 @@ $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
 $release = Join-Path $repo "target\release"
-$files = @("recomp-gui.exe", "recomp.exe", "nx_runtime.lib")
+$files = @("kiln-gui.exe", "kiln.exe", "nx_runtime.lib")
 foreach ($f in $files) {
     if (-not (Test-Path (Join-Path $release $f))) {
         throw "$f is not in ${release}: run cargo build --release --workspace first"
@@ -48,7 +48,7 @@ try {
     if ((git status --porcelain 2>$null)) { $dirty = "+modified" }
 } catch { }
 $date = Get-Date -Format "yyyy-MM-dd"
-$name = "recomp-$version-$sha-windows-x64"
+$name = "kiln-$version-$sha-windows-x64"
 
 $outDir = Join-Path $repo $Out
 $stage = Join-Path $outDir $name
@@ -84,7 +84,7 @@ if (-not $NoSelftest) {
 $rustc = "unknown"
 try { $rustc = (rustc --version 2>$null).Trim() } catch { }
 $lines = @(
-    "recomp $version",
+    "kiln $version",
     "commit $sha$dirty",
     "built $date with $rustc",
     "host $([System.Environment]::OSVersion.VersionString)"

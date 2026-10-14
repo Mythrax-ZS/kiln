@@ -42,7 +42,7 @@ fn llvm_bytes(bytes: &[u8]) -> String {
 }
 
 /// The unit holding the module descriptor, the embedded image and the program's `main` (an
-/// executable) or `recomp_main` (a shared library).
+/// executable) or `kiln_main` (a shared library).
 pub fn descriptor_unit(triple: &str, d: &Descriptor, shared: bool) -> String {
     let path = d.image_path.to_string_lossy().replace('\\', "/");
     let section = if triple.contains("windows") {
@@ -128,7 +128,7 @@ pub fn descriptor_unit(triple: &str, d: &Descriptor, shared: bool) -> String {
         d.romfs.len()
     );
     let main = if shared {
-        "dllexport i32 @recomp_main"
+        "dllexport i32 @kiln_main"
     } else {
         "i32 @main"
     };
@@ -181,7 +181,7 @@ mod tests {
         assert!(ll.contains("c\"C:\\5Cdata\\5Cromfs\""), "{ll}");
         assert!(ll.contains("ptr @nx_romfs, i64 13"), "{ll}");
         let lib = descriptor_unit("x86_64-pc-windows-msvc", &d, true);
-        assert!(lib.contains("dllexport i32 @recomp_main"));
+        assert!(lib.contains("dllexport i32 @kiln_main"));
         assert!(lib.contains("@nx_module = dllexport constant"));
         // The layout the runtime reads.
         assert_eq!(std::mem::size_of::<nx_runtime::rt::host::SegmentDesc>(), 40);

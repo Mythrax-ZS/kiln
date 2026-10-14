@@ -1,4 +1,4 @@
-# recomp
+# Kiln
 
 A static recompiler for Horizon OS (Nintendo Switch) AArch64 programs. It reads the **already
 extracted ExeFS and RomFS** of a title the owner dumped from their own console (or a homebrew NRO)
@@ -19,7 +19,7 @@ explains how the pieces fit together.
 
 Done: M1 (input layer), M2 (loader), M3 (decoder and interpreter, integer ISA), M4 (lifter and
 LLVM code generation, integer ISA), M5 (floating point and Advanced SIMD in all four layers), M6
-(the Horizon kernel layer: a homebrew NRO built by `recomp build` runs natively, prints through
+(the Horizon kernel layer: a homebrew NRO built by `kiln build` runs natively, prints through
 `svcOutputDebugString`, starts threads and talks to `sm:`), M7 (a title with a RomFS boots on that
 layer, through its own `rtld` and SDK start-up, until it asks for the GPU driver; the
 cryptographic extension was added on the way), M8 (the GPU front, `nx_gpu`: the driver service and
@@ -80,14 +80,14 @@ that many frames (default 6): `NX_INPUT_SCRIPT="2500 A 6"` presses A at frame 25
 ## Using it
 
 ```
-recomp inspect --exefs <dir|pfs0> [--romfs <dir|image>]
-recomp analyze (--exefs <dir|pfs0> | --nro <file>) [--hints <file>] [--main-only]
-recomp build   (--exefs <dir|pfs0> | --nro <file>) --out <dir> [--name <name>] [--opt <0-3>]
+kiln inspect --exefs <dir|pfs0> [--romfs <dir|image>]
+kiln analyze (--exefs <dir|pfs0> | --nro <file>) [--hints <file>] [--main-only]
+kiln build   (--exefs <dir|pfs0> | --nro <file>) --out <dir> [--name <name>] [--opt <0-3>]
                [--hints <file>] [--shared] [--keep-ir] [--main-only] [--romfs <dir|image>]
                [--reuse-objects]
-recomp relink  --out <dir> --name <name>
-recomp symbols (--exefs <dir|pfs0> | --nro <file>) [--match <text>] [<address>...]
-recomp doctor
+kiln relink  --out <dir> --name <name>
+kiln symbols (--exefs <dir|pfs0> | --nro <file>) [--match <text>] [<address>...]
+kiln doctor
 ```
 
 `inspect` also says which of the SVCs and services a program may use this runtime does not implement.
@@ -96,18 +96,18 @@ runtime library programs link) as `key: value` lines, and builds nothing.
 
 ### The desktop front end
 
-`recomp-gui` (the `recomp_gui` crate, built with `cargo build --release -p recomp_gui`) wraps the
+`kiln-gui` (the `kiln_gui` crate, built with `cargo build --release -p kiln_gui`) wraps the
 command line in a window: pick a game's already extracted folder (the one that holds `exefs` and
 `romfs`, or a homebrew `.nro`) or drop it on the window, choose how hard the compiler works, and
-press Recompile. The output of `recomp` streams into the window; the finished game appears in the
+press Recompile. The output of `kiln` streams into the window; the finished game appears in the
 Library, which keeps one folder per game and the settings each is run with (window and sound, keys, frame limit, save data
 and RomFS locations, the logging and GPU trace switches, extra environment variables), and starts
-the game (drawn in a window with the sound on, unless the settings say otherwise) with the output shown beside them. The Settings screen names the `recomp` program, the C
+the game (drawn in a window with the sound on, unless the settings say otherwise) with the output shown beside them. The Settings screen names the `kiln` program, the C
 compiler and the runtime library to use; the header shows whether each was found. The GUI finds
-`recomp` beside itself or on the `PATH`. It reads no keys and opens no NSP, XCI or NCA files, as
-the command line does not. `RECOMP_GUI_CONFIG_DIR` moves its settings folder, and
-`RECOMP_GUI_SCREENSHOT=<file.png>` makes it save a picture of its window and exit (with
-`RECOMP_GUI_TAB` and `RECOMP_GUI_GAME` choosing what is shown), which is how its looks are checked.
+`kiln` beside itself or on the `PATH`. It reads no keys and opens no NSP, XCI or NCA files, as
+the command line does not. `KILN_GUI_CONFIG_DIR` moves its settings folder, and
+`KILN_GUI_SCREENSHOT=<file.png>` makes it save a picture of its window and exit (with
+`KILN_GUI_TAB` and `KILN_GUI_GAME` choosing what is shown), which is how its looks are checked.
 
 `build` writes `<name>.exe` (or `<name>`), optionally `<name>.dll` with `--shared`, the embedded
 image, and `<name>.report.txt` listing everything the analysis could not settle: indirect branches
@@ -129,7 +129,7 @@ debugging: `NX_TRACE_SVC=1` logs every supervisor call and every IPC request wit
 standard error, `NX_TRACE_LOG=1` prints what the program logs through the log manager, and
 `NX_RANDOM_SEED=<decimal number>` makes the kernel's pseudo-random values (loader configuration,
 `GetInfo` entropy) reproducible, and `NX_WATCHDOG=<seconds>` says what every guest thread is doing
-when no frame has been presented for that long. `recomp relink` links the objects of an earlier build against the
+when no frame has been presented for that long. `kiln relink` links the objects of an earlier build against the
 current runtime and `--reuse-objects` skips recompiling unchanged code, which keeps the loop of
 trying a title short.
 
@@ -137,7 +137,7 @@ For the GPU: `NX_TRACE_GPU=1` prints every submission and, when the run ends, wh
 processor counted (`NX_GPU_TOP=<n>` sets how many of the busiest methods it lists, 0 lists all);
 `NX_TRACE_GPU=2` also prints every method write and macro call; `NX_MAX_FRAMES=<n>` ends the run
 after `n` presented frames; `NX_SAVE_DIR=<dir>` is where a program's save data goes (default
-`./nx_save`). `recomp symbols --exefs <dir> [--match <text>] [<address>...]` names the function
+`./nx_save`). `kiln symbols --exefs <dir> [--match <text>] [<address>...]` names the function
 around an address (the return addresses a stop report ends with), which is how a stop is read.
 
 To draw, run a produced program with `NX_RENDERER=vulkan` (it needs a Vulkan 1.1 device).
@@ -174,29 +174,29 @@ clang and Unicorn.
 
 - **windows**: `cargo fmt --all --check`, `cargo lint` and `cargo test` (with Unicorn 2.1.4 as the
   oracle of the instruction tests and the runner's clang for the programs the tests build), then
-  the library tests again with `RECOMP_REQUIRE_EXTERNAL=1`, so that a missing tool fails the run
+  the library tests again with `KILN_REQUIRE_EXTERNAL=1`, so that a missing tool fails the run
   instead of skipping.
-- **linux**: the same lint and tests for everything but `recomp_gui` (the ELF output and the
+- **linux**: the same lint and tests for everything but `kiln_gui` (the ELF output and the
   runtime on Linux).
 - **bundle** (after **windows**): `cargo build --release --workspace`, then `tools/bundle.ps1`
-  makes `recomp-<version>-<commit>-windows-x64.zip` from `recomp-gui.exe`, `recomp.exe` and
+  makes `kiln-<version>-<commit>-windows-x64.zip` from `kiln-gui.exe`, `kiln.exe` and
   `nx_runtime.lib` with a README, `doctor.cmd`, `selftest.cmd` (it compiles and runs a tiny
   synthetic program, no game needed) and `setup-toolchain.cmd` (it starts Microsoft's installer
   for the clang and the Windows libraries a build needs; clang is not in the bundle), and the job unpacks the zip somewhere else, with no `cargo`
   on the machine, and runs the self-test. A push to `main` that passes keeps the zip (with
   `SHA256SUMS.txt`) for good: the release makes a tag `build-<run number>-<commit>` on that commit
   and a pre-release (never marked "latest"); pushing a tag `v*` by hand makes a normal release of
-  it instead. A pull request or a manual run keeps it as the artifact `recomp-windows-x64` for 30
+  it instead. A pull request or a manual run keeps it as the artifact `kiln-windows-x64` for 30
   days.
 
 - **bundle-linux** (after the three above): the same for Linux, `tools/bundle.sh`: a
-  `recomp-<version>-<commit>-linux-x86_64.tar.gz` (`recomp-gui`, `recomp`, `libnx_runtime.a`, a
+  `kiln-<version>-<commit>-linux-x86_64.tar.gz` (`kiln-gui`, `kiln`, `libnx_runtime.a`, a
   README, `doctor.sh`, `selftest.sh`, `setup-toolchain.sh`) and an AppImage
-  `recomp-<version>-<commit>-x86_64.AppImage` of the desktop front end (`appimagetool` and the
+  `kiln-<version>-<commit>-x86_64.AppImage` of the desktop front end (`appimagetool` and the
   AppImage runtime are downloaded at pinned versions and checked against their SHA-256; the
-  AppImage runs the command line tool when its first argument is `recomp`). The job unpacks the
+  AppImage runs the command line tool when its first argument is `kiln`). The job unpacks the
   tarball with no `cargo` on the machine and runs the self-test, and builds and runs the
-  self-test program with the `recomp` inside the AppImage. Both files, with `SHA256SUMS-linux.txt`,
+  self-test program with the `kiln` inside the AppImage. Both files, with `SHA256SUMS-linux.txt`,
   go to the same tag and pre-release as the Windows bundle of that build. Clang is in neither
   bundle (a person installs it: `dist/linux/setup-toolchain.sh`); a game has not been run on
   Linux, and Linux has no sound output or gamepad.
@@ -206,7 +206,7 @@ What no runner has: a Vulkan device
 and `astcenc`, and any game. The bundle holds no game, key or firmware; a person who gets it
 brings the extracted ExeFS and RomFS of a game of their own (`dist/README.txt` is what they read).
 To make the bundle by hand: `cargo build --release --workspace`, then
-`RECOMP_SELFTEST_FIXTURE=<folder> cargo test -p recomp --lib -- --ignored --exact
+`KILN_SELFTEST_FIXTURE=<folder> cargo test -p kiln --lib -- --ignored --exact
 build::e2e_tests::writes_the_selftest_program`, then
 `pwsh -File tools/bundle.ps1 -Out <folder> -Selftest <the first folder>`.
 

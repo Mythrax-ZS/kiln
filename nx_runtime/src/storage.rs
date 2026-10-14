@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn file_storage_round_trip() {
-        let dir = std::env::temp_dir().join(format!("recomp-storage-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kiln-storage-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("f.dat");
         std::fs::write(&path, (0u8..=255).collect::<Vec<_>>()).unwrap();

@@ -30,13 +30,13 @@ instruction set the interpreter already runs. See `docs/ARCHITECTURE.md` for the
   calls check that control returned to the expected address; tail calls and the dispatcher use
   `musttail`. Output is split into translation units, plus a support unit (dispatcher, sorted
   function table) and a module descriptor unit (segments, embedded image via `.incbin`, NPDM,
-  exports, `main` or `recomp_main`).
+  exports, `main` or `kiln_main`).
 - **Runtime** (`nx_runtime/src/rt`): guest memory behind one checked interface (39-bit address
   space, 4 KiB pages, atomic page entries), the global exclusive monitor with spurious-failure
   injection (A-021), the function table, the interpreter slow path (`nx_runtime/src/slow.rs`) that
   logs every address it is entered at, the run loop, process start-up and stop reporting.
 - **Build** (`src/build`): clang discovery, parallel compile, response-file link against the
-  `nx_runtime` static library, and the commands `recomp analyze` and `recomp build`
+  `nx_runtime` static library, and the commands `kiln analyze` and `kiln build`
   (`--shared`, `--hints`, `--opt`, `--keep-ir`). Each worker thread lifts, emits and compiles one
   batch, so the IR of a whole program never exists at once. `build` writes a report of everything
   the analysis could not settle.
@@ -54,7 +54,7 @@ instruction set the interpreter already runs. See `docs/ARCHITECTURE.md` for the
 ## Tests
 
 `cargo test --workspace` (fmt and clippy clean): 125 tests in `nx_runtime`, 14 Unicorn
-differential tests, 75 in `recomp`, plus the opt-in real-title tests. Highlights:
+differential tests, 75 in `kiln`, plus the opt-in real-title tests. Highlights:
 
 | Layer | Test | Result |
 |-------|------|--------|
@@ -73,7 +73,7 @@ differential tests, 75 in `recomp`, plus the opt-in real-title tests. Highlights
 ### A real title
 
 On the owner's extracted title (aggregate numbers only; nothing from it is stored; opt-in,
-`RECOMP_TITLE_DIR`), phase one translates `main`:
+`KILN_TITLE_DIR`), phase one translates `main`:
 
 - Discovery: 74,820 functions, 1,728,527 guest blocks and 3,123,137 guest instructions, which is
   99.7% of the 3,131,392 instructions in its text segment, in 0.9 s. Lifting and emitting all of it

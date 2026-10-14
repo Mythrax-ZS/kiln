@@ -24,7 +24,7 @@ ExeFS / NRO ──loader──▶ Module ──discover──▶ per-function CF
 | GPU | `nx_gpu` | The driver service and its device nodes, the display and buffer queue, and a command processor with a macro engine. It decodes the 3D state (`state.rs`, `draw_state.rs`), keeps the constant buffer bindings, counts the shader programs draws use (`shaders.rs`), and hands each draw, clear, compute launch (`compute.rs` decodes its descriptor) and displayed buffer to a `Backend` (`render.rs`) when there is one; the inline-to-memory engine (`i2m.rs`) writes data sent in the command stream to memory. |
 | Shaders | `nx_shader` | The Maxwell program header, the instruction decoder, the control-flow graph (with the `SSY`/`PBK` stacks), a SPIR-V module builder, and the translation of a program to SPIR-V (`translate/`): registers and predicates as function variables, the blocks in address order each under a flag of its own when every jump goes forward and a dispatch loop over the blocks when one goes back (A-114), for the vertex and pixel stages and for a compute program as the title launches it (the kernel stage); `alu`, `int`, `io`, `tex`, `global` and `flow` hold the instructions (149 of 296 table rows, `example coverage`). |
 | Vulkan | `nx_vulkan` | The Vulkan device (loaded at run time), buffers, images with staging upload, a compute harness with textures and device-address patching (the translator's tests run its shaders here against plain Rust arithmetic), and the renderer, a `Backend` that draws with dynamic rendering, cached pipelines, textures (detiled, ASTC decoded by `astc.rs`), render targets that can be sampled or written back to the memory a texture reads, compute launches that run to the end before the next command, and guest memory imported for global access. |
-| Front end | `recomp_gui` | The desktop window around the command line: pick a game, recompile, keep a library of games and the settings each runs with. It runs `recomp` and the games as processes. |
+| Front end | `kiln_gui` | The desktop window around the command line: pick a game, recompile, keep a library of games and the settings each runs with. It runs `kiln` and the games as processes. |
 
 ## Calling protocol (generated code)
 
@@ -42,7 +42,7 @@ SSA values inside a function and in `cpu->state` between functions.
   built from the registered functions the first time a lookup follows a registration, read
   without a lock) and tail calls the function, or tail calls the slow path. The slow path interprets from that address,
   logs the address (`NX_UNKNOWN_LOG`), and hands control back to native code at the next known
-  entry. The log is a hints file (`recomp build --hints`).
+  entry. The log is a hints file (`kiln build --hints`).
 - **Stop**: a memory fault, an instruction that always stops (`BRK`, undefined, unimplemented), or
   an unhandled `SVC` records its details in `cpu->ctl` and sets `pc` to `STOP_PC`, which no call
   site expects, so the whole stack unwinds to the run loop.

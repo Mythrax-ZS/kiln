@@ -429,7 +429,8 @@ impl Service for ApplicationFunctions {
 const DISPLAY_VERSION: [u8; 16] = *b"1.0.0\0\0\0\0\0\0\0\0\0\0\0";
 
 /// The 16-byte id `GetPseudoDeviceId` returns: fixed, because the real one is derived from the
-/// console (docs/ASSUMPTIONS.md A-043).
+/// console (docs/ASSUMPTIONS.md A-043). It spells the program's first name and stays as it is: a
+/// game may have stored it.
 const PSEUDO_DEVICE_ID: [u8; 16] = *b"recomp-pseudo-id";
 
 /// `PopLaunchParameter` with nothing to pop: 2128-0002, "IStorage not available" in Switchbrew's

@@ -1,6 +1,6 @@
 @echo off
 setlocal
-rem Installs what recomp needs on a PC that has no clang: Microsoft's "Build Tools for Visual
+rem Installs what kiln needs on a PC that has no clang: Microsoft's "Build Tools for Visual
 rem Studio 2022" with its C++ workload (the C runtime and the Windows libraries that linking
 rem needs) and its optional "C++ Clang Compiler for Windows". The installer is Microsoft's and is
 rem downloaded from Microsoft; this script only starts it with those choices. Windows asks for
@@ -11,10 +11,10 @@ set "BOOT=%TEMP%\vs_BuildTools.exe"
 set "URL=https://aka.ms/vs/17/release/vs_BuildTools.exe"
 set "ARGS=--passive --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Llvm.Clang --includeRecommended"
 
-"%HERE%recomp.exe" doctor | findstr /b /c:"clang: not found" >nul
+"%HERE%kiln.exe" doctor | findstr /b /c:"clang: not found" >nul
 if errorlevel 1 goto already
 
-echo recomp found no clang on this PC.
+echo kiln found no clang on this PC.
 echo.
 echo This installs "Build Tools for Visual Studio 2022" from Microsoft: the C++ build tools, the
 echo Windows SDK and the C++ Clang compiler (a few GB, 10 to 20 minutes). Going on means you accept
@@ -45,7 +45,7 @@ exit /b 0
 
 :already
 echo clang is already on this PC:
-"%HERE%recomp.exe" doctor
+"%HERE%kiln.exe" doctor
 echo.
 if /i not "%~1"=="/dry" pause
 exit /b 0

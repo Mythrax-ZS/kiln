@@ -1,4 +1,4 @@
-recomp @VERSION@ (@SHA@, @DATE@) - Linux x86-64 bundle
+Kiln @VERSION@ (@SHA@, @DATE@) - Linux x86-64 bundle
 =====================================================
 
 What this is
@@ -13,18 +13,18 @@ it makes is the game's own code.
 
 Two ways to get it
 ------------------
-  recomp-<version>-<commit>-x86_64.AppImage   one file: chmod +x it and run it (the desktop
-                                              front end); `./recomp-*.AppImage recomp doctor`
+  kiln-<version>-<commit>-x86_64.AppImage   one file: chmod +x it and run it (the desktop
+                                              front end); `./kiln-*.AppImage kiln doctor`
                                               runs the command line tool inside it. An AppImage
                                               needs FUSE 2 (libfuse2); without it run
-                                              `./recomp-*.AppImage --appimage-extract-and-run`.
-  recomp-<version>-<commit>-linux-x86_64.tar.gz   this folder, with scripts
+                                              `./kiln-*.AppImage --appimage-extract-and-run`.
+  kiln-<version>-<commit>-linux-x86_64.tar.gz   this folder, with scripts
 
 What is in the folder
 ---------------------
-  recomp-gui        the desktop front end: pick a game, recompile it, run it
-  recomp            the recompiler (the front end runs it; you can use it from a terminal too)
-  libnx_runtime.a   the runtime every recompiled game links with (keep it beside recomp)
+  kiln-gui        the desktop front end: pick a game, recompile it, run it
+  kiln            the recompiler (the front end runs it; you can use it from a terminal too)
+  libnx_runtime.a   the runtime every recompiled game links with (keep it beside kiln)
   doctor.sh         shows what this PC has for a build (the compiler, the runtime library)
   selftest.sh       builds and runs a tiny program that is part of the bundle, with no game:
                     it proves that the compiler and the linking work on this PC
@@ -37,7 +37,7 @@ What your PC needs
    front end X11 or Wayland with OpenGL, libxkbcommon and libvulkan: on Ubuntu or Debian
    `sudo apt install libvulkan1 libxkbcommon-x11-0 libgl1 mesa-vulkan-drivers`. Plan on 8 GB of
    RAM or more.
-2. clang (a recent one: 21 and 22 are the ones tried) and lld, to compile and link what recomp generates. They are not in the
+2. clang (a recent one: 21 and 22 are the ones tried) and lld, to compile and link what kiln generates. They are not in the
    bundle. Run setup-toolchain.sh (`sudo apt install clang lld` and its equivalents).
 3. The extracted ExeFS and RomFS of the game, from your own copy: a folder or an image for each.
    No keys are needed and none are read.
@@ -46,10 +46,10 @@ First run
 ---------
 1. Run ./doctor.sh. It should name a clang and the runtime library (libnx_runtime.a).
 2. Run ./selftest.sh. It should end with "selftest passed".
-3. Run recomp-gui (or the AppImage). Choose the folder that holds the game's exefs and romfs
+3. Run kiln-gui (or the AppImage). Choose the folder that holds the game's exefs and romfs
    folders (or drop it on the window) and press Recompile; the output of the build streams into
    the window. The finished game appears in the Library: press Play. Games are kept in a "games"
-   folder beside recomp-gui, or in ~/.local/share/recomp-gui/games when that folder cannot be
+   folder beside kiln-gui, or in ~/.local/share/kiln/games when that folder cannot be
    written to (an AppImage), which the Settings screen shows and changes.
 
 Keys
@@ -79,6 +79,6 @@ What to expect
 
 If something goes wrong
 -----------------------
-Send: the text of the console in the recomp-gui window (a run that stops prints a report), the
+Send: the text of the console in the kiln-gui window (a run that stops prints a report), the
 output of doctor.sh and selftest.sh, your distribution, and your graphics card and driver version.
 Do not send game files.

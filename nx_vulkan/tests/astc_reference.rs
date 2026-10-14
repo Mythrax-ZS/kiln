@@ -1,5 +1,5 @@
 //! The ASTC decoder against ARM's reference decoder (`astcenc`), on random blocks of every
-//! footprint. The tool is external: `RECOMP_ASTCENC` names it (else it is looked for on the
+//! footprint. The tool is external: `KILN_ASTCENC` names it (else it is looked for on the
 //! `PATH`); without it the test says so and passes.
 
 use nx_vulkan::astc::{decode_image, inspect, ERROR_COLOR};
@@ -78,7 +78,7 @@ fn random_block(rng: &mut Rng, i: usize) -> [u8; 16] {
 }
 
 fn tool() -> Option<PathBuf> {
-    let path = std::env::var_os("RECOMP_ASTCENC")
+    let path = std::env::var_os("KILN_ASTCENC")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("astcenc"));
     Command::new(&path)
@@ -269,20 +269,20 @@ fn compare(name: &str, pictures: &Pictures<'_>, shown: &mut usize) -> Tally {
 #[test]
 fn random_blocks_decode_as_in_the_reference_decoder() {
     let Some(tool) = tool() else {
-        if std::env::var("RECOMP_REQUIRE_EXTERNAL").is_ok_and(|v| v == "1") {
-            panic!("no astcenc (set RECOMP_ASTCENC) and RECOMP_REQUIRE_EXTERNAL=1");
+        if std::env::var("KILN_REQUIRE_EXTERNAL").is_ok_and(|v| v == "1") {
+            panic!("no astcenc (set KILN_ASTCENC) and KILN_REQUIRE_EXTERNAL=1");
         }
-        eprintln!("SKIPPED: no astcenc (set RECOMP_ASTCENC to the reference decoder)");
+        eprintln!("SKIPPED: no astcenc (set KILN_ASTCENC to the reference decoder)");
         return;
     };
-    let batches: usize = std::env::var("RECOMP_ASTC_BATCHES")
+    let batches: usize = std::env::var("KILN_ASTC_BATCHES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
     let dir = std::env::temp_dir().join(format!("nx_astc_reference_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut failures = Vec::new();
-    let only: Option<usize> = std::env::var("RECOMP_ASTC_ONLY")
+    let only: Option<usize> = std::env::var("KILN_ASTC_ONLY")
         .ok()
         .and_then(|v| v.parse().ok());
     for (n, (bw, bh)) in FOOTPRINTS.iter().enumerate() {
@@ -376,7 +376,7 @@ fn dual_plane_block(w0: [u8; 8], w1: [u8; 8], ccs: u32, e0: [u8; 4], e1: [u8; 4]
 #[test]
 fn dual_plane_blocks_decode_as_in_the_reference_decoder() {
     let Some(tool) = tool() else {
-        eprintln!("SKIPPED: no astcenc (set RECOMP_ASTCENC to the reference decoder)");
+        eprintln!("SKIPPED: no astcenc (set KILN_ASTCENC to the reference decoder)");
         return;
     };
     let dir = std::env::temp_dir().join(format!("nx_astc_dual_{}", std::process::id()));
@@ -443,7 +443,7 @@ fn single_plane_block(weights: [u8; 16], mode: u32, values: &[u8]) -> [u8; 16] {
 #[test]
 fn endpoint_modes_decode_as_in_the_reference_decoder() {
     let Some(tool) = tool() else {
-        eprintln!("SKIPPED: no astcenc (set RECOMP_ASTCENC to the reference decoder)");
+        eprintln!("SKIPPED: no astcenc (set KILN_ASTCENC to the reference decoder)");
         return;
     };
     let dir = std::env::temp_dir().join(format!("nx_astc_modes_{}", std::process::id()));

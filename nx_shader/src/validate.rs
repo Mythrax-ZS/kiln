@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Where a tool of the Vulkan SDK is: `RECOMP_SPIRV_TOOLS` (a directory), the `PATH`, the
+/// Where a tool of the Vulkan SDK is: `KILN_SPIRV_TOOLS` (a directory), the `PATH`, the
 /// `VULKAN_SDK` directory, then the default install locations.
 pub fn find_tool(name: &str) -> Option<PathBuf> {
     let exe = if cfg!(windows) {
@@ -14,7 +14,7 @@ pub fn find_tool(name: &str) -> Option<PathBuf> {
         name.to_string()
     };
     let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(d) = std::env::var_os("RECOMP_SPIRV_TOOLS") {
+    if let Some(d) = std::env::var_os("KILN_SPIRV_TOOLS") {
         dirs.push(PathBuf::from(d));
     }
     if let Some(path) = std::env::var_os("PATH") {
@@ -87,13 +87,13 @@ pub fn disassemble(words: &[u32]) -> Option<String> {
 }
 
 /// For tests: validate and fail with the disassembly on an error; print a loud SKIPPED when the
-/// validator is missing (and fail instead when `RECOMP_REQUIRE_EXTERNAL=1`).
+/// validator is missing (and fail instead when `KILN_REQUIRE_EXTERNAL=1`).
 pub fn assert_valid(words: &[u32]) {
     match validate(words) {
         Ok(Some(())) => {}
         Ok(None) => {
-            if std::env::var("RECOMP_REQUIRE_EXTERNAL").is_ok_and(|v| v == "1") {
-                panic!("spirv-val is not installed and RECOMP_REQUIRE_EXTERNAL=1");
+            if std::env::var("KILN_REQUIRE_EXTERNAL").is_ok_and(|v| v == "1") {
+                panic!("spirv-val is not installed and KILN_REQUIRE_EXTERNAL=1");
             }
             eprintln!("SKIPPED: spirv-val is not installed; the module was not validated");
         }

@@ -86,7 +86,7 @@ fit; the assumptions behind it are A-034 to A-040 in `docs/ASSUMPTIONS.md`.
 ## Tests
 
 `cargo test --workspace` (fmt and clippy clean, exit status of each step checked): 229 `nx_runtime`
-unit tests (46 of them in the kernel layer), 29 Unicorn differential tests, 80 `recomp` tests (5 of
+unit tests (46 of them in the kernel layer), 29 Unicorn differential tests, 80 `kiln` tests (5 of
 them build and run homebrew programs), plus the opt-in real-title tests.
 
 | Layer | Test | Result |
@@ -124,10 +124,10 @@ The five native programs (`src/build/e2e_tests.rs`, `mod homebrew`):
 ### Validation on Linux
 
 The same checks on Linux (WSL, Ubuntu, clang 21), on the final commit: fmt and clippy clean, 229
-`nx_runtime` unit tests and 80 `recomp` tests pass, and the 80 `recomp` library tests also pass with
-`RECOMP_REQUIRE_EXTERNAL=1` (a missing tool becomes a failure), so the five native programs were
+`nx_runtime` unit tests and 80 `kiln` tests pass, and the 80 `kiln` library tests also pass with
+`KILN_REQUIRE_EXTERNAL=1` (a missing tool becomes a failure), so the five native programs were
 built and run there. The Unicorn tests do not run there: the library is not installed in that
-environment, they skip and pass (with `RECOMP_REQUIRE_EXTERNAL=1` they fail), so the
+environment, they skip and pass (with `KILN_REQUIRE_EXTERNAL=1` they fail), so the
 interpreter-versus-Unicorn results in this and the earlier reports come from Windows. The opt-in
 real-title tests need a title and were not run on Linux.
 

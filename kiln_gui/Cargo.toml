@@ -1,12 +1,12 @@
 [package]
-name = "recomp_gui"
+name = "kiln_gui"
 version = "0.1.0"
 edition = "2021"
-description = "A desktop front end for recomp: pick a game, recompile it, run it and keep its settings"
+description = "A desktop front end for kiln: pick a game, recompile it, run it and keep its settings"
 publish = false
 
 [[bin]]
-name = "recomp-gui"
+name = "kiln-gui"
 path = "src/main.rs"
 
 [dependencies]

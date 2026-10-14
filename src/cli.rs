@@ -16,17 +16,17 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 pub const USAGE: &str = "\
-recomp: static recompiler from Horizon OS AArch64 programs to native x86_64
+kiln: static recompiler from Horizon OS AArch64 programs to native x86_64
 
 usage:
-  recomp inspect --exefs <dir|pfs0> [--romfs <dir|image>]
-  recomp analyze (--exefs <dir|pfs0> | --nro <file>) [--hints <file>] [--main-only]
-  recomp build   (--exefs <dir|pfs0> | --nro <file>) --out <dir> [--name <name>] [--opt <0-3>]
+  kiln inspect --exefs <dir|pfs0> [--romfs <dir|image>]
+  kiln analyze (--exefs <dir|pfs0> | --nro <file>) [--hints <file>] [--main-only]
+  kiln build   (--exefs <dir|pfs0> | --nro <file>) --out <dir> [--name <name>] [--opt <0-3>]
                  [--hints <file>] [--shared] [--keep-ir] [--main-only] [--romfs <dir|image>] [--reuse-objects]
-  recomp relink  --out <dir> --name <name>
-  recomp symbols (--exefs <dir|pfs0> | --nro <file>) [--match <text>] [<address>...]
-  recomp doctor
-  recomp --version
+  kiln relink  --out <dir> --name <name>
+  kiln symbols (--exefs <dir|pfs0> | --nro <file>) [--match <text>] [<address>...]
+  kiln doctor
+  kiln --version
 
 Inputs are the already extracted ExeFS and RomFS of a game. No keys are read. From an ExeFS
 every NSO is loaded (rtld, main, subsdk0-9, sdk) unless --main-only asks for `main` alone.
@@ -333,7 +333,7 @@ fn describe_npdm(out: &mut String, bytes: &[u8]) -> Result<()> {
 /// link. Nothing is built or changed.
 pub fn doctor() -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "recomp: {}", crate::VERSION);
+    let _ = writeln!(out, "kiln: {}", crate::VERSION);
     let _ = writeln!(
         out,
         "host: {} {}",
@@ -373,7 +373,7 @@ pub fn doctor() -> String {
         None => {
             let _ = writeln!(
                 out,
-                "runtime library: not found (build it with `cargo build -p nx_runtime` or set RECOMP_RUNTIME_LIB)"
+                "runtime library: not found (build it with `cargo build -p nx_runtime` or set KILN_RUNTIME_LIB)"
             );
         }
     }
@@ -384,7 +384,7 @@ pub fn doctor() -> String {
 pub fn run(argv: &[String]) -> Result<String> {
     let args = parse_args(argv)?;
     if args.has("version") {
-        return Ok(format!("recomp {}\n", crate::VERSION));
+        return Ok(format!("kiln {}\n", crate::VERSION));
     }
     if args.has("help") || args.command.is_empty() {
         return Ok(USAGE.to_string());
@@ -407,7 +407,7 @@ pub fn run(argv: &[String]) -> Result<String> {
     }
 }
 
-/// `recomp symbols --exefs <dir> <address>...`: the exported function each guest address lies in,
+/// `kiln symbols --exefs <dir> <address>...`: the exported function each guest address lies in,
 /// with the offset into it. For reading a fault address or a trace.
 fn symbols_command(args: &Args) -> Result<String> {
     let program = load_program(args)?;
@@ -606,18 +606,18 @@ mod tests {
     #[test]
     fn doctor_reports_each_thing_on_its_own_line() {
         let text = run(&argv(&["doctor"])).unwrap();
-        assert!(text.starts_with("recomp: "), "{text}");
+        assert!(text.starts_with("kiln: "), "{text}");
         for key in ["host: ", "clang: ", "runtime library: "] {
             assert!(text.lines().any(|l| l.starts_with(key)), "{key} in {text}");
         }
-        assert!(run(&argv(&["--help"])).unwrap().contains("recomp doctor"));
+        assert!(run(&argv(&["--help"])).unwrap().contains("kiln doctor"));
     }
 
     #[test]
     fn version_help_and_unknown() {
-        assert!(run(&argv(&["--version"])).unwrap().starts_with("recomp "));
+        assert!(run(&argv(&["--version"])).unwrap().starts_with("kiln "));
         assert!(run(&argv(&[])).unwrap().contains("usage:"));
-        assert!(run(&argv(&["--help"])).unwrap().contains("recomp inspect"));
+        assert!(run(&argv(&["--help"])).unwrap().contains("kiln inspect"));
         assert!(run(&argv(&["frobnicate"])).is_err());
         assert!(run(&argv(&["inspect"]))
             .unwrap_err()
