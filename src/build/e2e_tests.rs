@@ -50,6 +50,68 @@ fn run(exe: &Path) -> std::process::Output {
         .expect("run the produced program")
 }
 
+/// The program of the bundle's self-test: the `main` of the next test, as the ExeFS of a game is
+/// on disk (an NSO named `main` in a folder named `exefs`).
+fn write_selftest_program(dir: &Path) {
+    let exefs = dir.join("exefs");
+    std::fs::create_dir_all(&exefs).unwrap();
+    let bytes = build_nso(
+        &build_parts(&Spec {
+            code: fib_main(),
+            ..Spec::default()
+        }),
+        NsoFlags::default(),
+    );
+    std::fs::write(exefs.join("main"), bytes).unwrap();
+}
+
+/// Writes the self-test program into the folder `RECOMP_SELFTEST_FIXTURE` names: the build of the
+/// bundle runs this test (`tools/bundle.ps1` puts what it wrote in the zip).
+#[test]
+#[ignore = "writes the bundle's self-test program into RECOMP_SELFTEST_FIXTURE"]
+fn writes_the_selftest_program() {
+    let dir = std::env::var_os("RECOMP_SELFTEST_FIXTURE")
+        .expect("RECOMP_SELFTEST_FIXTURE names the folder to write into");
+    write_selftest_program(Path::new(&dir));
+}
+
+/// What `selftest.cmd` of the bundle does, through the command line's own entry: the program
+/// builds from its folder and exits with 55, the tenth Fibonacci number.
+#[test]
+fn the_selftest_program_builds_from_its_folder_like_the_bundle_does() {
+    let Some(_tc) = toolchain_or_skip() else {
+        return;
+    };
+    let dir = TempDir::new("selftest-bundle");
+    write_selftest_program(dir.path());
+    let out = dir.join("out");
+    let argv: Vec<String> = [
+        "build",
+        "--exefs",
+        &dir.join("exefs").to_string_lossy(),
+        "--out",
+        &out.to_string_lossy(),
+        "--name",
+        "selftest",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    crate::cli::run(&argv).unwrap();
+    let exe = out.join(if cfg!(windows) {
+        "selftest.exe"
+    } else {
+        "selftest"
+    });
+    let result = run(&exe);
+    assert_eq!(
+        result.status.code(),
+        Some(55),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
 #[test]
 fn a_synthetic_nso_becomes_a_working_executable() {
     let Some(tc) = toolchain_or_skip() else {
