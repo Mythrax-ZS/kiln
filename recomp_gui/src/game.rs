@@ -337,9 +337,15 @@ impl BuildPlan {
 // ---- the library ---------------------------------------------------------------------------
 
 /// How a game is run: each field becomes an environment variable or an argument.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RunSettings {
+    /// Draw the game with Vulkan and show it in a window (`NX_RENDERER`, `NX_WINDOW`).
+    pub play: bool,
+    /// Leave the sound device out (`NX_AUDIO=0`).
+    pub mute: bool,
+    /// A file that rebinds the keys (`NX_KEYMAP`); empty uses the standard keys.
+    pub keymap: String,
     /// Stop after this many presented frames; 0 runs until the game ends (`NX_MAX_FRAMES`).
     pub frames: u32,
     /// Where save data goes (`NX_SAVE_DIR`); empty is `nx_save` in the game's run folder.
@@ -366,6 +372,30 @@ pub struct RunSettings {
     pub extra_env: String,
     /// More arguments for the program.
     pub args: String,
+}
+
+impl Default for RunSettings {
+    fn default() -> RunSettings {
+        RunSettings {
+            // A game is run to be played unless it is asked not to be.
+            play: true,
+            mute: false,
+            keymap: String::new(),
+            frames: 0,
+            save_dir: String::new(),
+            romfs: String::new(),
+            random_seed: String::new(),
+            trace_svc: false,
+            trace_log: false,
+            gpu_trace: 0,
+            gpu_top: 0,
+            shader_dump: String::new(),
+            vulkan_device: String::new(),
+            vulkan_validate: false,
+            extra_env: String::new(),
+            args: String::new(),
+        }
+    }
 }
 
 /// Parse `NAME=value` lines; blank lines and `#` comments are skipped. The second result lists
@@ -423,6 +453,16 @@ impl RunSettings {
     pub fn env(&self) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = Vec::new();
         let mut put = |k: &str, val: String| v.push((k.to_string(), val));
+        if self.play {
+            put("NX_RENDERER", "vulkan".into());
+            put("NX_WINDOW", "1".into());
+        }
+        if self.mute {
+            put("NX_AUDIO", "0".into());
+        }
+        if !self.keymap.trim().is_empty() {
+            put("NX_KEYMAP", self.keymap.trim().to_string());
+        }
         if self.frames > 0 {
             put("NX_MAX_FRAMES", self.frames.to_string());
         }
@@ -777,9 +817,24 @@ mod tests {
 
     #[test]
     fn run_settings_become_environment_variables() {
-        let none = RunSettings::default();
+        // By default a game is drawn and shown; with that off nothing is set.
+        let default = RunSettings::default().env();
+        assert_eq!(
+            default,
+            vec![
+                ("NX_RENDERER".to_string(), "vulkan".to_string()),
+                ("NX_WINDOW".to_string(), "1".to_string())
+            ]
+        );
+        let none = RunSettings {
+            play: false,
+            ..RunSettings::default()
+        };
         assert!(none.env().is_empty());
         let s = RunSettings {
+            play: false,
+            mute: true,
+            keymap: " keys.txt ".into(),
             frames: 600,
             save_dir: " D:\\saves ".into(),
             random_seed: "7".into(),
@@ -792,6 +847,9 @@ mod tests {
         };
         let env = s.env();
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("NX_RENDERER"), None);
+        assert_eq!(get("NX_AUDIO"), Some("0"));
+        assert_eq!(get("NX_KEYMAP"), Some("keys.txt"));
         assert_eq!(get("NX_MAX_FRAMES"), Some("600"));
         assert_eq!(get("NX_SAVE_DIR"), Some("D:\\saves"));
         assert_eq!(get("NX_RANDOM_SEED"), Some("7"));
@@ -806,6 +864,7 @@ mod tests {
         assert_eq!(bad, vec!["BAD LINE".to_string()]);
         // The GPU report length means nothing without tracing.
         let quiet = RunSettings {
+            play: false,
             gpu_top: 9,
             ..RunSettings::default()
         };

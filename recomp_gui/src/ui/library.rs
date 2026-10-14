@@ -386,6 +386,24 @@ fn run_settings_form(
 ) {
     setting_row(
         ui,
+        "Play",
+        "Draw the game with Vulkan in a window of its own, with the keyboard (and a gamepad) as its controls.",
+        |ui| {
+            ui.spacing_mut().item_spacing.y = 10.0;
+            theme::toggle(ui, &mut run.play, "Show the game in a window");
+            theme::toggle(ui, &mut run.mute, "Mute the sound");
+        },
+    );
+    setting_row(
+        ui,
+        "Keys",
+        "A file of NAME=Key lines that rebinds the keys; empty uses the standard ones.",
+        |ui| {
+            theme::text_field(ui, &mut run.keymap, "Standard keys", 320.0);
+        },
+    );
+    setting_row(
+        ui,
         "Stop after",
         "Frames to show before the game is stopped; 0 keeps it going.",
         |ui| {
