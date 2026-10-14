@@ -4,15 +4,19 @@
 # a value that is changing may be read torn.
 #
 # usage: pwsh -File tools/guest_memory.ps1 -Map <map file> -Ranges "<address>:<length>,..." [-Words]
-#            [-Process title]
+#            [-Find <value>] [-Process title]
 #
 # Addresses and lengths are hexadecimal with or without 0x. `-Words` prints 64-bit words (one per
-# line, with the address), otherwise a hex dump with the characters beside it.
+# line, with the address), otherwise a hex dump with the characters beside it. `-Find <value>`
+# prints instead the addresses in the ranges that hold that 64-bit value (aligned to 8 bytes): a
+# scan of gigabytes takes seconds, which finds an object by the address of its table of virtual
+# functions.
 param(
     [Parameter(Mandatory = $true)][string]$Map,
     [Parameter(Mandatory = $true)][string]$Ranges,
     [string]$Process = "title",
-    [switch]$Words
+    [switch]$Words,
+    [string]$Find = ""
 )
 Add-Type -TypeDefinition @"
 using System;
@@ -32,6 +36,27 @@ public static class Remote {
         return buf;
     }
     public static ulong U64(ulong addr) { byte[] b = Read(addr, 8); return b == null ? 0 : BitConverter.ToUInt64(b, 0); }
+    // The guest addresses in [start, start + length) that hold `value` as an aligned 64-bit word,
+    // found by walking the page table at `l1` page by page.
+    public static System.Collections.Generic.List<ulong> Find(ulong l1, ulong start, ulong length, ulong value) {
+        var found = new System.Collections.Generic.List<ulong>();
+        ulong l2 = 0, l2Index = ulong.MaxValue;
+        byte[] page = new byte[4096];
+        for (ulong g = start & ~4095UL; g < start + length; g += 4096) {
+            if ((g >> 39) != 0) break;
+            ulong index = g >> 21;
+            if (index != l2Index) { l2 = U64(l1 + 8 * index); l2Index = index; }
+            if (l2 == 0) { g = ((g >> 21) + 1 << 21) - 4096; continue; }
+            ulong entry = U64(l2 + 8 * ((g >> 12) & 511));
+            if ((entry & 8) == 0) continue;
+            IntPtr got;
+            if (!ReadProcessMemory(handle, (IntPtr)(long)(entry & 0xFFFFFFFFFFFFF000UL), page, (IntPtr)4096, out got) || (int)got != 4096) continue;
+            for (int o = 0; o < 4096; o += 8) {
+                if (BitConverter.ToUInt64(page, o) == value) found.Add(g + (ulong)o);
+            }
+        }
+        return found;
+    }
 }
 "@
 
@@ -79,6 +104,12 @@ try {
     foreach ($range in $Ranges.Split(',')) {
         $a, $n = $range.Split(':')
         $addr = [Convert]::ToUInt64($a.Trim().Replace('0x', ''), 16)
+        if ($Find -ne "") {
+            $length = [Convert]::ToUInt64($n.Trim().Replace('0x', ''), 16)
+            $value = [Convert]::ToUInt64($Find.Trim().Replace('0x', ''), 16)
+            foreach ($hit in [Remote]::Find($l1, $addr, $length, $value)) { "{0:x}" -f $hit }
+            continue
+        }
         $len = [int][Convert]::ToUInt64($n.Trim().Replace('0x', ''), 16)
         $bytes = Guest-Bytes $addr $len
         if ($Words) {

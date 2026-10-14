@@ -182,9 +182,11 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   program is (a generated function `f_<guest address>`, a Rust function of the runtime, a module
   of the process) to say what it is busy with (`-Callers` adds, to a sample in a system library,
   the place of the program that its stack points into), and `pwsh -File tools/guest_memory.ps1 -Map <file>
-  -Ranges "<address>:<length>,..." [-Words]` reads the guest memory of the running program from
-  outside (it walks the page table the map names, `nx_mem_l1`; a frame's saved registers on the
-  stack and the objects they point to answer what a stuck loop is looping on).
+  -Ranges "<address>:<length>,..." [-Words] [-Find <value>]` reads the guest memory of the running
+  program from outside (it walks the page table the map names, `nx_mem_l1`; a frame's saved
+  registers on the stack and the objects they point to answer what a stuck loop is looping on;
+  `-Find` lists where a 64-bit value is, scanning 3 GB in about 6 s: an object is found by the
+  address of its table of virtual functions, its fields then say what state a game is in).
   `NX_HOLD_ON_STOP=1` keeps the process alive after a stop, so that its memory can still be read.
   `pwsh -File tools/game_window.ps1 -ProcessId <pid> [-Capture <png>] [-Keys "F13:200,..."]` takes a
   picture of the program's own window (never of the screen) and posts keys to its message queue;
