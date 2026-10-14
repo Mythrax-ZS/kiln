@@ -38,9 +38,17 @@ artwork), in 23 s of wall clock on an RTX 5070 Ti (`docs/reports/M10-vulkan-back
 the title: the keys that stand for the directional pad and for the left stick moved the selection
 of its menu, and confirming it started the title's introduction: a story card and then its opening
 cutscene (characters lit and in color, a flame effect, subtitles), which was looked at in dumped
-frames. The cutscene runs at about 15 frames a second on that card, with about 600 draws a frame.
-There is no sound, nothing past the cutscene has been seen, and the title sometimes stops early
-(about one run in 30; the report says what is known). Nothing here is a claim that a game is playable.
+frames. After the cutscene the title loads its first area, and scripted input (`NX_INPUT_SCRIPT`)
+turns its camera and makes its character stand up and run, seen in dumped frames; a scripted run
+with random inputs went through the menu and the first area for 120,000 presented frames (about
+30 minutes, flat memory), through the character's death (the screen closes on it, loads for a
+second and the game goes on) and ended at its frame limit. On that card the title runs at 40 to 60 frames
+a second in its first area (49 in the heaviest scene seen, about 27 in the cutscene, whose 2,800
+draws a frame are the limit of the renderer thread). Its music and sounds are decoded, mixed and
+played (voices, ADPCM, mixes and the device sink; no reverb or other effects), but only measured
+(`NX_AUDIO_DUMP=<file>` writes what is played to a WAV file), never listened to by a person. The
+title sometimes stops early: rare, and the report says what is known. Nothing here is a claim that
+a game is playable; what a person finds past the first area has not been tried.
 
 ### Keys
 
@@ -92,9 +100,9 @@ runtime library programs link) as `key: value` lines, and builds nothing.
 command line in a window: pick a game's already extracted folder (the one that holds `exefs` and
 `romfs`, or a homebrew `.nro`) or drop it on the window, choose how hard the compiler works, and
 press Recompile. The output of `recomp` streams into the window; the finished game appears in the
-Library, which keeps one folder per game and the settings each is run with (frame limit, save data
+Library, which keeps one folder per game and the settings each is run with (window and sound, keys, frame limit, save data
 and RomFS locations, the logging and GPU trace switches, extra environment variables), and starts
-the game with the output shown beside them. The Settings screen names the `recomp` program, the C
+the game (drawn in a window with the sound on, unless the settings say otherwise) with the output shown beside them. The Settings screen names the `recomp` program, the C
 compiler and the runtime library to use; the header shows whether each was found. The GUI finds
 `recomp` beside itself or on the `PATH`. It reads no keys and opens no NSP, XCI or NCA files, as
 the command line does not. `RECOMP_GUI_CONFIG_DIR` moves its settings folder, and

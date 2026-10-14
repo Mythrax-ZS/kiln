@@ -249,6 +249,24 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
   exactly a layer and level of the texture, or a strip of one, is now copied into the texture's
   image on the device (A-113), without waiting; the lookups of targets by address that this
   needed (they were a scan of all targets for each of about 10 textures a draw) are indexed.
+- **After the character died the picture stayed black for ever (A-127).** Two long scripted runs
+  with random inputs (about 15 minutes of play) both ended in a black picture after 61,700
+  presented frames, drawing two things a frame at 1,370 frames a second until they were stopped.
+  The last visible frame (dumped every 500 frames) showed the circle that closes on the character
+  when it dies. The traced calls of the black part had only the presentation, the controller and
+  the audio update in them: the title was alive and loading nothing. Reading the live process from
+  outside with `tools/guest_memory.ps1` (now with `-Find`, which lists where a value is in the
+  guest's memory: the sequence object was found by the address of its table of virtual
+  functions) gave the state: the game's sequence was in its "destroy" state, running the scene
+  deletion state, which had been in its `exeFinalizeAudio` step for 475,000 steps, and the
+  thread that deletes the scene had finished. That step asks the audio director to finalize,
+  which switches off the scene's effects and waits for the renderer to say that each is removed;
+  the renderer's answer for an effect was zeros (in use) for ever. It now keeps the books of its
+  effects (new, enabled, disabled) and reports an effect that was switched off as removed one
+  update later. The same run no longer stays black: the circle closes, the screen is black for
+  about a second (1,400 frames), the stage loads (3.7 s for 100 frames, 143,000 draws) and
+  the game goes on (a frame dumped at 64,000 shows its HUD over a lit scene). The menu's scene, deleted when the game starts, had no effects in use, which is
+  why that went through before.
 
 ## What is not done, and what is not checked
 

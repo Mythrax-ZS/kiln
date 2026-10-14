@@ -26,9 +26,9 @@ test harness on a GPU (M9).
 `nx_vulkan` ran its 380,376 draws and 1,499 clears on a Vulkan device and none failed; the
 frames, dumped as PNG files and looked at, show an introduction screen (photographs, a logo, text
 and three small pictures, fading in) and then a menu screen with artwork, in 23 s of wall clock on
-an RTX 5070 Ti. There is **no window** yet, the sound is not played and nobody's input reaches the
-title, and what lies beyond those screens has not been tried. Nothing here is a claim that a game
-is playable.
+an RTX 5070 Ti (the numbers of the later work, the window, the keyboard, the first area and the
+sound, are in `docs/reports/M10-vulkan-backend.md`). Nothing here is a claim that a game is
+playable.
 
 ## What each milestone delivered
 
@@ -109,7 +109,7 @@ NPDM service list allows the name (`0x1015` otherwise). Implemented, with the co
 | `time:u` | the user, network and local clocks, the steady clock, a UTC time zone |
 | `nifm:u`, `bsd:u`, `ssl`, `prepo:u`, `nfp:user`, `friend:u` | offline: no network, no sockets or TLS contexts, reports discarded, no amiibo, no friends |
 | `pl:u` | six stand-in system fonts (blank glyphs) in a shared memory |
-| `audren:u` | a silent audio renderer and an audio device |
+| `audren:u` | an audio renderer (voices decoded, mixed and played; no effects, A-125) and an audio device |
 
 20 of the 42 services in the title's list are implemented; the other 22 (`audin:u`, `audout:u`,
 `hwopus`, `ldr:ro`, `mii:u`, `nfc:user`, `bcat:u`, `csrng`, ...) are not, nor is any command of the
@@ -144,7 +144,7 @@ source and its status. The ones with the widest effect:
 - The services: handheld, in focus, American English, no add-on content, no parental control, a
   fixed pseudo device id (A-042 to A-046); one local user (A-066); an idle handheld controller
   (A-070); the clocks and a UTC zone (A-071); an offline console (A-072); stand-in fonts (A-073);
-  a silent audio renderer (A-075, A-076).
+  an audio renderer that plays its voices without effects (A-075, A-076, A-125).
 - The GPU front: the driver's ioctls, error codes, memory handles, address space and syncpoints
   (A-050 to A-056, A-065, A-069), the command processor and its fences (A-060 to A-063), the display
   and its 60 Hz vsync (A-057 to A-059), and the macro engine's instruction set and its exit-flag
@@ -201,21 +201,21 @@ Plainly:
   different title asks for is unknown.
 - Cycle timing, GPU timing, audio timing and any real-time behavior beyond the 60 Hz and 200 Hz
   threads.
-- **Whether a title would be *playable***: its first screens are drawn (the dumped frames were
-  looked at), shown in a window, and its first menu answers the keyboard (looked at in captures of
-  the window); the picture after confirming that menu stayed black for the 45 s watched, there is
-  no sound, and a gamepad was never tried with a controller. Frame times were measured only for
-  the first screens and that stretch.
+- **Whether a title would be *playable***: its first screens, its opening cutscene and its first
+  area are drawn and answer the keyboard and scripted input (looked at in dumped frames and in
+  captures of the window); the sound is mixed and played but only measured, never heard, and has
+  no effects; a gamepad was never tried with a controller; frame times were measured on one card
+  and in the scenes the M10 report names.
 
 ## The next work
 
 The owner approved shader translation and the Vulkan backend on 2026-10-13. Shader translation
 (M9) is done as far as it can be checked without drawing, and the backend (M10) draws the title's
 first screens in a window and takes keyboard (and, untried, gamepad) input
-(`docs/reports/M10-vulkan-backend.md`). What is left of M10 is settings for the window and the
-input in the GUI and finding out why the picture after the first menu is black; after that the
-draws of later screens (more shader instructions, other texture types) as they stop the run,
-audio output, and the 22 services of the title's list that are not implemented.
+(`docs/reports/M10-vulkan-backend.md`). What is left of M10 is what the game does past its first
+area (more shader instructions and other texture types as they stop the run), the effects of the
+sound, the speed of the heaviest scenes, and the services of the title's list that are not
+implemented.
 
 ## Repository state
 
