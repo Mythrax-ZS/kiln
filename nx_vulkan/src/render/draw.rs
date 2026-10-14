@@ -672,6 +672,28 @@ impl Core {
                     "[vulkan] texture {} of the {kind_name} program: header {tic_id} {:08x?} sampler {tsc_id} {:08x?}",
                     used.index, tic.0, tsc.0
                 );
+                // What its memory holds now: the image is made once, so this tells a texture that
+                // was empty when it was made from one the cache has not seen change.
+                let at = tic.address();
+                let held = self
+                    .textures
+                    .span(&tic, used)
+                    .and_then(|s| scene.read_vec(at, s.min(4 << 20) as usize));
+                eprintln!(
+                    "[vulkan]   at GPU address {at:#x}, guest address {:x?}, {}x{}, format {:#x}: {}",
+                    scene.host_address(at).map(|(cpu, _)| cpu),
+                    tic.width(),
+                    tic.height(),
+                    tic.components(),
+                    match held {
+                        Some(b) => format!(
+                            "{} of {} bytes are not zero",
+                            b.iter().filter(|x| **x != 0).count(),
+                            b.len()
+                        ),
+                        None => "not readable".to_string(),
+                    }
+                );
             }
             lap(
                 &mut mark,
@@ -1026,18 +1048,21 @@ impl Core {
         }
         data[size as usize..].fill(0);
         if self.debug.trace_cbufs && self.traced().is_some() {
+            // The first words of the buffer, then the others that are not zero, as `word:value`.
             let words: Vec<String> = data
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .take(48)
-                .map(|c| {
+                .enumerate()
+                .filter(|(i, c)| *i < 16 || **c != [0u8; 4])
+                .take(64)
+                .map(|(i, c)| {
                     let w = u32::from_le_bytes(*c);
                     let f = f32::from_bits(w);
                     if f.is_finite() && f != 0.0 && f.abs() > 1e-6 && f.abs() < 1e6 {
-                        format!("{f}")
+                        format!("{i}:{f}")
                     } else {
-                        format!("{w:#x}")
+                        format!("{i}:{w:#x}")
                     }
                 })
                 .collect();
