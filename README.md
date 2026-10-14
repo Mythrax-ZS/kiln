@@ -168,6 +168,31 @@ cargo test
 Generating native outputs needs clang with the x86-64 target. See `CLAUDE.md` for how tests find
 clang and Unicorn.
 
+### Continuous integration and the bundle
+
+`.github/workflows/ci.yml` runs on every push to `main`, on pull requests and by hand:
+
+- **windows**: `cargo fmt --all --check`, `cargo lint` and `cargo test` (with Unicorn 2.1.4 as the
+  oracle of the instruction tests and the runner's clang for the programs the tests build), then
+  the library tests again with `RECOMP_REQUIRE_EXTERNAL=1`, so that a missing tool fails the run
+  instead of skipping.
+- **linux**: the same lint and tests for everything but `recomp_gui` (the ELF output and the
+  runtime on Linux).
+- **bundle** (after **windows**): `cargo build --release --workspace`, then `tools/bundle.ps1`
+  makes `recomp-<version>-<commit>-windows-x64.zip` from `recomp-gui.exe`, `recomp.exe` and
+  `nx_runtime.lib` with a README, `doctor.cmd` and `selftest.cmd` (it compiles and runs a tiny
+  synthetic program, no game needed), and the job unpacks the zip somewhere else, with no `cargo`
+  on the machine, and runs the self-test. The zip is the run's artifact `recomp-windows-x64`;
+  pushing a tag `v*` also attaches it to a draft release.
+
+What no runner has: a Vulkan device (the renderer's tests print `SKIPPED` and pass), `spirv-val`
+and `astcenc`, and any game. The bundle holds no game, key or firmware; a person who gets it
+brings the extracted ExeFS and RomFS of a game of their own (`dist/README.txt` is what they read).
+To make the bundle by hand: `cargo build --release --workspace`, then
+`RECOMP_SELFTEST_FIXTURE=<folder> cargo test -p recomp --lib -- --ignored --exact
+build::e2e_tests::writes_the_selftest_program`, then
+`pwsh -File tools/bundle.ps1 -Out <folder> -Selftest <the first folder>`.
+
 ## License
 
 Not chosen yet; that is the owner's decision. yuzu is GPL and no code was copied from it; the

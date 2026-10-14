@@ -3,3 +3,7 @@
 *.toml text eol=lf
 *.md text eol=lf
 *.ll text eol=lf
+
+# Files that Windows programs read as text keep Windows line endings in a checkout anywhere.
+dist/*.cmd text eol=crlf
+dist/*.txt text eol=crlf
