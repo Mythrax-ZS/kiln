@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Add the time since `mark` to `into` and start the next step.
-fn lap(mark: &mut Instant, into: &mut Duration) {
+fn lap(mark: &mut Instant, into: &mut Duration, _step: &'static str) {
     let now = Instant::now();
     *into += now - *mark;
     *mark = now;
@@ -60,6 +60,47 @@ impl Pipelines {
         for (_, p) in self.map.drain() {
             // SAFETY: nothing uses the pipeline any more.
             unsafe { vk.device.destroy_pipeline(p, None) };
+        }
+    }
+}
+
+/// Where the handle of a texture was read from, for messages.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum HandleFrom {
+    /// A word of constant buffer `slot` of the binding group of the stage.
+    Group { group: u32, slot: u32 },
+    /// A word of constant buffer `slot` of a compute launch, the buffer at this address.
+    Launch { slot: u32, address: u64 },
+}
+
+impl HandleFrom {
+    fn describe(self, scene: &Scene<'_>) -> String {
+        match self {
+            HandleFrom::Group { group, slot } => format!(
+                "slot {slot} of group {group} ({:?})",
+                scene.cbufs.get(group, slot)
+            ),
+            HandleFrom::Launch { slot, address } => {
+                format!("constant buffer {slot} of the launch at {address:#x}")
+            }
+        }
+    }
+}
+
+/// Whose constant buffer it is, for messages.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Owner {
+    /// The binding group of a stage of a draw.
+    Group(u32),
+    /// A compute launch.
+    Launch,
+}
+
+impl std::fmt::Display for Owner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Owner::Group(g) => write!(f, "group {g}"),
+            Owner::Launch => write!(f, "the launch"),
         }
     }
 }
@@ -170,20 +211,24 @@ impl Core {
             depth_minus_one_to_one: !window.z_zero_to_one,
         };
         let mut mark = Instant::now();
-        let frame = self.textures.frame;
-        let vs = self
-            .shaders
-            .program(&self.vk, scene, vs_slot, variation(Stage::Vertex), frame)?;
+        let vs = self.shaders.program(
+            &self.vk,
+            scene,
+            vs_slot,
+            variation(Stage::Vertex),
+            self.textures.frame,
+        )?;
         let ps = match ps_slot {
-            Some(slot) => {
-                Some(
-                    self.shaders
-                        .program(&self.vk, scene, slot, variation(Stage::Pixel), frame)?,
-                )
-            }
+            Some(slot) => Some(self.shaders.program(
+                &self.vk,
+                scene,
+                slot,
+                variation(Stage::Pixel),
+                self.textures.frame,
+            )?),
             None => None,
         };
-        lap(&mut mark, &mut self.phases.programs);
+        lap(&mut mark, &mut self.phases.programs, "programs");
 
         if self.debug.trace_textures && self.traced().is_some() {
             for group in 0..5u32 {
@@ -208,34 +253,44 @@ impl Core {
         }
         // The textures the programs sample: handle, headers, image and sampler.
         let pools = regs.texture_pools();
-        let mut image_infos: Vec<(u32, vk::DescriptorImageInfo)> = Vec::new();
+        let mut image_infos = std::mem::take(&mut self.scratch.image_infos);
+        image_infos.clear();
+        let mut handles = std::mem::take(&mut self.scratch.handles);
         for (p, slot) in std::iter::once((&vs, vs_slot)).chain(ps.iter().zip(ps_slot)) {
             // The handle is in the program's table, or (a bindless access) in a word of another
             // constant buffer the program names.
-            let mut handles = Vec::new();
+            handles.clear();
             for used in &p.info.textures {
                 let from_slot = used.source.unwrap_or(pools.bindless_slot);
                 let handle = self.texture_handle(scene, slot.group, from_slot, used.index)?;
-                let from = format!(
-                    "slot {from_slot} of group {} ({:?})",
-                    slot.group,
-                    scene.cbufs.get(slot.group, from_slot)
-                );
-                handles.push((handle, from));
+                handles.push((
+                    handle,
+                    HandleFrom::Group {
+                        group: slot.group,
+                        slot: from_slot,
+                    },
+                ));
             }
-            let bound = self.bind_textures(scene, p, slot.kind.name(), &pools, &handles)?;
-            image_infos.extend(bound);
+            self.bind_textures(
+                scene,
+                p,
+                slot.kind.name(),
+                &pools,
+                &handles,
+                &mut image_infos,
+            )?;
         }
-        let image_arrays: Vec<[vk::DescriptorImageInfo; 1]> =
-            image_infos.iter().map(|(_, i)| [*i]).collect();
-        lap(&mut mark, &mut self.phases.textures);
+        self.scratch.handles = handles;
+        lap(&mut mark, &mut self.phases.textures, "textures");
         self.begin_pass(scene)?;
         let pass = self.pass.clone().expect("the pass was begun");
-        lap(&mut mark, &mut self.phases.pass);
+        lap(&mut mark, &mut self.phases.pass, "pass");
 
         // Vertex input.
-        let mut attributes: Vec<(u32, u32, vk::Format, u32)> = Vec::new();
-        let mut streams: Vec<u32> = Vec::new();
+        let mut attributes = std::mem::take(&mut self.scratch.attributes);
+        attributes.clear();
+        let mut streams = std::mem::take(&mut self.scratch.streams);
+        streams.clear();
         for (loc, &format) in formats.iter().enumerate() {
             if vs.info.attributes_read[loc] == 0 {
                 continue;
@@ -263,8 +318,10 @@ impl Core {
         let (geometry, vertex_range) = self.geometry(scene, draw, &vs)?;
 
         // Vertex buffers.
-        let mut bound: Vec<(u32, vk::Buffer, u64)> = Vec::new();
-        let mut binding_state: Vec<(u32, u32, bool)> = Vec::new();
+        let mut bound = std::mem::take(&mut self.scratch.bound);
+        bound.clear();
+        let mut binding_state = std::mem::take(&mut self.scratch.binding_state);
+        binding_state.clear();
         for &s in &streams {
             let stream = regs.vertex_stream(s as usize);
             if !stream.enabled {
@@ -277,44 +334,40 @@ impl Core {
                 let divisor = u64::from(stream.frequency.max(1));
                 let (_, base_instance, _) = regs.bases();
                 let element = u64::from(base_instance) + u64::from(draw.instance) / divisor;
-                let data = self.read_gpu(
-                    scene,
-                    stream.address + element * stride,
-                    stride.max(4) as usize,
-                )?;
-                let (b, o) = self.frame.upload(&self.vk, &data, 16)?;
+                let n = stride.max(4);
+                let (b, o, ptr) = self.frame.reserve(&self.vk, n, 16)?;
+                // SAFETY: `reserve` gave `n` writable bytes at `ptr`, which nothing else uses.
+                let dst = unsafe { std::slice::from_raw_parts_mut(ptr, n as usize) };
+                self.read_exact(scene, stream.address + element * stride, dst)?;
                 (b, o, 0)
             } else {
                 let (lo, hi) = vertex_range;
                 let bytes = (hi + 1) * stride;
                 let (b, o, ptr) = self.frame.reserve(&self.vk, bytes, 16)?;
                 let from = lo * stride;
-                let data = self.read_gpu(scene, stream.address + from, (bytes - from) as usize)?;
-                // SAFETY: `reserve` gave `bytes` writable bytes at `ptr`; the data fits after `from`.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr(),
-                        ptr.add(from as usize),
-                        data.len(),
-                    );
-                }
+                // SAFETY: `reserve` gave `bytes` writable bytes at `ptr`, which nothing else uses;
+                // the vertices fit after `from`.
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(ptr.add(from as usize), (bytes - from) as usize)
+                };
+                self.read_exact(scene, stream.address + from, dst)?;
                 (b, o, stream.stride)
             };
             bound.push((s, buffer, offset));
             binding_state.push((s, state_stride, false));
         }
 
-        lap(&mut mark, &mut self.phases.vertices);
+        lap(&mut mark, &mut self.phases.vertices, "vertices");
 
         // Descriptors: the constant buffers the programs read.
-        let mut programs: Vec<&Program> = vec![&vs];
-        if let Some(p) = ps.as_ref() {
-            programs.push(p);
-        }
-        let layout_bindings = bindings_of(&programs);
+        let layout_bindings = match ps.as_deref() {
+            Some(p) => bindings_of(&[&*vs, p]),
+            None => bindings_of(&[&*vs]),
+        };
         let (set_layout, pipeline_layout) = self.layouts.get(&self.vk, &layout_bindings)?;
         let set = self.frame.descriptor_set(&self.vk, set_layout)?;
-        let mut buffer_infos: Vec<(u32, vk::DescriptorBufferInfo)> = Vec::new();
+        let mut buffer_infos = std::mem::take(&mut self.scratch.buffer_infos);
+        buffer_infos.clear();
         for (p, slot) in std::iter::once((&vs, vs_slot)).chain(ps.iter().zip(ps_slot)) {
             let base = 64 * p.stage.index();
             for cb in 0..18u32 {
@@ -347,35 +400,49 @@ impl Core {
                 ));
             }
         }
-        let infos: Vec<[vk::DescriptorBufferInfo; 1]> =
-            buffer_infos.iter().map(|(_, i)| [*i]).collect();
-        let writes: Vec<vk::WriteDescriptorSet> = buffer_infos
-            .iter()
-            .zip(&infos)
-            .map(|((binding, _), info)| {
+        // The writes are made in an array on the stack: at most 20 buffers and 40 textures a
+        // stage.
+        const MAX_WRITES: usize = 128;
+        if buffer_infos.len() + image_infos.len() > MAX_WRITES {
+            return Err(format!(
+                "{} constant buffers and {} textures in one draw",
+                buffer_infos.len(),
+                image_infos.len()
+            ));
+        }
+        let mut writes =
+            [const { std::mem::MaybeUninit::<vk::WriteDescriptorSet<'_>>::uninit() }; MAX_WRITES];
+        let mut n = 0;
+        for (binding, info) in &buffer_infos {
+            writes[n].write(
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
                     .dst_binding(*binding)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(info)
-            })
-            .collect();
-        let mut writes = writes;
-        writes.extend(
-            image_infos
-                .iter()
-                .zip(&image_arrays)
-                .map(|((binding, _), info)| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(*binding)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .image_info(info)
-                }),
-        );
-        // SAFETY: the set and the buffers are valid.
-        unsafe { self.vk.device.update_descriptor_sets(&writes, &[]) };
-        lap(&mut mark, &mut self.phases.descriptors);
+                    .buffer_info(std::slice::from_ref(info)),
+            );
+            n += 1;
+        }
+        for (binding, info) in &image_infos {
+            writes[n].write(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(*binding)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(info)),
+            );
+            n += 1;
+        }
+        // SAFETY: the first `n` writes were made above; the set, the buffers and the images are
+        // valid, and the infos the writes point to live until the call is over.
+        unsafe {
+            let made =
+                std::slice::from_raw_parts(writes.as_ptr().cast::<vk::WriteDescriptorSet<'_>>(), n);
+            self.vk.device.update_descriptor_sets(made, &[]);
+        }
+        self.scratch.buffer_infos = buffer_infos;
+        self.scratch.image_infos = image_infos;
+        lap(&mut mark, &mut self.phases.descriptors, "descriptors");
 
         // The pipeline.
         let blend = regs.blend();
@@ -392,7 +459,10 @@ impl Core {
             self.debug.discard_programs.contains(&vs_slot.address),
         );
         let pipeline = self.pipeline(&key, &vs, ps.as_deref(), pipeline_layout, &blend)?;
-        lap(&mut mark, &mut self.phases.pipeline);
+        self.scratch.attributes = attributes;
+        self.scratch.streams = streams;
+        self.scratch.binding_state = binding_state;
+        lap(&mut mark, &mut self.phases.pipeline, "pipeline");
 
         // Commands.
         let cmd = self.frame.cmd(&self.vk)?;
@@ -447,7 +517,8 @@ impl Core {
             }
         }
         let _ = geometry.restart;
-        lap(&mut mark, &mut self.phases.record);
+        self.scratch.bound = bound;
+        lap(&mut mark, &mut self.phases.record, "record");
         Ok(())
     }
 
@@ -513,6 +584,23 @@ impl Core {
         Ok(Some(view))
     }
 
+    /// Read GPU memory into `out`, failing with a message when it is not all mapped.
+    pub(super) fn read_exact(
+        &self,
+        scene: &Scene<'_>,
+        va: u64,
+        out: &mut [u8],
+    ) -> Result<(), String> {
+        if scene.read(va, out) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} bytes of GPU memory at {va:#x}, which is not all mapped",
+                out.len()
+            ))
+        }
+    }
+
     /// Read GPU memory, failing with a message when it is not all mapped.
     pub(super) fn read_gpu(
         &self,
@@ -534,10 +622,10 @@ impl Core {
         p: &Program,
         kind_name: &str,
         pools: &nx_gpu::draw_state::TexturePools,
-        handles: &[(u32, String)],
-    ) -> Result<Vec<(u32, vk::DescriptorImageInfo)>, String> {
+        handles: &[(u32, HandleFrom)],
+        out: &mut Vec<(u32, vk::DescriptorImageInfo)>,
+    ) -> Result<(), String> {
         let base = 64 * p.stage.index();
-        let mut out = Vec::new();
         for (used, (handle, from)) in p.info.textures.iter().zip(handles) {
             let handle = *handle;
             let (tic_id, tsc_id) = (handle & 0xF_FFFF, handle >> 20);
@@ -548,18 +636,29 @@ impl Core {
                 ));
             }
             let mut mark = Instant::now();
-            let tic_bytes =
-                self.read_gpu(scene, pools.header_address + 32 * u64::from(tic_id), 32)?;
-            let tsc_bytes =
-                self.read_gpu(scene, pools.sampler_address + 32 * u64::from(tsc_id), 32)?;
+            let mut tic_bytes = [0u8; 32];
+            self.read_exact(
+                scene,
+                pools.header_address + 32 * u64::from(tic_id),
+                &mut tic_bytes,
+            )?;
+            let mut tsc_bytes = [0u8; 32];
+            self.read_exact(
+                scene,
+                pools.sampler_address + 32 * u64::from(tsc_id),
+                &mut tsc_bytes,
+            )?;
             let words = |b: &[u8]| -> [u32; 8] {
                 std::array::from_fn(|i| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()))
             };
             let (tic, tsc) = (Tic(words(&tic_bytes)), Tsc(words(&tsc_bytes)));
             if self.sync_on {
                 self.last_textures.push(format!(
-                    "texture {} of the {kind_name} program: handle {handle:#x} from {from}, header {tic_id} {:08x?} sampler {tsc_id} {:08x?}",
-                    used.index, tic.0, tsc.0
+                    "texture {} of the {kind_name} program: handle {handle:#x} from {}, header {tic_id} {:08x?} sampler {tsc_id} {:08x?}",
+                    used.index,
+                    from.describe(scene),
+                    tic.0,
+                    tsc.0
                 ));
             }
             if self.debug.trace_textures && self.traced().is_some() {
@@ -568,13 +667,18 @@ impl Core {
                     used.index, tic.0, tsc.0
                 );
             }
-            lap(&mut mark, &mut self.phases.texture_headers);
+            lap(
+                &mut mark,
+                &mut self.phases.texture_headers,
+                "texture_headers",
+            );
             let target_view = self.render_target_view(scene, &tic, used)?;
-            lap(&mut mark, &mut self.phases.texture_target);
+            lap(&mut mark, &mut self.phases.texture_target, "texture_target");
             let decorate = |e: String| {
                 format!(
-                    "{e} [texture {}: handle {handle:#x} from {from}, header {tic_id} at {:#x}, sampler {tsc_id} at {:#x}]",
+                    "{e} [texture {}: handle {handle:#x} from {}, header {tic_id} at {:#x}, sampler {tsc_id} at {:#x}]",
                     used.index,
+                    from.describe(scene),
                     pools.header_address + 32 * u64::from(tic_id),
                     pools.sampler_address + 32 * u64::from(tsc_id)
                 )
@@ -589,13 +693,17 @@ impl Core {
                     // exactly a layer and a level of it are copied into its image on the device,
                     // the others that were drawn to are written into the memory it is read from.
                     let overlays = self.sync_targets(scene, &tic, used)?;
-                    lap(&mut mark, &mut self.phases.texture_write_back);
+                    lap(
+                        &mut mark,
+                        &mut self.phases.texture_write_back,
+                        "texture_write_back",
+                    );
                     let (bound, copies) = self
                         .textures
                         .bind(&self.vk, &mut self.frame, scene, tic, tsc, used, &overlays)
                         .map_err(decorate)?;
                     self.record_copies(&copies)?;
-                    lap(&mut mark, &mut self.phases.texture_bind);
+                    lap(&mut mark, &mut self.phases.texture_bind, "texture_bind");
                     bound
                 }
             };
@@ -607,7 +715,7 @@ impl Core {
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
             ));
         }
-        Ok(out)
+        Ok(())
     }
 
     /// The render targets that stand for parts of the memory the texture `tic` reads. Those that
@@ -857,8 +965,9 @@ impl Core {
                 );
             }
         }
-        let word = self.read_gpu(scene, b.address + offset, 4)?;
-        Ok(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        let mut word = [0u8; 4];
+        self.read_exact(scene, b.address + offset, &mut word)?;
+        Ok(u32::from_le_bytes(word))
     }
 
     /// The bytes of the constant buffer bound to `slot` of binding group `group` (at most `want`
@@ -871,7 +980,7 @@ impl Core {
         want: u32,
     ) -> Result<(vk::Buffer, u64, u64), String> {
         let bound = scene.cbufs.get(group, slot).map(|b| (b.address, b.size));
-        self.upload_constant_buffer(scene, &format!("group {group}"), slot, bound, want)
+        self.upload_constant_buffer(scene, Owner::Group(group), slot, bound, want)
     }
 
     /// The bytes of a constant buffer (its GPU address and size, or none when nothing is bound,
@@ -880,7 +989,7 @@ impl Core {
     pub(super) fn upload_constant_buffer(
         &mut self,
         scene: &Scene<'_>,
-        owner: &str,
+        owner: Owner,
         slot: u32,
         bound: Option<(u64, u32)>,
         want: u32,
@@ -897,7 +1006,11 @@ impl Core {
             return Ok((buffer, offset, 256));
         };
         let size = bound_size.min(want).max(16);
-        let mut data = vec![0u8; size.next_multiple_of(16) as usize];
+        let padded = u64::from(size.next_multiple_of(16));
+        // Read the bytes straight into upload memory, with zeros after them.
+        let (buffer, offset, ptr) = self.frame.reserve(&self.vk, padded, align)?;
+        // SAFETY: `reserve` gave `padded` writable bytes at `ptr`, which nothing else uses.
+        let data = unsafe { std::slice::from_raw_parts_mut(ptr, padded as usize) };
         let readable = scene.read(address, &mut data[..size as usize]);
         if !readable {
             return Err(format!(
@@ -905,6 +1018,7 @@ impl Core {
                 address
             ));
         }
+        data[size as usize..].fill(0);
         if self.debug.trace_cbufs && self.traced().is_some() {
             let words: Vec<String> = data
                 .as_chunks::<4>()
@@ -933,8 +1047,7 @@ impl Core {
                 words.join(" ")
             );
         }
-        let (buffer, offset) = self.frame.upload(&self.vk, &data, align)?;
-        Ok((buffer, offset, data.len() as u64))
+        Ok((buffer, offset, padded))
     }
 
     /// Where the vertices come from: indices read from the index buffer (rewritten for the
@@ -998,6 +1111,50 @@ impl Core {
                     return Err(format!("an index size of {size} bytes"));
                 }
                 let at = ib.address + u64::from(first) * u64::from(size);
+                // The common draw: indices of 16 or 32 bits, no restart, a topology Vulkan has.
+                // They are read straight into upload memory and used as they are.
+                if let (Topology::Native(t), false, 2 | 4) = (topology, ib.restart, size) {
+                    let bytes = u64::from(count) * u64::from(size);
+                    let (buffer, offset, ptr) = self.frame.reserve(&self.vk, bytes, 4)?;
+                    // SAFETY: `reserve` gave `bytes` writable bytes at `ptr`, which nothing else
+                    // uses.
+                    let data = unsafe { std::slice::from_raw_parts_mut(ptr, bytes as usize) };
+                    self.read_exact(scene, at, data)?;
+                    let (mut lo, mut hi) = (u32::MAX, 0u32);
+                    if size == 2 {
+                        for c in data.as_chunks::<2>().0 {
+                            let i = u32::from(u16::from_le_bytes(*c));
+                            lo = lo.min(i);
+                            hi = hi.max(i);
+                        }
+                    } else {
+                        for c in data.as_chunks::<4>().0 {
+                            let i = u32::from_le_bytes(*c);
+                            lo = lo.min(i);
+                            hi = hi.max(i);
+                        }
+                    }
+                    let lo = i64::from(lo) + i64::from(base_vertex as i32);
+                    let hi = i64::from(hi) + i64::from(base_vertex as i32);
+                    if lo < 0 {
+                        return Err(format!("indices that reach the vertex {lo}"));
+                    }
+                    let ty = if size == 4 {
+                        vk::IndexType::UINT32
+                    } else {
+                        vk::IndexType::UINT16
+                    };
+                    return Ok((
+                        Geometry {
+                            indices: Some((buffer, offset, ty, count)),
+                            vertices: (0, 0),
+                            vertex_offset: base_vertex as i32,
+                            topology: t,
+                            restart: false,
+                        },
+                        (lo as u64, hi as u64),
+                    ));
+                }
                 let raw = self.read_gpu(scene, at, count as usize * size as usize)?;
                 let mut idx: Vec<u32> = raw
                     .chunks_exact(size as usize)

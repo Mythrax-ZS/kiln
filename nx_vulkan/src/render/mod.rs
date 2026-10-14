@@ -104,6 +104,9 @@ struct Core {
     pass_target: Option<(u64, u32, u32)>,
     /// Where the draws spent their time since the last report.
     phases: Phases,
+    /// Vectors a draw fills and empties, kept so that their memory is not asked for again every
+    /// draw.
+    scratch: Scratch,
     /// Draws wait for the device (`NX_DEBUG_SYNC_DRAWS`).
     sync_on: bool,
     /// A program that reads or writes guest memory in place was recorded since the device was
@@ -125,6 +128,18 @@ struct Core {
 
 /// How many draws a batch has at least when the end of a pass sends it to the device.
 const BATCH_DRAWS: u32 = 24;
+
+/// What a draw keeps between draws: the memory of vectors that are empty when it begins.
+#[derive(Default)]
+struct Scratch {
+    image_infos: Vec<(u32, vk::DescriptorImageInfo)>,
+    handles: Vec<(u32, draw::HandleFrom)>,
+    buffer_infos: Vec<(u32, vk::DescriptorBufferInfo)>,
+    attributes: Vec<(u32, u32, vk::Format, u32)>,
+    streams: Vec<u32>,
+    bound: Vec<(u32, vk::Buffer, u64)>,
+    binding_state: Vec<(u32, u32, bool)>,
+}
 
 /// The time the draws spent in each of their steps (reported with `NX_TRACE_GPU`).
 #[derive(Clone, Copy, Debug, Default)]
@@ -260,6 +275,7 @@ impl Renderer {
                     seen_targets: std::collections::HashSet::new(),
                     pass_target: None,
                     phases: Phases::default(),
+                    scratch: Scratch::default(),
                     sync_on: false,
                     global_pending: false,
                     batch_draws: 0,

@@ -68,7 +68,7 @@ impl Core {
                 .flatten()
                 .map(|c| (c.address, c.size));
             let (buffer, offset, range) =
-                self.upload_constant_buffer(scene, "the launch", cb, bound, want)?;
+                self.upload_constant_buffer(scene, super::draw::Owner::Launch, cb, bound, want)?;
             buffer_infos.push((
                 base + cb,
                 vk::DescriptorBufferInfo::default()
@@ -130,17 +130,18 @@ impl Core {
                     used.index, buffer.size
                 ));
             }
-            let word = self.read_gpu(scene, buffer.address + at, 4)?;
-            let handle = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+            let mut word = [0u8; 4];
+            self.read_exact(scene, buffer.address + at, &mut word)?;
             handles.push((
-                handle,
-                format!(
-                    "constant buffer {slot} of the launch at {:#x}",
-                    buffer.address
-                ),
+                u32::from_le_bytes(word),
+                super::draw::HandleFrom::Launch {
+                    slot,
+                    address: buffer.address,
+                },
             ));
         }
-        let images = self.bind_textures(scene, &program, "compute", &pools, &handles)?;
+        let mut images = Vec::new();
+        self.bind_textures(scene, &program, "compute", &pools, &handles, &mut images)?;
         lap(&mut self.phases.compute[2]);
 
         let infos: Vec<[vk::DescriptorBufferInfo; 1]> =
