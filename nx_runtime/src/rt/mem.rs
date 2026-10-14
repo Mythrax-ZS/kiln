@@ -18,6 +18,7 @@
 use super::abi::perm;
 use crate::a64::bus::FaultKind;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::collections::HashMap;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
@@ -90,11 +91,105 @@ pub enum MapError {
 struct Block {
     ptr: *mut u8,
     layout: Layout,
+    /// Allocated from the system with write tracking (see [`Writes`]).
+    watched: bool,
 }
 
 pub struct GuestMemory {
     l1: Box<[AtomicPtr<L2>]>,
     blocks: Mutex<Vec<Block>>,
+    writes: Mutex<Writes>,
+}
+
+/// The smallest block of memory whose writes are tracked: the memory of textures is in large
+/// blocks, and a small block is not worth the system's bookkeeping.
+const WATCH_MIN: usize = 1 << 20;
+
+/// Which pages of memory were written, as far as the system's write tracking says (Windows
+/// `MEM_WRITE_WATCH`; docs/ASSUMPTIONS.md A-126). Time is cut into epochs: each call of
+/// [`GuestMemory::begin_epoch`] ends one and starts the next, and a page that was written during
+/// an epoch is stamped with the number of the epoch that follows it. A reader that looked at the
+/// bytes of a range after epoch `e` began knows they are as it saw them if no page of the range
+/// has a stamp above `e`.
+#[derive(Default)]
+struct Writes {
+    epoch: u32,
+    /// The tracked blocks (address and size), by address, and whether they are harvested.
+    blocks: Vec<Watched>,
+    /// The stamps, in runs of 512 pages, by the number of the first page.
+    stamps: HashMap<usize, Box<[u32; 512]>>,
+    /// Room for the pages one harvest finds.
+    scratch: Vec<usize>,
+    /// How many pages the harvests found (for the trace).
+    pages: usize,
+}
+
+struct Watched {
+    base: usize,
+    len: usize,
+    /// For each [`CHUNK`] of the block, whether it is harvested at each epoch: only the parts
+    /// somebody asked about are, as asking costs less than reading the system's bits of memory
+    /// nobody looks at (a block of the title's is 3 GB).
+    active: Vec<bool>,
+}
+
+/// The part of a block that is harvested, or not, as a whole.
+const CHUNK: usize = 16 << 20;
+
+/// The most the system is asked about in one call.
+const HARVEST_STEP: usize = 64 << 20;
+
+impl Writes {
+    /// Stamp the pages of `[base, base + len)` that were written since they were last harvested.
+    fn harvest_range(&mut self, base: usize, len: usize) {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let stamp = self.epoch;
+        let mut at = base;
+        while at < base + len {
+            let n = HARVEST_STEP.min(base + len - at);
+            tracking::harvest(at, n, &mut scratch);
+            let mut run: Option<(usize, *mut [u32; 512])> = None;
+            for page in scratch.iter().map(|a| a >> 12) {
+                let first = page & !511;
+                let stamps = match run {
+                    Some((f, p)) if f == first => p,
+                    _ => {
+                        let p: *mut [u32; 512] = &mut **self
+                            .stamps
+                            .entry(first)
+                            .or_insert_with(|| Box::new([0; 512]));
+                        run = Some((first, p));
+                        p
+                    }
+                };
+                // SAFETY: the box lives in `stamps`, which is not touched while `run` is used.
+                unsafe { (*stamps)[page & 511] = stamp };
+            }
+            self.pages += scratch.len();
+            at += n;
+        }
+        self.scratch = scratch;
+    }
+
+    /// Harvest every chunk of block `i` that is active.
+    fn harvest_active(&mut self, i: usize) {
+        let (base, len) = (self.blocks[i].base, self.blocks[i].len);
+        let chunks = self.blocks[i].active.len();
+        let mut c = 0;
+        while c < chunks {
+            if !self.blocks[i].active[c] {
+                c += 1;
+                continue;
+            }
+            let first = c;
+            while c < chunks && self.blocks[i].active[c] {
+                c += 1;
+            }
+            let from = first * CHUNK;
+            let to = (c * CHUNK).min(len);
+            self.harvest_range(base + from, to - from);
+        }
+    }
 }
 
 // SAFETY: the raw pointers in `blocks` are host allocations owned by this value; guest data races
@@ -118,8 +213,13 @@ impl Drop for GuestMemory {
             }
         }
         for b in self.blocks.get_mut().unwrap().drain(..) {
-            // SAFETY: allocated with this layout in `map`.
-            unsafe { dealloc(b.ptr, b.layout) };
+            if b.watched {
+                // SAFETY: allocated by `tracking::alloc` in `map`.
+                unsafe { tracking::free(b.ptr) };
+            } else {
+                // SAFETY: allocated with this layout in `map`.
+                unsafe { dealloc(b.ptr, b.layout) };
+            }
         }
     }
 }
@@ -146,6 +246,10 @@ impl GuestMemory {
         GuestMemory {
             l1: l1.into_boxed_slice(),
             blocks: Mutex::new(Vec::new()),
+            writes: Mutex::new(Writes {
+                epoch: 1,
+                ..Writes::default()
+            }),
         }
     }
 
@@ -213,15 +317,33 @@ impl GuestMemory {
         }
         let layout = Layout::from_size_align(size as usize, PAGE_SIZE as usize)
             .map_err(|_| MapError::Range)?;
-        // SAFETY: the layout has a non-zero size.
-        let host = unsafe { alloc_zeroed(layout) };
+        let watched = tracking::AVAILABLE && size as usize >= WATCH_MIN;
+        let host = if watched {
+            tracking::alloc(size as usize)
+        } else {
+            // SAFETY: the layout has a non-zero size.
+            unsafe { alloc_zeroed(layout) }
+        };
         if host.is_null() {
             return Err(MapError::OutOfMemory);
         }
-        self.blocks
-            .lock()
-            .unwrap()
-            .push(Block { ptr: host, layout });
+        self.blocks.lock().unwrap().push(Block {
+            ptr: host,
+            layout,
+            watched,
+        });
+        if watched {
+            let mut w = self.writes.lock().unwrap();
+            let at = w.blocks.partition_point(|b| b.base < host as usize);
+            w.blocks.insert(
+                at,
+                Watched {
+                    base: host as usize,
+                    len: size as usize,
+                    active: vec![false; (size as usize).div_ceil(CHUNK)],
+                },
+            );
+        }
         let flags = flags_of(permissions);
         for page in 0..size / PAGE_SIZE {
             let a = addr + page * PAGE_SIZE;
@@ -289,6 +411,82 @@ impl GuestMemory {
             slot.store((old & !FLAGS) | flags, Ordering::Release);
         }
         Ok(())
+    }
+
+    /// End the epoch of write tracking that is running and start the next: the number of the new
+    /// one, to be kept by whoever looks at memory from now on and asks [`Self::untouched_since`]
+    /// later. 0 when memory is not tracked.
+    pub fn begin_epoch(&self) -> u32 {
+        if !tracking::AVAILABLE {
+            return 0;
+        }
+        let mut w = self.writes.lock().unwrap();
+        w.epoch = w.epoch.wrapping_add(1).max(1);
+        let began = std::time::Instant::now();
+        w.pages = 0;
+        let mut chunks = 0;
+        for i in 0..w.blocks.len() {
+            chunks += w.blocks[i].active.iter().filter(|a| **a).count();
+            w.harvest_active(i);
+        }
+        if w.epoch.is_multiple_of(100) && std::env::var_os("NX_TRACE_PERF").is_some() {
+            eprintln!(
+                "[memory] epoch {}: harvested {chunks} chunks of {} MB in {:?}, {} pages written",
+                w.epoch,
+                CHUNK >> 20,
+                began.elapsed(),
+                w.pages
+            );
+        }
+        w.epoch
+    }
+
+    /// Whether none of the `len` bytes at host address `host` was written since epoch `epoch`
+    /// began (`Some(true)`), or some was (`Some(false)`). `None` if that cannot be told: the
+    /// bytes are not all in a tracked block, or the part of the block has not been looked at
+    /// before. Asking starts the harvesting of that part, so a later question about it can be
+    /// answered.
+    pub fn untouched_since(&self, host: *const u8, len: usize, epoch: u32) -> Option<bool> {
+        if !tracking::AVAILABLE || len == 0 || epoch == 0 {
+            return None;
+        }
+        let (start, end) = (host as usize, (host as usize).checked_add(len)?);
+        let mut w = self.writes.lock().unwrap();
+        let i = w
+            .blocks
+            .partition_point(|b| b.base <= start)
+            .checked_sub(1)?;
+        let b = &w.blocks[i];
+        if end > b.base + b.len {
+            return None;
+        }
+        let (first, last) = ((start - b.base) / CHUNK, (end - 1 - b.base) / CHUNK);
+        if !b.active[first..=last].iter().all(|a| *a) {
+            // Bring the bits of the chunks up to date: the next epoch stamps what is written from
+            // now.
+            for c in first..=last {
+                if !w.blocks[i].active[c] {
+                    w.blocks[i].active[c] = true;
+                    let base = w.blocks[i].base + c * CHUNK;
+                    let len = CHUNK.min(w.blocks[i].len - c * CHUNK);
+                    w.harvest_range(base, len);
+                }
+            }
+            return None;
+        }
+        let mut page = start >> 12;
+        let last = (end - 1) >> 12;
+        while page <= last {
+            let first = page & !511;
+            let upto = last.min(first + 511);
+            if let Some(run) = w.stamps.get(&first) {
+                if run[page & 511..=upto & 511].iter().any(|s| *s > epoch) {
+                    return Some(false);
+                }
+            }
+            page = upto + 1;
+        }
+        Some(true)
     }
 
     /// The host address of the guest byte at `addr` and how many bytes from there, at most `max`,
@@ -509,8 +707,95 @@ unsafe fn store(p: *mut u8, size: u8, value: u128, order: Ordering) {
     }
 }
 
+/// The system's write tracking.
+#[cfg(windows)]
+mod tracking {
+    use std::ffi::c_void;
+
+    extern "system" {
+        fn VirtualAlloc(addr: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
+        fn VirtualFree(addr: *mut c_void, size: usize, kind: u32) -> i32;
+        fn GetWriteWatch(
+            flags: u32,
+            base: *mut c_void,
+            size: usize,
+            addresses: *mut *mut c_void,
+            count: *mut usize,
+            granularity: *mut u32,
+        ) -> u32;
+    }
+
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_RESERVE: u32 = 0x2000;
+    const MEM_RELEASE: u32 = 0x8000;
+    const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+    const PAGE_READWRITE: u32 = 4;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+
+    pub const AVAILABLE: bool = true;
+
+    /// `size` bytes of zeroed memory whose writes the system tracks.
+    pub fn alloc(size: usize) -> *mut u8 {
+        // SAFETY: a plain allocation; null on failure.
+        unsafe {
+            VirtualAlloc(
+                std::ptr::null_mut(),
+                size,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+            .cast()
+        }
+    }
+
+    /// # Safety
+    /// `ptr` came from [`alloc`] and is not used again.
+    pub unsafe fn free(ptr: *mut u8) {
+        VirtualFree(ptr.cast(), 0, MEM_RELEASE);
+    }
+
+    /// Put in `pages` the addresses of the pages of the block that were written since the last
+    /// harvest, and forget that they were.
+    pub fn harvest(base: usize, len: usize, pages: &mut Vec<usize>) {
+        // Room for every page of the block, so that one call finds them all.
+        pages.clear();
+        pages.resize(len / 4096, 0);
+        let mut count = pages.len();
+        let mut granularity = 0u32;
+        // SAFETY: the range is one block from `alloc`; `pages` has room for `count` addresses (a
+        // `usize` is a pointer's size).
+        let status = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                base as *mut c_void,
+                len,
+                pages.as_mut_ptr().cast::<*mut c_void>(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        pages.truncate(if status == 0 { count } else { 0 });
+    }
+}
+
+#[cfg(not(windows))]
+mod tracking {
+    pub const AVAILABLE: bool = false;
+
+    pub fn alloc(_size: usize) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+
+    /// # Safety
+    /// Never called: nothing is allocated.
+    pub unsafe fn free(_ptr: *mut u8) {}
+
+    pub fn harvest(_base: usize, _len: usize, _pages: &mut Vec<usize>) {}
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     const RO: u32 = perm::R;
@@ -725,5 +1010,58 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    /// Writes to a large block are noticed by the epochs, and only the pages written.
+    #[cfg(windows)]
+    #[test]
+    fn written_pages_are_found_by_the_epoch_they_were_written_in() {
+        let mem = GuestMemory::new();
+        let base = 0x4000_0000u64;
+        let size = 4u64 << 20;
+        mem.map(base, size, perm::R | perm::W).unwrap();
+        let host = |a: u64| mem.host_run(a, 4096).unwrap().0 as *const u8;
+        // The first question about a block cannot be answered; it starts the tracking.
+        let e1 = mem.begin_epoch();
+        assert!(e1 > 0);
+        assert_eq!(mem.untouched_since(host(base), 8192, e1), None);
+        let e2 = mem.begin_epoch();
+        assert!(e2 > e1);
+        assert_eq!(mem.untouched_since(host(base), 8192, e2), Some(true));
+        // A write to the second page of the range, and one far away.
+        mem.write_bytes(base + 4096 + 8, &[1, 2, 3], true).unwrap();
+        mem.write_bytes(base + (3 << 20), &[9], true).unwrap();
+        let e3 = mem.begin_epoch();
+        assert_eq!(
+            mem.untouched_since(host(base), 8192, e2),
+            Some(false),
+            "the second page was written after epoch e2 began"
+        );
+        assert_eq!(
+            mem.untouched_since(host(base), 4096, e2),
+            Some(true),
+            "the first page was not"
+        );
+        assert_eq!(
+            mem.untouched_since(host(base + (3 << 20)), 100, e2),
+            Some(false)
+        );
+        // Looked at again after the write: untouched from then on.
+        assert_eq!(mem.untouched_since(host(base), 8192, e3), Some(true));
+        // A range past the block cannot be answered.
+        assert_eq!(
+            mem.untouched_since(host(base + size - 4096), 8192, e3),
+            None
+        );
+    }
+
+    /// A block too small to be tracked is not answered for.
+    #[test]
+    fn small_blocks_are_not_tracked() {
+        let mem = GuestMemory::new();
+        mem.map(0x5000_0000, 64 << 10, perm::R | perm::W).unwrap();
+        let p = mem.host_run(0x5000_0000, 4096).unwrap().0 as *const u8;
+        let e = mem.begin_epoch();
+        assert_eq!(mem.untouched_since(p, 4096, e), None);
     }
 }

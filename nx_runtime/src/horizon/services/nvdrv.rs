@@ -33,6 +33,23 @@ impl GuestMemory for ProcessMemory {
     fn host_run(&self, addr: u64, max: u64) -> Option<(*mut u8, u64)> {
         rt().mem.host_run(addr, max)
     }
+
+    fn begin_write_epoch(&self) -> u32 {
+        rt().mem.begin_epoch()
+    }
+
+    fn untouched_since(&self, addr: u64, len: u64, epoch: u32) -> Option<bool> {
+        let (mut at, mut left) = (addr, len);
+        while left > 0 {
+            let (host, run) = rt().mem.host_run(at, left)?;
+            if !rt().mem.untouched_since(host, run as usize, epoch)? {
+                return Some(false);
+            }
+            at += run;
+            left -= run;
+        }
+        Some(true)
+    }
 }
 
 /// The driver and the events behind its tokens, shared by every connection of the process.

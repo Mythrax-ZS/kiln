@@ -39,6 +39,23 @@ pub trait GuestMemory: Send + Sync {
         let _ = (addr, max);
         None
     }
+
+    /// End the epoch of write tracking that is running and start the next, and say its number
+    /// (never 0), or 0 when writes to memory are not tracked. A reader that keeps a copy of
+    /// memory takes this number before it looks at the bytes, and asks
+    /// [`GuestMemory::untouched_since`] with it later.
+    fn begin_write_epoch(&self) -> u32 {
+        0
+    }
+
+    /// Whether none of the `len` bytes at `addr` was written since epoch `epoch` began:
+    /// `Some(true)` if none was, `Some(false)` if some was, `None` if that cannot be told (the
+    /// memory is not tracked, or nobody has asked about it before). A reader looks at the bytes
+    /// again unless this says `Some(true)`.
+    fn untouched_since(&self, addr: u64, len: u64, epoch: u32) -> Option<bool> {
+        let _ = (addr, len, epoch);
+        None
+    }
 }
 
 /// Memory for tests: a few mapped ranges backed by vectors.

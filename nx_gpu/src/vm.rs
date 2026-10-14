@@ -461,6 +461,29 @@ impl AddressSpace {
         (h ^ done, done)
     }
 
+    /// Whether none of the `len` bytes of GPU memory at `va` was written since epoch `epoch`
+    /// began (see [`GuestMemory::untouched_since`]); `None` when that cannot be told or part of
+    /// the range is not mapped.
+    pub fn untouched_since(
+        &self,
+        mem: &dyn GuestMemory,
+        mut va: u64,
+        len: u64,
+        epoch: u32,
+    ) -> Option<bool> {
+        let mut done = 0u64;
+        while done < len {
+            let (cpu, avail) = self.translate(va)?;
+            let n = (len - done).min(avail);
+            if !mem.untouched_since(cpu, n, epoch)? {
+                return Some(false);
+            }
+            done += n;
+            va += n;
+        }
+        Some(true)
+    }
+
     /// Read GPU memory, across mappings that touch. `false` when any byte is unmapped.
     pub fn read(&self, mem: &dyn GuestMemory, mut va: u64, out: &mut [u8]) -> bool {
         let mut done = 0;

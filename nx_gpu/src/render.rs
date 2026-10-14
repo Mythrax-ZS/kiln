@@ -33,6 +33,18 @@ impl Scene<'_> {
         self.space.hash(self.mem, va, len)
     }
 
+    /// Start a new epoch of write tracking, and say its number (0: writes are not tracked); see
+    /// [`GuestMemory::begin_write_epoch`].
+    pub fn begin_write_epoch(&self) -> u32 {
+        self.mem.begin_write_epoch()
+    }
+
+    /// Whether none of the `len` bytes of GPU memory at `va` was written since epoch `epoch`
+    /// began (see [`AddressSpace::untouched_since`]).
+    pub fn untouched_since(&self, va: u64, len: u64, epoch: u32) -> Option<bool> {
+        self.space.untouched_since(self.mem, va, len, epoch)
+    }
+
     /// `len` bytes of GPU memory at `va`.
     pub fn read_vec(&self, va: u64, len: usize) -> Option<Vec<u8>> {
         let mut v = vec![0u8; len];

@@ -652,6 +652,9 @@ struct Texture {
     /// The frame it was last compared with memory in, and the hash of the bytes then.
     checked: u64,
     hash: u64,
+    /// The epoch of write tracking the bytes were last looked at in (0: not known), to tell that
+    /// they were not written since without reading them.
+    epoch: u32,
     bytes: u64,
     /// Where the memory it was made of is in the guest process (0 when that is not known), to
     /// tell which textures a write of the renderer into memory touches.
@@ -805,6 +808,9 @@ pub struct Textures {
     samplers: FastMap<(Tsc, bool), vk::Sampler>,
     /// The number of buffers shown so far: a texture is compared with memory once per frame.
     pub frame: u64,
+    /// The epoch of write tracking begun for the frame in `epoch_frame`.
+    epoch: u32,
+    epoch_frame: u64,
     /// Say what each new image is made of (`NX_TRACE_TEXTURES`).
     pub trace: bool,
     /// How many bytes of memory a texture takes (see [`Textures::span`]), by header and shape.
@@ -974,6 +980,18 @@ impl Textures {
             total,
             ..
         } = plan(&tic, shape, format)?;
+        // Memory that the system tracks the writes of needs no reading to be found unchanged;
+        // the epoch of tracking is begun once a frame, at the first comparison.
+        if self.epoch_frame != current {
+            self.epoch = scene.begin_write_epoch();
+            self.epoch_frame = current;
+        }
+        if let Some(t) = self.map.get_mut(&key) {
+            if t.epoch != 0 && scene.untouched_since(tic.address(), total, t.epoch) == Some(true) {
+                t.checked = current;
+                return Ok(t.image.view);
+            }
+        }
         // The memory as it is now, compared in place: a texture that has not changed (nearly
         // all of them, nearly always) is not copied.
         let (hash, readable) = scene.hash(tic.address(), total);
@@ -986,6 +1004,7 @@ impl Textures {
         if let Some(t) = self.map.get_mut(&key) {
             if t.hash == hash {
                 t.checked = current;
+                t.epoch = self.epoch;
                 return Ok(t.image.view);
             }
             // The contents changed: the old image goes once the submission is over.
@@ -1149,6 +1168,7 @@ impl Textures {
                 image,
                 checked: current,
                 hash,
+                epoch: self.epoch,
                 bytes: total,
                 cpu: scene.host_address(tic.address()).map_or(0, |(cpu, _)| cpu),
                 overlays: FastMap::default(),
@@ -1166,6 +1186,7 @@ impl Textures {
         for t in self.map.values_mut() {
             if t.cpu == 0 || (t.cpu < end && t.cpu + t.bytes > start) {
                 t.checked = UNCHECKED;
+                t.epoch = 0;
             }
         }
     }
