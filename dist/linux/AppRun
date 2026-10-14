@@ -1,0 +1,14 @@
+#!/bin/sh
+# What an AppImage runs: the desktop front end, or with `recomp` as the first argument the
+# command line tool (`./recomp-*.AppImage recomp doctor`). The front end finds `recomp` and the
+# runtime library beside itself, in usr/bin.
+here="$(dirname "$(readlink -f "$0")")"
+case "${1:-}" in
+    recomp)
+        shift
+        exec "$here/usr/bin/recomp" "$@"
+        ;;
+    *)
+        exec "$here/usr/bin/recomp-gui" "$@"
+        ;;
+esac

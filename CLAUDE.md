@@ -34,7 +34,8 @@ cargo test
 ```
 
 `.github/workflows/ci.yml` runs this gate on Windows and (without `recomp_gui`) on Linux for every
-push and pull request, and builds the Windows bundle (`tools/bundle.ps1`, `dist/`); see the README.
+push and pull request, and builds the Windows bundle (`tools/bundle.ps1`, `dist/`) and the Linux
+bundle and AppImage (`tools/bundle.sh`, `dist/linux/`); see the README.
 The workflow pins the Rust version (`RUST_VERSION`) and Unicorn: move them on purpose.
 
 ## Commits

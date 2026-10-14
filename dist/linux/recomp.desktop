@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=recomp
+Comment=Recompile the program of a game you dumped yourself, and run it
+Exec=recomp-gui
+Icon=recomp
+Terminal=false
+Categories=Development;

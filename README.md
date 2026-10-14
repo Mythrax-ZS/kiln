@@ -189,7 +189,20 @@ clang and Unicorn.
   it instead. A pull request or a manual run keeps it as the artifact `recomp-windows-x64` for 30
   days.
 
-What no runner has: a Vulkan device (the renderer's tests print `SKIPPED` and pass), `spirv-val`
+- **bundle-linux** (after the three above): the same for Linux, `tools/bundle.sh`: a
+  `recomp-<version>-<commit>-linux-x86_64.tar.gz` (`recomp-gui`, `recomp`, `libnx_runtime.a`, a
+  README, `doctor.sh`, `selftest.sh`, `setup-toolchain.sh`) and an AppImage
+  `recomp-<version>-<commit>-x86_64.AppImage` of the desktop front end (`appimagetool` and the
+  AppImage runtime are downloaded at pinned versions and checked against their SHA-256; the
+  AppImage runs the command line tool when its first argument is `recomp`). The job unpacks the
+  tarball with no `cargo` on the machine and runs the self-test, and builds and runs the
+  self-test program with the `recomp` inside the AppImage. Both files, with `SHA256SUMS-linux.txt`,
+  go to the same tag and pre-release as the Windows bundle of that build. Clang is in neither
+  bundle (a person installs it: `dist/linux/setup-toolchain.sh`); a game has not been run on
+  Linux, and Linux has no sound output or gamepad.
+
+What no runner has: a Vulkan device
+ (the renderer's tests print `SKIPPED` and pass), `spirv-val`
 and `astcenc`, and any game. The bundle holds no game, key or firmware; a person who gets it
 brings the extracted ExeFS and RomFS of a game of their own (`dist/README.txt` is what they read).
 To make the bundle by hand: `cargo build --release --workspace`, then
