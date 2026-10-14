@@ -170,14 +170,15 @@ impl Core {
             depth_minus_one_to_one: !window.z_zero_to_one,
         };
         let mut mark = Instant::now();
+        let frame = self.textures.frame;
         let vs = self
             .shaders
-            .program(&self.vk, scene, vs_slot, variation(Stage::Vertex))?;
+            .program(&self.vk, scene, vs_slot, variation(Stage::Vertex), frame)?;
         let ps = match ps_slot {
             Some(slot) => {
                 Some(
                     self.shaders
-                        .program(&self.vk, scene, slot, variation(Stage::Pixel))?,
+                        .program(&self.vk, scene, slot, variation(Stage::Pixel), frame)?,
                 )
             }
             None => None,

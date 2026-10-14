@@ -40,7 +40,9 @@ impl Core {
             *into += now - mark;
             mark = now;
         };
-        let program = self.shaders.kernel(&self.vk, scene, d.program, d.block)?;
+        let program =
+            self.shaders
+                .kernel(&self.vk, scene, d.program, d.block, self.textures.frame)?;
         let bindings = bindings_of(&[&program]);
         let (set_layout, pipeline_layout) = self.layouts.get(&self.vk, &bindings)?;
         let set = self.frame.descriptor_set(&self.vk, set_layout)?;

@@ -52,6 +52,8 @@ struct Entry {
     /// Bytes from the header to the end of the last reachable instruction.
     size: usize,
     hash: u64,
+    /// The frame it was last compared with memory in (a program is compared once a frame).
+    checked: u64,
     sph: Sph,
     code: Vec<u8>,
     variations: FastMap<Variation, Arc<Program>>,
@@ -62,6 +64,7 @@ struct KernelEntry {
     /// Bytes from the start to the end of the last reachable instruction.
     size: usize,
     hash: u64,
+    checked: u64,
     program: Arc<Program>,
 }
 
@@ -169,13 +172,19 @@ impl Shaders {
         scene: &Scene<'_>,
         slot: &StageSlot,
         variation: Variation,
+        frame: u64,
     ) -> Result<Arc<Program>, String> {
         let name = slot.kind.name();
-        // The same address: unchanged if the bytes still hash the same.
-        if let Some(e) = self.entries.get(&slot.address) {
-            let (hash, mapped) = scene.hash(slot.address, e.size as u64);
-            if !(mapped == e.size as u64 && hash == e.hash) {
-                self.entries.remove(&slot.address);
+        // The same address: unchanged if the bytes still hash the same, which is looked at once a
+        // frame (a program that is rewritten while it is in use is seen in the next frame).
+        if let Some(e) = self.entries.get_mut(&slot.address) {
+            if e.checked != frame {
+                let (hash, mapped) = scene.hash(slot.address, e.size as u64);
+                if mapped == e.size as u64 && hash == e.hash {
+                    e.checked = frame;
+                } else {
+                    self.entries.remove(&slot.address);
+                }
             }
         }
         let entry = match self.entries.entry(slot.address) {
@@ -211,6 +220,7 @@ impl Shaders {
                 v.insert(Entry {
                     size,
                     hash: scene.hash(slot.address, size as u64).0,
+                    checked: frame,
                     sph,
                     code,
                     variations: FastMap::default(),
@@ -266,11 +276,16 @@ impl Shaders {
         scene: &Scene<'_>,
         address: u64,
         block: [u32; 3],
+        frame: u64,
     ) -> Result<Arc<Program>, String> {
-        // The same program: unchanged if the bytes still hash the same.
-        if let Some(e) = self.kernels.get(&(address, block)) {
+        // The same program: unchanged if the bytes still hash the same (looked at once a frame).
+        if let Some(e) = self.kernels.get_mut(&(address, block)) {
+            if e.checked == frame {
+                return Ok(Arc::clone(&e.program));
+            }
             let (hash, mapped) = scene.hash(address, e.size as u64);
             if mapped == e.size as u64 && hash == e.hash {
+                e.checked = frame;
                 return Ok(Arc::clone(&e.program));
             }
             self.kernels.remove(&(address, block));
@@ -315,6 +330,7 @@ impl Shaders {
             KernelEntry {
                 size,
                 hash: scene.hash(address, size as u64).0,
+                checked: frame,
                 program: Arc::clone(&program),
             },
         );
