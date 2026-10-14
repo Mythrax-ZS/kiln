@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Where a tool of the Vulkan SDK is: `RECOMP_SPIRV_TOOLS` (a directory), the `PATH`, the
 /// `VULKAN_SDK` directory, then the default install locations.
@@ -36,12 +37,17 @@ pub fn find_tool(name: &str) -> Option<PathBuf> {
     dirs.into_iter().map(|d| d.join(&exe)).find(|p| p.is_file())
 }
 
+/// A file of its own for each call: tests that run at the same time on different threads of one
+/// process validate the same module now and then, and one that removes its file must not take
+/// the other's away.
 fn words_to_file(words: &[u32], tag: &str) -> Result<PathBuf, String> {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir();
     let name = format!(
-        "nx_shader_{}_{}_{}.spv",
+        "nx_shader_{}_{}_{}_{}.spv",
         std::process::id(),
         tag,
+        CALLS.fetch_add(1, Ordering::Relaxed),
         words.iter().fold(0u32, |h, w| h.rotate_left(5) ^ w)
     );
     let path = dir.join(name);
@@ -133,4 +139,21 @@ pub fn optimize(words: &[u32], args: &[&str]) -> Result<Option<Vec<u32>>, String
             .map(|w| u32::from_le_bytes(*w))
             .collect(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_same_words_never_share_a_file() {
+        let words = [0x0723_0203u32, 1, 2, 3];
+        let a = words_to_file(&words, "t").unwrap();
+        let b = words_to_file(&words, "t").unwrap();
+        assert_ne!(a, b);
+        // A test that removes its file leaves the other's.
+        std::fs::remove_file(&a).unwrap();
+        assert!(b.is_file());
+        std::fs::remove_file(&b).unwrap();
+    }
 }
