@@ -344,6 +344,10 @@ pub struct RunSettings {
     pub play: bool,
     /// Leave the sound device out (`NX_AUDIO=0`).
     pub mute: bool,
+    /// Stop the game at a draw the renderer cannot make. Off, a game that is drawn skips such a
+    /// draw (and says so once), as a person playing wants (`NX_GPU_LENIENT=1`); a developer
+    /// looking for what the renderer lacks wants the stop.
+    pub strict_gpu: bool,
     /// A file that rebinds the keys (`NX_KEYMAP`); empty uses the standard keys.
     pub keymap: String,
     /// Stop after this many presented frames; 0 runs until the game ends (`NX_MAX_FRAMES`).
@@ -380,6 +384,7 @@ impl Default for RunSettings {
             // A game is run to be played unless it is asked not to be.
             play: true,
             mute: false,
+            strict_gpu: false,
             keymap: String::new(),
             frames: 0,
             save_dir: String::new(),
@@ -456,6 +461,9 @@ impl RunSettings {
         if self.play {
             put("NX_RENDERER", "vulkan".into());
             put("NX_WINDOW", "1".into());
+            if !self.strict_gpu {
+                put("NX_GPU_LENIENT", "1".into());
+            }
         }
         if self.mute {
             put("NX_AUDIO", "0".into());
@@ -823,9 +831,16 @@ mod tests {
             default,
             vec![
                 ("NX_RENDERER".to_string(), "vulkan".to_string()),
-                ("NX_WINDOW".to_string(), "1".to_string())
+                ("NX_WINDOW".to_string(), "1".to_string()),
+                ("NX_GPU_LENIENT".to_string(), "1".to_string())
             ]
         );
+        // Asked to stop at a draw it cannot make, a game does not skip it.
+        let strict = RunSettings {
+            strict_gpu: true,
+            ..RunSettings::default()
+        };
+        assert!(!strict.env().iter().any(|(k, _)| k == "NX_GPU_LENIENT"));
         let none = RunSettings {
             play: false,
             ..RunSettings::default()

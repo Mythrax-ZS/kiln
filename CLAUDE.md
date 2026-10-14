@@ -145,7 +145,10 @@ Set `RECOMP_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   `NX_DEBUG_EQUAL_AS_LEQUAL=1`, `NX_DEBUG_NO_DEPTH_TEST=1`, `NX_DEBUG_FLIP_FRONT=1`,
   `NX_TRACE_TARGETS=1` (each render target configuration, the first time it is drawn to) and
   `NX_GPU_SYNC=1` runs the commands of a submission in the call that makes it (with a renderer they
-  otherwise run on a thread of their own, A-124);
+  otherwise run on a thread of their own, A-124); `NX_GPU_LENIENT=1` skips a draw the renderer
+  cannot make (counted in the report of every 100 frames, and said once) instead of stopping the
+  run: development runs set it, and so does `recomp-gui` for a game it starts to be played (its
+  "Stop at a draw that cannot be rendered" setting turns that off);
   `NX_SPIRV_CHECK=1` look at one thing each; `NX_DEBUG_WAIT_FINISH=1` waits for the device at the end
   of every submission of the guest (the renderer otherwise lets the device run behind the
   recording, A-123); `NX_DEBUG_SYNC_DRAWS=<n>` waits for the device after

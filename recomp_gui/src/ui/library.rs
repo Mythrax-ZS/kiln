@@ -392,6 +392,11 @@ fn run_settings_form(
             ui.spacing_mut().item_spacing.y = 10.0;
             theme::toggle(ui, &mut run.play, "Show the game in a window");
             theme::toggle(ui, &mut run.mute, "Mute the sound");
+            theme::toggle(
+                ui,
+                &mut run.strict_gpu,
+                "Stop at a draw that cannot be rendered",
+            );
         },
     );
     setting_row(

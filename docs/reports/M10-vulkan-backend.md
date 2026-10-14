@@ -352,10 +352,20 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
   address (`nx_shader --example audit` lists what the translator lacks: `TLD`, `TLDS`, `TXD`, the
   bindless forms of `TEX`, `TLD4` and `TXQ`, half-precision arithmetic, local and shared memory,
   atomics and others); the programs of the screens and the cutscene seen so far did not need them.
-- **Textures:** 2D, 2D array, cube, 3D and depth textures are sampled now, with BC, ASTC LDR and
-  the plain color formats; 1D and stencil textures, texture views of other formats (an sRGB view
-  of a linear target) and mip chains of render targets other than through the write-back are
-  refused or not modelled. ASTC textures of high dynamic range blocks are magenta.
+- **Textures:** 1D, 2D, 2D array, cube, 3D and depth textures are sampled now, with BC, ASTC LDR
+  and the plain color formats (A-128 for 1D); 1D arrays, stencil textures, texture views of other
+  formats (an sRGB view of a linear target) and mip chains of render targets other than through
+  the write-back are refused or not modelled. ASTC textures of high dynamic range blocks are
+  magenta.
+- **One draw at the start of the first area used a 1D texture, which the renderer refused, and in
+  a run that does not skip failed draws that stopped the game** (`a draw could not be rendered: a
+  texture header of type 0 sampled as a D1 texture`: a 256 by 1 half-float table). Every run made
+  while developing used `NX_GPU_LENIENT=1`, which skips a failed draw and counts it, so the count
+  of one failed draw at the move into the area (frame 7,300 of a headless run) was seen but the
+  stop was not; the first person to play from the desktop front end, which did not set it,
+  met the stop. 1D textures are drawn now (a 1D image; the test samples one on the device through
+  `TEX` and `TEXS`), and the front end sets `NX_GPU_LENIENT=1` for a game it starts to be played
+  unless the setting "Stop at a draw that cannot be rendered" is on.
 - **The device's pictures reach guest memory only through the write-back (A-111).** A texture that
   is a render target of its own size is read from the device (A-100); a texture made from memory
   that color targets cover gets them written first; depth targets are never written back, and a
