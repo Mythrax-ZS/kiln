@@ -124,6 +124,8 @@ pub(super) struct State {
     pub cv_waiters: HashMap<u64, Vec<CvWaiter>>,
     pub arbiter_waiters: HashMap<u64, Vec<Waiter>>,
     pub exit: Option<Exit>,
+    /// The report of a stop is being printed: the process does not end before it is over.
+    pub reporting: bool,
     pub seq: u64,
     pub main_handle: Handle,
     /// Regions this kernel mapped into guest memory, unmapped again when it is dropped.
@@ -352,6 +354,7 @@ impl Kernel {
             cv_waiters: HashMap::new(),
             arbiter_waiters: HashMap::new(),
             exit: None,
+            reporting: false,
             seq: 0,
             main_handle: 0,
             mapped: Vec::new(),
@@ -553,12 +556,16 @@ impl Kernel {
         let mut st = self.lock();
         let first = st.exit.is_none();
         st.exit.get_or_insert(Exit::Fatal(report));
+        st.reporting |= first;
         drop(st);
         self.notify();
         if first {
-            // What the other threads were doing when the run stopped is half of the story.
+            // What the other threads were doing when the run stopped is half of the story, and
+            // the process must not end while it is told.
             eprintln!("[stop] the other threads at the stop:");
             super::watchdog::report_threads(self, "stop");
+            self.lock().reporting = false;
+            self.notify();
         }
     }
 
@@ -569,7 +576,18 @@ impl Kernel {
     /// Block until the process has ended.
     pub fn wait_for_exit(&self) -> Exit {
         let st = self.lock();
-        let (_st, out) = self.wait_until(st, None, |st| st.exit.clone());
+        let (_st, out) =
+            self.wait_until(
+                st,
+                None,
+                |st| {
+                    if st.reporting {
+                        None
+                    } else {
+                        st.exit.clone()
+                    }
+                },
+            );
         match out {
             Waited::Ready(e) => e,
             _ => unreachable!("waiting for the exit cannot end another way"),
@@ -809,8 +827,10 @@ impl Kernel {
                     .enumerate()
                     .map(|(i, v)| format!("x{i}={v:#x}"))
                     .collect();
+                let (entry, arg, priority, core) = self.thread_entry(thread).unwrap_or_default();
                 eprintln!(
-                    "[stop] registers of thread {thread} as of its last call: {} sp={:#x}",
+                    "[stop] registers of thread {thread} (entry {entry:#x}, argument {arg:#x}, \
+                     priority {priority}, core {core}) as of its last call: {} sp={:#x}",
                     registers.join(" "),
                     cpu.state.sp
                 );
