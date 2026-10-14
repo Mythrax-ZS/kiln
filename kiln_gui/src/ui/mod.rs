@@ -71,8 +71,8 @@ impl App {
             )
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
-                    theme::logo(ui, 38.0);
-                    ui.add_space(4.0);
+                    theme::logo(ui, 32.0);
+                    ui.add_space(8.0);
                     ui.label(theme::bold("Kiln", 25.0));
                     ui.add_space(22.0);
                     for (tab, label) in [
@@ -216,10 +216,9 @@ impl App {
 /// The empty central area while a screen has nothing to show: a hint in the middle.
 pub(crate) fn empty_state(ui: &mut Ui, title: &str, text: &str) {
     ui.vertical_centered(|ui| {
-        ui.add_space((ui.available_height() / 2.0 - 70.0).max(20.0));
-        let (r, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
-        theme::paint_icon(ui.painter(), r, theme::Icon::Box, theme::FAINT);
-        ui.add_space(8.0);
+        ui.add_space((ui.available_height() / 2.0 - 80.0).max(20.0));
+        theme::mascot(ui, 2.0);
+        ui.add_space(10.0);
         ui.label(theme::bold(title, 18.0));
         ui.label(theme::muted(text));
     });

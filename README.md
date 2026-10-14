@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="assets/brand/kiln-banner.png" width="100%"
+       alt="Kiln: a brick kiln with a fire in it, the name in fire colors, and Cinder, a black salamander with yellow spots">
+</p>
+
 # Kiln
 
 A static recompiler for Horizon OS (Nintendo Switch) AArch64 programs. It reads the **already
@@ -209,6 +214,16 @@ To make the bundle by hand: `cargo build --release --workspace`, then
 `KILN_SELFTEST_FIXTURE=<folder> cargo test -p kiln --lib -- --ignored --exact
 build::e2e_tests::writes_the_selftest_program`, then
 `pwsh -File tools/bundle.ps1 -Out <folder> -Selftest <the first folder>`.
+
+## The look
+
+The icon, the mascot and the lettering are pixel art drawn for this project and kept as text in
+`kiln_gui/src/brand.rs`. Cinder is a fire salamander who lives in the kiln: black, with yellow
+spots and a tail that glows at the tip. `cargo run -p kiln_gui --example brand` writes the pictures
+under `assets/brand/` from that text (the icon as PNG files from 16 to 512 pixels and as `kiln.ico`,
+the icon and Cinder as vector files, the logo, the banner above and a 1280 by 640 card for the
+repository's social preview) and the icon of the AppImage, `dist/linux/kiln.png`;
+`kiln_gui/build.rs` puts the icon into `kiln-gui.exe`.
 
 ## License
 

@@ -4,10 +4,11 @@
 //! one blue accent, rounded corners everywhere and status shown with small colored dots. Icons are
 //! drawn with the painter (no icon font to ship or to be missing).
 
+use crate::brand;
 use eframe::egui::{
-    self, epaint::PathShape, pos2, vec2, Align, Color32, CornerRadius, FontData, FontDefinitions,
-    FontFamily, FontId, Frame, Layout, Margin, Painter, Rect, Response, RichText, Sense, Shape,
-    Stroke, StrokeKind, TextEdit, TextStyle, Ui,
+    self, pos2, vec2, Align, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
+    Frame, Layout, Margin, Painter, Rect, Response, RichText, Sense, Shape, Stroke, StrokeKind,
+    TextEdit, TextStyle, Ui,
 };
 use std::sync::Arc;
 
@@ -883,86 +884,51 @@ pub fn labeled(ui: &mut Ui, label: &str, help: &str) {
     }
 }
 
-/// The logo: a rounded square with a gradient and a loop arrow. Painted, so it scales.
+/// The icon, drawn from the pixel art of `brand.rs`. `size` is its side in points: a multiple of 32
+/// keeps every pixel of the art the same size on screen.
 pub fn logo(ui: &mut Ui, size: f32) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
-    paint_logo(ui.painter(), rect);
-    response
+    let texture = art_texture(ui.ctx(), "kiln-icon", brand::icon32);
+    ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
+        texture.id(),
+        vec2(size, size),
+    )))
 }
 
-pub fn paint_logo(painter: &Painter, rect: Rect) {
-    let r = CornerRadius::same((rect.width() * 0.26) as u8);
-    painter.rect_filled(rect, r, Color32::from_rgb(0x4d, 0x6b, 0xff));
-    // A lighter upper half gives the gradient feel without a gradient mesh.
-    let top = Rect::from_min_max(rect.min, pos2(rect.right(), rect.center().y));
-    painter.with_clip_rect(top).rect_filled(
-        rect,
-        r,
-        alpha(Color32::from_rgb(0x8b, 0x7b, 0xff), 150),
-    );
-    let c = rect.center();
-    let s = rect.width();
-    let stroke = Stroke::new(s * 0.085, Color32::WHITE);
-    let points: Vec<_> = (0..=18)
-        .map(|i| {
-            let a = (-50.0 + 280.0 * i as f32 / 18.0).to_radians();
-            pos2(c.x + s * 0.24 * a.cos(), c.y + s * 0.24 * a.sin())
-        })
-        .collect();
-    let end = *points.last().expect("points");
-    painter.add(PathShape::line(points, stroke));
-    painter.add(Shape::convex_polygon(
-        vec![
-            pos2(end.x - s * 0.02, end.y - s * 0.17),
-            pos2(end.x + s * 0.14, end.y + s * 0.03),
-            pos2(end.x - s * 0.14, end.y + s * 0.07),
-        ],
-        Color32::WHITE,
-        Stroke::NONE,
-    ));
+/// Cinder, the mascot, with every pixel of the art `scale` points wide.
+pub fn mascot(ui: &mut Ui, scale: f32) -> Response {
+    let texture = art_texture(ui.ctx(), "kiln-cinder", brand::cinder);
+    let [w, h] = texture.size();
+    ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
+        texture.id(),
+        vec2(w as f32, h as f32) * scale,
+    )))
 }
 
-/// The 64x64 RGBA pixels of the window icon.
-pub fn icon_pixels() -> (Vec<u8>, u32, u32) {
-    let n = 64usize;
-    let mut px = vec![0u8; n * n * 4];
-    let radius = n as f32 * 0.26;
-    for y in 0..n {
-        for x in 0..n {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            // Distance to the rounded square.
-            let dx = ((fx - n as f32 / 2.0).abs() - (n as f32 / 2.0 - radius)).max(0.0);
-            let dy = ((fy - n as f32 / 2.0).abs() - (n as f32 / 2.0 - radius)).max(0.0);
-            let d = (dx * dx + dy * dy).sqrt() - radius;
-            let cover = (0.5 - d).clamp(0.0, 1.0);
-            if cover <= 0.0 {
-                continue;
-            }
-            let t = fy / n as f32;
-            let base = mix(
-                Color32::from_rgb(0x8b, 0x7b, 0xff),
-                Color32::from_rgb(0x3d, 0x6b, 0xff),
-                t,
-            );
-            // The loop arrow: a ring open on the right.
-            let (cx, cy) = (fx - n as f32 / 2.0, fy - n as f32 / 2.0);
-            let ring = ((cx * cx + cy * cy).sqrt() - n as f32 * 0.24).abs();
-            let angle = cy.atan2(cx).to_degrees();
-            let on_arc = !(-50.0..=-10.0).contains(&angle);
-            let ink = if on_arc {
-                (n as f32 * 0.045 - ring + 0.5).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let c = mix(base, Color32::WHITE, ink);
-            let i = (y * n + x) * 4;
-            px[i] = c.r();
-            px[i + 1] = c.g();
-            px[i + 2] = c.b();
-            px[i + 3] = (cover * 255.0) as u8;
-        }
+/// A texture made once from the art and kept in the context; its pixels are scaled without
+/// smoothing.
+fn art_texture(
+    ctx: &egui::Context,
+    name: &str,
+    make: impl FnOnce() -> brand::Image,
+) -> egui::TextureHandle {
+    let id = egui::Id::new(("kiln-art", name));
+    if let Some(texture) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return texture;
     }
-    (px, n as u32, n as u32)
+    let image = make();
+    let texture = ctx.load_texture(
+        name,
+        egui::ColorImage::from_rgba_unmultiplied([image.width, image.height], &image.rgba),
+        egui::TextureOptions::NEAREST,
+    );
+    ctx.data_mut(|d| d.insert_temp(id, texture.clone()));
+    texture
+}
+
+/// The 128 by 128 RGBA pixels of the window icon.
+pub fn icon_pixels() -> (Vec<u8>, u32, u32) {
+    let image = brand::icon32().scaled(4);
+    (image.rgba, image.width as u32, image.height as u32)
 }
 
 /// Lay out `add` right-aligned in the remaining width of a row.

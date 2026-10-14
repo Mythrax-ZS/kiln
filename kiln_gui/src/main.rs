@@ -6,6 +6,7 @@
 //! games themselves, run as ordinary processes whose output is shown here.
 
 mod app;
+mod brand;
 mod console;
 mod game;
 mod process;

@@ -25,6 +25,9 @@ impl App {
                                     .map_or(String::new(), |v| format!(" - kiln {v}"))
                             )));
                         });
+                        theme::right(ui, |ui| {
+                            theme::mascot(ui, 3.0);
+                        });
                     });
                     ui.add_space(10.0);
                     paragraph(
