@@ -362,7 +362,7 @@ impl Display {
                     .swapchains(&swapchains)
                     .image_indices(&indices);
                 match self.swapchain_loader.queue_present(vk.queue, &present) {
-                    Ok(_) => {}
+                    Ok(_) => crate::window::note_presented(),
                     Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR) => {
                         // The window changed under the frame: the next one starts afresh.
                         self.swapchain_stale();

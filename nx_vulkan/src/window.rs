@@ -4,11 +4,17 @@
 //! thread of the guest that draws, only needs the raw handles of the window (to make a surface of
 //! it) and its size. Closing the window ends the process, as closing a game does. The keys that
 //! go down and up in the window, and its keyboard focus, are handed to an [`InputSink`].
+//!
+//! The window can be opened before the renderer exists ([`open_early`]): a game takes seconds to
+//! draw its first frame, and a person who started it wants a window at once, not one that
+//! appears when the game gets round to drawing. Until a frame has been presented to it, the
+//! window thread paints it black (on Windows a window nobody has painted shows what is behind
+//! it, which looks as if there were no window).
 
 use crate::input::{InputEvent, InputSink};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -55,9 +61,51 @@ struct Handles(RawDisplayHandle, RawWindowHandle);
 // SAFETY: as for `Window`: identifiers that stay valid while the window thread runs.
 unsafe impl Send for Handles {}
 
-/// Open a window of `width` x `height` pixels titled `title` and wait until it exists. What the
-/// person does in it goes to `input`.
+/// The window [`open_early`] opened, until the renderer asks for it.
+static EARLY: Mutex<Option<Window>> = Mutex::new(None);
+
+/// Whether a frame has been presented to the window: from then on the window is the renderer's
+/// to paint.
+static PRESENTED: AtomicBool = AtomicBool::new(false);
+
+/// The renderer presented a frame to the window.
+pub fn note_presented() {
+    PRESENTED.store(true, Ordering::Release);
+}
+
+/// Open the window now, and keep it for the first [`open`], whenever the renderer makes that
+/// call.
+pub fn open_early(
+    title: &str,
+    width: u32,
+    height: u32,
+    input: Option<InputSink>,
+) -> Result<(), String> {
+    let window = open_new(title, width, height, input)?;
+    keep_early(window);
+    Ok(())
+}
+
+fn keep_early(window: Window) {
+    *EARLY.lock().unwrap_or_else(|e| e.into_inner()) = Some(window);
+}
+
+/// Open a window of `width` x `height` pixels titled `title` and wait until it exists, or take
+/// the one opened ahead of time. What the person does in it goes to `input`.
 pub fn open(
+    title: &str,
+    width: u32,
+    height: u32,
+    input: Option<InputSink>,
+) -> Result<Window, String> {
+    let early = EARLY.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match early {
+        Some(window) => Ok(window),
+        None => open_new(title, width, height, input),
+    }
+}
+
+fn open_new(
     title: &str,
     width: u32,
     height: u32,
@@ -116,6 +164,56 @@ impl App {
     }
 }
 
+/// Fill the window with black, for as long as nothing else is drawn in it.
+fn paint_black(window: &WinitWindow) {
+    #[cfg(windows)]
+    if let Ok(handle) = window.window_handle() {
+        if let RawWindowHandle::Win32(h) = handle.as_raw() {
+            gdi::black(h.hwnd.get());
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = window;
+}
+
+#[cfg(windows)]
+mod gdi {
+    type Handle = isize;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetDC(hwnd: Handle) -> Handle;
+        fn ReleaseDC(hwnd: Handle, dc: Handle) -> i32;
+        fn GetClientRect(hwnd: Handle, rect: *mut [i32; 4]) -> i32;
+        fn FillRect(dc: Handle, rect: *const [i32; 4], brush: Handle) -> i32;
+    }
+
+    #[link(name = "gdi32")]
+    extern "system" {
+        fn GetStockObject(object: i32) -> Handle;
+    }
+
+    const BLACK_BRUSH: i32 = 4;
+
+    /// Fill the client area of the window `hwnd` with black.
+    pub fn black(hwnd: Handle) {
+        // SAFETY: plain calls on the handle of a window of this process; a device context that
+        // cannot be had (the window is gone) ends it, and the rectangle is only read after the
+        // call that fills it succeeds.
+        unsafe {
+            let dc = GetDC(hwnd);
+            if dc == 0 {
+                return;
+            }
+            let mut rect = [0i32; 4];
+            if GetClientRect(hwnd, &mut rect) != 0 {
+                FillRect(dc, &rect, GetStockObject(BLACK_BRUSH));
+            }
+            ReleaseDC(hwnd, dc);
+        }
+    }
+}
+
 /// The name of a physical key: the name of the variant of winit's `KeyCode` (`KeyW`, `ArrowUp`).
 fn key_name(code: KeyCode) -> String {
     format!("{code:?}")
@@ -133,6 +231,10 @@ impl ApplicationHandler for App {
             Ok(w) => w,
             Err(e) => return self.tell(Err(format!("creating the window: {e}"))),
         };
+        // Show it: in front of the other windows, and with something in it.
+        window.set_minimized(false);
+        window.focus_window();
+        paint_black(&window);
         let handles = window
             .display_handle()
             .map(|d| d.as_raw())
@@ -152,6 +254,15 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => std::process::exit(0),
+            WindowEvent::RedrawRequested => {
+                // Until the renderer has put a frame in the window, anything that uncovers or
+                // resizes it is painted black again.
+                if !PRESENTED.load(Ordering::Acquire) {
+                    if let Some(window) = &self.window {
+                        paint_black(window);
+                    }
+                }
+            }
             WindowEvent::Resized(s) => self.size.store(pack(s.width, s.height), Ordering::Relaxed),
             WindowEvent::KeyboardInput { event, .. } => {
                 // A key that is held sends its press again and again; the first one says it all.
@@ -211,6 +322,23 @@ mod tests {
         assert_eq!(unpack(pack(1280, 720)), (1280, 720));
         assert_eq!(unpack(pack(0, 0)), (0, 0));
         assert_eq!(unpack(pack(u32::MAX, 1)), (u32::MAX, 1));
+    }
+
+    #[test]
+    fn a_window_opened_early_is_the_one_the_renderer_gets_and_only_once() {
+        use raw_window_handle::{Win32WindowHandle, WindowsDisplayHandle};
+        let early = Window {
+            display: RawDisplayHandle::Windows(WindowsDisplayHandle::new()),
+            window: RawWindowHandle::Win32(Win32WindowHandle::new(
+                std::num::NonZeroIsize::new(7).unwrap(),
+            )),
+            size: Arc::new(AtomicU64::new(pack(640, 360))),
+        };
+        keep_early(early);
+        // `open` hands it over without making one (there is no display to make one on here).
+        let window = open("x", 1280, 720, None).unwrap();
+        assert_eq!(window.size(), (640, 360));
+        assert!(EARLY.lock().unwrap().is_none(), "it is handed over once");
     }
 
     #[test]

@@ -185,6 +185,8 @@ fn vulkan_renderer() -> Option<Box<dyn nx_gpu::render::Backend>> {
         InputEvent::Focus(true) => input::focus_gained(),
         InputEvent::Focus(false) => input::focus_lost(),
     }));
+    // A game takes seconds to draw its first frame: the window it will draw in opens now.
+    config.open_window_early();
     Some(Box::new(nx_vulkan::Renderer::new(config)))
 }
 

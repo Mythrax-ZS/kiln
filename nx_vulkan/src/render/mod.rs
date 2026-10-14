@@ -72,6 +72,20 @@ impl Config {
             input: None,
         }
     }
+
+    /// Open the window this configuration asks for (if it asks for one) now, rather than when the
+    /// renderer first has something to draw, which a game gets to seconds after it starts. The
+    /// renderer takes the window that is open when it comes to make its device.
+    pub fn open_window_early(&self) {
+        #[cfg(feature = "window")]
+        if let Some((width, height)) = self.window {
+            if let Err(e) =
+                crate::window::open_early(&self.window_title, width, height, self.input.clone())
+            {
+                eprintln!("[vulkan] no window: {e}");
+            }
+        }
+    }
 }
 
 /// The attachments of the rendering in progress.
