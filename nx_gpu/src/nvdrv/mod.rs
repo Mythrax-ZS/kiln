@@ -178,7 +178,7 @@ impl Nvdrv {
         let before = self.trace.then(|| hex(&args.data));
         let outcome = match self.nodes.get(&fd) {
             Some(Node::Ctrl { .. }) => self.ctrl_ioctl(fd, ioctl, &mut args),
-            Some(Node::CtrlGpu) => self.ctrl_gpu_ioctl(ioctl, &mut args),
+            Some(Node::CtrlGpu) => self.ctrl_gpu_ioctl(ioctl, &mut args, &mut extra_out),
             Some(Node::Nvmap) => self.nvmap_ioctl(ioctl, &mut args),
             Some(Node::AsGpu(space)) => {
                 let space = *space;

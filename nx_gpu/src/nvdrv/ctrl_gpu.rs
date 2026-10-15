@@ -96,7 +96,12 @@ fn gpu_ticks() -> u64 {
 }
 
 impl Nvdrv {
-    pub(super) fn ctrl_gpu_ioctl(&mut self, code: Ioctl, args: &mut Args) -> IoResult {
+    pub(super) fn ctrl_gpu_ioctl(
+        &mut self,
+        code: Ioctl,
+        args: &mut Args,
+        extra_out: &mut Vec<u8>,
+    ) -> IoResult {
         if code.ty() != TYPE {
             return unimplemented(format!(
                 "a type {:#x} command on the GPU control node",
@@ -111,12 +116,17 @@ impl Nvdrv {
             (ZBC_SET_TABLE, 44) => {}
             (GET_CHARACTERISTICS, 176) => {
                 // The first word is the size of the buffer, which the driver overwrites with the
-                // size it filled. The second is a pointer that must not be null (Switchbrew).
-                if args.u64(0) == 0 || args.u64(8) == 0 {
+                // size it filled. The second is the address of a buffer, which the characteristics
+                // do not use: they are returned inline, after these two words, and a title's call
+                // passes a null address (docs/ASSUMPTIONS.md A-139).
+                if args.u64(0) == 0 {
                     return Err(NvError::BAD_PARAMETER.into());
                 }
                 args.set_u64(0, 160);
                 args.put(16, &characteristics());
+                // `Ioctl3` has the program give the buffer as its second output buffer.
+                extra_out.clear();
+                extra_out.extend_from_slice(&characteristics());
             }
             (GET_TPC_MASKS, 24) => {
                 // One 32-bit mask per GPC: the GM20B has one GPC with two TPCs.
@@ -172,9 +182,17 @@ mod tests {
         assert_eq!(out.u64(16 + 16), 0x40000);
         assert_eq!(out.u64(16 + 80), 0x55);
         assert_eq!(&out.bytes(16 + 144, 5), b"gm20b");
-        // The buffer arguments must not be null.
+        // A size of zero is refused; a null address is not (a title passes one).
         let (e, _) = call(&mut nv, fd, CHARACTERISTICS, &[0u8; 176]);
         assert_eq!(e, NvError::BAD_PARAMETER);
+        input[8..16].copy_from_slice(&0u64.to_le_bytes());
+        let (e, out) = call(&mut nv, fd, CHARACTERISTICS, &input);
+        assert_eq!(e, NvError::SUCCESS);
+        assert_eq!((out.u64(0), out.u32(16)), (160, 0x120));
+        // `Ioctl3` has the characteristics come back in its second output buffer too.
+        let r = nv.ioctl(fd, CHARACTERISTICS, &input, &[]).unwrap();
+        assert_eq!(r.extra_out.len(), 160);
+        assert_eq!(r.extra_out, characteristics());
     }
 
     #[test]
