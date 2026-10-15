@@ -321,9 +321,10 @@ impl Service for HidServer {
                 Ok(Response::ok())
             }
             121 => Ok(Response::ok().with_u64(self.joy_hold_type)),
-            // SetNpadJoyAssignmentModeSingleByDefault / Single / Dual, MergeSingleJoyAsDualJoy:
-            // the Joy-Cons are attached, so there is nothing to assign
-            122..=125 => Ok(Response::ok()),
+            // SetNpadJoyAssignmentModeSingleByDefault / Single / Dual, MergeSingleJoyAsDualJoy,
+            // StartLrAssignmentMode, StopLrAssignmentMode: the Joy-Cons are attached, so there is
+            // nothing to assign (docs/ASSUMPTIONS.md A-151)
+            122..=127 => Ok(Response::ok()),
             // SetNpadHandheldActivationMode(aruid, s64 mode, pid); Get(aruid, pid) -> s64
             128 => {
                 self.handheld_mode = req.u64_at(8);

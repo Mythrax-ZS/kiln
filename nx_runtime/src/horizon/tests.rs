@@ -2997,6 +2997,20 @@ fn vibration_devices_are_listed_and_never_vibrate() {
     assert_eq!(e.call(hid, &permit).result, 0);
     assert_eq!(e.call(hid, &Message::new(205)).data[0], 0);
 }
+
+#[test]
+fn the_left_right_assignment_has_nothing_to_assign() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let hid = e.service("hid");
+    for command in 122..=127 {
+        let mut m = Message::new(command);
+        m.pid = true;
+        m.payload = [vec![0; 8], 7u64.to_le_bytes().to_vec()].concat();
+        assert_eq!(e.call(hid, &m).result, 0, "command {command}");
+    }
+}
+
 #[test]
 fn the_handheld_controller_appears_once_the_program_has_asked_for_it() {
     let mut e = Env::new();
