@@ -200,6 +200,9 @@ impl Service for Profile {
             }
             // GetBase() -> ProfileBase
             1 => Ok(Response::ok().with_bytes(&profile_base())),
+            // GetImageSize() -> u32, and LoadImage() -> (u32 size, buffer): the user has no
+            // picture (docs/ASSUMPTIONS.md A-150)
+            10 | 11 => Ok(Response::ok().with_u32(0)),
             other => Err(Stop::unknown_command("IProfile", other)),
         }
     }

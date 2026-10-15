@@ -2498,6 +2498,10 @@ fn the_account_service_has_one_open_user_listed_through_a_pointer_buffer() {
     let r = e.call(profile, &get);
     assert_eq!(&r.data[..0x38], &base[..]);
     assert_eq!(r.pointers, vec![(0, SCRATCH + 0x800, 0x80)]);
+    // The user has no picture: both of the picture commands answer a size of 0.
+    for command in [10, 11] {
+        assert_eq!(e.call(profile, &Message::new(command)).data, [0, 0, 0, 0]);
+    }
     // A user that does not exist has no profile: the run stops.
     let mut missing = Message::new(5);
     missing.payload = vec![9; 16];
