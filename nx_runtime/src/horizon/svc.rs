@@ -9,7 +9,7 @@ use super::handle::Handle;
 use super::kernel::{Kernel, ThreadCtx};
 use super::layout::{
     mem_type, ALIAS_BASE, ALIAS_SIZE, ASLR_BASE, ASLR_SIZE, HEAP_BASE, HEAP_REGION_SIZE,
-    STACK_BASE, STACK_REGION_SIZE,
+    STACK_BASE, STACK_REGION_SIZE, TLS_BASE,
 };
 use super::object::KObject;
 use super::result::{kernel as err, ResultCode};
@@ -653,13 +653,6 @@ impl Kernel {
                 result(cpu, r);
             }
             0x35 => {
-                if w(x[1]) == 2 {
-                    return self.stop_run(
-                        cpu,
-                        "SignalToAddress with type SignalAndModifyBasedOnWaitingThreadCountIfEqual is not implemented"
-                            .to_string(),
-                    );
-                }
                 let r = self.signal_to_address(x[0], w(x[1]), w(x[2]) as i32, w(x[3]) as i32);
                 result(cpu, r);
             }
@@ -774,10 +767,14 @@ impl Kernel {
             17 => 0,
             18 => self.process.program_id,
             19 => return Ok(Err(err::INVALID_ENUM_VALUE)),
+            // UserExceptionContextAddress [5.0.0+]: the slot of the first thread-local page that
+            // no thread takes, which is where the kernel would write the context of an exception
+            // (docs/ASSUMPTIONS.md A-143)
+            20 => TLS_BASE,
             21 => TOTAL_MEMORY_SIZE,
             22 => self.used_memory(),
             23 => u64::from(self.process.kind == super::kernel::ProcessKind::Nso),
-            9 | 20 | 24 | 26..=28 => {
+            9 | 24 | 26..=28 => {
                 return Err(format!(
                     "GetInfo with information type {id} is not implemented"
                 ))

@@ -446,6 +446,13 @@ fn get_info_reports_the_regions_and_refuses_what_it_does_not_know() {
     let (_, used) = info(&mut e, 7, proc, 0);
     assert!(r == 0 && total > used && used > 0);
     assert_eq!(info(&mut e, 8, 0, 0), (0, 0));
+    // The page of the user exception context is mapped, read-write, and a thread-local page.
+    let (r, context) = info(&mut e, 20, proc, 0);
+    assert_eq!((r, context), (0, TLS_BASE));
+    e.svc(0x06, &[SCRATCH, 0, context]);
+    let q = e.read(SCRATCH, 0x28);
+    assert_eq!((q[16], q[24]), (mem_type::THREAD_LOCAL, 3));
+    assert!(rt().mem.write(context, 8, 1, Relaxed).is_ok());
     // A process-typed query with the wrong kind of handle, a zero-handle query with a handle.
     assert_eq!(info(&mut e, 2, 0, 0).0, err::INVALID_HANDLE.0);
     assert_eq!(info(&mut e, 8, proc, 0).0, err::INVALID_HANDLE.0);
@@ -975,6 +982,40 @@ fn wait_for_address_and_signal_to_address() {
     assert_eq!(k.signal_to_address(a, 1, 9, 1), err::INVALID_STATE);
     assert_eq!(k.signal_to_address(a, 1, 2, 1), ResultCode::SUCCESS);
     assert_eq!(word(a), 3);
+
+    // Signal-and-modify-by-waiting-count sets the word, when it equals the value, from how many
+    // threads wait on it (docs/ASSUMPTIONS.md A-148).
+    set_word(a, 10);
+    assert_eq!(k.signal_to_address(a, 2, 9, 0), err::INVALID_STATE);
+    assert_eq!(word(a), 10);
+    // Nobody waits: one more.
+    assert_eq!(k.signal_to_address(a, 2, 10, 0), ResultCode::SUCCESS);
+    assert_eq!(word(a), 11);
+    let (w2, _cpu2) = second_thread(&k);
+    let wait = |thread: u64| {
+        let k = Arc::clone(&k);
+        std::thread::spawn(move || k.wait_for_address(thread, a, 2, 5, -1))
+    };
+    // Two wait and everyone is woken (a count of zero): two less.
+    set_word(a, 5);
+    let (first, second) = (wait(w), wait(w2));
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(k.signal_to_address(a, 2, 5, 0), ResultCode::SUCCESS);
+    assert_eq!(word(a), 3);
+    assert_eq!(first.join().unwrap(), ResultCode::SUCCESS);
+    assert_eq!(second.join().unwrap(), ResultCode::SUCCESS);
+    // Two wait and one is woken: some remain, so the value stays; then the last one is woken with
+    // room to spare: one less.
+    set_word(a, 5);
+    let (first, second) = (wait(w), wait(w2));
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(k.signal_to_address(a, 2, 5, 1), ResultCode::SUCCESS);
+    assert_eq!(word(a), 5);
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(k.signal_to_address(a, 2, 5, 2), ResultCode::SUCCESS);
+    assert_eq!(word(a), 4);
+    assert_eq!(first.join().unwrap(), ResultCode::SUCCESS);
+    assert_eq!(second.join().unwrap(), ResultCode::SUCCESS);
 }
 
 #[test]

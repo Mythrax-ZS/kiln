@@ -1302,18 +1302,35 @@ impl Kernel {
         }
     }
 
-    /// `SignalToAddress` for the signal types 0 and 1. Type 2 is reported by the caller.
+    /// `SignalToAddress`: type 0 signals, type 1 adds one to the word first when it equals `value`,
+    /// and type 2 sets it, when it equals `value`, from the number of threads waiting on it
+    /// (docs/ASSUMPTIONS.md A-148).
     pub fn signal_to_address(&self, addr: u64, kind: u32, value: i32, count: i32) -> ResultCode {
         if let Err(e) = Self::user_word(addr) {
             return e;
         }
         let mut st = self.lock();
-        if kind == 1 {
+        if kind == 1 || kind == 2 {
+            let new_value = if kind == 1 {
+                value.wrapping_add(1)
+            } else {
+                let waiting = st.arbiter_waiters.get(&addr).map_or(0, Vec::len) as i32;
+                match (count <= 0, waiting) {
+                    // Nobody waits: one more than the value.
+                    (_, 0) => value.wrapping_add(1),
+                    // Everyone is woken: two less.
+                    (true, _) => value.wrapping_sub(2),
+                    // Some are woken: one less when that is all of them, else the value stays.
+                    (false, n) if n <= count => value.wrapping_sub(1),
+                    (false, _) => value,
+                }
+            };
             let Some(cur) = self.read_u32(addr).map(|v| v as i32) else {
                 return err::INVALID_CURRENT_MEMORY;
             };
             if cur != value
-                || self.cas_u32(addr, cur as u32, cur.wrapping_add(1) as u32) != Some(true)
+                || (new_value != cur
+                    && self.cas_u32(addr, cur as u32, new_value as u32) != Some(true))
             {
                 return err::INVALID_STATE;
             }
