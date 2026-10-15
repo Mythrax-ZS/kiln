@@ -115,6 +115,62 @@ fn float_arithmetic_matches_rust() {
 }
 
 #[test]
+fn predicates_move_to_and_from_registers() {
+    let Some(vk) = vulkan() else { return };
+    // R4 = R1 with the byte B1 holding the predicates named by 0x5B (P2R), R5 the same of byte B3
+    // for all of them from R2, then the predicates are set again from R1's byte 2 under a mask
+    // (R2P with an immediate) and from byte 0 under the mask in R3 (R2P with a register).
+    let program = [
+        Enc::op(Op::P2rImm20)
+            .rd(4)
+            .ra(1)
+            .imm20(0x5B)
+            .field(41, 2, 1)
+            .build(),
+        Enc::op(Op::P2rImm20)
+            .rd(5)
+            .ra(2)
+            .imm20(0xFF)
+            .field(41, 2, 3)
+            .build(),
+        Enc::op(Op::R2pImm20)
+            .ra(1)
+            .imm20(0x0F)
+            .field(41, 2, 2)
+            .build(),
+        exit(Guard::ALWAYS),
+    ];
+    let inputs = random_states(256, 11);
+    let out = run(&vk, &program, &inputs, &[]);
+    for (i, (inp, got)) in inputs.iter().zip(&out).enumerate() {
+        let pr = (inp.preds & 0x7F) | 0x80;
+        let mask = 0x5Bu32;
+        let expect4 = (inp.regs[1] & !(mask << 8)) | ((pr & mask) << 8);
+        assert_eq!(got.regs[4], expect4, "p2r with a mask, input {i}");
+        let expect5 = (inp.regs[2] & !(0xFFu32 << 24)) | (pr << 24);
+        assert_eq!(got.regs[5], expect5, "p2r of all, input {i}");
+        let from = (inp.regs[1] >> 16) & 0x0F;
+        let expect_preds = (inp.preds & !0x0F) | from;
+        assert_eq!(got.preds & 0x7F, expect_preds & 0x7F, "r2p, input {i}");
+    }
+    // The register form takes its mask from a register, and a guard keeps the predicates.
+    let program = [
+        Enc::op(Op::R2pReg).ra(1).rb(3).field(41, 2, 0).build(),
+        exit(Guard::ALWAYS),
+    ];
+    let out = run(&vk, &program, &inputs, &[]);
+    for (i, (inp, got)) in inputs.iter().zip(&out).enumerate() {
+        let mask = inp.regs[3] & 0x7F;
+        let expect = (inp.preds & !mask) | (inp.regs[1] & mask);
+        assert_eq!(
+            got.preds & 0x7F,
+            expect & 0x7F,
+            "r2p by register, input {i}"
+        );
+    }
+}
+
+#[test]
 fn a_guarded_instruction_and_a_branch_follow_the_predicates() {
     let Some(vk) = vulkan() else { return };
     // Slots 1..3 are the first bundle, slot 4 is its scheduling word... no: slot 0 is the

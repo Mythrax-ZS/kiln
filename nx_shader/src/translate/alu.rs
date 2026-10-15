@@ -44,6 +44,8 @@ pub(super) fn translate(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<bool> {
         Op::MovReg | Op::MovCbuf | Op::MovImm20 => mov(tx, inst)?,
         Op::Mov32iImm32 => mov32i(tx, inst)?,
         Op::Psetp => psetp(tx, inst)?,
+        Op::R2pReg | Op::R2pCbuf | Op::R2pImm20 => r2p(tx, inst)?,
+        Op::P2rReg | Op::P2rCbuf | Op::P2rImm20 => p2r(tx, inst)?,
         Op::CsetpCc => csetp(tx, inst)?,
         Op::Pset => pset(tx, inst)?,
         Op::ImulReg | Op::ImulCbuf | Op::ImulImm20 | Op::Imul32iImm32 => imul(tx, inst, opc)?,
@@ -1095,6 +1097,70 @@ fn psetp(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
     let r2 = bool_op(tx, inst.bits(45, 2), second, c)?;
     tx.write_pred(inst, inst.bits(3, 3) as u8, r1);
     tx.write_pred(inst, inst.bits(0, 3) as u8, r2);
+    Ok(())
+}
+
+/// `R2P PR, Ra, mask`: each of the predicates P0 to P6 that `mask` names takes the bit of `Ra` that
+/// has its number within the byte the instruction selects (bits 41 and 42), the others keep their
+/// value (docs/ASSUMPTIONS.md A-154).
+fn r2p(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
+    if inst.bit(40) {
+        return tx.fail("R2P to the condition code flags");
+    }
+    let shift = 8 * inst.bits(41, 2) as u32;
+    let value = tx.read(inst.ra());
+    let literal = (inst.form() == Form::Imm20).then(|| inst.imm20() as u32);
+    let mask = src_b(tx, inst)?;
+    let zero = tx.c32(0);
+    let b = tx.t.bool_;
+    for p in 0..7u8 {
+        if literal.is_some_and(|m| m >> p & 1 == 0) {
+            continue;
+        }
+        let bit = tx.c32(1 << (shift + u32::from(p)));
+        let bits = tx.and(value, bit);
+        let taken = tx.cmp(op::I_NOT_EQUAL, bits, zero);
+        let new = if literal.is_some() {
+            taken
+        } else {
+            let named = tx.c32(1 << p);
+            let masked = tx.and(mask, named);
+            let wanted = tx.cmp(op::I_NOT_EQUAL, masked, zero);
+            let old = tx.read_pred(p, false);
+            tx.select(b, wanted, taken, old)
+        };
+        tx.write_pred(inst, p, new);
+    }
+    Ok(())
+}
+
+/// `P2R Rd, PR, Ra, mask`: `Rd` is `Ra` with the bits of the byte the instruction selects that
+/// `mask` names replaced by the predicates, P0 in the lowest bit and PT (always true) in bit 7
+/// (docs/ASSUMPTIONS.md A-154).
+fn p2r(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
+    if inst.bit(40) {
+        return tx.fail("P2R of the condition code flags");
+    }
+    let shift = tx.c32(8 * inst.bits(41, 2) as u32);
+    let value = tx.read(inst.ra());
+    let mask = src_b(tx, inst)?;
+    let byte = tx.c32(0xFF);
+    let mask = tx.and(mask, byte);
+    let mut predicates = tx.c32(0x80);
+    let zero = tx.c32(0);
+    for p in 0..7u8 {
+        let on = tx.read_pred(p, false);
+        let bit = tx.c32(1 << p);
+        let set = tx.select_u32(on, bit, zero);
+        predicates = tx.or(predicates, set);
+    }
+    let named = tx.and(predicates, mask);
+    let moved = tx.shl(named, shift);
+    let window = tx.shl(mask, shift);
+    let kept = tx.not(window);
+    let kept = tx.and(value, kept);
+    let result = tx.or(kept, moved);
+    tx.write(inst, inst.rd(), result);
     Ok(())
 }
 
