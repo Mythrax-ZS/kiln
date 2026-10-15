@@ -15,6 +15,10 @@ use nx_shader::translate::{Class, Dim, Stage, TextureUse};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// The vertex buffer binding of the stream that holds the value of the attributes that are
+/// switched off.
+const DEFAULT_ATTRIBUTE_STREAM: u32 = 31;
+
 /// Add the time since `mark` to `into` and start the next step.
 fn lap(mark: &mut Option<Instant>, into: &mut Duration, _step: &'static str) {
     if let Some(mark) = mark {
@@ -311,9 +315,18 @@ impl Core {
                         a.widths, a.numeric
                     ));
                 }
-                return Err(format!(
-                    "vertex attribute {loc} is read by the vertex program and switched off"
+                // An attribute that is switched off reads as (0, 0, 0, 1): from a stream of one
+                // vertex that every vertex reads (docs/ASSUMPTIONS.md A-162).
+                if !streams.contains(&DEFAULT_ATTRIBUTE_STREAM) {
+                    streams.push(DEFAULT_ATTRIBUTE_STREAM);
+                }
+                attributes.push((
+                    loc as u32,
+                    DEFAULT_ATTRIBUTE_STREAM,
+                    vk::Format::R32G32B32A32_SFLOAT,
+                    0,
                 ));
+                continue;
             };
             if !streams.contains(&a.stream) {
                 streams.push(a.stream);
@@ -331,6 +344,20 @@ impl Core {
         let mut binding_state = std::mem::take(&mut self.scratch.binding_state);
         binding_state.clear();
         for &s in &streams {
+            if s == DEFAULT_ATTRIBUTE_STREAM {
+                let (b, o, ptr) = self.frame.reserve(&self.vk, 16, 16)?;
+                let value = [0f32, 0.0, 0.0, 1.0];
+                // SAFETY: `reserve` gave 16 writable bytes at `ptr`, which nothing else uses.
+                unsafe {
+                    for (k, v) in value.iter().enumerate() {
+                        ptr.add(4 * k)
+                            .copy_from_nonoverlapping(v.to_ne_bytes().as_ptr(), 4);
+                    }
+                }
+                bound.push((s, b, o));
+                binding_state.push((s, 0, false));
+                continue;
+            }
             let stream = regs.vertex_stream(s as usize);
             if !stream.enabled {
                 return Err(format!("vertex stream {s} is read and not enabled"));

@@ -83,6 +83,49 @@ fn a_smaller_triangle_covers_part_of_the_target() {
     assert_eq!(at(10, 50), [255, 0, 0, 255]);
 }
 
+#[test]
+fn an_attribute_that_is_switched_off_reads_as_zero_zero_zero_one() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    // The program takes its color from location 2, which the state leaves switched off.
+    let vertex = vertex_program(&[
+        ald(0, 0x80, 4),
+        ald(4, 0xA0, 4),
+        ast(0, 0x70, 4),
+        ast(4, 0x80, 4),
+        exit(Guard::ALWAYS),
+    ]);
+    let mut w = scene(&vertex, &flat_color_pixel(), 16, target);
+    // Location 2 is marked as a constant (bit 6 of its format register).
+    w.set(0x1168, 1 << 6);
+    let unused = [0.5, 0.5, 0.5, 0.5];
+    vertices(
+        &mut w,
+        GPU_BASE + 0x30_0000,
+        &[
+            ([-1.0, -1.0, 0.5, 1.0], unused),
+            ([3.0, -1.0, 0.5, 1.0], unused),
+            ([-1.0, 3.0, 0.5, 1.0], unused),
+        ],
+    );
+    let mut r = Renderer::new(RenderConfig::default());
+    r.draw(
+        &w.scene(),
+        &Draw {
+            source: Source::Arrays { first: 0, count: 3 },
+            topology: 4,
+            instance: 0,
+        },
+    )
+    .unwrap();
+    let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    for px in rgba.as_chunks::<4>().0 {
+        assert_eq!(px, &[0, 0, 0, 255]);
+    }
+}
+
 /// Draw the red triangle with its right angle at clip (-1, -1), counter-clockwise in clip space
 /// (y up), in a world whose viewport and culling the caller has set; the picture and its width.
 fn red_triangle(w: &mut World, target: u64) -> (Vec<u8>, usize) {
