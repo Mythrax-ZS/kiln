@@ -268,9 +268,15 @@ fn trace_request(service: &str, req: &Request, answer: &Result<Response, Stop>) 
         req.move_handles.len(),
         if req.pid.is_some() { ", pid" } else { "" }
     );
+    // `NX_TRACE_IPC_DATA=1` adds the first bytes of what each request sent.
+    let data = if std::env::var_os("NX_TRACE_IPC_DATA").is_some() {
+        format!(", data {:02x?}", &req.data[..req.data.len().min(32)])
+    } else {
+        String::new()
+    };
     match answer {
         Ok(r) => eprintln!(
-            "[ipc] {service} command {}: {shape} -> result {:#x}, {} data bytes, {} objects, {} handles",
+            "[ipc] {service} command {}: {shape}{data} -> result {:#x}, {} data bytes, {} objects, {} handles",
             req.command,
             r.result.0,
             r.data.len(),
@@ -278,8 +284,10 @@ fn trace_request(service: &str, req: &Request, answer: &Result<Response, Stop>) 
             r.copy_handles.len() + r.move_handles.len()
         ),
         Err(s) => eprintln!(
-            "[ipc] {service} command {}: {shape} -> stops the run: {}",
-            req.command, s.0
+            "[ipc] {service} command {}: {shape}, data {:02x?} -> stops the run: {}",
+            req.command,
+            &req.data[..req.data.len().min(32)],
+            s.0
         ),
     }
 }
