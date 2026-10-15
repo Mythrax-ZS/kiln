@@ -638,6 +638,15 @@ impl Core {
         // the draw changes neither its depth nor its stencil; any other target the draw uses
         // cannot be read while it is written, and its memory is read instead.
         let mut layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        // A draw that writes the depth it samples samples a copy of it (A-163).
+        if depth == Some(key) && !self.leaves_depth_alone(scene) && !colors.contains(&key) {
+            self.end_pass();
+            let cmd = self.frame.cmd(&self.vk)?;
+            let view = self
+                .targets
+                .depth_copy(&self.vk, cmd, &key, tic.view_mapping())?;
+            return Ok(view.map(|v| (v, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)));
+        }
         if colors.contains(&key) || (depth == Some(key) && !self.leaves_depth_alone(scene)) {
             if trace {
                 self.say_once(format!(

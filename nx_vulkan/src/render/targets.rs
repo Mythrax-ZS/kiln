@@ -160,6 +160,15 @@ pub struct Targets {
     next_serial: u64,
     /// What writing targets back to memory cost since the last report.
     pub write_backs: WriteBacks,
+    /// A copy of the depth of a target, for the draws that sample the depth target they write
+    /// (see [`Targets::depth_copy`]).
+    snapshots: FastMap<Key, Snapshot>,
+}
+
+/// A copy of the depth of a target and the layout it is in.
+struct Snapshot {
+    image: Image,
+    layout: vk::ImageLayout,
 }
 
 /// How many submissions a target that was drawn to and not yet written to memory may go without
@@ -218,6 +227,9 @@ impl Targets {
             for k in stale {
                 if let Some(t) = self.map.remove(&k) {
                     frame.garbage.push(Garbage::Image(t.image));
+                }
+                if let Some(s) = self.snapshots.remove(&k) {
+                    frame.garbage.push(Garbage::Image(s.image));
                 }
                 self.by_address.remove(&k.address);
             }
@@ -439,6 +451,120 @@ impl Targets {
         self.map.get_mut(key)
     }
 
+    /// A view, in the layout for sampling, of a copy of the depth that the depth target `key` holds
+    /// now: what a draw that writes the target reads instead of it (the target cannot be read
+    /// while it is written; docs/ASSUMPTIONS.md A-163). `None` when there is no such target. The
+    /// copy is recorded in `cmd`, outside any rendering, and the target is left in the transfer
+    /// layout.
+    pub fn depth_copy(
+        &mut self,
+        vk: &Vk,
+        cmd: vk::CommandBuffer,
+        key: &Key,
+        components: vk::ComponentMapping,
+    ) -> Result<Option<vk::ImageView>, String> {
+        let Some(target) = self.map.get_mut(key) else {
+            return Ok(None);
+        };
+        if !self.snapshots.contains_key(key) {
+            let image = vk.create_image(ImageInfo {
+                format: key.format,
+                width: key.width,
+                height: key.height,
+                depth: 1,
+                layers: 1,
+                levels: 1,
+                usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+                view_type: vk::ImageViewType::TYPE_2D,
+                components: vk::ComponentMapping::default(),
+            })?;
+            self.snapshots.insert(
+                *key,
+                Snapshot {
+                    image,
+                    layout: vk::ImageLayout::UNDEFINED,
+                },
+            );
+        }
+        let snapshot = self.snapshots.get_mut(key).expect("just made");
+        target.transition(vk, cmd, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        let aspect = aspect_of(key.format);
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: aspect,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let barrier = |from, to| {
+            vk::ImageMemoryBarrier::default()
+                .old_layout(from)
+                .new_layout(to)
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(snapshot.image.image)
+                .subresource_range(range)
+        };
+        let depth = vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::DEPTH,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let region = [vk::ImageCopy {
+            src_subresource: depth,
+            src_offset: vk::Offset3D::default(),
+            dst_subresource: depth,
+            dst_offset: vk::Offset3D::default(),
+            extent: vk::Extent3D {
+                width: key.width,
+                height: key.height,
+                depth: 1,
+            },
+        }];
+        // SAFETY: the command buffer is recording outside a rendering; both images are valid, the
+        // target is in the transfer source layout and the copy is in the transfer destination
+        // layout between the barriers.
+        unsafe {
+            vk.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(
+                    snapshot.layout,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                )],
+            );
+            vk.device.cmd_copy_image(
+                cmd,
+                target.image.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                snapshot.image.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &region,
+            );
+            vk.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                )],
+            );
+        }
+        snapshot.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        Ok(Some(vk.swizzled_view(&mut snapshot.image, components)?))
+    }
+
     /// How many submissions ago the target `key` was drawn to.
     pub fn age(&self, key: &Key) -> Option<u64> {
         self.map
@@ -470,6 +596,9 @@ impl Targets {
         for key in &old {
             if let Some(t) = self.map.remove(key) {
                 frame.garbage.push(Garbage::Image(t.image));
+            }
+            if let Some(s) = self.snapshots.remove(key) {
+                frame.garbage.push(Garbage::Image(s.image));
             }
             if self
                 .by_address
@@ -505,6 +634,9 @@ impl Targets {
     pub fn destroy(&mut self, vk: &Vk) {
         for (_, t) in self.map.drain() {
             vk.destroy_image(t.image);
+        }
+        for (_, s) in self.snapshots.drain() {
+            vk.destroy_image(s.image);
         }
     }
 }

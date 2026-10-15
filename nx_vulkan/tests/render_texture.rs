@@ -391,6 +391,151 @@ fn a_target_is_not_read_while_the_same_draw_writes_it() {
     }
 }
 
+/// Bind a depth target of `size` x `size` at `va` with the zeta format `format`.
+fn depth_target(w: &mut World, va: u64, size: u32, format: u32) {
+    w.set_address(0xfe0, va);
+    w.set(0xfe8, format);
+    w.set(0xfec, 4 << 4);
+    w.set(0x1228, size);
+    w.set(0x122c, size);
+    w.set(0x1230, 1 << 16);
+    w.set(0x1538, 1);
+}
+
+/// Depth test and write as given, passing every fragment.
+fn depth_state(w: &mut World, test: bool, write: bool) {
+    w.set(0x12cc, u32::from(test));
+    w.set(0x12e8, u32::from(write));
+    w.set(0x130c, 0x207);
+}
+
+/// Clear the depth target to `value`.
+fn clear_depth(r: &mut Renderer, w: &mut World, value: f32) {
+    w.set(0xd90, value.to_bits());
+    w.set(0x10f8, 0);
+    let depth_only = Clear {
+        depth: true,
+        stencil: false,
+        red: false,
+        green: false,
+        blue: false,
+        alpha: false,
+        target: 0,
+        layer: 0,
+    };
+    r.clear(&w.scene(), &depth_only).unwrap();
+}
+
+/// The red channel of the picture at `target` where the draw sampled a depth: every pixel the
+/// same, within a step of the 8 bits.
+fn sampled_depth(r: &mut Renderer, w: &World, target: u64) -> u8 {
+    let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    let first = rgba[0];
+    for px in rgba.as_chunks::<4>().0 {
+        assert!(px[0].abs_diff(first) <= 1, "{px:?} against {first}");
+        assert_eq!(&px[1..], &[0, 0, 255], "{px:?}");
+    }
+    first
+}
+
+#[test]
+fn a_depth_target_is_sampled_as_a_texture_by_a_later_pass() {
+    if vulkan().is_none() {
+        return;
+    }
+    let depth = GPU_BASE + 0x60_0000;
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = textured(8, target, header(0x2F, 7, 8, 8, depth), nearest_sampler());
+    let mut r = Renderer::new(RenderConfig::default());
+    depth_target(&mut w, depth, 8, 0x0A);
+    clear_depth(&mut r, &mut w, 0.25);
+    // The next pass has no depth target of its own and reads the one that was cleared.
+    w.set(0x1538, 0);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    assert!(sampled_depth(&mut r, &w, target).abs_diff(64) <= 1);
+}
+
+#[test]
+fn the_depth_of_a_combined_format_is_the_second_component_of_its_header() {
+    if vulkan().is_none() {
+        return;
+    }
+    let depth = GPU_BASE + 0x60_0000;
+    let target = GPU_BASE + 0x20_0000;
+    // S8Z24: the first component is an unsigned integer (the stencil), the others normalized; the
+    // shader reads the second component into x, y and z.
+    let mut tic = header(0x29, 2, 8, 8, depth);
+    set_bits(&mut tic, 7, 3, 4);
+    for lo in [19, 22, 25] {
+        set_bits(&mut tic, lo, 3, 3);
+    }
+    set_bits(&mut tic, 28, 3, 7);
+    let mut w = textured(8, target, tic, nearest_sampler());
+    let mut r = Renderer::new(RenderConfig::default());
+    depth_target(&mut w, depth, 8, 0x14);
+    clear_depth(&mut r, &mut w, 0.25);
+    w.set(0x1538, 0);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    for px in rgba.as_chunks::<4>().0 {
+        assert!(px[0].abs_diff(64) <= 1, "{px:?}");
+        assert_eq!(px[0], px[1], "{px:?}");
+        assert_eq!(px[0], px[2], "{px:?}");
+        assert_eq!(px[3], 255, "{px:?}");
+    }
+}
+
+#[test]
+fn a_draw_that_writes_the_depth_it_samples_samples_a_copy_of_it() {
+    if vulkan().is_none() {
+        return;
+    }
+    let depth = GPU_BASE + 0x60_0000;
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = textured(8, target, header(0x2F, 7, 8, 8, depth), nearest_sampler());
+    let mut r = Renderer::new(RenderConfig::default());
+    depth_target(&mut w, depth, 8, 0x0A);
+    depth_state(&mut w, true, true);
+    clear_depth(&mut r, &mut w, 0.25);
+    // The draw writes the depth of its triangle and reads the target it writes: it sees what was
+    // there before it.
+    r.draw(&w.scene(), &DRAW).unwrap();
+    assert!(
+        sampled_depth(&mut r, &w, target).abs_diff(64) <= 1,
+        "the copy"
+    );
+    // What it wrote is in the target afterwards: the next pass reads that.
+    w.set(0x1538, 0);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let written = sampled_depth(&mut r, &w, target);
+    assert!(
+        written.abs_diff(64) > 8,
+        "the depth the triangle wrote: {written}"
+    );
+}
+
+#[test]
+fn a_draw_that_only_tests_the_depth_it_samples_reads_it_where_it_is() {
+    if vulkan().is_none() {
+        return;
+    }
+    let depth = GPU_BASE + 0x60_0000;
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = textured(8, target, header(0x2F, 7, 8, 8, depth), nearest_sampler());
+    let mut r = Renderer::new(RenderConfig::default());
+    depth_target(&mut w, depth, 8, 0x0A);
+    depth_state(&mut w, true, false);
+    clear_depth(&mut r, &mut w, 0.25);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    assert!(sampled_depth(&mut r, &w, target).abs_diff(64) <= 1);
+    // Nothing was written to the depth, and a draw that writes it afterwards still works.
+    depth_state(&mut w, true, true);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    w.set(0x1538, 0);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    assert!(sampled_depth(&mut r, &w, target).abs_diff(64) > 8);
+}
+
 /// A void-extent ASTC block of one color (16-bit components) with no extent.
 fn astc_solid(rgba: [u16; 4]) -> [u8; 16] {
     let mut v: u128 = 0x1FC | 3 << 10;
