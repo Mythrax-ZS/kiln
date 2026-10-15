@@ -9,7 +9,11 @@
 
 use super::handle::Handle;
 use super::kernel::Kernel;
-use super::layout::{mem_type, ASLR_BASE, KERNEL_SCRATCH_BASE, KERNEL_SCRATCH_SIZE, PAGE};
+use super::layout::{
+    mem_type, ADDRESS_SPACE_END, ALIAS_BASE, ALIAS_SIZE, ASLR_BASE, HEAP_BASE, HEAP_REGION_SIZE,
+    KERNEL_SCRATCH_BASE, KERNEL_SCRATCH_SIZE, PAGE, STACK_BASE, STACK_REGION_SIZE, TLS_BASE,
+    TLS_REGION_SIZE,
+};
 use super::memory::Info;
 use super::object::KObject;
 use super::result::{kernel as err, KResult, ResultCode};
@@ -92,8 +96,26 @@ impl Kernel {
             return err::INVALID_SIZE;
         }
         let source = block.addr;
-        if addr < ASLR_BASE || addr.saturating_add(size) > KERNEL_SCRATCH_BASE {
+        let end = addr.saturating_add(size);
+        if addr < ASLR_BASE || end > ADDRESS_SPACE_END {
             return err::INVALID_MEMORY_REGION;
+        }
+        // The regions the process may map shared memory in are those of the address space region
+        // outside the ones that other mappings own: a program that picks an address at random in
+        // the region it was told of is answered "in use" for these and picks another
+        // (docs/ASSUMPTIONS.md A-164).
+        let reserved = [
+            (ALIAS_BASE, ALIAS_SIZE),
+            (HEAP_BASE, HEAP_REGION_SIZE),
+            (STACK_BASE, STACK_REGION_SIZE),
+            (TLS_BASE, TLS_REGION_SIZE),
+            (KERNEL_SCRATCH_BASE, KERNEL_SCRATCH_SIZE),
+        ];
+        if reserved
+            .iter()
+            .any(|&(base, length)| addr < base + length && base < end)
+        {
+            return err::INVALID_CURRENT_MEMORY;
         }
         if !st.memory.blocks_in(addr, size).is_empty() {
             return err::INVALID_CURRENT_MEMORY;

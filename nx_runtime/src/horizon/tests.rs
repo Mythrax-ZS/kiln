@@ -2814,6 +2814,21 @@ fn shared_memory_is_mapped_where_the_program_asks_and_shows_what_the_service_wro
         err::INVALID_CURRENT_MEMORY.0,
         "over memory that is in use"
     );
+    // An address picked at random in the region the program was told of can fall where the
+    // kernel keeps its own pages, or in a region another kind of mapping owns: the answer is "in
+    // use", which makes the program pick again. Past the end of the address space is no region.
+    for at in [
+        super::layout::KERNEL_SCRATCH_BASE + 0x50E0_0000,
+        super::layout::HEAP_BASE + 0x1000_0000,
+        super::layout::ALIAS_BASE,
+        super::layout::STACK_BASE,
+        super::layout::TLS_BASE + 0x10_0000,
+    ] {
+        e.svc(0x13, &[handle, at, 0x4000, 3]);
+        assert_eq!(e.r(), err::INVALID_CURRENT_MEMORY.0, "at {at:#x}");
+    }
+    e.svc(0x13, &[handle, super::layout::ADDRESS_SPACE_END, 0x4000, 3]);
+    assert_eq!(e.r(), err::INVALID_MEMORY_REGION.0, "past the end");
     // Mapped read-write at a free address: the service's bytes are there, and a write by the
     // program reaches the service.
     e.svc(0x13, &[handle, 0x5000_0000, 0x4000, 3]);
