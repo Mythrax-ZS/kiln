@@ -34,7 +34,7 @@ pub const TOTAL_MEMORY_SIZE: u64 = 0xCD50_0000;
 pub const IMPLEMENTED: &[u32] = &[
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
     0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x21,
-    0x24, 0x25, 0x26, 0x27, 0x29, 0x34, 0x35, 0x36, 0x45,
+    0x24, 0x25, 0x26, 0x27, 0x29, 0x2C, 0x2D, 0x34, 0x35, 0x36, 0x45,
 ];
 
 /// The names of the SVCs, for reports.
@@ -81,6 +81,8 @@ pub fn svc_name(id: u32) -> Option<&'static str> {
         0x27 => "OutputDebugString",
         0x28 => "ReturnFromException",
         0x29 => "GetInfo",
+        0x2C => "MapPhysicalMemory",
+        0x2D => "UnmapPhysicalMemory",
         0x34 => "WaitForAddress",
         0x35 => "SignalToAddress",
         0x36 => "SynchronizePreemptionState",
@@ -659,6 +661,14 @@ impl Kernel {
                     );
                 }
                 let r = self.signal_to_address(x[0], w(x[1]), w(x[2]) as i32, w(x[3]) as i32);
+                result(cpu, r);
+            }
+            0x2C => {
+                let r = self.map_physical_memory(x[0], x[1]);
+                result(cpu, r);
+            }
+            0x2D => {
+                let r = self.unmap_physical_memory(x[0], x[1]);
                 result(cpu, r);
             }
             0x36 => {}

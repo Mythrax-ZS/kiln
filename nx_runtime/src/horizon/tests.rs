@@ -284,6 +284,90 @@ fn map_memory_makes_a_second_view_and_unmap_gives_the_pages_back() {
 }
 
 #[test]
+fn map_physical_memory_makes_zeroed_pages_in_the_alias_region_and_unmap_takes_them_back() {
+    let mut e = Env::new();
+    let at = ALIAS_BASE + 0x10_0000;
+    // The size, the address and the range are checked, as the SVC page lists them.
+    for (args, expected) in [
+        ([at, 0], err::INVALID_SIZE),
+        ([at, 0x1800], err::INVALID_SIZE),
+        ([at + 0x10, 0x1000], err::INVALID_ADDRESS),
+        ([HEAP_BASE, 0x1000], err::INVALID_MEMORY_REGION),
+        (
+            [ALIAS_BASE + ALIAS_SIZE - 0x1000, 0x2000],
+            err::INVALID_MEMORY_REGION,
+        ),
+        ([0xFFFF_FFFF_FFFF_F000, 0x2000], err::INVALID_MEMORY_REGION),
+    ] {
+        e.svc(0x2C, &args);
+        assert_eq!(e.r(), expected.0, "{args:x?}");
+        e.svc(0x2D, &args);
+        assert_eq!(e.r(), expected.0, "unmap {args:x?}");
+    }
+    // Three zeroed read-write pages of the type the heap has.
+    e.svc(0x2C, &[at, 0x3000]);
+    assert_eq!(e.r(), 0);
+    assert_eq!(rt().mem.read(at + 0x2FF8, 8, Relaxed), Ok(0));
+    rt().mem.write(at + 8, 8, 0x55, Relaxed).unwrap();
+    e.svc(0x06, &[SCRATCH, 0, at + 0x1000]);
+    let q = e.read(SCRATCH, 0x28);
+    assert_eq!(u64::from_le_bytes(q[0..8].try_into().unwrap()), at);
+    assert_eq!(u64::from_le_bytes(q[8..16].try_into().unwrap()), 0x3000);
+    assert_eq!((q[16], q[20], q[24]), (mem_type::NORMAL, 0, 3));
+    // Mapping over part of it, and past its end, keeps what is there and adds the rest.
+    e.svc(0x2C, &[at + 0x2000, 0x2000]);
+    assert_eq!(e.r(), 0);
+    assert_eq!(rt().mem.read(at + 8, 8, Relaxed), Ok(0x55));
+    assert_eq!(rt().mem.read(at + 0x3FF8, 8, Relaxed), Ok(0));
+    e.svc(0x06, &[SCRATCH, 0, at]);
+    assert_eq!(
+        u64::from_le_bytes(e.read(SCRATCH, 0x28)[8..16].try_into().unwrap()),
+        0x4000
+    );
+    // A page that is not what the call makes (here one made read-only) is refused, and nothing
+    // is changed by the refusal.
+    e.svc(0x02, &[at + 0x1000, 0x1000, 1]);
+    assert_eq!(e.r(), 0);
+    e.svc(0x2C, &[at, 0x7000]);
+    assert_eq!(e.r(), err::INVALID_CURRENT_MEMORY.0);
+    assert!(rt().mem.read(at + 0x4000, 8, Relaxed).is_err());
+    e.svc(0x2D, &[at, 0x2000]);
+    assert_eq!(e.r(), err::INVALID_CURRENT_MEMORY.0);
+    e.svc(0x02, &[at + 0x1000, 0x1000, 3]);
+    assert_eq!(e.r(), 0);
+    // Unmapping takes the pages back, free pages in the range are left alone, and a page mapped
+    // again is zeroed.
+    e.svc(0x2D, &[at + 0x1000, 0x1000]);
+    assert_eq!(e.r(), 0);
+    assert!(rt().mem.read(at + 0x1000, 8, Relaxed).is_err());
+    assert_eq!(rt().mem.read(at + 8, 8, Relaxed), Ok(0x55));
+    e.svc(0x2D, &[at, 0x8000]);
+    assert_eq!(e.r(), 0);
+    assert!(rt().mem.read(at, 8, Relaxed).is_err());
+    assert!(rt().mem.read(at + 0x4000, 8, Relaxed).is_err());
+    e.svc(0x2C, &[at, 0x1000]);
+    assert_eq!(e.r(), 0);
+    assert_eq!(rt().mem.read(at + 8, 8, Relaxed), Ok(0));
+    e.svc(0x2D, &[at, 0x1000]);
+    assert_eq!(e.r(), 0);
+}
+
+#[test]
+fn map_physical_memory_needs_a_system_resource_when_the_program_has_an_npdm() {
+    // The builder makes an NPDM whose system resource size is zero.
+    let spec = builder::NpdmSpec {
+        kc: vec![builder::enable_svcs(1, &[20])],
+        ..builder::NpdmSpec::default()
+    };
+    let npdm = Npdm::parse(&builder::build(&spec)).unwrap();
+    assert_eq!(npdm.meta.system_resource_size, 0);
+    let mut e = Env::with(ProcessKind::Nso, Some(npdm), Vec::new());
+    e.svc(0x2C, &[ALIAS_BASE, 0x1000]);
+    assert_eq!(e.r(), err::INVALID_STATE.0);
+    assert!(rt().mem.read(ALIAS_BASE, 8, Relaxed).is_err());
+}
+
+#[test]
 fn query_memory_describes_modules_gaps_and_the_ends() {
     let mut e = Env::with(
         ProcessKind::Nso,

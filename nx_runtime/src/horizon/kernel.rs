@@ -186,6 +186,26 @@ impl Drop for Kernel {
     }
 }
 
+/// The kernel no longer owns the pages `lo..hi` (it unmapped them): cut them out of the ranges it
+/// unmaps when it is dropped, keeping what is left of a range that only partly overlaps.
+fn forget_mapped(st: &mut State, lo: u64, hi: u64) {
+    let mut kept = Vec::new();
+    for &(addr, size) in &st.mapped {
+        let end = addr + size;
+        if end <= lo || addr >= hi {
+            kept.push((addr, size));
+            continue;
+        }
+        if addr < lo {
+            kept.push((addr, lo - addr));
+        }
+        if end > hi {
+            kept.push((hi, end - hi));
+        }
+    }
+    st.mapped = kept;
+}
+
 /// How long a wait lasts: `None` is forever.
 pub fn deadline_of(timeout_ns: i64) -> Option<Instant> {
     if timeout_ns < 0 {
@@ -1351,6 +1371,110 @@ impl Kernel {
         }
         st.heap_size = size;
         Ok(HEAP_BASE)
+    }
+
+    /// The checks `MapPhysicalMemory` and `UnmapPhysicalMemory` share: the sizes, the alias region
+    /// and, for a program that has an NPDM, a system resource (docs/ASSUMPTIONS.md A-130).
+    fn check_physical_range(&self, addr: u64, size: u64) -> Result<(), ResultCode> {
+        use super::layout::{ALIAS_BASE, ALIAS_SIZE};
+        if size == 0 || !size.is_multiple_of(PAGE) {
+            return Err(err::INVALID_SIZE);
+        }
+        if !addr.is_multiple_of(PAGE) {
+            return Err(err::INVALID_ADDRESS);
+        }
+        let end = addr.checked_add(size).ok_or(err::INVALID_MEMORY_REGION)?;
+        if addr < ALIAS_BASE || end > ALIAS_BASE + ALIAS_SIZE {
+            return Err(err::INVALID_MEMORY_REGION);
+        }
+        if let Some(npdm) = &self.process.npdm {
+            if npdm.meta.system_resource_size == 0 {
+                return Err(err::INVALID_STATE);
+            }
+        }
+        Ok(())
+    }
+
+    /// The pages `MapPhysicalMemory` makes: zeroed, read-write, of the type the heap has.
+    fn physical_info() -> Info {
+        Info {
+            mem_type: mem_type::NORMAL,
+            perm: perm::R | perm::W,
+            attr: 0,
+        }
+    }
+
+    /// `MapPhysicalMemory`: zeroed read-write pages at `addr` in the alias region. The parts of the
+    /// range that are already such pages stay as they are; any other page in it is an error.
+    pub fn map_physical_memory(&self, addr: u64, size: u64) -> ResultCode {
+        if let Err(e) = self.check_physical_range(addr, size) {
+            return e;
+        }
+        let info = Self::physical_info();
+        let mut st = self.lock();
+        // The free parts of the range.
+        let mut gaps = Vec::new();
+        let mut at = addr;
+        for (start, len, found) in st.memory.blocks_in(addr, size) {
+            if found != info {
+                return err::INVALID_CURRENT_MEMORY;
+            }
+            if start > at {
+                gaps.push((at, start - at));
+            }
+            at = start + len;
+        }
+        if at < addr + size {
+            gaps.push((at, addr + size - at));
+        }
+        let new: u64 = gaps.iter().map(|g| g.1).sum();
+        let used = st.memory.total(|t| {
+            matches!(
+                t,
+                mem_type::CODE
+                    | mem_type::CODE_DATA
+                    | mem_type::NORMAL
+                    | mem_type::STACK
+                    | mem_type::THREAD_LOCAL
+            )
+        });
+        if used + new > super::svc::TOTAL_MEMORY_SIZE {
+            return err::LIMIT_REACHED;
+        }
+        let mut done = Vec::new();
+        for (gap_addr, gap_size) in gaps {
+            if let Err(e) = self.map_owned(&mut st, gap_addr, gap_size, info) {
+                // Leave nothing of this call behind.
+                for (a, s) in done {
+                    st.memory.remove(a, s);
+                    let _ = rt().mem.unmap(a, s);
+                    forget_mapped(&mut st, a, a + s);
+                }
+                return e;
+            }
+            done.push((gap_addr, gap_size));
+        }
+        ResultCode::SUCCESS
+    }
+
+    /// `UnmapPhysicalMemory`: give back the pages of the range that `MapPhysicalMemory` made; the
+    /// free parts of it are left alone and any other page is an error.
+    pub fn unmap_physical_memory(&self, addr: u64, size: u64) -> ResultCode {
+        if let Err(e) = self.check_physical_range(addr, size) {
+            return e;
+        }
+        let info = Self::physical_info();
+        let mut st = self.lock();
+        let blocks = st.memory.blocks_in(addr, size);
+        if blocks.iter().any(|b| b.2 != info) {
+            return err::INVALID_CURRENT_MEMORY;
+        }
+        for (a, s, _) in blocks {
+            st.memory.remove(a, s);
+            let _ = rt().mem.unmap(a, s);
+            forget_mapped(&mut st, a, a + s);
+        }
+        ResultCode::SUCCESS
     }
 
     pub fn query_memory(&self, addr: u64) -> super::memory::MemoryInfo {
