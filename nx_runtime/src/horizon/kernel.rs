@@ -93,6 +93,22 @@ pub(super) struct Thread {
     pub wake: Option<ResultCode>,
 }
 
+impl Thread {
+    /// The core the thread is on, as `GetCurrentProcessorNumber` tells it: its ideal core when the
+    /// core mask allows that core, otherwise the lowest core the mask names (docs/ASSUMPTIONS.md
+    /// A-149).
+    pub fn running_core(&self) -> i32 {
+        let mask = self.core_mask & 0xF;
+        if (0..4).contains(&self.ideal_core) && mask & (1 << self.ideal_core) != 0 {
+            self.ideal_core
+        } else if mask != 0 {
+            mask.trailing_zeros() as i32
+        } else {
+            0
+        }
+    }
+}
+
 pub(super) struct Event {
     pub signaled: bool,
 }
@@ -426,7 +442,7 @@ impl Kernel {
         self.lock()
             .threads
             .get(&thread)
-            .map(|t| (t.entry, t.arg, t.priority, t.ideal_core))
+            .map(|t| (t.entry, t.arg, t.priority, t.running_core()))
     }
 
     pub fn trace_log(&self) -> bool {
@@ -792,7 +808,11 @@ impl Kernel {
     /// Wait for the core `thread` runs on, if cores are modelled (`NX_CORES`); `held` records it.
     pub(super) fn take_core(&self, thread: u64, held: &AtomicUsize) {
         if let Some(cores) = &self.cores {
-            let ideal = self.lock().threads.get(&thread).map_or(0, |t| t.ideal_core);
+            let ideal = self
+                .lock()
+                .threads
+                .get(&thread)
+                .map_or(0, Thread::running_core);
             let core = cores.core_of(ideal);
             cores.acquire(core);
             held.store(core, Ordering::Relaxed);

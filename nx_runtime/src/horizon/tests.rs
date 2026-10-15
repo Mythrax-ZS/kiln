@@ -790,6 +790,28 @@ fn thread_arguments_are_validated() {
     assert_eq!(e.r(), err::INVALID_HANDLE.0);
 }
 
+#[test]
+fn the_processor_number_is_a_core_the_mask_names() {
+    let mut e = Env::new();
+    let me = u64::from(CURRENT_THREAD);
+    let core = |e: &mut Env| {
+        e.svc(0x10, &[]);
+        e.x(0)
+    };
+    // A mask with the ideal core in it: that core.
+    e.svc(0x0F, &[me, 1, 0b0011]);
+    assert_eq!((e.r(), core(&mut e)), (0, 1));
+    // The ideal core is left alone with -1; when the mask no longer has it, the lowest core of the
+    // mask is where the thread is.
+    e.svc(0x0F, &[me, (-1i32) as u32 as u64, 0b0100]);
+    assert_eq!((e.r(), core(&mut e)), (0, 2));
+    e.svc(0x0F, &[me, (-1i32) as u32 as u64, 0b1010]);
+    assert_eq!((e.r(), core(&mut e)), (0, 1));
+    // The ideal core comes back when the mask has it again.
+    e.svc(0x0F, &[me, 3, 0b1010]);
+    assert_eq!((e.r(), core(&mut e)), (0, 3));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Mutexes, condition variables and address arbitration
 // ---------------------------------------------------------------------------------------------

@@ -457,8 +457,12 @@ impl Kernel {
                 result(cpu, r);
             }
             0x10 => {
-                let core = self.lock().threads.get(&thread).map_or(0, |t| t.ideal_core);
-                cpu.state.x[0] = core.max(0) as u64;
+                let core = self
+                    .lock()
+                    .threads
+                    .get(&thread)
+                    .map_or(0, |t| t.running_core());
+                cpu.state.x[0] = core as u64;
             }
             0x11 => {
                 let r = self.signal_event(w(x[0]));
