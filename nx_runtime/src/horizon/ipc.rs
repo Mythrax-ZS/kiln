@@ -309,6 +309,15 @@ impl Kernel {
         handle: Handle,
     ) -> Result<ResultCode, Stop> {
         let Some(KObject::Session(session)) = self.object(handle, current) else {
+            if self.trace {
+                let mut words = [0u8; 32];
+                let _ = rt().mem.read_bytes(tls, &mut words, false);
+                eprintln!(
+                    "[ipc] SendSyncRequest on handle {handle:#x}, which is not a session; the \
+                     message starts {:02x?}",
+                    words
+                );
+            }
             return Ok(err::INVALID_HANDLE);
         };
 
