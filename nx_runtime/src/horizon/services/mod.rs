@@ -96,7 +96,10 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     });
     register(kernel, "set", set::SettingsServer::new);
     register(kernel, "ssl", |_| ssl::SslService::new());
-    register(kernel, "time:u", time::StaticService::new);
+    let clocks = Arc::new(time::Shared::default());
+    register(kernel, "time:u", move |k| {
+        time::StaticService::new(k, clocks.clone())
+    });
 }
 
 /// An interface object with no command implemented: handing it out is right, using it stops the

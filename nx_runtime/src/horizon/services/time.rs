@@ -5,8 +5,11 @@
 //! (docs/ASSUMPTIONS.md A-071). A command not listed stops the run.
 
 use super::super::kernel::Kernel;
+use super::super::object::KObject;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
-use std::sync::{OnceLock, Weak};
+use crate::a64::bus::COUNTER_FREQUENCY;
+use crate::rt::runtime::rt;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// The id of the one steady clock (the source id of every time point). It spells the program's
@@ -89,15 +92,58 @@ fn calendar(time: i64) -> Vec<u8> {
     out
 }
 
+/// The size of the shared memory of the time service: one page.
+const SHARED_MEMORY_SIZE: u64 = 0x1000;
+
+/// What the connections of one process share: the shared memory, made on first request.
+#[derive(Debug, Default)]
+pub struct Shared {
+    memory: Mutex<Option<KObject>>,
+}
+
+/// Write `value` the way the shared memory keeps it: a 32-bit counter at `at`, `padding` bytes, then
+/// two slots of `value.len()` bytes; the slot the counter's lowest bit selects is the current one
+/// (a reader takes the counter, the slot, and the counter again, and retries if it changed).
+fn put_atomic(memory: &mut [u8], at: usize, padding: usize, value: &[u8]) {
+    let counter: u32 = 1;
+    memory[at..at + 4].copy_from_slice(&counter.to_le_bytes());
+    let slot = at + 4 + padding + (counter as usize & 1) * value.len();
+    memory[slot..slot + value.len()].copy_from_slice(value);
+}
+
+/// The shared memory of the time service as a program reads it (docs/ASSUMPTIONS.md A-142): at 0x00
+/// the context of the steady clock, at 0x38 and 0x80 the contexts of the local and network system
+/// clocks, at 0xC8 whether the user clock corrects itself. `counter_ns` is the program's system
+/// counter now, in nanoseconds.
+fn shared_memory_image(counter_ns: u64) -> Vec<u8> {
+    let mut m = vec![0u8; SHARED_MEMORY_SIZE as usize];
+    let steady = steady_now();
+    // The steady clock is the offset plus the counter: the offset is what makes it the clock
+    // `ISteadyClock` answers now.
+    let steady_ns = (steady as u64).wrapping_mul(1_000_000_000);
+    let mut context = steady_ns.wrapping_sub(counter_ns).to_le_bytes().to_vec();
+    context.extend_from_slice(&CLOCK_SOURCE_ID);
+    put_atomic(&mut m, 0x00, 4, &context);
+    // A system clock context is the offset to add to the steady clock, then the time point of the
+    // steady clock it was made at: the same one `ISystemClock::GetSystemClockContext` gives.
+    let mut system = (posix_now() - steady).to_le_bytes().to_vec();
+    system.extend_from_slice(&time_point(steady));
+    put_atomic(&mut m, 0x38, 4, &system);
+    put_atomic(&mut m, 0x80, 4, &system);
+    put_atomic(&mut m, 0xC8, 0, &[0]);
+    m
+}
+
 /// `nn::timesrv::detail::service::IStaticService`.
 #[derive(Debug)]
 pub struct StaticService {
     kernel: Weak<Kernel>,
+    shared: Arc<Shared>,
 }
 
 impl StaticService {
-    pub fn new(kernel: Weak<Kernel>) -> StaticService {
-        StaticService { kernel }
+    pub fn new(kernel: Weak<Kernel>, shared: Arc<Shared>) -> StaticService {
+        StaticService { kernel, shared }
     }
 }
 
@@ -116,6 +162,33 @@ impl Service for StaticService {
             3 => Ok(Response::ok().with_object(Box::new(TimeZoneService {
                 kernel: self.kernel.clone(),
             }))),
+            // GetSharedMemoryNativeHandle() -> the shared memory of the clocks [6.0.0+]
+            20 => {
+                let kernel = self.kernel.upgrade().ok_or_else(gone)?;
+                let mut slot = self.shared.memory.lock().unwrap_or_else(|e| e.into_inner());
+                let object = match slot.as_ref() {
+                    Some(o) => o.clone(),
+                    None => {
+                        let (object, addr) = kernel
+                            .create_shared_memory(SHARED_MEMORY_SIZE)
+                            .map_err(|e| {
+                                Stop(format!(
+                                    "the time shared memory cannot be made ({:#x})",
+                                    e.0
+                                ))
+                            })?;
+                        let counter_ns = (u128::from(rt().counter()) * 1_000_000_000
+                            / u128::from(COUNTER_FREQUENCY))
+                            as u64;
+                        if !kernel.write_memory(addr, &shared_memory_image(counter_ns)) {
+                            return Err(Stop("the time shared memory is not writable".into()));
+                        }
+                        *slot = Some(object.clone());
+                        object
+                    }
+                };
+                Ok(Response::ok().with_copy_handle(object))
+            }
             // IsStandardUserSystemClockAutomaticCorrectionEnabled() -> bool
             100 => Ok(Response::ok().with_bytes(&[0])),
             other => Err(Stop::unknown_command("time:u", other)),

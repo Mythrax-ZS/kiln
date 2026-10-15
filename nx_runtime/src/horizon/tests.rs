@@ -2750,6 +2750,47 @@ fn shared_memory_is_mapped_where_the_program_asks_and_shows_what_the_service_wro
 }
 
 #[test]
+fn the_time_service_shares_its_clocks_in_a_memory_the_program_reads() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let time = e.service("time:u");
+    // GetSharedMemoryNativeHandle() [6.0.0+], the same object every time.
+    let memory = e.call(time, &Message::new(20)).copied[0];
+    let again = e.call(time, &Message::new(20)).copied[0];
+    assert_ne!(memory, 0);
+    e.svc(0x13, &[u64::from(memory), 0x6100_0000, 0x1000, 1]);
+    assert_eq!(e.r(), 0);
+    e.svc(0x14, &[u64::from(memory), 0x6100_0000, 0x1000]);
+    e.svc(0x13, &[u64::from(again), 0x6100_0000, 0x1000, 1]);
+    assert_eq!(e.r(), 0, "the second handle names the same object");
+    let m = e.read(0x6100_0000, 0x1000);
+    let u32_at = |o: usize| u32::from_le_bytes(m[o..o + 4].try_into().unwrap());
+    let i64_at = |o: usize| i64::from_le_bytes(m[o..o + 8].try_into().unwrap());
+    // Each block is a counter and two slots; the slot the counter's lowest bit names is current.
+    for counter_at in [0x00, 0x38, 0x80] {
+        assert_eq!(u32_at(counter_at) & 1, 1, "block at {counter_at:#x}");
+    }
+    // The steady clock: the offset plus the counter is the steady clock of `ISteadyClock`; the
+    // counter has run since the process began, so the offset is small and negative or zero.
+    assert_eq!(&m[0x08 + 0x18 + 8..0x08 + 0x18 + 0x18], b"recomp-steady-01");
+    let offset = i64_at(0x08 + 0x18);
+    assert!(offset <= 0 && offset > -10_000_000_000, "{offset}");
+    // The local and network contexts: the POSIX time of the steady clock's zero (near now), then
+    // the time point of the steady clock they were made at.
+    for slot in [0x40 + 0x20, 0x88 + 0x20] {
+        let posix = i64_at(slot);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!((now - 60..=now).contains(&posix), "{posix} against {now}");
+        assert_eq!(&m[slot + 16..slot + 32], b"recomp-steady-01");
+    }
+    assert_eq!(u32_at(0xC8) & 1, 1);
+    assert_eq!(m[0xCD], 0, "no automatic correction");
+}
+
+#[test]
 fn hid_publishes_input_in_a_shared_memory_the_program_maps() {
     let mut e = Env::new();
     super::services::register_defaults(&e.kernel);
