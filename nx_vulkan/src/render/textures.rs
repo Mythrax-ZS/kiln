@@ -124,6 +124,29 @@ impl Tic {
         self.bits(124, 4) + 1
     }
 
+    /// What the view of the texture makes of the components, for the view of the image the
+    /// texture's format becomes. S8Z24 keeps its stencil in the first component and its depth in
+    /// the second (docs/ASSUMPTIONS.md A-152), while the view of the depth aspect has the depth in
+    /// its first: what the shader takes from the second component is taken from the first, and
+    /// the stencil, which the view does not have, reads as zero.
+    pub fn view_mapping(&self) -> vk::ComponentMapping {
+        if self.components() != 0x29 {
+            return self.component_mapping();
+        }
+        let from = |source: u32| match source {
+            3 => vk::ComponentSwizzle::R,
+            0 | 2 | 4 => vk::ComponentSwizzle::ZERO,
+            _ => vk::ComponentSwizzle::ONE,
+        };
+        let s = self.sources();
+        vk::ComponentMapping {
+            r: from(s[0]),
+            g: from(s[1]),
+            b: from(s[2]),
+            a: from(s[3]),
+        }
+    }
+
     /// What the view of the texture makes of the components.
     pub fn component_mapping(&self) -> vk::ComponentMapping {
         let s = self.sources();
@@ -468,6 +491,10 @@ pub fn texture_format(components: u32, data_type: u32, srgb: bool) -> Option<Tex
             bc,
             16,
         ),
+        // S8Z24 and Z24S8: 24-bit depth with 8 bits of stencil, X8Z24: the depth alone. They are
+        // sampled through the depth view of a render target; memory is not read for them.
+        0x29 | 0x2B => (F::D24_UNORM_S8_UINT, one, 4),
+        0x2A => (F::X8_D24_UNORM_PACK32, one, 4),
         // ZF32: 32-bit floating point depth, sampled as a depth image.
         0x2F => (F::D32_SFLOAT, one, 4),
         _ => return None,
@@ -828,6 +855,8 @@ const UNCHECKED: u64 = u64::MAX;
 pub struct Bound {
     pub view: vk::ImageView,
     pub sampler: vk::Sampler,
+    /// The layout the image is in while the draw samples it.
+    pub layout: vk::ImageLayout,
 }
 
 impl Textures {
@@ -880,6 +909,7 @@ impl Textures {
         let bound = Bound {
             view,
             sampler: self.sampler(vk, tsc, used.shadow)?,
+            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         };
         Ok((bound, copies))
     }
@@ -893,6 +923,7 @@ impl Textures {
         tsc: Tsc,
         used: &TextureUse,
         view: vk::ImageView,
+        layout: vk::ImageLayout,
     ) -> Result<Bound, String> {
         if shape_of(tic, used)?.kind != Kind::D2 {
             return Err(format!(
@@ -904,6 +935,7 @@ impl Textures {
         Ok(Bound {
             view,
             sampler: self.sampler(vk, tsc, used.shadow)?,
+            layout,
         })
     }
 
@@ -960,11 +992,22 @@ impl Textures {
         let types = tic.types();
         let Some(format) = texture_format(tic.components(), types[0], tic.srgb()) else {
             return Err(format!(
-                "a texture of format {:#x} with data type {}",
+                "a texture of format {:#x} with data types {:?} (components from {:?})",
                 tic.components(),
-                types[0]
+                types,
+                tic.sources()
             ));
         };
+        // The memory of a 24-bit depth texture holds the GPU's own arrangement of depth and
+        // stencil, which is not read into an image: such a texture is a render target's picture.
+        if aspect_of(format.vk).contains(vk::ImageAspectFlags::STENCIL)
+            || format.vk == vk::Format::X8_D24_UNORM_PACK32
+        {
+            return Err(format!(
+                "a 24-bit depth texture of format {:#x} that is not a render target's picture",
+                tic.components()
+            ));
+        }
         if !vk.format_supports(format.vk, vk::FormatFeatureFlags::SAMPLED_IMAGE) {
             return Err(format!(
                 "the device cannot sample {:?} (texture format {:#x})",
@@ -1032,7 +1075,7 @@ impl Textures {
                 raw.len()
             );
         }
-        let components = tic.component_mapping();
+        let components = tic.view_mapping();
         let image = vk.create_image(ImageInfo {
             format: format.vk,
             width,
@@ -1597,5 +1640,45 @@ mod tests {
         let t = target(base + 20 * 2048, format, (320, 32), 2);
         let o = overlay_of(&tic, &plain_2d(), base, &t, 1).expect("a block of rows down");
         assert_eq!((o.y, o.width, o.height), (32, 320, 32));
+    }
+
+    #[test]
+    fn a_depth_and_stencil_texture_is_sampled_through_the_depth_view() {
+        use vk::{ComponentSwizzle as C, Format as F};
+        assert_eq!(
+            texture_format(0x29, 4, false).unwrap().vk,
+            F::D24_UNORM_S8_UINT
+        );
+        assert_eq!(
+            texture_format(0x2B, 2, false).unwrap().vk,
+            F::D24_UNORM_S8_UINT
+        );
+        assert_eq!(
+            texture_format(0x2A, 2, false).unwrap().vk,
+            F::X8_D24_UNORM_PACK32
+        );
+        // The header a title makes for S8Z24 whose shader reads the second component into x, y
+        // and z: the depth, which the depth view has first.
+        let s8z24 = tic_with(&[
+            (0, 7, 0x29),
+            (7, 3, 4),
+            (10, 3, 2),
+            (13, 3, 2),
+            (16, 3, 2),
+            (19, 3, 3),
+            (22, 3, 3),
+            (25, 3, 3),
+            (28, 3, 7),
+        ]);
+        let m = s8z24.view_mapping();
+        assert_eq!((m.r, m.g, m.b, m.a), (C::R, C::R, C::R, C::ONE));
+        // The first component of S8Z24 is the stencil, which that view lacks.
+        let stencil = tic_with(&[(0, 7, 0x29), (19, 3, 2), (22, 3, 3), (25, 3, 0), (28, 3, 5)]);
+        let m = stencil.view_mapping();
+        assert_eq!((m.r, m.g, m.b, m.a), (C::ZERO, C::R, C::ZERO, C::ONE));
+        // Every other format keeps the header's own components.
+        let z24s8 = tic_with(&[(0, 7, 0x2B), (19, 3, 2), (22, 3, 3), (25, 3, 4), (28, 3, 5)]);
+        let (a, b) = (z24s8.view_mapping(), z24s8.component_mapping());
+        assert_eq!((a.r, a.g, a.b, a.a), (b.r, b.g, b.b, b.a));
     }
 }

@@ -6,6 +6,7 @@ use super::shaders::{bindings_of, Program, Variation};
 use super::textures::{texture_format, Copy, Overlay, Tic, Tsc};
 use super::Core;
 use crate::fast::FastMap;
+use crate::image::aspect_of;
 use ash::vk;
 use nx_gpu::draw_state::{Blend, DepthStencil, Raster, StencilFace};
 use nx_gpu::render::{Draw, Scene, Source};
@@ -146,6 +147,7 @@ impl Core {
         #[cfg(feature = "alloc_stats")]
         crate::alloc_stats::lap("outside the draws");
         self.last_textures.clear();
+        self.depth_read_only = false;
         let regs = scene.regs;
         let raster = regs.raster();
         if !raster.enabled {
@@ -537,13 +539,27 @@ impl Core {
         scene: &Scene<'_>,
         tic: &Tic,
         used: &TextureUse,
-    ) -> Result<Option<vk::ImageView>, String> {
+    ) -> Result<Option<(vk::ImageView, vk::ImageLayout)>, String> {
         // Only a plain 2D texture is a target's picture (the others have more to them); that is
         // a 2D header, and the first layer of an array or a cube header (as `shape_of` has it).
         if used.dim != Dim::D2 || used.arrayed || !matches!(tic.texture_type(), 1 | 3 | 5 | 7) {
+            if matches!(tic.components(), 0x29..=0x2B) && self.debug.trace_textures {
+                eprintln!(
+                    "[vulkan] a depth texture sampled as {:?}{} from a header of type {}",
+                    used.dim,
+                    if used.arrayed { " array" } else { "" },
+                    tic.texture_type()
+                );
+            }
             return Ok(None);
         }
         let Some((cpu, _)) = scene.host_address(tic.address()) else {
+            if matches!(tic.components(), 0x29..=0x2B) && self.debug.trace_textures {
+                eprintln!(
+                    "[vulkan] a depth texture at GPU address {:#x} is not mapped",
+                    tic.address()
+                );
+            }
             return Ok(None);
         };
         let Some(format) = texture_format(tic.components(), tic.types()[0], tic.srgb()) else {
@@ -558,18 +574,57 @@ impl Core {
             Some(t) => Some(t.key),
             None => self.targets.depth_at_address(cpu).map(|t| t.key),
         };
+        let wants_depth = aspect_of(format.vk) != vk::ImageAspectFlags::COLOR;
+        let trace = wants_depth && self.debug.trace_textures;
         let Some(key) = found else {
+            if trace {
+                self.say_once(format!(
+                    "[vulkan] a depth texture at {cpu:#x} ({}x{}, format {:#x}) has no render target",
+                    tic.width(),
+                    tic.height(),
+                    tic.components()
+                ));
+            }
             return Ok(None);
         };
+        // A depth texture may be a texel narrower or shorter than the target it shows (a title
+        // that scales its resolution describes the part of the target it drew; docs/ASSUMPTIONS.md
+        // A-153).
+        let slack = u32::from(wants_depth);
         if key.format != format.vk
             || key.layers != 1
-            || (key.width, key.height) != (tic.width(), tic.height())
+            || key.width.abs_diff(tic.width()) > slack
+            || key.height.abs_diff(tic.height()) > slack
         {
+            if trace {
+                self.say_once(format!(
+                    "[vulkan] a depth texture at {cpu:#x} ({}x{}, {:?}) differs from the target {key:?}",
+                    tic.width(),
+                    tic.height(),
+                    format.vk
+                ));
+            }
             return Ok(None);
         }
         let (colors, depth) = self.attachments(scene)?;
-        if colors.contains(&key) || depth == Some(key) {
+        // The depth target the draw tests against is sampled while it is attached, as long as
+        // the draw changes neither its depth nor its stencil; any other target the draw uses
+        // cannot be read while it is written, and its memory is read instead.
+        let mut layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        if colors.contains(&key) || (depth == Some(key) && !self.leaves_depth_alone(scene)) {
+            if trace {
+                self.say_once(format!(
+                    "[vulkan] a depth texture at {cpu:#x} is the target the draw writes to (color {}, depth write {}, stencil test {})",
+                    colors.contains(&key),
+                    scene.regs.depth_stencil().depth_write,
+                    scene.regs.depth_stencil().stencil_test
+                ));
+            }
             return Ok(None);
+        }
+        if depth == Some(key) {
+            self.depth_read_only = true;
+            layout = vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL;
         }
         // Leaving the rendering is what lets the image change layout.
         self.end_pass();
@@ -577,17 +632,32 @@ impl Core {
         let Some(target) = self.targets.existing(&key) else {
             return Ok(None);
         };
-        target.transition(&self.vk, cmd, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        target.transition(&self.vk, cmd, layout);
         let view = self
             .vk
-            .swizzled_view(&mut target.image, tic.component_mapping())?;
+            .swizzled_view(&mut target.image, tic.view_mapping())?;
         if self.debug.trace_textures && self.traced().is_some() {
             eprintln!(
                 "[vulkan] a texture is the render target at {cpu:#x} ({}x{})",
                 key.width, key.height
             );
         }
-        Ok(Some(view))
+        Ok(Some((view, layout)))
+    }
+
+    /// Print a line the first time it is said (the trace of a state that comes again and again).
+    fn say_once(&mut self, line: String) {
+        if self.seen_targets.insert(line.clone()) {
+            eprintln!("{line}");
+        }
+    }
+
+    /// The draw neither writes depth nor changes the stencil.
+    fn leaves_depth_alone(&self, scene: &Scene<'_>) -> bool {
+        let ds = scene.regs.depth_stencil();
+        !ds.depth_write
+            && (!ds.stencil_test
+                || (ds.front.write_mask == 0 && (!ds.two_sided || ds.back.write_mask == 0)))
     }
 
     /// Read GPU memory into `out`, failing with a message when it is not all mapped.
@@ -712,9 +782,9 @@ impl Core {
                 )
             };
             let bound = match target_view {
-                Some(view) => self
+                Some((view, layout)) => self
                     .textures
-                    .bind_view(&self.vk, &tic, tsc, used, view)
+                    .bind_view(&self.vk, &tic, tsc, used, view, layout)
                     .map_err(decorate)?,
                 None => {
                     // The render targets that stand for parts of this texture: the ones that are
@@ -740,7 +810,7 @@ impl Core {
                 vk::DescriptorImageInfo::default()
                     .sampler(bound.sampler)
                     .image_view(bound.view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                    .image_layout(bound.layout),
             ));
         }
         Ok(())

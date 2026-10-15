@@ -93,6 +93,9 @@ impl Config {
 struct Pass {
     colors: Vec<Key>,
     depth: Option<Key>,
+    /// The depth target is attached to be read: a draw that samples it as a texture while it tests
+    /// against it (it writes neither depth nor stencil).
+    depth_read_only: bool,
     extent: (u32, u32),
 }
 
@@ -108,6 +111,9 @@ struct Core {
     compute_pipelines: compute::ComputePipelines,
     /// The attachments of the rendering that is begun in the command buffer, if any.
     pass: Option<Pass>,
+    /// The draw being recorded samples the depth target it tests against, so its pass attaches
+    /// the target read-only (see `Pass::depth_read_only`).
+    depth_read_only: bool,
     dumped: u64,
     debug: Debug,
     /// Commands of the traced frame so far (`NX_TRACE_DRAWS`).
@@ -298,6 +304,7 @@ impl Renderer {
                     pipelines: draw::Pipelines::default(),
                     compute_pipelines: compute::ComputePipelines::default(),
                     pass: None,
+                    depth_read_only: false,
                     dumped: 0,
                     debug,
                     traced_commands: 0,
@@ -482,6 +489,7 @@ impl Core {
         let (colors, depth) = self.attachments(scene)?;
         let extent = self.extent_of(&colors, depth.as_ref())?;
         let wanted = Pass {
+            depth_read_only: self.depth_read_only && depth.is_some(),
             colors,
             depth,
             extent,
@@ -511,17 +519,24 @@ impl Core {
         let mut depth_info = None;
         if let Some(key) = &wanted.depth {
             let t = self.targets.get(&self.vk, &mut self.frame, *key)?;
-            t.transition(
-                &self.vk,
-                cmd,
-                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            );
+            let (layout, store) = if wanted.depth_read_only {
+                (
+                    vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                    vk::AttachmentStoreOp::NONE,
+                )
+            } else {
+                (
+                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    vk::AttachmentStoreOp::STORE,
+                )
+            };
+            t.transition(&self.vk, cmd, layout);
             depth_info = Some(
                 vk::RenderingAttachmentInfo::default()
                     .image_view(t.image.view)
-                    .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                    .image_layout(layout)
                     .load_op(vk::AttachmentLoadOp::LOAD)
-                    .store_op(vk::AttachmentStoreOp::STORE),
+                    .store_op(store),
             );
         }
         let mut info = vk::RenderingInfo::default()
@@ -644,6 +659,7 @@ impl Core {
         if !wants_color && !clear.depth && !clear.stencil {
             return Ok(());
         }
+        self.depth_read_only = false;
         self.begin_pass(scene)?;
         let pass = self.pass.clone().expect("a pass was just begun");
         let values = scene.regs.clear_values();
