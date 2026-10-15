@@ -36,6 +36,14 @@ pub(super) struct Types {
     pub v4i32: Id,
 }
 
+/// What a block knows of its registers when it ends: the constant buffer word and the immediate
+/// some of them are known to hold.
+#[derive(Clone, Default)]
+pub(super) struct ExitState {
+    pub origin: std::collections::HashMap<u8, (u32, u32)>,
+    pub constant: std::collections::HashMap<u8, u32>,
+}
+
 /// The flags of the condition code: zero, sign (negative), carry and overflow, as function-local
 /// booleans.
 #[derive(Clone, Copy)]
@@ -74,8 +82,17 @@ pub(super) struct Tx<'a> {
     /// The immediate a register is known to hold in the block being translated (a `MOV32I`): what a
     /// texture instruction with texel offsets needs to know about its offset register.
     pub reg_const: std::collections::HashMap<u8, u32>,
+    /// The blocks that lead to each block, and what `reg_origin` and `reg_const` held at the end
+    /// of each block translated so far: a block starts knowing what all of its predecessors agree
+    /// on, and nothing when one of them is not translated yet (a jump back).
+    pub block_preds: std::collections::HashMap<u32, Vec<u32>>,
+    pub exit_state: std::collections::HashMap<u32, ExitState>,
     /// The global memory table variable and the address translation function.
     pub gmap: Option<(Id, Id)>,
+    /// The local memory variable and its length in words, made on first use.
+    pub local: Option<(Id, u32)>,
+    /// The words of local memory the constant-offset accesses of the program reach.
+    pub local_min_words: u32,
     /// The offset of the instruction being translated, for messages.
     pub pc: u32,
 }
@@ -121,7 +138,11 @@ impl<'a> Tx<'a> {
             texture_dims: std::collections::HashMap::new(),
             reg_origin: std::collections::HashMap::new(),
             reg_const: std::collections::HashMap::new(),
+            block_preds: std::collections::HashMap::new(),
+            exit_state: std::collections::HashMap::new(),
             gmap: None,
+            local: None,
+            local_min_words: 0,
             pc: 0,
         }
     }
@@ -586,6 +607,7 @@ pub fn translate(code: Code<'_>, sph: Option<&Sph>, cfg: &Config) -> Result<Tran
     }
     let mut tx = Tx::new(cfg, sph);
     tx.texture_dims = super::tex::scan_dims(code, &graph);
+    tx.local_min_words = super::local::scan(code, &graph);
     super::flow::build(&mut tx, code, &graph)?;
     let Tx {
         mut m,

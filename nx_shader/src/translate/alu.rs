@@ -83,7 +83,7 @@ fn src_b_f(tx: &mut Tx<'_>, inst: Inst) -> R<Id> {
 }
 
 /// Apply the absolute value and then the negation of a float source.
-fn fmods(tx: &mut Tx<'_>, v: Id, neg: bool, abs: bool) -> Id {
+pub(super) fn fmods(tx: &mut Tx<'_>, v: Id, neg: bool, abs: bool) -> Id {
     let v = if abs { tx.fabs(v) } else { v };
     if neg {
         tx.fneg(v)
@@ -93,7 +93,7 @@ fn fmods(tx: &mut Tx<'_>, v: Id, neg: bool, abs: bool) -> Id {
 }
 
 /// Clamp to 0..1, NaN to 0.
-fn fsat(tx: &mut Tx<'_>, v: Id) -> Id {
+pub(super) fn fsat(tx: &mut Tx<'_>, v: Id) -> Id {
     let zero = tx.cf32(0.0);
     let one = tx.cf32(1.0);
     let t = tx.t.f32;
@@ -113,13 +113,13 @@ pub(super) fn no_cc(tx: &Tx<'_>, inst: Inst, bit: u32) -> R<()> {
 }
 
 /// The predicate source at bits `lo..lo+2` with its negation in bit `lo+3`.
-fn pred_at(tx: &mut Tx<'_>, inst: Inst, lo: u32) -> Id {
+pub(super) fn pred_at(tx: &mut Tx<'_>, inst: Inst, lo: u32) -> Id {
     let p = inst.bits(lo, 3) as u8;
     tx.read_pred(p, inst.bit(lo + 3))
 }
 
 /// `a op b` for the boolean operation code of `PSETP`/`ISETP`: 0 and, 1 or, 2 xor.
-fn bool_op(tx: &mut Tx<'_>, code: u64, a: Id, b: Id) -> R<Id> {
+pub(super) fn bool_op(tx: &mut Tx<'_>, code: u64, a: Id, b: Id) -> R<Id> {
     Ok(match code {
         0 => tx.land(a, b),
         1 => tx.lor(a, b),
@@ -129,7 +129,7 @@ fn bool_op(tx: &mut Tx<'_>, code: u64, a: Id, b: Id) -> R<Id> {
 }
 
 /// A floating point comparison by the 4-bit code of `FSETP`.
-fn fcompare(tx: &mut Tx<'_>, code: u64, a: Id, b: Id) -> R<Id> {
+pub(super) fn fcompare(tx: &mut Tx<'_>, code: u64, a: Id, b: Id) -> R<Id> {
     let opcode = match code {
         0 => return Ok(tx.cfalse()),
         1 => op::F_ORD_LESS_THAN,

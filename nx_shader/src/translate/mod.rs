@@ -23,8 +23,10 @@ pub(crate) mod alu;
 mod emit;
 mod flow;
 mod global;
+mod half;
 mod int;
 mod io;
+mod local;
 mod tex;
 
 pub use emit::translate;

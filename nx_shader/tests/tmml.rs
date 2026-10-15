@@ -103,8 +103,8 @@ fn a_handle_that_was_computed_is_refused() {
 }
 
 #[test]
-fn a_handle_loaded_in_another_block_is_refused() {
-    // The program is two blocks; what the first block knew of R7 does not reach the second.
+fn a_handle_loaded_in_the_one_block_that_leads_here_is_followed() {
+    // Two blocks; the second is reached from the first alone, so what the first knew of R7 holds.
     let (sph, code) = program(
         5,
         &[
@@ -114,8 +114,33 @@ fn a_handle_loaded_in_another_block_is_refused() {
             exit(Guard::ALWAYS),
         ],
     );
+    let t = translate(Code(&code), Some(&sph), &Config::new(Stage::Pixel)).unwrap();
+    assert_eq!(
+        (t.info.textures[0].index, t.info.textures[0].source),
+        (8, Some(2))
+    );
+    nx_shader::validate::assert_valid(&t.spirv);
+}
+
+#[test]
+fn a_handle_loaded_on_only_one_of_the_paths_is_refused() {
+    // The third instruction is reached by a branch that skips the load and by falling through it:
+    // the paths do not agree on R7.
+    let p0 = Guard {
+        index: 0,
+        negated: false,
+    };
+    let (sph, code) = program(
+        5,
+        &[
+            nx_shader::asm::bra(0x8, 0x18, p0),
+            mov_cbuf(7, 2, 0x20),
+            tmml_b(0, 4, 7, 2),
+            exit(Guard::ALWAYS),
+        ],
+    );
     let e = translate(Code(&code), Some(&sph), &Config::new(Stage::Pixel))
-        .expect_err("the second block knows nothing about R7")
+        .expect_err("one path knows nothing about R7")
         .message;
     assert!(e.contains("does not come straight from a word"), "{e}");
 }

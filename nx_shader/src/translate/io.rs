@@ -343,7 +343,11 @@ pub(super) fn translate(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<bool> {
         Op::Ldc => ldc(tx, inst)?,
         Op::S2r => s2r(tx, inst)?,
         Op::Texs => super::tex::texs(tx, inst)?,
-        Op::TexBound => super::tex::tex(tx, inst)?,
+        Op::TexBound => super::tex::tex(tx, inst, false)?,
+        Op::TexBindless => super::tex::tex(tx, inst, true)?,
+        Op::Tlds => super::tex::tlds(tx, inst)?,
+        Op::Ldl => super::local::ldl(tx, inst)?,
+        Op::Stl => super::local::stl(tx, inst)?,
         Op::Tld4s => super::tex::tld4s(tx, inst)?,
         Op::Tld4Bound => super::tex::tld4(tx, inst)?,
         Op::TxqBound => super::tex::txq(tx, inst)?,
@@ -776,7 +780,7 @@ fn extract_small(tx: &mut Tx<'_>, word: Id, byte: u32, size: u64) -> Id {
     extract_small_dynamic_shift(tx, word, shift, size)
 }
 
-fn extract_small_dynamic(tx: &mut Tx<'_>, word: Id, byte: Id, size: u64) -> Id {
+pub(super) fn extract_small_dynamic(tx: &mut Tx<'_>, word: Id, byte: Id, size: u64) -> Id {
     let eight = tx.c32(8);
     let shift = tx.imul(byte, eight);
     extract_small_dynamic_shift(tx, word, shift, size)

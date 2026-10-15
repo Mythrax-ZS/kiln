@@ -651,6 +651,141 @@ fn tex_of_a_cube_array_takes_the_cube_then_the_direction() {
     }
 }
 
+/// A 2x2 image whose texels say where they are: `(x, y, 3, 4)`.
+fn position_texels() -> Vec<u8> {
+    let texels: Vec<[f32; 4]> = (0..2u32)
+        .flat_map(|y| (0..2u32).map(move |x| [x as f32, y as f32, 3.0, 4.0]))
+        .collect();
+    floats(&texels)
+}
+
+#[test]
+fn tex_with_a_handle_in_a_register_takes_the_operands_after_it() {
+    let Some(vk) = vulkan() else { return };
+    // The handle is loaded from the constant buffer into R3 (the translator learns which word of
+    // which buffer holds it); the coordinates are R1 and R2. Level zero (mode 1), and a bias (mode
+    // 2) that is read from the register after the handle, R4, which is zero.
+    let bindless = |rd: u8, mode: u64| {
+        Enc::op(Op::TexBindless)
+            .rd(rd)
+            .ra(1)
+            .rb(3)
+            .field(28, 3, 2)
+            .field(31, 4, 0xF)
+            .bit(36, false)
+            .field(37, 3, mode)
+    };
+    let program = [
+        Enc::op(Op::MovCbuf)
+            .rd(3)
+            .ra(RZ)
+            .cbuf(0, 8)
+            .field(39, 4, 0xF)
+            .build(),
+        bindless(8, 1).build(),
+        bindless(12, 2).build(),
+        exit(Guard::ALWAYS),
+    ];
+    let mut inputs = Vec::new();
+    let mut wanted = Vec::new();
+    for y in 0..2u32 {
+        for x in 0..2u32 {
+            inputs.push(regs(&[
+                (1, (x as f32 + 0.5) / 2.0),
+                (2, (y as f32 + 0.5) / 2.0),
+                (4, 0.0),
+            ]));
+            wanted.push([x as f32, y as f32, 3.0, 4.0]);
+        }
+    }
+    let bytes = position_texels();
+    let extras = Extras {
+        images: vec![image(
+            SampledKind::D2,
+            vk::Format::R32G32B32A32_SFLOAT,
+            (2, 2, 1),
+            1,
+            false,
+            &bytes,
+        )],
+        ..Extras::default()
+    };
+    let out = run_with(&vk, &program, &inputs, &[0, 0, 0x1234_5678], extras);
+    for (i, (want, got)) in wanted.iter().zip(&out.states).enumerate() {
+        assert_eq!(
+            [f(got, 8), f(got, 9), f(got, 10), f(got, 11)],
+            *want,
+            "level zero, sample {i}"
+        );
+        assert_eq!(
+            [f(got, 12), f(got, 13), f(got, 14), 4.0],
+            [want[0], want[1], want[2], 4.0],
+            "with a bias, sample {i}"
+        );
+    }
+}
+
+#[test]
+fn tlds_fetches_a_texel_by_its_integer_position() {
+    let Some(vk) = vulkan() else { return };
+    // Kind 2: x in R1 and y in R2, level zero; kind 3: x in R1, y in R2 and the level in R3. The
+    // results are written as TEXS writes them: R8 and R9, then R10 and R11 (bits 28..35).
+    let tlds = |rd: u8, ra: u8, rb: u8, kind: u64| {
+        Enc::op(Op::Tlds)
+            .rd(rd)
+            .ra(ra)
+            .rb(rb)
+            .field(28, 8, u64::from(rd) + 2)
+            .field(36, 13, TEXTURE_INDEX)
+            .field(50, 3, 4)
+            .field(53, 4, kind)
+            .bit(59, true)
+    };
+    let program = [
+        tlds(8, 1, 2, 2).build(),
+        tlds(4, 1, 3, 3).build(),
+        exit(Guard::ALWAYS),
+    ];
+    let mut inputs = Vec::new();
+    let mut wanted = Vec::new();
+    for y in 0..2u32 {
+        for x in 0..2u32 {
+            let mut s = State::default();
+            // Kind 3 reads its y from the register after x, so R2 serves both.
+            s.regs[1] = x;
+            s.regs[2] = y;
+            s.regs[3] = 0;
+            inputs.push(s);
+            wanted.push([x as f32, y as f32, 3.0, 4.0]);
+        }
+    }
+    let bytes = position_texels();
+    let extras = Extras {
+        images: vec![image(
+            SampledKind::D2,
+            vk::Format::R32G32B32A32_SFLOAT,
+            (2, 2, 1),
+            1,
+            false,
+            &bytes,
+        )],
+        ..Extras::default()
+    };
+    let out = run_with(&vk, &program, &inputs, &[], extras);
+    for (i, (want, got)) in wanted.iter().zip(&out.states).enumerate() {
+        assert_eq!(
+            [f(got, 8), f(got, 9), f(got, 10), f(got, 11)],
+            *want,
+            "kind 2, fetch {i}"
+        );
+        assert_eq!(
+            [f(got, 4), f(got, 5), f(got, 6), f(got, 7)],
+            *want,
+            "kind 3, fetch {i}"
+        );
+    }
+}
+
 #[test]
 fn tex_with_a_depth_comparison_takes_the_reference_after_the_level() {
     let Some(vk) = vulkan() else { return };

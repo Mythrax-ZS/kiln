@@ -1,7 +1,7 @@
 //! Blocks and control flow: the straight-line case, the loop-free form for a program whose jumps
 //! all go forward (A-114), and the dispatch loop for a program with a jump back.
 
-use super::emit::{Tx, R};
+use super::emit::{ExitState, Tx, R};
 use super::{alu, int, io};
 use crate::cfg::{Block, Cfg, Code, Term};
 use crate::inst::Inst;
@@ -12,6 +12,11 @@ use std::collections::BTreeMap;
 /// Translate the program: the prologue, every block, the epilogue.
 pub(super) fn build(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg) -> R<()> {
     io::begin(tx)?;
+    for (pc, block) in &graph.blocks {
+        for next in successors(block) {
+            tx.block_preds.entry(next).or_default().push(*pc);
+        }
+    }
     let entry = &graph.blocks[&graph.entry];
     let straight = graph.blocks.len() == 1
         && matches!(entry.term, Term::Exit { guard, .. } if guard.is_always());
@@ -64,25 +69,32 @@ pub(super) fn build(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg) -> R<()> {
     Ok(())
 }
 
+/// The blocks a block can go on to.
+fn successors(block: &Block) -> Vec<u32> {
+    let mut successors: Vec<u32> = Vec::new();
+    match block.term {
+        Term::Fall(next) => successors.push(next),
+        Term::Jump { target, next, .. } => {
+            successors.push(target);
+            successors.extend(next);
+        }
+        Term::Indirect { next, .. } => {
+            successors.extend(block.targets.iter().map(|(_, t)| *t));
+            successors.extend(next);
+        }
+        Term::Exit { next, .. } | Term::Kill { next, .. } => successors.extend(next),
+        Term::Unsupported => {}
+    }
+    successors
+}
+
 /// Is every edge of the graph a jump forward (to a higher address)? Then no loop is needed.
 fn forward_only(graph: &Cfg) -> bool {
-    graph.blocks.iter().all(|(pc, block)| {
-        let mut successors: Vec<u32> = Vec::new();
-        match block.term {
-            Term::Fall(next) => successors.push(next),
-            Term::Jump { target, next, .. } => {
-                successors.push(target);
-                successors.extend(next);
-            }
-            Term::Indirect { next, .. } => {
-                successors.extend(block.targets.iter().map(|(_, t)| *t));
-                successors.extend(next);
-            }
-            Term::Exit { next, .. } | Term::Kill { next, .. } => successors.extend(next),
-            Term::Unsupported => {}
-        }
-        successors.iter().all(|s| s > pc)
-    }) && graph.blocks.keys().next() == Some(&graph.entry)
+    graph
+        .blocks
+        .iter()
+        .all(|(pc, block)| successors(block).iter().all(|s| s > pc))
+        && graph.blocks.keys().next() == Some(&graph.entry)
 }
 
 /// The program as a sequence of regions in address order with no loop (for a graph whose edges
@@ -216,9 +228,10 @@ fn indirect_address(tx: &mut Tx<'_>, reg: u8, base: u32) -> Id {
 
 /// The instructions of a block, without its terminator.
 fn body(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg, block: &Block) -> R<()> {
-    // What is known of the registers does not carry over from another block.
-    tx.reg_origin.clear();
-    tx.reg_const.clear();
+    // What is known of the registers is what every block that leads here ends knowing.
+    let known = entry_state(tx, block);
+    tx.reg_origin = known.origin;
+    tx.reg_const = known.constant;
     let mut insts: Vec<(u32, Inst)> = graph.instructions(code, block).collect();
     if !matches!(block.term, Term::Fall(_)) {
         insts.pop();
@@ -231,7 +244,36 @@ fn body(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg, block: &Block) -> R<()> {
         instruction(tx, inst)?;
         tx.info.instructions += 1;
     }
+    let state = ExitState {
+        origin: tx.reg_origin.clone(),
+        constant: tx.reg_const.clone(),
+    };
+    tx.exit_state.insert(block.start, state);
     Ok(())
+}
+
+/// What a block can count on knowing of its registers: what the blocks before it all end knowing,
+/// and nothing when it has no block before it or one of them is not translated yet.
+fn entry_state(tx: &Tx<'_>, block: &Block) -> ExitState {
+    let Some(preds) = tx.block_preds.get(&block.start) else {
+        return ExitState::default();
+    };
+    let mut states = Vec::new();
+    for p in preds {
+        match tx.exit_state.get(p) {
+            Some(s) => states.push(s),
+            None => return ExitState::default(),
+        }
+    }
+    let Some((first, rest)) = states.split_first() else {
+        return ExitState::default();
+    };
+    let mut known = (*first).clone();
+    for s in rest {
+        known.origin.retain(|r, o| s.origin.get(r) == Some(o));
+        known.constant.retain(|r, c| s.constant.get(r) == Some(c));
+    }
+    known
 }
 
 fn label_of(labels: &[(u32, Id)], pc: u32) -> Id {
@@ -350,6 +392,9 @@ fn instruction(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
                 return Ok(());
             }
             if int::translate(tx, inst, row.op)? {
+                return Ok(());
+            }
+            if super::half::translate(tx, inst, row.op)? {
                 return Ok(());
             }
             if io::translate(tx, inst, row.op)? {

@@ -430,19 +430,46 @@ pub(super) fn texs(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
     write_short_results(tx, inst, result)
 }
 
-pub(super) fn tex(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
+/// The texture a bindless instruction names: the constant buffer word its handle register was
+/// loaded from (the translator knows it only when the register was loaded from one in the same
+/// block).
+fn bindless_texture(tx: &mut Tx<'_>, handle: u8) -> R<Tex> {
+    let Some(&(slot, word)) = tx.reg_origin.get(&handle) else {
+        return tx.fail(
+            "a bindless texture instruction whose handle does not come straight from a word of a constant buffer",
+        );
+    };
+    Ok(Tex {
+        index: word,
+        source: Some(slot),
+    })
+}
+
+/// `TEX` and `TEX.B`. The bound form names the texture in bits 36..48 and keeps `AOFFI` in bit 54,
+/// the way the level of detail is chosen in bits 55..57 and a level clamp in bit 58. The bindless
+/// form takes the handle from `Rb`, the operands that follow it from the registers after it, and
+/// has those three fields in bits 36, 37..39 and 40 (docs/ASSUMPTIONS.md A-158).
+pub(super) fn tex(tx: &mut Tx<'_>, inst: Inst, bindless: bool) -> R<()> {
     let Some((dim, arrayed)) = tex_dim(inst.bits(28, 3)) else {
         return tx.fail(format!("TEX of dimension {}", inst.bits(28, 3)));
     };
     if arrayed && dim == Dim::D1 {
         return tx.fail("TEX of a 1D array");
     }
-    let aoffi = inst.bit(54);
+    let (aoffi_bit, mode_at) = if bindless { (36, 37) } else { (54, 55) };
+    if bindless && inst.bit(40) {
+        return tx.fail("TEX.B with a level of detail clamp");
+    }
+    let aoffi = inst.bit(aoffi_bit);
     if aoffi && dim == Dim::Cube {
         return tx.fail("TEX of a cube map with texel offsets");
     }
     let shadow = inst.bit(50);
-    let index = inst.bits(36, 13) as u32;
+    let (texture, mut m) = if bindless {
+        (bindless_texture(tx, inst.rb())?, reg_at(inst.rb(), 1))
+    } else {
+        (Tex::table(inst.bits(36, 13) as u32), inst.rb())
+    };
     let f = tx.t.f32;
     let mut r = inst.ra();
     let layer = if arrayed {
@@ -458,11 +485,10 @@ pub(super) fn tex(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
         Dim::D3 | Dim::Cube => 3,
     };
     let coords: Vec<Id> = (0..n).map(|k| tx.read_f(reg_at(r, k))).collect();
-    let mut m = inst.rb();
-    let lod = match inst.bits(55, 3) {
+    let lod = match inst.bits(mode_at, 3) {
         0 => Lod::Implicit,
         1 => Lod::Zero,
-        2 | 6 => {
+        2 | 5 | 6 => {
             let bias = tx.read_f(m);
             m = reg_at(m, 1);
             Lod::Bias(bias)
@@ -498,7 +524,7 @@ pub(super) fn tex(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
     let result = sample(
         tx,
         &Sample {
-            tex: Tex::table(index),
+            tex: texture,
             dim,
             arrayed,
             shadow,
@@ -511,6 +537,41 @@ pub(super) fn tex(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
     )?;
     write_masked_results(tx, inst, result);
     Ok(())
+}
+
+/// `TLDS`: a fetch of one texel (no filtering, integer coordinates) with the results written as
+/// `TEXS` writes them. Kind 2 is a 2D texture at level zero (`x` in `Ra`, `y` in `Rb`), kind 3 a
+/// 2D texture at a level (`x` in `Ra`, `y` in the register after it, the level in `Rb`)
+/// (docs/ASSUMPTIONS.md A-159).
+pub(super) fn tlds(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
+    let kind = inst.bits(53, 4);
+    let index = inst.bits(36, 13) as u32;
+    let (ra, rb) = (inst.ra(), inst.rb());
+    let (x, y, level) = match kind {
+        2 => (tx.read(ra), tx.read(rb), None),
+        3 => (tx.read(ra), tx.read(reg_at(ra, 1)), Some(tx.read(rb))),
+        _ => return tx.fail(format!("TLDS of kind {kind}")),
+    };
+    let texture = Tex::table(index);
+    let (var, sampled_ty) = sampler(tx, texture, Dim::D2, false, false)?;
+    let sampled = tx.f.load(&mut tx.m, sampled_ty, var);
+    let f = tx.t.f32;
+    let image_ty = tx.m.ty_image(f, 1, 0, 0, 0, 1, 0);
+    let image = tx.f.emit_result(&mut tx.m, op::IMAGE, image_ty, &[sampled]);
+    let int = tx.t.i32;
+    let v2i = tx.m.ty_vector(int, 2);
+    let (xi, yi) = (tx.as_i32(x), tx.as_i32(y));
+    let coord =
+        tx.f.emit_result(&mut tx.m, op::COMPOSITE_CONSTRUCT, v2i, &[xi, yi]);
+    let level = match level {
+        Some(l) => tx.as_i32(l),
+        None => tx.ci32(0),
+    };
+    let v4 = tx.t.v4f32;
+    // The image operands: a level (mask bit 1).
+    let result =
+        tx.f.emit_result(&mut tx.m, op::IMAGE_FETCH, v4, &[image, coord, 0x2, level]);
+    write_short_results(tx, inst, result)
 }
 
 /// The constant texel offsets `packed` holds for `count` coordinates: a signed field of `bits` bits
