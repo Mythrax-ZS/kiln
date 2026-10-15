@@ -7,6 +7,9 @@
 //! its own, so the targets of `SYNC`, `BRK` and `CONT` are found here by following each path with
 //! the stacks it has built up. A block reached on two paths with different stacks is reported.
 //!
+//! `BRX` jumps to a computed address: the targets are found by reading the table of offsets the
+//! program loads its register from out of a constant buffer (docs/ASSUMPTIONS.md A-155).
+//!
 //! Offsets are bytes from the start of the code, which is where the first scheduling word sits;
 //! the first instruction is the next slot. A branch target is the offset of the branch plus 8
 //! plus its signed 24-bit offset field.
@@ -33,6 +36,37 @@ impl Code<'_> {
         let at = pc as usize;
         let b = self.0.get(at..at + 8)?;
         Some(Inst(u64::from_le_bytes(b.try_into().ok()?)))
+    }
+}
+
+/// A word of a constant buffer that was read to find where an indirect branch goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableWord {
+    pub slot: u32,
+    pub offset: u32,
+    pub value: u32,
+}
+
+/// Words of the constant buffers, for a program whose control flow depends on them (the jump
+/// table of an indirect branch).
+pub trait Constants {
+    /// The word at byte `offset` of constant buffer `slot`, if it can be read.
+    fn word(&self, slot: u32, offset: u32) -> Option<u32>;
+}
+
+/// No constant buffer can be read.
+impl Constants for () {
+    fn word(&self, _slot: u32, _offset: u32) -> Option<u32> {
+        None
+    }
+}
+
+/// Words that were read before (see [`Cfg::tables`]).
+impl Constants for [TableWord] {
+    fn word(&self, slot: u32, offset: u32) -> Option<u32> {
+        self.iter()
+            .find(|w| w.slot == slot && w.offset == offset)
+            .map(|w| w.value)
     }
 }
 
@@ -69,6 +103,14 @@ pub enum Term {
         target: u32,
         next: Option<u32>,
     },
+    /// Jump, when `guard` holds, to the address that register `reg` holds plus `base` (the
+    /// block's `targets` are the places it can be); otherwise continue at `next`.
+    Indirect {
+        guard: Guard,
+        reg: u8,
+        base: u32,
+        next: Option<u32>,
+    },
     /// End the invocation when `guard` holds.
     Exit { guard: Guard, next: Option<u32> },
     /// Discard the fragment when `guard` holds.
@@ -85,6 +127,10 @@ pub struct Block {
     pub term: Term,
     /// The stacks on entry.
     pub stacks: Stacks,
+    /// The places an indirect jump that ends the block can go to: the address it computes for
+    /// each entry of its table, and the block that starts there (an address that is the place of a
+    /// scheduling word is the block after it).
+    pub targets: Vec<(u32, u32)>,
 }
 
 #[derive(Debug, Default)]
@@ -95,6 +141,9 @@ pub struct Cfg {
     pub issues: Vec<String>,
     /// Bytes of code that are reachable, counting from the start of the code.
     pub extent: u32,
+    /// The words of constant buffers the discovery read to find the targets of indirect jumps:
+    /// the graph is right only while they hold these values.
+    pub tables: Vec<TableWord>,
 }
 
 /// The first instruction of a program: the slot after the first scheduling word.
@@ -114,11 +163,18 @@ fn valid_target(code: Code<'_>, pc: u32) -> bool {
 }
 
 impl Cfg {
+    /// The graph of a program that has no indirect jump.
     pub fn discover(code: Code<'_>) -> Cfg {
+        Cfg::discover_with(code, &())
+    }
+
+    /// The graph of a program, finding the targets of its indirect jumps in `constants`.
+    pub fn discover_with(code: Code<'_>, constants: &(impl Constants + ?Sized)) -> Cfg {
         let mut cfg = Cfg {
             entry: ENTRY,
             ..Cfg::default()
         };
+        let mut indirect: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
         // Phase 1: follow every path instruction by instruction with its stacks.
         let mut seen: BTreeMap<u32, Stacks> = BTreeMap::new();
         let mut leaders: BTreeSet<u32> = BTreeSet::new();
@@ -221,6 +277,35 @@ impl Cfg {
                         leaders.insert(next);
                         pc = next;
                     }
+                    Some(Op::Brx) => {
+                        if !condition_is_always(inst) {
+                            cfg.issues
+                                .push(format!("BRX at {pc:#x} on a condition code"));
+                            break;
+                        }
+                        let (targets, words) = match indirect_targets(code, pc, inst, constants) {
+                            Ok(found) => found,
+                            Err(issue) => {
+                                cfg.issues.push(issue);
+                                break;
+                            }
+                        };
+                        for word in words {
+                            if !cfg.tables.contains(&word) {
+                                cfg.tables.push(word);
+                            }
+                        }
+                        for (_, t) in &targets {
+                            leaders.insert(*t);
+                            work.push((*t, st.clone()));
+                        }
+                        indirect.insert(pc, targets);
+                        if guard.is_always() {
+                            break;
+                        }
+                        leaders.insert(next);
+                        pc = next;
+                    }
                     Some(Op::Exit | Op::Kil) => {
                         if !condition_is_always(inst) {
                             cfg.issues
@@ -306,6 +391,16 @@ impl Cfg {
                                 _ => ends(Term::Unsupported),
                             }
                         }
+                        Some(Op::Brx) if indirect.contains_key(&pc) => {
+                            let base = (i64::from(pc) + 8 + inst.sbits(20, 24)) as u32;
+                            ends(Term::Indirect {
+                                guard,
+                                reg: inst.ra(),
+                                base,
+                                next: (!guard.is_always()).then_some(next),
+                            })
+                        }
+                        Some(Op::Brx) => ends(Term::Unsupported),
                         Some(Op::Exit) if condition_is_always(inst) => ends(Term::Exit {
                             guard,
                             next: (!guard.is_always()).then_some(next),
@@ -323,6 +418,11 @@ impl Cfg {
                 let falls_into_leader = term.is_none() && leaders.contains(&next);
                 if let Some(term) = term {
                     cfg.finish(start, end, term, stacks);
+                    if let Some(targets) = indirect.get(&pc) {
+                        if let Some(block) = cfg.blocks.get_mut(&start) {
+                            block.targets = targets.clone();
+                        }
+                    }
                     break;
                 }
                 if falls_into_leader {
@@ -349,6 +449,7 @@ impl Cfg {
                 end,
                 term,
                 stacks,
+                targets: Vec::new(),
             },
         );
     }
@@ -394,7 +495,6 @@ fn is_unsupported_flow(op: Op) -> bool {
         Op::Ret
             | Op::Cal
             | Op::CalCbuf
-            | Op::Brx
             | Op::BrxCbuf
             | Op::JmpCbuf
             | Op::JmpImm32
@@ -414,6 +514,141 @@ fn is_unsupported_flow(op: Op) -> bool {
 /// The condition code test of a control-flow instruction must be "always" (15).
 fn condition_is_always(inst: Inst) -> bool {
     inst.bits(0, 5) == 0xF
+}
+
+/// What reading a jump table gives: the address each entry computes with the block that starts
+/// there, and the words that were read.
+type JumpTable = (Vec<(u32, u32)>, Vec<TableWord>);
+
+/// The places the `BRX` at `pc` can go to, and the words of the constant buffer that say so.
+///
+/// The compiler's pattern, looked for in the straight-line code before the jump: the register is
+/// loaded from a table with `LDC`, at an address that is another register shifted left by two, and
+/// that register was clamped to the table's size with an unsigned `IMNMX` against an immediate. The
+/// address jumped to is the table word plus the jump's own offset field plus the address after the
+/// jump instruction, which makes the words offsets from the start of the code.
+fn indirect_targets(
+    code: Code<'_>,
+    pc: u32,
+    inst: Inst,
+    constants: &(impl Constants + ?Sized),
+) -> Result<JumpTable, String> {
+    let missing = |what: &str| format!("BRX at {pc:#x}: {what}");
+    let base = (i64::from(pc) + 8 + inst.sbits(20, 24)) as u32;
+    // (slot, offset of the table, the register of the table index)
+    let mut table: Option<(u32, i64, u8)> = None;
+    let mut scaled = None;
+    let mut bound = None;
+    let mut want = inst.ra();
+    let mut at = pc;
+    for _ in 0..32 {
+        let Some(p) = previous_pc(at) else { break };
+        at = p;
+        let Some(i) = code.get(p) else { break };
+        let op = i.op();
+        if matches!(
+            op,
+            Some(
+                Op::Bra
+                    | Op::Sync
+                    | Op::Brk
+                    | Op::Cont
+                    | Op::Exit
+                    | Op::Kil
+                    | Op::Brx
+                    | Op::Ssy
+                    | Op::Pbk
+                    | Op::Pcnt
+            )
+        ) {
+            break;
+        }
+        if i.guard().is_never() {
+            continue;
+        }
+        let writes_it = i.rd() == want && want != crate::inst::RZ;
+        match (table, scaled, op) {
+            (None, _, Some(Op::Ldc)) if writes_it => {
+                if !i.guard().is_always() || i.bits(44, 2) != 0 || i.bits(48, 3) != 4 {
+                    return Err(missing("the table is loaded in a way not understood"));
+                }
+                table = Some((i.bits(36, 5) as u32, i.sbits(20, 16), i.ra()));
+                want = i.ra();
+            }
+            (Some(_), None, Some(Op::ShlImm20)) if writes_it => {
+                if !i.guard().is_always() || i.imm20() != 2 {
+                    return Err(missing("the table index is scaled in a way not understood"));
+                }
+                scaled = Some(i.ra());
+                want = i.ra();
+            }
+            (Some(_), Some(_), Some(Op::ImnmxImm20)) if writes_it => {
+                // An unsigned minimum (the predicate that chooses it is PT).
+                if !i.guard().is_always()
+                    || i.bit(48)
+                    || i.bits(39, 4) != u64::from(crate::inst::PT)
+                {
+                    return Err(missing(
+                        "the table index is limited in a way not understood",
+                    ));
+                }
+                bound = Some(i.imm20() as u32);
+                break;
+            }
+            _ if writes_it && table.is_some() => {
+                return Err(missing(
+                    "the table index is computed in a way not understood",
+                ));
+            }
+            _ => {}
+        }
+    }
+    let (Some((slot, first, _)), Some(_), Some(last)) = (table, scaled, bound) else {
+        return Err(missing("no jump table was found before it"));
+    };
+    if last > 4096 || first < 0 {
+        return Err(missing(
+            "the jump table is not of a size or place understood",
+        ));
+    }
+    let (mut targets, mut words) = (Vec::new(), Vec::new());
+    for index in 0..=last {
+        let offset = first as u32 + 4 * index;
+        let Some(value) = constants.word(slot, offset) else {
+            return Err(missing(&format!(
+                "the jump table word at c[{slot}][{offset:#x}] cannot be read"
+            )));
+        };
+        words.push(TableWord {
+            slot,
+            offset,
+            value,
+        });
+        let address = base.wrapping_add(value);
+        let mut t = i64::from(address);
+        if is_sched_slot(address) {
+            t += i64::from(SLOT_BYTES);
+        }
+        let valid = u32::try_from(t).ok().filter(|t| valid_target(code, *t));
+        let Some(t) = valid else {
+            return Err(missing(&format!(
+                "entry {index} of the jump table leads to {address:#x}, outside the code"
+            )));
+        };
+        if !targets.iter().any(|(a, _)| *a == address) {
+            targets.push((address, t));
+        }
+    }
+    Ok((targets, words))
+}
+
+/// The instruction slot before `pc`, if there is one.
+fn previous_pc(pc: u32) -> Option<u32> {
+    let mut p = pc.checked_sub(SLOT_BYTES)?;
+    if is_sched_slot(p) {
+        p = p.checked_sub(SLOT_BYTES)?;
+    }
+    (p >= ENTRY).then_some(p)
 }
 
 /// The target of a relative branch at `pc`, if it lands in the code. A target at the place of a
@@ -458,6 +693,97 @@ mod tests {
 
     fn mov() -> u64 {
         mov32i(1, 0)
+    }
+
+    /// A jump through a table of three entries, as the compiler writes it.
+    fn jump_table_program() -> (Vec<u8>, [TableWord; 3]) {
+        use crate::ops::Op;
+        // Instruction `i` of the assembled code is at this byte offset.
+        let at = |i: u32| 8 * (1 + i + i / 3);
+        let undo_the_place = ((-(i64::from(at(3)) + 8)) as u64) & 0xFF_FFFF;
+        let bytes = assemble(&[
+            Enc::op(Op::ImnmxImm20)
+                .rd(1)
+                .ra(1)
+                .imm20(2)
+                .pred(39, PT, false)
+                .build(),
+            Enc::op(Op::ShlImm20).rd(2).ra(1).imm20(2).build(),
+            Enc::op(Op::Ldc)
+                .rd(3)
+                .ra(2)
+                .field(36, 5, 1)
+                .field(20, 16, 0x40)
+                .field(48, 3, 4)
+                .build(),
+            Enc::op(Op::Brx)
+                .ra(3)
+                .field(0, 5, 0xF)
+                .field(20, 24, undo_the_place)
+                .build(),
+            mov(),
+            exit(ALWAYS),
+            mov(),
+            exit(ALWAYS),
+            mov(),
+            exit(ALWAYS),
+        ]);
+        let word = |i: u32, target: u32| TableWord {
+            slot: 1,
+            offset: 0x40 + 4 * i,
+            value: target,
+        };
+        (bytes, [word(0, at(4)), word(1, at(6)), word(2, at(8))])
+    }
+
+    #[test]
+    fn an_indirect_jump_goes_to_the_places_its_table_names() {
+        let (bytes, words) = jump_table_program();
+        let cfg = Cfg::discover_with(Code(&bytes), &words[..]);
+        assert!(cfg.issues.is_empty(), "{:?}", cfg.issues);
+        assert_eq!(cfg.tables, words);
+        let entry = &cfg.blocks[&ENTRY];
+        assert!(matches!(
+            entry.term,
+            Term::Indirect {
+                reg: 3,
+                base: 0,
+                next: None,
+                ..
+            }
+        ));
+        assert_eq!(entry.targets, vec![(48, 48), (72, 72), (88, 88)]);
+        for (_, target) in &entry.targets {
+            assert!(matches!(cfg.blocks[target].term, Term::Exit { .. }));
+        }
+    }
+
+    #[test]
+    fn an_indirect_jump_without_its_table_is_reported() {
+        let (bytes, words) = jump_table_program();
+        let cfg = Cfg::discover(Code(&bytes));
+        assert_eq!(cfg.issues.len(), 1);
+        assert!(cfg.issues[0].contains("cannot be read"), "{:?}", cfg.issues);
+        // A table that leads out of the code is reported too.
+        let mut bad = words;
+        bad[1].value = 0x10_0000;
+        let cfg = Cfg::discover_with(Code(&bytes), &bad[..]);
+        assert!(
+            cfg.issues[0].contains("outside the code"),
+            "{:?}",
+            cfg.issues
+        );
+        // And so is a jump that is not preceded by the pattern.
+        let lone = assemble(&[
+            Enc::op(crate::ops::Op::Brx).ra(3).field(0, 5, 0xF).build(),
+            exit(ALWAYS),
+        ]);
+        let cfg = Cfg::discover_with(Code(&lone), &words[..]);
+        assert!(
+            cfg.issues[0].contains("no jump table was found"),
+            "{:?}",
+            cfg.issues
+        );
     }
 
     #[test]

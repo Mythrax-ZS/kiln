@@ -67,13 +67,21 @@ pub(super) fn build(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg) -> R<()> {
 /// Is every edge of the graph a jump forward (to a higher address)? Then no loop is needed.
 fn forward_only(graph: &Cfg) -> bool {
     graph.blocks.iter().all(|(pc, block)| {
-        let successors: [Option<u32>; 2] = match block.term {
-            Term::Fall(next) => [Some(next), None],
-            Term::Jump { target, next, .. } => [Some(target), next],
-            Term::Exit { next, .. } | Term::Kill { next, .. } => [next, None],
-            Term::Unsupported => [None, None],
-        };
-        successors.iter().flatten().all(|s| s > pc)
+        let mut successors: Vec<u32> = Vec::new();
+        match block.term {
+            Term::Fall(next) => successors.push(next),
+            Term::Jump { target, next, .. } => {
+                successors.push(target);
+                successors.extend(next);
+            }
+            Term::Indirect { next, .. } => {
+                successors.extend(block.targets.iter().map(|(_, t)| *t));
+                successors.extend(next);
+            }
+            Term::Exit { next, .. } | Term::Kill { next, .. } => successors.extend(next),
+            Term::Unsupported => {}
+        }
+        successors.iter().all(|s| s > pc)
     }) && graph.blocks.keys().next() == Some(&graph.entry)
 }
 
@@ -145,6 +153,28 @@ fn activate(tx: &mut Tx<'_>, block: &Block, flags: &BTreeMap<u32, Id>) -> R<bool
                 set(tx, next, Some(otherwise));
             }
         },
+        Term::Indirect {
+            guard,
+            reg,
+            base,
+            next,
+        } => {
+            let address = indirect_address(tx, reg, base);
+            let taken = tx.guard_condition(guard);
+            for &(at, target) in &block.targets {
+                let place = tx.c32(at);
+                let hit = tx.cmp(op::I_EQUAL, address, place);
+                let cond = match taken {
+                    Some(g) => tx.land(hit, g),
+                    None => hit,
+                };
+                set(tx, target, Some(cond));
+            }
+            if let (Some(g), Some(next)) = (taken, next) {
+                let stay = tx.lnot(g);
+                set(tx, next, Some(stay));
+            }
+        }
         Term::Exit { guard, next } => {
             if let (Some(cond), Some(next)) = (tx.guard_condition(guard), next) {
                 let stay = tx.lnot(cond);
@@ -175,6 +205,13 @@ fn activate(tx: &mut Tx<'_>, block: &Block, flags: &BTreeMap<u32, Id>) -> R<bool
         }
     }
     Ok(true)
+}
+
+/// The address an indirect jump goes to: the register plus the jump's own base.
+fn indirect_address(tx: &mut Tx<'_>, reg: u8, base: u32) -> Id {
+    let value = tx.read(reg);
+    let base = tx.c32(base);
+    tx.iadd(value, base)
 }
 
 /// The instructions of a block, without its terminator.
@@ -238,6 +275,30 @@ fn terminate(
                     tx.f.branch(cont);
                 }
             }
+        }
+        Term::Indirect {
+            guard,
+            reg,
+            base,
+            next,
+        } => {
+            let address = indirect_address(tx, reg, base);
+            // The address names the block, except where it is the place of a scheduling word.
+            let mut pc = address;
+            for &(at, target) in &block.targets {
+                if at != target {
+                    let place = tx.c32(at);
+                    let hit = tx.cmp(op::I_EQUAL, address, place);
+                    let to = tx.c32(target);
+                    pc = tx.select_u32(hit, to, pc);
+                }
+            }
+            if let (Some(cond), Some(next)) = (tx.guard_condition(guard), next) {
+                let n = tx.c32(next);
+                pc = tx.select_u32(cond, pc, n);
+            }
+            tx.f.store(pc_var, pc);
+            tx.f.branch(cont);
         }
         Term::Exit { guard, next } => match (tx.guard_condition(guard), next) {
             (None, _) | (Some(_), None) => tx.f.branch(exit),

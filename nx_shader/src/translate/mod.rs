@@ -82,6 +82,9 @@ pub struct Config {
     /// Translate a program whose jumps all go forward with the loop around a `switch` on a program
     /// counter anyway (a bring-up switch: docs/ASSUMPTIONS.md A-114).
     pub force_loop: bool,
+    /// The words of constant buffers the program's indirect jumps find their targets in (see
+    /// [`crate::cfg::Cfg::tables`]): the program is translated for these values.
+    pub constants: Vec<crate::cfg::TableWord>,
 }
 
 impl Config {
@@ -95,6 +98,7 @@ impl Config {
             debug_names: false,
             block: [1, 1, 1],
             force_loop: false,
+            constants: Vec::new(),
         }
     }
 }

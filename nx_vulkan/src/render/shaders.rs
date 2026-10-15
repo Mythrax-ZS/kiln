@@ -6,7 +6,7 @@ use crate::fast::FastMap;
 use ash::vk;
 use nx_gpu::render::Scene;
 use nx_gpu::state::{StageKind, StageSlot};
-use nx_shader::cfg::{Cfg, Code};
+use nx_shader::cfg::{Cfg, Code, Constants, TableWord};
 use nx_shader::sph::{Sph, SPH_BYTES};
 use nx_shader::translate::{translate, Class, Config, Info, Stage};
 use std::sync::Arc;
@@ -56,7 +56,29 @@ struct Entry {
     checked: u64,
     sph: Sph,
     code: Vec<u8>,
+    /// The words of constant buffers the program's indirect jumps were resolved with; the entry is
+    /// good while the buffers still hold them.
+    constants: Vec<TableWord>,
     variations: FastMap<Variation, Arc<Program>>,
+}
+
+/// The words of the constant buffers that the group of a stage has bound, read from GPU memory.
+struct BoundConstants<'a, 'b> {
+    scene: &'a Scene<'b>,
+    group: u32,
+}
+
+impl Constants for BoundConstants<'_, '_> {
+    fn word(&self, slot: u32, offset: u32) -> Option<u32> {
+        let bound = self.scene.cbufs.get(self.group, slot)?;
+        if u64::from(offset) + 4 > u64::from(bound.size) {
+            return None;
+        }
+        let mut word = [0u8; 4];
+        self.scene
+            .read(bound.address + u64::from(offset), &mut word)
+            .then(|| u32::from_le_bytes(word))
+    }
 }
 
 /// A compute program found in GPU memory (it has no header), translated for a workgroup size.
@@ -180,7 +202,15 @@ impl Shaders {
         if let Some(e) = self.entries.get_mut(&slot.address) {
             if e.checked != frame {
                 let (hash, mapped) = scene.hash(slot.address, e.size as u64);
-                if mapped == e.size as u64 && hash == e.hash {
+                let bound = BoundConstants {
+                    scene,
+                    group: slot.group,
+                };
+                let tables_hold = e
+                    .constants
+                    .iter()
+                    .all(|w| bound.word(w.slot, w.offset) == Some(w.value));
+                if mapped == e.size as u64 && hash == e.hash && tables_hold {
                     e.checked = frame;
                 } else {
                     self.entries.remove(&slot.address);
@@ -194,7 +224,11 @@ impl Shaders {
                 let sph = Sph::parse(&bytes)
                     .map_err(|e| format!("the {name} program at {:#x}: {e}", slot.address))?;
                 let code = &bytes[SPH_BYTES..];
-                let cfg = Cfg::discover(Code(code));
+                let bound = BoundConstants {
+                    scene,
+                    group: slot.group,
+                };
+                let cfg = Cfg::discover_with(Code(code), &bound);
                 if let Some(issue) = cfg.issues.first() {
                     return Err(format!(
                         "the control flow of the {name} program at {:#x}: {issue}",
@@ -223,6 +257,7 @@ impl Shaders {
                     checked: frame,
                     sph,
                     code,
+                    constants: cfg.tables,
                     variations: FastMap::default(),
                 })
             }
@@ -230,7 +265,8 @@ impl Shaders {
         if let Some(p) = entry.variations.get(&variation) {
             return Ok(Arc::clone(p));
         }
-        let config = variation.config();
+        let mut config = variation.config();
+        config.constants = entry.constants.clone();
         let _phase = nx_gpu::progress::enter(nx_gpu::progress::TRANSLATING);
         let translation = translate(Code(&entry.code), Some(&entry.sph), &config)
             .map_err(|e| format!("the {name} program at {:#x}: {e}", slot.address))?;

@@ -53,6 +53,8 @@ pub struct Extras<'a> {
     pub attrs_in: Vec<[u32; 64]>,
     /// Translate with the loop around a `switch` even for a program whose jumps all go forward.
     pub force_loop: bool,
+    /// The words of constant buffers an indirect jump is resolved with.
+    pub constants: Vec<nx_shader::cfg::TableWord>,
 }
 
 pub struct Outcome {
@@ -73,6 +75,7 @@ pub fn run_with(
     let bytes = assemble(program);
     let mut config = Config::new(Stage::Compute);
     config.force_loop = extras.force_loop;
+    config.constants = extras.constants.clone();
     let t = translate(Code(&bytes), None, &config)
         .unwrap_or_else(|e| panic!("translation failed: {e}"));
     nx_shader::validate::assert_valid(&t.spirv);

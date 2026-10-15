@@ -4,6 +4,7 @@ mod common;
 
 use common::{random_states, run, run_with, vulkan, Extras, State};
 use nx_shader::asm::{bra, brk, exit, mov32i, pbk, ssy, sync, Enc, NOT_P0, P0};
+use nx_shader::cfg::TableWord;
 use nx_shader::inst::{Guard, RZ};
 use nx_shader::ops::Op;
 
@@ -17,6 +18,82 @@ const P1: Guard = Guard {
     index: 1,
     negated: false,
 };
+
+#[test]
+fn an_indirect_jump_goes_where_its_table_says() {
+    let Some(vk) = vulkan() else { return };
+    // R1 = min(R1, 2); R2 = R1 << 2; R3 = c[0][R2 + 0x40]; BRX R3 (the jump's own offset makes the
+    // words offsets from the start of the code); three cases set R5 and exit.
+    let table = [at(4), at(6), at(8)];
+    let undo_the_place = ((-(i64::from(at(3)) + 8)) as u64) & 0xFF_FFFF;
+    let program = [
+        Enc::op(Op::ImnmxImm20)
+            .rd(1)
+            .ra(1)
+            .imm20(2)
+            .pred(39, 7, false)
+            .build(),
+        Enc::op(Op::ShlImm20).rd(2).ra(1).imm20(2).build(),
+        Enc::op(Op::Ldc)
+            .rd(3)
+            .ra(2)
+            .field(36, 5, 0)
+            .field(20, 16, 0x40)
+            .field(48, 3, 4)
+            .build(),
+        Enc::op(Op::Brx)
+            .ra(3)
+            .field(0, 5, 0xF)
+            .field(20, 24, undo_the_place)
+            .build(),
+        mov32i(5, 0xA),
+        exit(Guard::ALWAYS),
+        mov32i(5, 0xB),
+        exit(Guard::ALWAYS),
+        mov32i(5, 0xC),
+        exit(Guard::ALWAYS),
+    ];
+    let mut cbuf0 = vec![0u32; 32];
+    let mut constants = Vec::new();
+    for (i, t) in table.iter().enumerate() {
+        cbuf0[16 + i] = *t;
+        constants.push(TableWord {
+            slot: 0,
+            offset: 0x40 + 4 * i as u32,
+            value: *t,
+        });
+    }
+    let inputs: Vec<State> = (0..16u32)
+        .map(|i| {
+            let mut s = State::default();
+            s.regs[1] = i % 5;
+            s
+        })
+        .collect();
+    // The jumps all go forward, which has a form without a loop; the other form is the loop.
+    for force_loop in [false, true] {
+        let out = run_with(
+            &vk,
+            &program,
+            &inputs,
+            &cbuf0,
+            Extras {
+                force_loop,
+                constants: constants.clone(),
+                ..Extras::default()
+            },
+        )
+        .states;
+        for (i, (inp, got)) in inputs.iter().zip(&out).enumerate() {
+            let case = inp.regs[1].min(2) as usize;
+            assert_eq!(
+                got.regs[5],
+                [0xA, 0xB, 0xC][case],
+                "input {i}, loop {force_loop}"
+            );
+        }
+    }
+}
 
 #[test]
 fn a_backward_branch_makes_a_loop() {

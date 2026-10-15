@@ -577,7 +577,7 @@ pub fn translate(code: Code<'_>, sph: Option<&Sph>, cfg: &Config) -> Result<Tran
             at: None,
         });
     }
-    let graph = Cfg::discover(code);
+    let graph = Cfg::discover_with(code, cfg.constants.as_slice());
     if let Some(issue) = graph.issues.first() {
         return Err(Error {
             message: format!("the control flow of the program: {issue}"),
