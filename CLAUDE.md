@@ -105,7 +105,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   that presents the frames of a loading screen for ever). `NX_JITTER=<percent>[,<microseconds>]`
   makes that share of the supervisor calls sleep for up to that long first (500 by default), to stir
   the threads' timing when looking for a race. A run
-  that stops reports every thread (priority, core, what it is doing), then the registers of the
+  that stops reports the last supervisor calls that failed, every thread (priority, core, what it
+  is doing), then the registers of the
   thread that stopped and 256 bytes at each register that holds an address (and at what those
   point at in the heap), for reading a crash. `NX_CORES=per-core` (or `one`) makes a guest thread
   hold a core to run guest code and give it up at a supervisor call that can block or reschedule,

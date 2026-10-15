@@ -191,7 +191,13 @@ pub struct Kernel {
     /// up to that long (500 by default), to stir the threads' timing when looking for a race.
     jitter: Option<(u64, u64)>,
     jitter_state: std::sync::atomic::AtomicU64,
+    /// The last supervisor calls that failed (not the waits that timed out and the like), for the
+    /// report of a stop.
+    recent_errors: Mutex<std::collections::VecDeque<String>>,
 }
+
+/// How many failed supervisor calls the stop report remembers.
+const RECENT_ERRORS: usize = 24;
 
 impl Drop for Kernel {
     fn drop(&mut self) {
@@ -418,6 +424,7 @@ impl Kernel {
             cores: Cores::from_env(),
             jitter: jitter_from_env(),
             jitter_state: std::sync::atomic::AtomicU64::new(0x9E37_79B9_7F4A_7C15),
+            recent_errors: Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -598,6 +605,7 @@ impl Kernel {
         if first {
             // What the other threads were doing when the run stopped is half of the story, and
             // the process must not end while it is told.
+            self.report_recent_errors();
             eprintln!("[stop] the other threads at the stop:");
             super::watchdog::report_threads(self, "stop");
             self.lock().reporting = false;
@@ -802,6 +810,33 @@ impl Kernel {
         self.jitter_state.store(x, Ordering::Relaxed);
         if x % 100 < percent {
             std::thread::sleep(Duration::from_micros((x >> 8) % micros));
+        }
+    }
+
+    /// Remember a supervisor call that failed, for the report of a stop.
+    pub(super) fn note_error(&self, thread: u64, pc: u64, imm: u32, args: [u64; 4], result: u64) {
+        let name = super::svc::svc_name(imm).unwrap_or("?");
+        let line = format!(
+            "thread {thread} at {pc:#x}: {name} ({imm:#x}) x0..x3 = {:#x} {:#x} {:#x} {:#x} -> {result:#x}",
+            args[0], args[1], args[2], args[3]
+        );
+        let mut recent = self.recent_errors.lock().unwrap_or_else(|e| e.into_inner());
+        if recent.len() == RECENT_ERRORS {
+            recent.pop_front();
+        }
+        recent.push_back(line);
+    }
+
+    /// Say which supervisor calls failed last (a program that stops itself with a result often
+    /// does so for one of them).
+    fn report_recent_errors(&self) {
+        let recent = self.recent_errors.lock().unwrap_or_else(|e| e.into_inner());
+        if recent.is_empty() {
+            return;
+        }
+        eprintln!("[stop] the supervisor calls that failed last, oldest first:");
+        for line in recent.iter() {
+            eprintln!("[stop]   {line}");
         }
     }
 

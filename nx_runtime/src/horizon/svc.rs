@@ -220,7 +220,7 @@ impl Kernel {
                     let (x0, x1, x2) = (cpu.state.x[0], cpu.state.x[1], cpu.state.x[2]);
                     let pc = cpu.state.pc.wrapping_sub(4);
                     let began = std::time::Instant::now();
-                    let flow = self.svc_dispatch(cpu, thread, imm);
+                    let flow = self.dispatch_noting_errors(cpu, thread, imm);
                     let took = began.elapsed();
                     if took >= least {
                         let at = began.duration_since(self.started);
@@ -240,7 +240,7 @@ impl Kernel {
                     return flow;
                 }
             }
-            return self.svc_dispatch(cpu, thread, imm);
+            return self.dispatch_noting_errors(cpu, thread, imm);
         }
         let args = [
             cpu.state.x[0],
@@ -260,7 +260,7 @@ impl Kernel {
                 self.trace_wait_list(thread, args[1], args[2]);
             }
         }
-        let flow = self.svc_dispatch(cpu, thread, imm);
+        let flow = self.dispatch_noting_errors(cpu, thread, imm);
         eprintln!(
             "[svc] thread {thread} at {pc:#x}: {name} ({imm:#x}) x0..x3 = {:#x} {:#x} {:#x} {:#x} -> x0 = {:#x} x1 = {:#x}{}",
             args[0],
@@ -271,6 +271,34 @@ impl Kernel {
             cpu.state.x[1],
             if flow == Flow::Stop { " (stop)" } else { "" }
         );
+        flow
+    }
+
+    /// Run a call, and remember it when it failed in a way that is not an everyday answer.
+    fn dispatch_noting_errors(
+        self: &Arc<Kernel>,
+        cpu: &mut NativeCpu,
+        thread: u64,
+        imm: u32,
+    ) -> Flow {
+        let args = [
+            cpu.state.x[0],
+            cpu.state.x[1],
+            cpu.state.x[2],
+            cpu.state.x[3],
+        ];
+        let pc = cpu.state.pc.wrapping_sub(4);
+        let flow = self.svc_dispatch(cpu, thread, imm);
+        let r = cpu.state.x[0];
+        // The calls that give no result in x0, and the waits and arbiter calls whose timeouts and
+        // refusals are everyday answers, are left out.
+        let gives_result = !matches!(
+            imm,
+            0x0B | 0x10 | 0x17 | 0x18 | 0x1C | 0x1E | 0x26 | 0x34 | 0x35
+        );
+        if gives_result && r != 0 && r < 1 << 22 && flow != Flow::Stop {
+            self.note_error(thread, pc, imm, args, r);
+        }
         flow
     }
 
