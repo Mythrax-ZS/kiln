@@ -140,7 +140,9 @@ impl Service for RootService {
     fn request(&mut self, req: &Request) -> ServiceResult {
         match req.command {
             // GetDisplayService(u32 privilege) -> IApplicationDisplayService. 0 is an application.
-            0 => {
+            // GetDisplayServiceWithProxyNameExchange(u32 privilege) -> IApplicationDisplayService
+            // [9.0.0+] is the same call here (docs/ASSUMPTIONS.md A-135).
+            0 | 1 => {
                 if req.u32_at(0) != 0 {
                     return Ok(Response::error(NOT_AVAILABLE));
                 }

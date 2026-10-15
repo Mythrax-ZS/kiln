@@ -101,8 +101,13 @@ impl Service for AccountService {
             0 => Ok(Response::ok().with_u32(1)),
             // GetUserExistence(Uid) -> bool
             1 => Ok(Response::ok().with_bytes(&[u8::from(Self::is_the_user(req, 0))])),
-            // ListAllUsers() -> buffer of Uid; ListOpenUsers() the same: the user is always open
-            2 | 3 => self.list(req),
+            // ListAllUsers() -> buffer of Uid; ListOpenUsers() the same: the user is always open.
+            // ListOpenContextStoredUsers() [6.0.0+] the same too: the users that were open when the
+            // console last stopped are the ones that are open (docs/ASSUMPTIONS.md A-144)
+            2 | 3 | 131 => self.list(req),
+            // ListQualifiedUsers() [6.0.0+]: the users the program can use; the one user qualifies
+            // (docs/ASSUMPTIONS.md A-146)
+            141 => self.list(req),
             // GetLastOpenedUser() -> Uid
             4 => Ok(Response::ok().with_bytes(&user_id_bytes())),
             // GetProfile(Uid) -> IProfile
@@ -135,8 +140,24 @@ impl Service for AccountService {
             50 => Ok(Response::ok().with_bytes(&[0])),
             // TrySelectUserWithoutInteraction(bool) -> Uid: the only user is the selection
             51 => Ok(Response::ok().with_bytes(&user_id_bytes())),
-            // InitializeApplicationInfoV0 (before 6.0.0) / InitializeApplicationInfo(u64, pid)
-            100 | 140 => Ok(Response::ok()),
+            // LoadOpenContext(Uid) [5.0.0+]: opens the user from the context the console stored;
+            // the user is always open, so there is nothing to load (docs/ASSUMPTIONS.md A-145)
+            130 => {
+                if !Self::is_the_user(req, 0) {
+                    return Err(Stop(
+                        "the program asked to load the open context of a user that does not exist"
+                            .into(),
+                    ));
+                }
+                Ok(Response::ok())
+            }
+            // IsUserAccountSwitchLocked() -> bool [6.0.0+]: the program has no control property
+            // that locks the switch, and there is one user anyway (docs/ASSUMPTIONS.md A-138)
+            150 => Ok(Response::ok().with_bytes(&[0])),
+            // InitializeApplicationInfoV0 (before 6.0.0) / InitializeApplicationInfo(u64, pid).
+            // InitializeApplicationInfoV2 (160) is taken to be the same: a title's first call of it
+            // had the same input, 8 bytes and the process id (docs/ASSUMPTIONS.md A-137).
+            100 | 140 | 160 => Ok(Response::ok()),
             other => Err(Stop::unknown_command("acc:u0", other)),
         }
     }

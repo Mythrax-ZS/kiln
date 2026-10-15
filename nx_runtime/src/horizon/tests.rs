@@ -2144,6 +2144,12 @@ fn a_layer_is_created_and_its_buffer_queue_runs_through_the_binder_driver() {
     let display = u64::from(e.call(root, &get).moved[0]);
     get.payload = 1u32.to_le_bytes().to_vec();
     assert_eq!(e.call(root, &get).result, ResultCode::new(114, 5).0);
+    // GetDisplayServiceWithProxyNameExchange (1) answers the same, for an application only.
+    let mut exchange = Message::new(1);
+    exchange.payload = 0u32.to_le_bytes().to_vec();
+    assert_eq!(e.call(root, &exchange).moved.len(), 1);
+    exchange.payload = 1u32.to_le_bytes().to_vec();
+    assert_eq!(e.call(root, &exchange).result, ResultCode::new(114, 5).0);
     // GetRelayService -> IHOSBinderDriver; the system and manager displays are not available.
     let binder = u64::from(e.call(display, &Message::new(100)).moved[0]);
     assert_eq!(e.call(display, &Message::new(101)).result, 0xA72);
@@ -2279,6 +2285,48 @@ fn a_managed_layer_from_the_applet_manager_can_be_opened_with_its_id() {
 }
 
 #[test]
+fn a_separable_layer_gives_two_layer_ids_that_can_both_be_opened() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let applet = e.service("appletOE");
+    let mut open = Message::new(0);
+    open.pid = true;
+    open.copy_handles = vec![CURRENT_PROCESS];
+    open.payload = vec![0; 8];
+    let proxy = u64::from(e.call(applet, &open).moved[0]);
+    let self_controller = u64::from(e.call(proxy, &Message::new(1)).moved[0]);
+    // CreateManagedDisplaySeparableLayer() -> (layer id, recording layer id)
+    let r = e.call(self_controller, &Message::new(44));
+    assert_eq!((r.result, r.data.len()), (0, 16));
+    let ids: Vec<u64> = (0..2)
+        .map(|i| u64::from_le_bytes(r.data[8 * i..8 * i + 8].try_into().unwrap()))
+        .collect();
+    assert_ne!(ids[0], ids[1]);
+    // SetManagedDisplayLayerSeparationMode takes 0 or 1.
+    for mode in [0u32, 1] {
+        let mut set = Message::new(45);
+        set.payload = mode.to_le_bytes().to_vec();
+        assert_eq!(e.call(self_controller, &set).result, 0);
+    }
+    let root = e.service("vi:u");
+    let mut get = Message::new(0);
+    get.payload = 0u32.to_le_bytes().to_vec();
+    let display = u64::from(e.call(root, &get).moved[0]);
+    for id in ids {
+        let mut name = vec![0u8; 0x40];
+        name[..7].copy_from_slice(b"Default");
+        let mut open_layer = Message::new(2020);
+        open_layer.pid = true;
+        open_layer.payload = [name, id.to_le_bytes().to_vec(), vec![0; 8]].concat();
+        open_layer.receive = vec![(SCRATCH + 0x400, 0x100)];
+        assert_eq!(e.call(display, &open_layer).result, 0);
+    }
+    let mut set = Message::new(45);
+    set.payload = 2u32.to_le_bytes().to_vec();
+    assert!(e.send(self_controller, &set.bytes(), false).is_none());
+}
+
+#[test]
 fn library_applets_are_launchable_at_once_and_the_other_events_stay_quiet() {
     let mut e = Env::new();
     super::services::register_defaults(&e.kernel);
@@ -2321,6 +2369,17 @@ fn the_account_service_has_one_open_user_listed_through_a_pointer_buffer() {
     assert_eq!(e.call(acc, &exists).data[0], 1);
     exists.payload = vec![7; 16];
     assert_eq!(e.call(acc, &exists).data[0], 0);
+    // IsUserAccountSwitchLocked answers false.
+    assert_eq!(e.call(acc, &Message::new(150)).data[0], 0);
+    // InitializeApplicationInfo, its first form and its second take the process id and 8 bytes,
+    // and answer nothing.
+    for command in [100, 140, 160] {
+        let mut init = Message::new(command);
+        init.pid = true;
+        init.payload = vec![0; 8];
+        let r = e.call(acc, &init);
+        assert_eq!((r.result, r.data.len()), (0, 0), "command {command}");
+    }
 
     // ListAllUsers returns eight Uids through a receive-list entry; the reply names the entry.
     let mut list = Message::new(2);
@@ -2334,6 +2393,27 @@ fn the_account_service_has_one_open_user_listed_through_a_pointer_buffer() {
         users[16..].iter().all(|&b| b == 0),
         "the rest of the list is empty"
     );
+    // ListOpenContextStoredUsers lists the open user the same way.
+    let mut stored = Message::new(131);
+    stored.recv_list = vec![(SCRATCH + 0x680, 0x80)];
+    assert_eq!(
+        e.call(acc, &stored).pointers,
+        vec![(0, SCRATCH + 0x680, 0x80)]
+    );
+    assert_eq!(&e.read(SCRATCH + 0x680, 16), &uid[..]);
+    // ListQualifiedUsers lists the user too.
+    let mut qualified = Message::new(141);
+    qualified.recv_list = vec![(SCRATCH + 0x6c0, 0x80)];
+    assert_eq!(
+        e.call(acc, &qualified).pointers,
+        vec![(0, SCRATCH + 0x6c0, 0x80)]
+    );
+    assert_eq!(&e.read(SCRATCH + 0x6c0, 16), &uid[..]);
+    // LoadOpenContext(Uid) accepts the user and nothing else.
+    let mut load = Message::new(130);
+    load.payload = uid.clone();
+    let r = e.call(acc, &load);
+    assert_eq!((r.result, r.data.len()), (0, 0));
     // A smaller buffer gets what fits.
     let mut short = Message::new(3);
     short.recv_list = vec![(SCRATCH + 0x700, 0x20)];

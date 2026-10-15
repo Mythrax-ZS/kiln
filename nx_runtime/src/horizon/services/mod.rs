@@ -10,6 +10,7 @@ mod apm;
 mod applet;
 mod audren;
 mod bsd;
+mod ectx;
 mod friend;
 mod fsp;
 mod hid;
@@ -68,6 +69,7 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     register(kernel, "aoc:u", aoc::AddOnContent::new);
     register(kernel, "audren:u", audren::Manager::new);
     register(kernel, "bsd:u", |_| bsd::Client::new());
+    register(kernel, "ectx:aw", |_| ectx::WriterForApplication);
     register(kernel, "apm", apm::Apm::new);
     let fs = std::sync::Arc::new(fsp::Shared::default());
     register(kernel, "friend:u", |_| friend::ServiceCreator);
@@ -82,6 +84,7 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     register(kernel, "mm:u", |_| mm::Requests::new());
     register(kernel, "nfp:user", nfp::UserManager::new);
     register(kernel, "nifm:u", nifm::StaticService::new);
+    register(kernel, "ngc:u", |_| Bare("nn::ngc::detail::IService"));
     let report = gpu.clone();
     kernel.on_finish(Box::new(move || report.report()));
     register(kernel, "nvdrv", move |k| nvdrv::NvDrv::new(k, gpu.clone()));

@@ -168,10 +168,11 @@ impl Service for CommonStateGetter {
     }
 
     fn request(&mut self, req: &Request) -> ServiceResult {
-        let kernel = self.kernel.upgrade().ok_or_else(gone)?;
+        let kernel = || self.kernel.upgrade().ok_or_else(gone);
         match req.command {
             // GetEventHandle() -> event
             0 => {
+                let kernel = kernel()?;
                 let mut s = lock(&self.shared);
                 if s.message_event.is_none() {
                     let ends = kernel.new_event();
@@ -183,6 +184,7 @@ impl Service for CommonStateGetter {
             }
             // ReceiveMessage() -> AppletMessage
             1 => {
+                let kernel = kernel()?;
                 let mut s = lock(&self.shared);
                 let Some(m) = s.messages.pop_front() else {
                     return Ok(Response::error(NO_MESSAGE));
@@ -203,7 +205,15 @@ impl Service for CommonStateGetter {
             // GetDefaultDisplayResolution() -> (s32 width, s32 height) [3.0.0+]
             60 => Ok(Response::ok().with_u32(1280).with_u32(720)),
             // GetDefaultDisplayResolutionChangeEvent() -> event [3.0.0+]
-            61 => Ok(Response::ok().with_copy_handle(idle_event(&kernel, &self.shared, 0))),
+            61 => Ok(Response::ok().with_copy_handle(idle_event(&*kernel()?, &self.shared, 0))),
+            // SetCpuBoostMode(u32: 0 normal, 1 fast load) [6.0.0+], CancelCpuBoostMode() [10.0.0+]: a
+            // request for the console's CPU to run faster while the program loads; the host's
+            // clock is not the program's to change (docs/ASSUMPTIONS.md A-134)
+            66 | 67 => Ok(Response::ok()),
+            // SetRequestExitToLibraryAppletAtExecuteNextProgramEnabled() [11.0.0+]: it only
+            // changes what a later ExecuteProgram does, and that stops the run, so it is accepted
+            // and nothing more (docs/ASSUMPTIONS.md A-131).
+            900 => Ok(Response::ok()),
             other => Err(Stop::unknown_command("ICommonStateGetter", other)),
         }
     }
@@ -240,8 +250,21 @@ impl Service for SelfController {
             // SetAlbumImageOrientation(u32): which way up the pictures of the capture button are
             // taken; nothing takes them (docs/ASSUMPTIONS.md A-116)
             19 => Ok(Response::ok()),
-            // CreateManagedDisplayLayer() -> u64 layer id, for `vi`'s OpenLayer
-            40 => {
+            // GetAccumulatedSuspendedTickValue() -> u64 [6.0.0+]: nothing suspends the program, so
+            // it has been suspended for no ticks (docs/ASSUMPTIONS.md A-132)
+            90 => Ok(Response::ok().with_u64(0)),
+            // GetAccumulatedSuspendedTickChangedEvent() -> event [6.0.0+]: the value never changes,
+            // so the event is never signalled (docs/ASSUMPTIONS.md A-132)
+            91 => {
+                let kernel = self.kernel.upgrade().ok_or_else(gone)?;
+                Ok(Response::ok().with_copy_handle(idle_event(&kernel, &self.shared, 2)))
+            }
+            // CreateManagedDisplayLayer() -> u64 layer id, for `vi`'s OpenLayer.
+            // CreateManagedDisplaySeparableLayer() -> (u64 layer id, u64 recording layer id)
+            // [10.0.0+]: the first is used as the one of command 40, the second only by
+            // `nn::vi::CreateRecordingLayer`, which opens it the same way; both are made here the
+            // same way (docs/ASSUMPTIONS.md A-136).
+            40 | 44 => {
                 let display = lock(&self.shared).display.clone();
                 let Some(display) = display else {
                     return Err(Stop("a layer was asked for but there is no display".into()));
@@ -250,8 +273,21 @@ impl Service for SelfController {
                 let Some(d) = comp.open_display("Default") else {
                     return Err(Stop("the default display cannot be opened".into()));
                 };
-                Ok(Response::ok().with_u64(comp.create_layer(d)))
+                let mut response = Response::ok().with_u64(comp.create_layer(d));
+                if req.command == 44 {
+                    response = response.with_u64(comp.create_layer(d));
+                }
+                Ok(response)
             }
+            // SetManagedDisplayLayerSeparationMode(u32, 0 or 1) [10.0.0+], which the SDK exposes as
+            // `SetRecordingLayerEnabled`: nothing composes a recording layer, so it is accepted
+            // (docs/ASSUMPTIONS.md A-136).
+            45 => match req.u32_at(0) {
+                0 | 1 => Ok(Response::ok()),
+                other => Err(Stop(format!(
+                    "SetManagedDisplayLayerSeparationMode was given {other}; it takes 0 or 1"
+                ))),
+            },
             other => Err(Stop::unknown_command("ISelfController", other)),
         }
     }
@@ -596,6 +632,32 @@ mod tests {
         // The neighbouring commands that are not implemented still stop the run.
         let stop = f.request(&req(24, &[])).unwrap_err();
         assert!(stop.0.contains("IApplicationFunctions") && stop.0.contains("24"));
+    }
+
+    #[test]
+    fn the_common_state_getter_accepts_the_exit_to_library_applet_request_and_stops_on_others() {
+        let mut g = CommonStateGetter {
+            kernel: Weak::new(),
+            shared: Arc::default(),
+        };
+        let r = g.request(&req(900, &[])).unwrap();
+        assert!(r.result.is_success() && r.data.is_empty());
+        // 910 (GetLaunchRequiredTick) is not implemented and says so.
+        let stop = g.request(&req(910, &[])).unwrap_err();
+        assert!(stop.0.contains("ICommonStateGetter") && stop.0.contains("910"));
+    }
+
+    #[test]
+    fn the_self_controller_says_the_program_was_never_suspended() {
+        let mut c = SelfController {
+            kernel: Weak::new(),
+            shared: Arc::default(),
+        };
+        let r = c.request(&req(90, &[])).unwrap();
+        assert_eq!(r.data, 0u64.to_le_bytes());
+        // The event needs a kernel; without one the request says the process is gone.
+        assert!(c.request(&req(91, &[])).unwrap_err().0.contains("gone"));
+        assert!(c.request(&req(92, &[])).unwrap_err().0.contains("92"));
     }
 
     #[test]
