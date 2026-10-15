@@ -1212,11 +1212,12 @@ fn describe_draw(scene: &Scene<'_>, draw: &Draw) -> Vec<String> {
             regs.scissor(0)
         ),
         format!(
-            "window {:?}; SET_VIEWPORT_SCALE_OFFSET {:#x}, SET_VIEWPORT_CLIP_CONTROL {:#x}, SET_WINDOW_ORIGIN {:#x}",
+            "window {:?}; SET_VIEWPORT_SCALE_OFFSET {:#x}, SET_VIEWPORT_CLIP_CONTROL {:#x}, SET_WINDOW_ORIGIN {:#x}, SET_VIEWPORT_Z_CLIP {:#x}",
             regs.window(),
             regs.word(0x192c),
             regs.word(0x193c),
-            regs.word(0x13ac)
+            regs.word(0x13ac),
+            regs.word(0x0d7c)
         ),
         format!("raster {:?}", regs.raster()),
         format!(

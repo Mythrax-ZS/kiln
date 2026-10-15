@@ -29,6 +29,7 @@ mod r {
     pub const SCISSOR: u32 = 0x0e00;
     pub const WINDOW_ORIGIN: u32 = 0x13ac;
     pub const WINDOW_OFFSET_X: u32 = 0x0df8;
+    pub const VIEWPORT_Z_CLIP: u32 = 0x0d7c;
     pub const VIEWPORT_SCALE_OFFSET: u32 = 0x192c;
     pub const VIEWPORT_CLIP_CONTROL: u32 = 0x193c;
     pub const RASTER_ENABLE: u32 = 0x037c;
@@ -318,7 +319,8 @@ pub struct Window {
     /// `SET_VIEWPORT_SCALE_OFFSET` is set. Only for tracing: a title's draws use the viewport of
     /// the registers whichever it is (docs/ASSUMPTIONS.md A-112).
     pub transform_enabled: bool,
-    /// Clip space z runs from 0 to 1 (else from -1 to 1): bit 0 of `SET_VIEWPORT_CLIP_CONTROL`.
+    /// Clip space z runs from 0 to w (else from -w to w): bit 0 of `SET_VIEWPORT_Z_CLIP`. Bit 0 of
+    /// `SET_VIEWPORT_CLIP_CONTROL` is not this (docs/ASSUMPTIONS.md A-096).
     pub z_zero_to_one: bool,
     pub pixel_center_integer: bool,
 }
@@ -433,7 +435,6 @@ impl Regs<'_> {
 
     pub fn window(&self) -> Window {
         let origin = self.word(r::WINDOW_ORIGIN);
-        let clip = self.word(r::VIEWPORT_CLIP_CONTROL);
         Window {
             lower_left: origin & 1 != 0,
             flip_y: origin >> 4 & 1 != 0,
@@ -442,7 +443,7 @@ impl Regs<'_> {
                 self.word(r::WINDOW_OFFSET_X + 4),
             ],
             transform_enabled: self.flag(r::VIEWPORT_SCALE_OFFSET),
-            z_zero_to_one: clip & 1 != 0,
+            z_zero_to_one: self.word(r::VIEWPORT_Z_CLIP) & 1 != 0,
             pixel_center_integer: self.flag(0x1924),
         }
     }
@@ -759,18 +760,30 @@ mod tests {
     #[test]
     fn the_clip_control_register_is_read_field_by_field() {
         let mut f = file();
-        // Other fields set (a guardband and a clip mode) do not make the z range 0 to 1.
+        // Other fields set (a guardband and a clip mode) leave the depth alone.
         f[0x193c / 4] = 1 << 7 | 3 << 11;
-        let w = Regs(&f).window();
-        assert!(!w.z_zero_to_one && !Regs(&f).raster().depth_clamp);
-        f[0x193c / 4] = 1;
-        assert!(Regs(&f).window().z_zero_to_one);
+        assert!(!Regs(&f).raster().depth_clamp);
         // Depth is clamped when both ends say so, not for one.
         f[0x193c / 4] = 1 << 3;
         assert!(!Regs(&f).raster().depth_clamp);
         f[0x193c / 4] = 1 << 3 | 1 << 4;
-        let w = Regs(&f).window();
-        assert!(Regs(&f).raster().depth_clamp && !w.z_zero_to_one);
+        assert!(Regs(&f).raster().depth_clamp);
+    }
+
+    #[test]
+    fn the_range_of_clip_z_is_the_one_the_z_clip_register_names() {
+        let mut f = file();
+        assert!(!Regs(&f).window().z_zero_to_one, "from -w to w at reset");
+        // Bit 0 of the clip control (minimum z zero and maximum z one) is not the clip range: a
+        // title sets it with clip z running from -w to w.
+        f[0x193c / 4] = 0x181d;
+        assert!(!Regs(&f).window().z_zero_to_one);
+        f[0x0d7c / 4] = 1;
+        assert!(Regs(&f).window().z_zero_to_one);
+        f[0x193c / 4] = 0;
+        assert!(Regs(&f).window().z_zero_to_one);
+        f[0x0d7c / 4] = 0;
+        assert!(!Regs(&f).window().z_zero_to_one);
     }
 
     #[test]

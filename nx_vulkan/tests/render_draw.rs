@@ -129,14 +129,19 @@ fn an_attribute_that_is_switched_off_reads_as_zero_zero_zero_one() {
 /// Draw the red triangle with its right angle at clip (-1, -1), counter-clockwise in clip space
 /// (y up), in a world whose viewport and culling the caller has set; the picture and its width.
 fn red_triangle(w: &mut World, target: u64) -> (Vec<u8>, usize) {
+    red_triangle_at(w, target, 0.5)
+}
+
+/// The same triangle with clip z `z` at all three vertices (w is 1).
+fn red_triangle_at(w: &mut World, target: u64, z: f32) -> (Vec<u8>, usize) {
     let red = [1.0, 0.0, 0.0, 1.0];
     vertices(
         w,
         GPU_BASE + 0x30_0000,
         &[
-            ([-1.0, -1.0, 0.5, 1.0], red),
-            ([1.0, -1.0, 0.5, 1.0], red),
-            ([-1.0, 1.0, 0.5, 1.0], red),
+            ([-1.0, -1.0, z, 1.0], red),
+            ([1.0, -1.0, z, 1.0], red),
+            ([-1.0, 1.0, z, 1.0], red),
         ],
     );
     let mut r = Renderer::new(RenderConfig::default());
@@ -204,6 +209,67 @@ fn the_front_face_is_judged_on_the_picture_whichever_way_the_viewport_turns_it()
             "scale y {scale_y}, front face {front_face:#x}: {pixels} pixels"
         );
     }
+}
+
+/// How many pixels the triangle at clip z `z` covers, in a world where the caller has set
+/// the registers that decide the range of clip z.
+fn covered_at(w: &mut World, target: u64, z: f32) -> usize {
+    covered(&red_triangle_at(w, target, z).0)
+}
+
+#[test]
+fn clip_z_runs_from_minus_w_to_w_unless_the_z_clip_register_says_otherwise() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    // A title sets the "minimum z zero, maximum z one" bit of the clip control while its vertex
+    // programs put clip z between -w and w (docs/ASSUMPTIONS.md A-096): what lies in front of the
+    // middle of that range is drawn.
+    let mut w = scene(&pass_through_vertex(), &flat_color_pixel(), 16, target);
+    w.set(0x193c, 1);
+    assert!(covered_at(&mut w, target, -0.5) > 0, "z -0.5");
+    assert!(covered_at(&mut w, target, 0.5) > 0, "z 0.5");
+    assert_eq!(
+        covered_at(&mut w, target, -1.5),
+        0,
+        "z -1.5 is in front of the volume"
+    );
+    assert_eq!(
+        covered_at(&mut w, target, 1.5),
+        0,
+        "z 1.5 is behind the volume"
+    );
+    // With the fields that clamp depth set as well (all the title's value 0x181d says of it),
+    // what is outside the volume is clamped to the range of depths, not clipped.
+    w.set(0x193c, 0x181d);
+    assert!(
+        covered_at(&mut w, target, -0.5) > 0,
+        "z -0.5 with the clamp"
+    );
+    assert!(covered_at(&mut w, target, -1.5) > 0, "z -1.5 clamped");
+    assert!(covered_at(&mut w, target, 1.5) > 0, "z 1.5 clamped");
+}
+
+#[test]
+fn clip_z_runs_from_zero_to_w_when_the_z_clip_register_says_so() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = scene(&pass_through_vertex(), &flat_color_pixel(), 16, target);
+    w.set(0xd7c, 1);
+    assert_eq!(
+        covered_at(&mut w, target, -0.5),
+        0,
+        "z -0.5 is in front of the volume"
+    );
+    assert!(covered_at(&mut w, target, 0.5) > 0, "z 0.5");
+    assert_eq!(
+        covered_at(&mut w, target, 1.5),
+        0,
+        "z 1.5 is behind the volume"
+    );
 }
 
 #[test]
