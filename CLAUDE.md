@@ -92,7 +92,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   and needs no external tool. The homebrew tests in `src/build/e2e_tests.rs` build small NROs
   from assembled words and run them (clang needed). `NX_TRACE_SVC=1` logs every SVC and IPC
   request of a produced program (`NX_TRACE_IPC_DATA=1` adds the data bytes of each request to
-  its line); `NX_TRACE_LOG=1` prints what it logs through `lm`;
+  its line); `NX_TRACE_ROMFS=1` names the RomFS file and offset of every read of the data storage;
+  `NX_TRACE_LOG=1` prints what it logs through `lm`;
   `NX_TRACE_WAITS=<microseconds>` logs every blocking supervisor call (sleep, wait, lock, condition
   variable, address, request of a service) that took that long, with the thread and the time in
   milliseconds since the start, to see which threads wait for which;

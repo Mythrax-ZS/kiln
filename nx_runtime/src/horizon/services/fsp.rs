@@ -8,7 +8,7 @@
 use super::super::kernel::Kernel;
 use super::super::result::ResultCode;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
-use crate::romfs;
+use crate::romfs::{self, RomFile, RomFs};
 use crate::storage::SharedStorage;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -26,6 +26,9 @@ const ACCOUNT_SAVE_DATA: u8 = 1;
 #[derive(Default)]
 pub struct Shared {
     rom: Mutex<Option<SharedStorage>>,
+    /// The files of the RomFS by where they are in the image, when `NX_TRACE_ROMFS` asks for a
+    /// line for every read.
+    index: Mutex<Option<Arc<Vec<RomFile>>>>,
 }
 
 impl std::fmt::Debug for Shared {
@@ -71,6 +74,21 @@ impl FileSystemProxy {
         })?;
         *slot = Some(storage.clone());
         Ok(storage)
+    }
+
+    /// The files of the RomFS by their place in the image, when reads are traced.
+    fn traced_files(&self, storage: &SharedStorage) -> Option<Arc<Vec<RomFile>>> {
+        std::env::var_os("NX_TRACE_ROMFS")?;
+        let mut slot = self.shared.index.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(files) = slot.as_ref() {
+            return Some(files.clone());
+        }
+        let parsed = RomFs::open(storage.clone()).ok()?;
+        let mut files = parsed.files().to_vec();
+        files.sort_by_key(|f| f.offset);
+        let files = Arc::new(files);
+        *slot = Some(files.clone());
+        Some(files)
     }
 }
 
@@ -147,10 +165,14 @@ impl Service for FileSystemProxy {
             // GetGlobalAccessLogMode() -> u32: access logging is off.
             1005 => Ok(Response::ok().with_u32(0)),
             // OpenDataStorageByCurrentProcess() -> IStorage
-            200 => Ok(Response::ok().with_object(Box::new(RomStorage {
-                kernel: self.kernel.clone(),
-                storage: self.rom()?,
-            }))),
+            200 => {
+                let storage = self.rom()?;
+                Ok(Response::ok().with_object(Box::new(RomStorage {
+                    kernel: self.kernel.clone(),
+                    files: self.traced_files(&storage),
+                    storage,
+                })))
+            }
             other => Err(Stop::unknown_command("fsp-srv", other)),
         }
     }
@@ -166,6 +188,8 @@ impl Service for FileSystemProxy {
 struct RomStorage {
     kernel: Weak<Kernel>,
     storage: SharedStorage,
+    /// The files by offset, for `NX_TRACE_ROMFS`.
+    files: Option<Arc<Vec<RomFile>>>,
 }
 
 impl std::fmt::Debug for RomStorage {
@@ -204,6 +228,19 @@ impl Service for RomStorage {
                     .is_none_or(|end| end > self.storage.size())
                 {
                     return Ok(Response::error(OUT_OF_RANGE));
+                }
+                if let Some(files) = &self.files {
+                    // The file the read starts in (the last that starts at or before it).
+                    let at = files.partition_point(|f| f.offset <= offset);
+                    match at.checked_sub(1).map(|i| &files[i]) {
+                        Some(f) if offset < f.offset + f.size => eprintln!(
+                            "[romfs] read {} at {:#x} of {:#x} bytes",
+                            f.path,
+                            offset - f.offset,
+                            size
+                        ),
+                        _ => eprintln!("[romfs] read of {size:#x} bytes at {offset:#x}, no file"),
+                    }
                 }
                 let mut data = vec![0u8; size as usize];
                 if let Err(e) = self.storage.read_at(offset, &mut data) {
