@@ -796,12 +796,17 @@ pub fn crop_rgba(rgba: &[u8], width: u32, height: u32, crop: [i32; 4]) -> (Vec<u
     (out, right - left, bottom - top)
 }
 
-/// The depth of every pixel of a `D32_SFLOAT` depth target, as of the commands recorded so far
-/// (they are run first), for looking at what a pass left in it.
+/// The depth of every pixel of a depth target of 32-bit float or 24-bit normalized depth, as of
+/// the commands recorded so far (they are run first), for looking at what a pass left in it.
 pub fn read_depth(vk: &Vk, frame: &mut Frame, target: &mut Target) -> Result<Vec<f32>, String> {
     let _phase = nx_gpu::progress::enter(nx_gpu::progress::READING_BACK);
     let key = target.key;
-    if key.format != vk::Format::D32_SFLOAT {
+    // The depth of a 24-bit format is copied out in the low 24 bits of a 32-bit word.
+    let normalized_24 = matches!(
+        key.format,
+        vk::Format::D24_UNORM_S8_UINT | vk::Format::X8_D24_UNORM_PACK32
+    );
+    if key.format != vk::Format::D32_SFLOAT && !normalized_24 {
         return Err(format!(
             "the depth of a {:?} target is not read",
             key.format
@@ -853,7 +858,13 @@ pub fn read_depth(vk: &Vk, frame: &mut Frame, target: &mut Target) -> Result<Vec
         .0
         .iter()
         .take((key.width * key.height) as usize)
-        .map(|c| f32::from_le_bytes(*c))
+        .map(|c| {
+            if normalized_24 {
+                (u32::from_le_bytes(*c) & 0xFF_FFFF) as f32 / 16_777_215.0
+            } else {
+                f32::from_le_bytes(*c)
+            }
+        })
         .collect();
     vk.destroy_host_buffer(staging);
     submitted.map(|()| depths)
