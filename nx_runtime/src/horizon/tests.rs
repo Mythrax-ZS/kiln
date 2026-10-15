@@ -2582,6 +2582,45 @@ impl Env {
 }
 
 #[test]
+fn save_data_that_was_never_created_is_target_not_found_except_the_users_when_opened_for_writing() {
+    use crate::testing::TempDir;
+    let dir = TempDir::new("saveopen");
+    let mut e = Env::new();
+    std::env::set_var("NX_SAVE_DIR", dir.path());
+    super::services::register_defaults(&e.kernel);
+    let fs = e.service("fsp-srv");
+    // The attribute: the user at 8, the kind at 32 (1 an account's save data, 3 the device's).
+    let attribute = |kind: u8| {
+        let mut attr = vec![0u8; 0x40];
+        attr[8..24].copy_from_slice(&[0x11; 16]);
+        attr[32] = kind;
+        [vec![0u8; 8], attr].concat()
+    };
+    let not_found = ResultCode::new(2, 1002).0;
+    // The device's save data and a read-only open of the user's are not there.
+    let mut device = Message::new(51);
+    device.payload = attribute(3);
+    assert_eq!(e.call(fs, &device).result, not_found);
+    let mut read_only = Message::new(53);
+    read_only.payload = attribute(1);
+    assert_eq!(e.call(fs, &read_only).result, not_found);
+    // CreateSaveDataFileSystem makes the device's, and then it opens.
+    let mut create = Message::new(22);
+    create.payload = attribute(3)[8..].to_vec();
+    assert_eq!(e.call(fs, &create).result, 0);
+    let r = e.call(fs, &device);
+    assert_eq!((r.result, r.moved.len()), (0, 1));
+    // The user's is made when it is first opened for writing, and is there for the read-only open.
+    let mut open = Message::new(51);
+    open.payload = attribute(1);
+    let r = e.call(fs, &open);
+    assert_eq!((r.result, r.moved.len()), (0, 1));
+    let r = e.call(fs, &read_only);
+    assert_eq!((r.result, r.moved.len()), (0, 1));
+    std::env::remove_var("NX_SAVE_DIR");
+}
+
+#[test]
 fn a_save_file_system_is_a_directory_with_files_and_listings() {
     use crate::testing::TempDir;
     let dir = TempDir::new("savefs");

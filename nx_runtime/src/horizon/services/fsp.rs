@@ -15,6 +15,13 @@ use std::sync::{Arc, Mutex, Weak};
 /// `fs::ResultOutOfRange`: module 2, description 3005 (2002-3005).
 const OUT_OF_RANGE: ResultCode = ResultCode::new(2, 3005);
 
+/// What opening save data that does not exist answers: 2002-1002, "target not found"
+/// (docs/ASSUMPTIONS.md A-068).
+const TARGET_NOT_FOUND: ResultCode = ResultCode::new(2, 1002);
+
+/// The kind of `SaveDataAttribute` that is an account's save data.
+const ACCOUNT_SAVE_DATA: u8 = 1;
+
 /// What every connection to the proxy shares: the RomFS, opened on first use.
 #[derive(Default)]
 pub struct Shared {
@@ -114,12 +121,20 @@ impl Service for FileSystemProxy {
                         attr.get(32).copied().unwrap_or(0)
                     )));
                 };
+                // Save data that was never created is not there to open: the program is told so,
+                // and creates it (`EnsureSaveData` or `CreateSaveDataFileSystem`). The account save
+                // data of the user, opened for writing, is made here, as the console makes it
+                // before it starts a title that has any (docs/ASSUMPTIONS.md A-147).
                 if !dir.is_dir() {
-                    return Err(Stop(format!(
-                        "the program opened save data that was never created (expected {}); \
-                         EnsureSaveData or CreateSaveDataFileSystem should come first",
-                        dir.display()
-                    )));
+                    if req.command != 51 || attr.get(32) != Some(&ACCOUNT_SAVE_DATA) {
+                        return Ok(Response::error(TARGET_NOT_FOUND));
+                    }
+                    std::fs::create_dir_all(&dir).map_err(|e| {
+                        Stop(format!(
+                            "the save data directory {} cannot be made: {e}",
+                            dir.display()
+                        ))
+                    })?;
                 }
                 Ok(
                     Response::ok().with_object(Box::new(super::savefs::HostFileSystem::new(
