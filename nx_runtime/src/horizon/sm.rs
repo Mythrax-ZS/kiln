@@ -12,7 +12,9 @@ use super::result::sm as sm_err;
 use super::service::{Request, Response, Service, ServiceResult, Stop};
 use std::sync::Weak;
 
-/// The commands of `nn::sm::detail::IUserInterface` before firmware 12.0.0.
+/// The commands of `nn::sm::detail::IUserInterface`: over CMIF before firmware 12.0.0, and over
+/// TIPC from 12.0.0 on, where a message has type 16 + the number and `RegisterClient` takes only the
+/// process id (docs/ASSUMPTIONS.md A-129).
 mod cmd {
     pub const REGISTER_CLIENT: u32 = 0;
     pub const GET_SERVICE_HANDLE: u32 = 1;
@@ -93,6 +95,14 @@ impl Service for Sm {
                 }
             }
             other => Err(Stop::unknown_command("sm:", other)),
+        }
+    }
+
+    fn request_tipc(&mut self, req: &Request) -> ServiceResult {
+        match req.command {
+            // The same two commands as over CMIF: the payload is the same name, or nothing.
+            cmd::REGISTER_CLIENT | cmd::GET_SERVICE_HANDLE => self.request(req),
+            other => Err(Stop::unknown_command("sm: (TIPC)", other)),
         }
     }
 }

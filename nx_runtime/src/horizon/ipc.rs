@@ -22,6 +22,10 @@ pub mod msg {
     pub const CONTROL: u32 = 5;
     pub const REQUEST_WITH_CONTEXT: u32 = 6;
     pub const CONTROL_WITH_CONTEXT: u32 = 7;
+    /// TIPC (tiny IPC, firmware 12.0.0 and later; only `sm:` and `pgl` speak it): type 15 closes the
+    /// session, type 16 + n is command n (docs/ASSUMPTIONS.md A-129).
+    pub const TIPC_CLOSE: u32 = 15;
+    pub const TIPC_REQUEST: u32 = 16;
 }
 
 const SFCI: u32 = 0x4943_4653;
@@ -177,7 +181,10 @@ fn pointer_reply_descriptor(index: u8, addr: u64, size: u64) -> [u8; 8] {
 
 /// What the kernel does with one request, before the reply is built.
 enum Routed {
+    /// A CMIF reply; the flag says the session is a domain.
     Reply(Response, bool),
+    /// A TIPC reply: the result, then the data, and no CMIF header.
+    Tipc(Response),
     Stop(Stop),
 }
 
@@ -189,6 +196,8 @@ pub struct Reply {
     pub move_handles: Vec<Handle>,
     pub object_ids: Vec<u32>,
     pub domain: bool,
+    /// A TIPC reply: the raw data is the result code and then the data, with no `SFCO` header.
+    pub tipc: bool,
     /// Pointer (X) descriptors: (index of the caller's receive-list entry, address, size).
     pub pointers: Vec<(u8, u64, u64)>,
 }
@@ -213,16 +222,23 @@ pub fn build_reply(r: &Reply) -> Option<[u8; MESSAGE_BYTES]> {
             .copy_from_slice(&pointer_reply_descriptor(index, addr, size));
         off += 8;
     }
+    // A reply's data starts at the next 16 bytes, CMIF or TIPC: a TIPC request has none of this
+    // padding, but a program that gets a refusal from the service manager (no handle, so the
+    // data would start at 8) took the result for a success when it was written there.
     let raw_start = off.next_multiple_of(16);
     let mut raw = Vec::new();
-    if r.domain {
-        raw.extend_from_slice(&(r.object_ids.len() as u32).to_le_bytes());
-        raw.extend_from_slice(&[0u8; 12]);
+    if r.tipc {
+        raw.extend_from_slice(&r.result.0.to_le_bytes());
+    } else {
+        if r.domain {
+            raw.extend_from_slice(&(r.object_ids.len() as u32).to_le_bytes());
+            raw.extend_from_slice(&[0u8; 12]);
+        }
+        raw.extend_from_slice(&SFCO.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&r.result.0.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
     }
-    raw.extend_from_slice(&SFCO.to_le_bytes());
-    raw.extend_from_slice(&0u32.to_le_bytes());
-    raw.extend_from_slice(&r.result.0.to_le_bytes());
-    raw.extend_from_slice(&0u32.to_le_bytes());
     raw.extend_from_slice(&r.data);
     for id in &r.object_ids {
         raw.extend_from_slice(&id.to_le_bytes());
@@ -295,6 +311,7 @@ impl Kernel {
         let Some(KObject::Session(session)) = self.object(handle, current) else {
             return Ok(err::INVALID_HANDLE);
         };
+
         let mut buf = [0u8; MESSAGE_BYTES];
         if rt().mem.read_bytes(tls, &mut buf, false).is_err() {
             return Ok(err::INVALID_POINTER);
@@ -307,11 +324,15 @@ impl Kernel {
         };
         let receive_list = msg.receive_list.clone();
         let routed = self.route(current, &session, msg, copies, moves);
-        let (response, domain, object_ids) = match routed {
+        let (response, domain, tipc, object_ids) = match routed {
             Routed::Stop(s) => return Err(s),
             Routed::Reply(r, domain) => {
                 let (r, ids) = self.finish_objects(&session, r, domain);
-                (r, domain, ids)
+                (r, domain, false, ids)
+            }
+            Routed::Tipc(r) => {
+                let (r, ids) = self.finish_objects(&session, r, false);
+                (r, false, true, ids)
             }
         };
         // Turn the response's objects into handles.
@@ -348,6 +369,7 @@ impl Kernel {
             move_handles,
             object_ids,
             domain,
+            tipc,
             pointers,
         };
         let Some(bytes) = build_reply(&reply) else {
@@ -452,6 +474,37 @@ impl Kernel {
                 }
                 match answer {
                     Ok(r) => Routed::Reply(r, domain),
+                    Err(s) => Routed::Stop(s),
+                }
+            }
+            // TIPC: the payload is all of the raw data, which starts right after the descriptors
+            // (the 16-byte alignment is CMIF's), with no CMIF header; there are no domains, so
+            // the session's one object is the target.
+            msg::TIPC_CLOSE => Routed::Tipc(Response::ok()),
+            kind if kind >= msg::TIPC_REQUEST => {
+                let req = Request {
+                    command: kind - msg::TIPC_REQUEST,
+                    data: msg.raw.clone(),
+                    pid: msg.pid.map(|_| self.process.process_id),
+                    copy_handles: copies,
+                    move_handles: moves,
+                    object_ids: Vec::new(),
+                    pointer_buffers: msg.pointer,
+                    send_buffers: msg.send,
+                    receive_buffers: msg.receive,
+                    exchange_buffers: msg.exchange,
+                    receive_list: msg.receive_list,
+                };
+                let service: &mut dyn Service = sess.root.as_mut();
+                self.note(current, || {
+                    format!("`{}` TIPC command {}", service.name(), req.command)
+                });
+                let answer = service.request_tipc(&req);
+                if self.trace {
+                    trace_request(service.name(), &req, &answer);
+                }
+                match answer {
+                    Ok(r) => Routed::Tipc(r),
                     Err(s) => Routed::Stop(s),
                 }
             }
@@ -667,6 +720,7 @@ mod tests {
             move_handles: vec![],
             object_ids: vec![],
             domain: false,
+            tipc: false,
             pointers: vec![(1, 0x3_4000_1000, 0x80)],
         };
         let out = build_reply(&r).unwrap();
@@ -706,6 +760,7 @@ mod tests {
             move_handles: vec![0xAB],
             object_ids: vec![],
             domain: false,
+            tipc: false,
             pointers: vec![],
         };
         let out = build_reply(&r).unwrap();
@@ -727,6 +782,7 @@ mod tests {
             move_handles: vec![],
             object_ids: vec![5, 6],
             domain: true,
+            tipc: false,
             pointers: vec![],
         };
         let out = build_reply(&r).unwrap();
@@ -740,6 +796,57 @@ mod tests {
     }
 
     #[test]
+    fn a_tipc_reply_is_the_result_and_then_the_data_with_no_cmif_header() {
+        let r = Reply {
+            result: ResultCode(0x415),
+            data: vec![9, 8, 7, 6],
+            copy_handles: vec![],
+            move_handles: vec![0xAB],
+            object_ids: vec![],
+            domain: false,
+            tipc: true,
+            pointers: vec![],
+        };
+        let out = build_reply(&r).unwrap();
+        let parsed = parse_message(&out).unwrap();
+        assert_eq!(parsed.move_handles, vec![0xAB]);
+        // The special header takes 8 + 4 + 4 bytes, so the data starts at 16 at once.
+        assert_eq!(&out[16..24], &[0x15, 0x04, 0, 0, 9, 8, 7, 6]);
+        assert_eq!(u32_at(&out, 4), Some(2 | (1 << 31)));
+        // With no handle the header ends at 8 and the data is aligned to 16 as in a CMIF reply:
+        // the 8 bytes between are padding, counted in the words of the raw data.
+        let plain = Reply {
+            move_handles: vec![],
+            ..r
+        };
+        let out = build_reply(&plain).unwrap();
+        assert_eq!(u32_at(&out, 4), Some(4));
+        assert_eq!(&out[8..16], &[0; 8]);
+        assert_eq!(&out[16..24], &[0x15, 0x04, 0, 0, 9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn a_tipc_request_has_its_payload_right_after_the_header() {
+        // Type 17 (command 1) with no process id: the name follows the 8-byte header at once, so
+        // there are no padding bytes in the raw data (what a title's first GetServiceHandle sends).
+        let mut m = vec![0u8; MESSAGE_BYTES];
+        m[0..4].copy_from_slice(&(msg::TIPC_REQUEST + 1).to_le_bytes());
+        m[4..8].copy_from_slice(&2u32.to_le_bytes());
+        m[8..16].copy_from_slice(b"fsp-srv\0");
+        let p = parse_message(&m).unwrap();
+        assert_eq!(p.kind, msg::TIPC_REQUEST + 1);
+        assert_eq!(p.pid, None);
+        assert_eq!(p.raw, b"fsp-srv\0");
+        // With a process id (RegisterClient): the header and the pid end at 20, and no data.
+        let mut m = vec![0u8; MESSAGE_BYTES];
+        m[0..4].copy_from_slice(&msg::TIPC_REQUEST.to_le_bytes());
+        m[4..8].copy_from_slice(&(1u32 << 31).to_le_bytes());
+        m[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let p = parse_message(&m).unwrap();
+        assert_eq!((p.pid, p.raw.len()), (Some(0), 0));
+    }
+
+    #[test]
     fn an_oversized_reply_is_refused() {
         let r = Reply {
             result: ResultCode::SUCCESS,
@@ -748,6 +855,7 @@ mod tests {
             move_handles: vec![],
             object_ids: vec![],
             domain: false,
+            tipc: false,
             pointers: vec![],
         };
         assert!(build_reply(&r).is_none());

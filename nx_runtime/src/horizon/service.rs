@@ -18,10 +18,11 @@ pub struct Buffer {
 /// One IPC request as a service sees it.
 #[derive(Debug, Default)]
 pub struct Request {
-    /// The command id of the CMIF header.
+    /// The command id of the CMIF header, or for a TIPC message the type minus 16.
     pub command: u32,
     /// The payload after the CMIF header, `data_size` bytes for a domain message and the rest of
-    /// the raw data otherwise (so it may include trailing padding).
+    /// the raw data otherwise (so it may include trailing padding). For a TIPC message, the raw
+    /// data after the padding that aligns it.
     pub data: Vec<u8>,
     /// The caller's process id, when the message carried one.
     pub pid: Option<u64>,
@@ -180,6 +181,16 @@ pub trait Service: Send + std::fmt::Debug {
     /// Handle one request. A command that is not implemented is `Err(Stop::unknown_command(..))`;
     /// it must never answer success without doing what the command does.
     fn request(&mut self, req: &Request) -> ServiceResult;
+
+    /// Handle one TIPC request (firmware 12.0.0 and later; docs/ASSUMPTIONS.md A-129). Only `sm:`
+    /// and `pgl` speak TIPC, so a service that does not stops the run.
+    fn request_tipc(&mut self, req: &Request) -> ServiceResult {
+        Err(Stop(format!(
+            "service `{}` was sent a TIPC message (command {}), which only `sm:` and `pgl` speak",
+            self.name(),
+            req.command
+        )))
+    }
 
     /// The size of the pointer buffer the service reports (`QueryPointerBufferSize`). A client
     /// sends a buffer through a pointer descriptor only when it fits; zero makes every client map

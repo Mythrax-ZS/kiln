@@ -983,6 +983,23 @@ fn request_bytes(command: u32, payload: &[u8], with_pid: bool, kind: u32) -> Vec
     m
 }
 
+/// A TIPC request: the type is 16 + the command, and the raw data is the payload alone, right after
+/// the header (and the process id), with no padding.
+fn tipc_request_bytes(command: u32, payload: &[u8], with_pid: bool) -> Vec<u8> {
+    let mut m = vec![0u8; 8];
+    let mut off: usize = 8;
+    if with_pid {
+        m.extend_from_slice(&1u32.to_le_bytes());
+        m.extend_from_slice(&0u64.to_le_bytes());
+        off += 12;
+    }
+    m.extend_from_slice(payload);
+    let words = (m.len() - off).div_ceil(4);
+    m[0..4].copy_from_slice(&(16 + command).to_le_bytes());
+    m[4..8].copy_from_slice(&(words as u32 | (u32::from(with_pid) << 31)).to_le_bytes());
+    m
+}
+
 fn domain_request(object: u32, command: u32, payload: &[u8]) -> Vec<u8> {
     let inner = {
         let mut b = Vec::new();
@@ -1092,6 +1109,34 @@ impl Env {
         })
     }
 
+    /// Send a TIPC message: the answer is the result, the data after it and the moved handles; `None`
+    /// when the run stopped.
+    fn send_tipc(&mut self, session: u64, message: &[u8]) -> Option<(u32, Vec<u8>, Vec<u32>)> {
+        let mut buf = message.to_vec();
+        buf.resize(0x100, 0);
+        self.write(self.tls(), &buf);
+        if self.svc(0x21, &[session]) == Flow::Stop {
+            return None;
+        }
+        assert_eq!(self.r(), 0, "SendSyncRequest failed");
+        let out = self.read(self.tls(), 0x100);
+        let word = |at: usize| u32::from_le_bytes(out[at..at + 4].try_into().unwrap());
+        let h1 = word(4);
+        let (mut off, mut moved) = (8, Vec::new());
+        if h1 >> 31 != 0 {
+            let tag = word(8);
+            off = 12 + 4 * ((tag >> 1) & 0xF) as usize;
+            for _ in 0..(tag >> 5) & 0xF {
+                moved.push(word(off));
+                off += 4;
+            }
+        }
+        // The result is the first word of the data, which starts at the next 16 bytes.
+        let raw_start = off.next_multiple_of(16);
+        let raw_end = off + 4 * (h1 & 0x3FF) as usize;
+        Some((word(raw_start), out[raw_start + 4..raw_end].to_vec(), moved))
+    }
+
     fn connect_sm(&mut self) -> u64 {
         self.write(SCRATCH + 0x200, b"sm:\0");
         self.svc(0x1F, &[0, SCRATCH + 0x200]);
@@ -1186,6 +1231,70 @@ fn a_program_asks_sm_for_a_service_and_calls_it() {
     e.svc(0x16, &[calc]);
     e.svc(0x21, &[calc]);
     assert_eq!(e.r(), err::INVALID_HANDLE.0);
+}
+
+#[test]
+fn sm_answers_tipc_messages() {
+    // Firmware 12.0.0 and later: the type is 16 + the command, the payload is the raw data alone and
+    // the reply starts with the result (docs/ASSUMPTIONS.md A-129).
+    let mut e = calc_env(None);
+    let sm = e.connect_sm();
+    // GetServiceHandle (type 17) before RegisterClient (type 16) is refused, as over CMIF.
+    let (result, data, moved) = e
+        .send_tipc(sm, &tipc_request_bytes(1, b"tst:calc", false))
+        .unwrap();
+    assert_eq!((result, data.len(), moved.len()), (0x415, 0, 0));
+    // Without the process id of the header the client is not accepted.
+    let (result, _, _) = e.send_tipc(sm, &tipc_request_bytes(0, &[], false)).unwrap();
+    assert_eq!(result, 0x415);
+    // RegisterClient takes only the process id of the header.
+    let (result, data, moved) = e.send_tipc(sm, &tipc_request_bytes(0, &[], true)).unwrap();
+    assert_eq!((result, data.len(), moved.len()), (0, 0, 0));
+    // GetServiceHandle answers with a move handle, which is an ordinary session.
+    let (result, _, moved) = e
+        .send_tipc(sm, &tipc_request_bytes(1, b"tst:calc", false))
+        .unwrap();
+    assert_eq!((result, moved.len()), (0, 1));
+    let calc = u64::from(moved[0]);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&40u64.to_le_bytes());
+    payload.extend_from_slice(&2u64.to_le_bytes());
+    let r = e
+        .send(calc, &request_bytes(1, &payload, false, 4), false)
+        .unwrap();
+    assert_eq!(u64::from_le_bytes(r.data[..8].try_into().unwrap()), 42);
+    // An empty name is refused with the service manager's own result.
+    let (result, _, moved) = e
+        .send_tipc(sm, &tipc_request_bytes(1, &[0; 8], false))
+        .unwrap();
+    assert_eq!((result, moved.len()), (ResultCode::new(21, 6).0, 0));
+    // Type 15 closes the session.
+    let (result, _, _) = e.send_tipc(sm, &15u32.to_le_bytes()).unwrap();
+    assert_eq!(result, 0);
+    // A command the service manager has not got over TIPC stops the run and says so.
+    assert!(e
+        .send_tipc(sm, &tipc_request_bytes(9, &[], false))
+        .is_none());
+    match e.kernel.exit_state() {
+        Some(Exit::Fatal(m)) => assert!(m.contains("sm: (TIPC)") && m.contains("command 9"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_service_that_does_not_speak_tipc_stops_the_run() {
+    let mut e = calc_env(None);
+    let sm = e.connect_sm();
+    e.send(sm, &request_bytes(0, &[0; 8], true, 4), false)
+        .unwrap();
+    let calc = u64::from(e.get_service(sm, "tst:calc").unwrap().moved[0]);
+    assert!(e
+        .send_tipc(calc, &tipc_request_bytes(0, &[], false))
+        .is_none());
+    match e.kernel.exit_state() {
+        Some(Exit::Fatal(m)) => assert!(m.contains("tst:calc") && m.contains("TIPC"), "{m}"),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
