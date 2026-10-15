@@ -3279,6 +3279,20 @@ fn the_audio_device_names_itself_and_is_stereo() {
         1,
         "the device event"
     );
+    // The commands of firmware 13 and later: the active output device, and the list of the
+    // output devices from the first one named in the input.
+    let mut active = Message::new(13);
+    active.receive = vec![(SCRATCH + 0x2400, 0x100)];
+    assert_eq!(e.call(device, &active).result, 0);
+    assert_eq!(&e.read(SCRATCH + 0x2400, 25), b"AudioBuiltInSpeakerOutput");
+    let mut outputs = Message::new(14);
+    outputs.payload = 0u32.to_le_bytes().to_vec();
+    outputs.receive = vec![(SCRATCH + 0x2800, 0x400)];
+    assert_eq!(e.call(device, &outputs).data, [4, 0, 0, 0]);
+    assert_eq!(&e.read(SCRATCH + 0x2800, 21), b"AudioStereoJackOutput");
+    outputs.payload = 3u32.to_le_bytes().to_vec();
+    assert_eq!(e.call(device, &outputs).data, [1, 0, 0, 0]);
+    assert_eq!(&e.read(SCRATCH + 0x2800, 21), b"AudioUsbDeviceOutput\0");
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! `audren:u`, the audio renderer (Switchbrew, "Audio services"; the layouts of the update buffers
-//! are those `libnx` documents for the revisions 1 to 6 of the renderer).
+//! are those `libnx` documents for the revisions 1 to 6 of the renderer, used as they are for 7 to
+//! 11: docs/ASSUMPTIONS.md A-140).
 //!
 //! The renderer is what a program can see of the console's audio DSP (docs/ASSUMPTIONS.md A-075,
 //! A-125). Each update is answered with the state of the memory pools, voices and sinks, and plays
@@ -30,8 +31,9 @@ const FRAME_PERIOD: Duration = Duration::from_millis(5);
 /// The `REV` tag every revision number carries in its low three bytes.
 const REVISION_TAG: u32 = 0x0056_4552;
 
-/// The newest revision whose layouts are known here (`libnx`: `AUDREN_REVISION_6`).
-const LAST_KNOWN_REVISION: u32 = 6;
+/// The newest revision a program may ask for: 6 is the last whose layouts `libnx` documents, and
+/// 7 to 11 are taken to have the same section sizes (docs/ASSUMPTIONS.md A-140).
+const LAST_KNOWN_REVISION: u32 = 11;
 
 /// The size of the parameter block `OpenAudioRenderer` and `GetWorkBufferSize` take.
 const PARAMETER_SIZE: usize = 0x34;
@@ -569,8 +571,20 @@ impl Service for Device {
             }
             // GetAudioDeviceOutputVolume(buffer name) -> f32, and its automatic form
             2 | 8 => Ok(Response::ok().with_u32(self.volume.to_bits())),
-            // GetActiveAudioDeviceName() -> buffer with one name, and its automatic form
-            3 | 10 => {
+            // ListAudioOutputDeviceName(s32 first) -> (buffer of names, s32 count) [13.0.0+]: the
+            // names from the `first`th on (the title that sent it sent 0; docs/ASSUMPTIONS.md A-141)
+            14 => {
+                let first = (req.u32_at(0) as usize).min(DEVICE_NAMES.len());
+                let (count, pointer) = self.write_names(req, &DEVICE_NAMES[first..])?;
+                let mut r = Response::ok().with_u32(count as u32);
+                if pointer {
+                    r = r.with_pointer_reply(0, count * NAME_SIZE as u64);
+                }
+                Ok(r)
+            }
+            // GetActiveAudioDeviceName() -> buffer with one name, and its automatic form;
+            // GetActiveAudioOutputDeviceName() -> buffer with one name [13.0.0+]
+            3 | 10 | 13 => {
                 let (_, pointer) = self.write_names(req, &[ACTIVE_DEVICE])?;
                 let mut r = Response::ok();
                 if pointer {
@@ -594,9 +608,10 @@ impl Service for Device {
 /// buffers would be read wrongly.
 fn check_revision(params: &Parameters) -> Result<(), Stop> {
     let tag_ok = params.revision & 0x00FF_FFFF == REVISION_TAG;
-    let number = (params.revision >> 24) as u8 as char;
-    match (tag_ok, number.to_digit(10)) {
-        (true, Some(n)) if (1..=LAST_KNOWN_REVISION).contains(&n) => Ok(()),
+    // The revision number is the top byte as a character: '1' to '9', then ':' for 10, ';' for 11.
+    let number = (params.revision >> 24).wrapping_sub(u32::from(b'0'));
+    match (tag_ok, number) {
+        (true, n) if (1..=LAST_KNOWN_REVISION).contains(&n) => Ok(()),
         _ => Err(Stop(format!(
             "the audio renderer revision {:#x}, of which only REV1 to REV{LAST_KNOWN_REVISION} \
              are known",
@@ -1069,11 +1084,14 @@ mod tests {
         };
         assert!(check_revision(&with(0x3156_4552)).is_ok(), "REV1");
         assert!(check_revision(&with(0x3656_4552)).is_ok(), "REV6");
+        assert!(check_revision(&with(0x3956_4552)).is_ok(), "REV9");
+        assert!(check_revision(&with(0x3A56_4552)).is_ok(), "REV10");
+        assert!(check_revision(&with(0x3B56_4552)).is_ok(), "REV11");
         assert!(
-            check_revision(&with(0x3756_4552)).is_err(),
-            "REV7 is not known"
+            check_revision(&with(0x3C56_4552)).is_err(),
+            "REV12 is not known"
         );
-        assert!(check_revision(&with(0x4256_4552)).is_err(), "nor REVB");
+        assert!(check_revision(&with(0x3056_4552)).is_err(), "nor REV0");
         assert!(check_revision(&with(0x3156_4553)).is_err(), "not a REV tag");
     }
 
