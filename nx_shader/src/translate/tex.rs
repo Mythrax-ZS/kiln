@@ -149,9 +149,6 @@ pub(super) fn scan_dims(code: Code<'_>, graph: &Cfg) -> HashMap<u32, (Dim, bool)
 
 /// The combined image sampler variable of a texture, made on first use.
 fn sampler(tx: &mut Tx<'_>, tex: Tex, dim: Dim, arrayed: bool, shadow: bool) -> R<(Id, Id)> {
-    if dim == Dim::Cube && arrayed {
-        return tx.fail("a cube map array is not translated yet");
-    }
     if dim == Dim::D3 && (arrayed || shadow) {
         return tx.fail("a 3D texture with an array or a depth comparison");
     }
@@ -163,7 +160,12 @@ fn sampler(tx: &mut Tx<'_>, tex: Tex, dim: Dim, arrayed: bool, shadow: bool) -> 
         }
         Dim::D2 => 1,
         Dim::D3 => 2,
-        Dim::Cube => 3,
+        Dim::Cube => {
+            if arrayed {
+                tx.m.capability(cap::IMAGE_CUBE_ARRAY);
+            }
+            3
+        }
     };
     let image =
         tx.m.ty_image(f, dim_code, u32::from(shadow), u32::from(arrayed), 0, 1, 0);

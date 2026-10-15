@@ -63,6 +63,7 @@ pub enum SampledKind {
     D2,
     D2Array,
     Cube,
+    CubeArray,
     D3,
 }
 
@@ -301,6 +302,7 @@ impl Vk {
                         SampledKind::D2 => vk::ImageViewType::TYPE_2D,
                         SampledKind::D2Array => vk::ImageViewType::TYPE_2D_ARRAY,
                         SampledKind::Cube => vk::ImageViewType::CUBE,
+                        SampledKind::CubeArray => vk::ImageViewType::CUBE_ARRAY,
                         SampledKind::D3 => vk::ImageViewType::TYPE_3D,
                     },
                     components: vk::ComponentMapping::default(),

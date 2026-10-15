@@ -606,6 +606,52 @@ fn tex_of_an_array_a_volume_and_a_cube() {
 }
 
 #[test]
+fn tex_of_a_cube_array_takes_the_cube_then_the_direction() {
+    let Some(vk) = vulkan() else { return };
+    // Two cubes of 2x2 faces; each texel says its layer (cube * 6 + face), column and row.
+    let faces: Vec<[f32; 4]> = (0..12u32)
+        .flat_map(|layer| {
+            (0..2u32)
+                .flat_map(move |y| (0..2u32).map(move |x| [layer as f32, x as f32, y as f32, 5.0]))
+        })
+        .collect();
+    let bytes = floats(&faces);
+    // The cube (an integer) in R1, then the direction in R2..R4; level zero (mode 1).
+    let program = [tex(8, 1, RZ, 7, 0xF, 1, false).build(), exit(Guard::ALWAYS)];
+    let directions: Vec<[f32; 3]> = vec![[1.0, 0.25, -0.5], [-0.5, -1.0, 0.25], [0.25, 0.5, 1.0]];
+    let mut inputs = Vec::new();
+    let mut wanted = Vec::new();
+    for cube in 0..2u32 {
+        for d in &directions {
+            let mut s = regs(&[(2, d[0]), (3, d[1]), (4, d[2])]);
+            s.regs[1] = cube;
+            inputs.push(s);
+            let (face, x, y) = cube_texel(*d, 2);
+            wanted.push([(cube * 6 + face) as f32, x as f32, y as f32, 5.0]);
+        }
+    }
+    let extras = Extras {
+        images: vec![image(
+            SampledKind::CubeArray,
+            vk::Format::R32G32B32A32_SFLOAT,
+            (2, 2, 1),
+            12,
+            false,
+            &bytes,
+        )],
+        ..Extras::default()
+    };
+    let out = run_with(&vk, &program, &inputs, &[], extras);
+    for (i, (want, got)) in wanted.iter().zip(&out.states).enumerate() {
+        assert_eq!(
+            [f(got, 8), f(got, 9), f(got, 10), f(got, 11)],
+            *want,
+            "cube array sample {i}"
+        );
+    }
+}
+
+#[test]
 fn tex_with_a_depth_comparison_takes_the_reference_after_the_level() {
     let Some(vk) = vulkan() else { return };
     let depths: [f32; 4] = [0.25, 0.5, 0.75, 1.0];

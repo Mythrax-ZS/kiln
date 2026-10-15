@@ -700,6 +700,7 @@ pub enum Kind {
     D2,
     D2Array,
     Cube,
+    CubeArray,
     D3,
 }
 
@@ -742,6 +743,10 @@ pub fn shape_of(tic: &Tic, used: &TextureUse) -> Result<Shape, String> {
         (Dim::D2, true) if matches!(ty, 1 | 7) => shape(Kind::D2Array, 1, 1),
         (Dim::D2, true) if ty == 5 => shape(Kind::D2Array, tic.depth(), 1),
         (Dim::Cube, false) if ty == 3 => shape(Kind::Cube, 6, 1),
+        // A cube array header counts its cubes in the depth field (docs/ASSUMPTIONS.md A-157); a
+        // cube sampled as an array is an array of one.
+        (Dim::Cube, true) if ty == 8 => shape(Kind::CubeArray, tic.depth() * 6, 1),
+        (Dim::Cube, true) if ty == 3 => shape(Kind::CubeArray, 6, 1),
         (Dim::D3, false) if ty == 2 => shape(Kind::D3, 1, tic.depth()),
         _ => Err(wrong()),
     }
@@ -1089,6 +1094,7 @@ impl Textures {
                 Kind::D2 => vk::ImageViewType::TYPE_2D,
                 Kind::D2Array => vk::ImageViewType::TYPE_2D_ARRAY,
                 Kind::Cube => vk::ImageViewType::CUBE,
+                Kind::CubeArray => vk::ImageViewType::CUBE_ARRAY,
                 Kind::D3 => vk::ImageViewType::TYPE_3D,
             },
             components,
