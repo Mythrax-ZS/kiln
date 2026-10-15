@@ -115,6 +115,70 @@ fn float_arithmetic_matches_rust() {
 }
 
 #[test]
+fn integer_compare_and_select_matches_rust() {
+    let Some(vk) = vulkan() else { return };
+    // ICMP in its four forms, for every comparison and both signednesses: R4 = Ra (R1) when Rc (R3)
+    // compares with zero, else B (R2, the immediate 0x1234, or c[0][0]); the form with the constant
+    // as the compared operand takes R3 as the alternative.
+    let inputs = {
+        let mut v = random_states(64, 21);
+        for (i, s) in v.iter_mut().enumerate() {
+            // Zero, small and negative values for Rc, which the comparison is about.
+            s.regs[3] = [0, 1, 0xFFFF_FFFF, 0x8000_0000, 0x7FFF_FFFF, s.regs[3]][i % 6];
+        }
+        v
+    };
+    for code in 0..8u64 {
+        for signed in [false, true] {
+            let tail = |e: Enc| e.field(49, 3, code).bit(48, signed);
+            let program = [
+                tail(Enc::op(Op::IcmpReg).rd(4).ra(1).rb(2).rc(3)).build(),
+                tail(Enc::op(Op::IcmpImm20).rd(5).ra(1).imm20(0x1234).rc(3)).build(),
+                tail(Enc::op(Op::IcmpCbuf_5340).rd(6).ra(1).cbuf(0, 0).rc(3)).build(),
+                tail(Enc::op(Op::IcmpCbuf_4b40).rd(7).ra(1).cbuf(0, 4).rc(3)).build(),
+                exit(Guard::ALWAYS),
+            ];
+            let cbuf0 = [0xCAFE_F00D, 0u32];
+            let out = run(&vk, &program, &inputs, &cbuf0);
+            for (i, (inp, got)) in inputs.iter().zip(&out).enumerate() {
+                let test = |v: u32| {
+                    let (u, s) = (v, v as i32);
+                    match (code, signed) {
+                        (0, _) => false,
+                        (1, true) => s < 0,
+                        (1, false) => false,
+                        (2, _) => u == 0,
+                        (3, true) => s <= 0,
+                        (3, false) => u == 0,
+                        (4, true) => s > 0,
+                        (4, false) => u > 0,
+                        (5, _) => u != 0,
+                        (6, true) => s >= 0,
+                        (6, false) => true,
+                        _ => true,
+                    }
+                };
+                let (a, b, c) = (inp.regs[1], inp.regs[2], inp.regs[3]);
+                let msg = format!("code {code} signed {signed} input {i}");
+                assert_eq!(got.regs[4], if test(c) { a } else { b }, "reg, {msg}");
+                assert_eq!(got.regs[5], if test(c) { a } else { 0x1234 }, "imm, {msg}");
+                assert_eq!(
+                    got.regs[6],
+                    if test(c) { a } else { 0xCAFE_F00D },
+                    "cbuf, {msg}"
+                );
+                // The constant (0) is what is compared here; R3 is the alternative.
+                assert_eq!(
+                    got.regs[7],
+                    if test(0) { a } else { c },
+                    "cbuf compared, {msg}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn predicates_move_to_and_from_registers() {
     let Some(vk) = vulkan() else { return };
     // R4 = R1 with the byte B1 holding the predicates named by 0x5B (P2R), R5 the same of byte B3

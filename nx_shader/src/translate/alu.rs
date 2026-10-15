@@ -40,6 +40,7 @@ pub(super) fn translate(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<bool> {
         Op::ImnmxReg | Op::ImnmxCbuf | Op::ImnmxImm20 => imnmx(tx, inst)?,
         Op::IsetpReg | Op::IsetpCbuf | Op::IsetpImm20 => isetp(tx, inst)?,
         Op::IsetReg | Op::IsetCbuf | Op::IsetImm20 => iset(tx, inst)?,
+        Op::IcmpReg | Op::IcmpCbuf_4b40 | Op::IcmpCbuf_5340 | Op::IcmpImm20 => icmp(tx, inst, opc)?,
         Op::SelReg | Op::SelCbuf | Op::SelImm20 => sel(tx, inst)?,
         Op::MovReg | Op::MovCbuf | Op::MovImm20 => mov(tx, inst)?,
         Op::Mov32iImm32 => mov32i(tx, inst)?,
@@ -1035,6 +1036,25 @@ fn iset(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
     let r = bool_op(tx, inst.bits(45, 2), c, pc)?;
     let v = set_value(tx, r, inst.bit(44));
     tx.write(inst, inst.rd(), v);
+    Ok(())
+}
+
+/// `ICMP.cmp Rd, Ra, B, Rc`: `Rd` is `Ra` when `Rc` compares with zero as the instruction says
+/// (signed with bit 48, the comparison in bits 49 to 51), otherwise `B`. In the form with the
+/// constant buffer as the compared operand, `Rc` takes the place of `B` (docs/ASSUMPTIONS.md
+/// A-156).
+fn icmp(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
+    let signed = inst.bit(48);
+    let ra = tx.read(inst.ra());
+    let (other, operand) = match opc {
+        Op::IcmpReg => (tx.read(inst.rb()), tx.read(inst.rc())),
+        Op::IcmpCbuf_4b40 => (tx.read(inst.rc()), src_b(tx, inst)?),
+        _ => (src_b(tx, inst)?, tx.read(inst.rc())),
+    };
+    let zero = tx.c32(0);
+    let hit = icompare(tx, inst.bits(49, 3), operand, zero, signed);
+    let r = tx.select_u32(hit, ra, other);
+    tx.write(inst, inst.rd(), r);
     Ok(())
 }
 
