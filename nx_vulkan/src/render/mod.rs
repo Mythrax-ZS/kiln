@@ -866,7 +866,11 @@ impl Core {
             .iter()
             .filter(|(key, dirty)| {
                 *dirty
+                    && !self.debug.no_save_targets
                     && crate::image::aspect_of(key.format) == vk::ImageAspectFlags::COLOR
+                    && key
+                        .memory_bytes()
+                        .is_some_and(|bytes| bytes <= targets::SAVED_BYTES)
                     && self.targets.memory_unchanged(scene.mem, key)
             })
             .map(|(key, _)| *key)

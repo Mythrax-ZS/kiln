@@ -943,6 +943,9 @@ impl Core {
                 !super::textures::overlays_cover(tic, used, &newer)
             })
             .map(|c| c.key)
+            // A target whose memory the title has changed since the target was drawn to is not
+            // written over it: the title has other data there now (A-171).
+            .filter(|key| self.targets.memory_unchanged(scene.mem, key))
             .collect();
         if keys.is_empty() {
             return Ok(overlays);

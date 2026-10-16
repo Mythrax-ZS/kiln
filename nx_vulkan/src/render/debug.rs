@@ -71,6 +71,9 @@ pub struct Debug {
     /// `NX_DEBUG_WAIT_FINISH`: wait for the device at the end of every submission of the guest, as
     /// the renderer did before it overlapped the device's work with recording (A-123).
     pub wait_at_finish: bool,
+    /// `NX_DEBUG_NO_SAVE_TARGETS`: a render target that is let go has not its pixels put into
+    /// memory first (the behavior before docs/ASSUMPTIONS.md A-171).
+    pub no_save_targets: bool,
     /// `NX_DEBUG_SKIP_PROGRAMS=<hex address>[,...]`: a draw whose vertex or pixel program is at one
     /// of these addresses is not drawn (does the loss of a device come from those draws?).
     pub skip_programs: Vec<u64>,
@@ -123,6 +126,7 @@ impl Debug {
                 .then(|| number("NX_DEBUG_SYNC_DRAWS").unwrap_or(1)),
             sync_from: number("NX_DEBUG_SYNC_FROM"),
             wait_at_finish: set("NX_DEBUG_WAIT_FINISH"),
+            no_save_targets: set("NX_DEBUG_NO_SAVE_TARGETS"),
             skip_programs: addresses("NX_DEBUG_SKIP_PROGRAMS"),
             discard_programs: addresses("NX_DEBUG_DISCARD_PROGRAMS"),
         }

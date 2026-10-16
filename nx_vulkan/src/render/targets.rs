@@ -189,6 +189,10 @@ struct Snapshot {
 const DIRTY_LIFETIME: u64 = 300;
 /// The same for a target whose pixels are in memory.
 const CLEAN_LIFETIME: u64 = 3000;
+/// The most memory a target may stand for and still have its pixels put into it when it is let go
+/// (docs/ASSUMPTIONS.md A-171): what a title draws once and reads for ever (text, shapes, probes)
+/// is small, and the memory of a big buffer that was freed is likely to be in use again.
+pub const SAVED_BYTES: u64 = 128 << 10;
 
 /// What the address index keeps of a target, so that finding the targets of some memory looks at
 /// numbers and not at the map of targets.
@@ -346,7 +350,9 @@ impl Targets {
 
     /// Put the pixels of the color targets `keys` into the memory they stand for, in the layout
     /// the registers gave them (what the commands recorded so far did is in them first), so that
-    /// a texture made from that memory sees what was drawn (docs/ASSUMPTIONS.md A-111).
+    /// a texture made from that memory sees what was drawn (docs/ASSUMPTIONS.md A-111). Memory
+    /// that the title has changed since (it runs while the pixels are read out of the device)
+    /// is not written over (A-171).
     pub fn write_back(
         &mut self,
         vk: &Vk,
@@ -414,7 +420,9 @@ impl Targets {
         self.write_backs.runs += 1;
         self.write_backs.targets += staged.len() as u64;
         for (key, staging) in staged {
-            if submitted.is_ok() {
+            // The title ran while the pixels were read out of the device: memory that it has used
+            // for something else since is not written over.
+            if submitted.is_ok() && self.memory_unchanged(mem, &key) {
                 let bpp = pixel_bytes(key.format).unwrap_or(4);
                 let row = key.width as usize * bpp as usize;
                 let linear = &staging.as_slice()[..row * key.height as usize];
@@ -437,7 +445,21 @@ impl Targets {
                     }
                 };
                 self.write_backs.bytes += tiled.len() as u64;
+                // What this write changes in the memory of another target is the renderer's own
+                // doing: a target that was as the title left it stays so.
+                let overlapped: Vec<Key> = self
+                    .covering(key.address, key.address + tiled.len() as u64)
+                    .into_iter()
+                    .map(|c| c.key)
+                    .filter(|k| *k != key && self.memory_unchanged(mem, k))
+                    .collect();
                 mem.write(key.address, &tiled);
+                for k in overlapped {
+                    let baseline = memory_hash(mem, &k);
+                    if let Some(t) = self.map.get_mut(&k) {
+                        t.baseline = baseline;
+                    }
+                }
                 let baseline = memory_hash(mem, &key);
                 if let Some(t) = self.map.get_mut(&key) {
                     t.dirty = false;

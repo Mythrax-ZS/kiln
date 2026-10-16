@@ -163,7 +163,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   cannot make (counted in the report of every 100 frames, and said once) instead of stopping the
   run: development runs set it, and so does `kiln-gui` for a game it starts to be played (its
   "Stop at a draw that cannot be rendered" setting turns that off);
-  `NX_SPIRV_CHECK=1` look at one thing each; `NX_DEBUG_WAIT_FINISH=1` waits for the device at the end
+  `NX_SPIRV_CHECK=1` look at one thing each; `NX_DEBUG_NO_SAVE_TARGETS=1` lets render targets go
+  without putting their pixels into memory first (A-171); `NX_DEBUG_WAIT_FINISH=1` waits for the device at the end
   of every submission of the guest (the renderer otherwise lets the device run behind the
   recording, A-123); `NX_DEBUG_SYNC_DRAWS=<n>` waits for the device after
   every draw (slow), from the first frame with `n` draws on (`NX_DEBUG_SYNC_FROM=<frame>`: from

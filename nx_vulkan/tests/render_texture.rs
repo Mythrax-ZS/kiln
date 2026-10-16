@@ -388,6 +388,37 @@ fn a_target_drawn_once_and_read_long_after_keeps_its_pixels() {
 }
 
 #[test]
+fn a_big_target_that_is_let_go_is_not_written_to_its_memory() {
+    if vulkan().is_none() {
+        return;
+    }
+    let source = GPU_BASE + 0x50_0000;
+    let other = GPU_BASE + 0x70_0000;
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = textured(
+        16,
+        target,
+        header(0x08, 2, 256, 256, source),
+        nearest_sampler(),
+    );
+    let mut r = Renderer::new(RenderConfig::default());
+    // 256 x 256 pixels of 4 bytes are more than the memory that is saved: what is likely to be
+    // freed and used again.
+    w.color_target(0, source, 256, 256, 0xD5);
+    clear_to(&mut r, &mut w, [1.0, 0.0, 0.0, 1.0], None);
+    w.color_target(0, other, 16, 16, 0xD5);
+    for _ in 0..LONG {
+        clear_to(&mut r, &mut w, [0.0, 0.0, 1.0, 1.0], None);
+        r.finish().unwrap();
+    }
+    w.color_target(0, target, 16, 16, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let mut now = vec![0u8; 0x1000];
+    assert!(w.mem.read(w.cpu(source), &mut now));
+    assert!(now.iter().all(|b| *b == 0), "memory was left as it was");
+}
+
+#[test]
 fn a_target_whose_memory_was_used_for_something_else_does_not_overwrite_it() {
     if vulkan().is_none() {
         return;
@@ -746,6 +777,29 @@ fn a_render_target_nothing_draws_to_for_long_is_not_written_over_reused_memory()
         "the memory was overwritten by a stale target"
     );
     assert!(r.picture_at(w.cpu(source)).unwrap().is_none());
+}
+
+#[test]
+fn a_target_whose_memory_the_title_changed_after_the_draw_is_not_written_over_it() {
+    if vulkan().is_none() {
+        return;
+    }
+    let source = GPU_BASE + 0x50_0000;
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = textured(8, target, header(0x08, 2, 8, 8, source), nearest_sampler());
+    let mut r = Renderer::new(RenderConfig::default());
+    // A 16 by 16 target is drawn to, and a frame or two later the title uses its memory for
+    // something else (a page of data) and reads a texture over it: the target is not that
+    // memory's any more, and what the title keeps there is not for its pixels to replace.
+    w.color_target(0, source, 16, 16, 0xD5);
+    clear_to(&mut r, &mut w, [1.0, 0.0, 0.0, 1.0], None);
+    let data: Vec<u8> = (0..0x1000u32).map(|i| (i % 251) as u8 | 1).collect();
+    w.put(source, &data);
+    w.color_target(0, target, 8, 8, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let mut memory = vec![0u8; data.len()];
+    assert!(w.mem.read(w.cpu(source), &mut memory));
+    assert_eq!(memory, data, "the data of the title was written over");
 }
 
 #[test]
