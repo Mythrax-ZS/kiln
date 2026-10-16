@@ -348,6 +348,77 @@ fn a_render_target_is_sampled_from_the_target_and_not_from_memory() {
     }
 }
 
+/// More submissions than a target that nothing draws to is kept for.
+const LONG: usize = 350;
+
+#[test]
+fn a_target_drawn_once_and_read_long_after_keeps_its_pixels() {
+    if vulkan().is_none() {
+        return;
+    }
+    let source = GPU_BASE + 0x50_0000;
+    let other = GPU_BASE + 0x60_0000;
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = textured(
+        16,
+        target,
+        header(0x08, 2, 16, 16, source),
+        nearest_sampler(),
+    );
+    let mut r = Renderer::new(RenderConfig::default());
+    // Drawn to once, as a title draws the text of its interface, and read much later.
+    w.color_target(0, source, 16, 16, 0xD5);
+    clear_to(&mut r, &mut w, [1.0, 0.0, 0.0, 1.0], None);
+    // Other work goes on for longer than a target that nothing draws to is kept (A-118).
+    w.color_target(0, other, 16, 16, 0xD5);
+    for _ in 0..LONG {
+        clear_to(&mut r, &mut w, [0.0, 0.0, 1.0, 1.0], None);
+        r.finish().unwrap();
+    }
+    w.color_target(0, target, 16, 16, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    for px in rgba.as_chunks::<4>().0 {
+        assert_eq!(
+            px,
+            &[255, 0, 0, 255],
+            "what was drawn is what the memory holds"
+        );
+    }
+}
+
+#[test]
+fn a_target_whose_memory_was_used_for_something_else_does_not_overwrite_it() {
+    if vulkan().is_none() {
+        return;
+    }
+    let source = GPU_BASE + 0x50_0000;
+    let other = GPU_BASE + 0x60_0000;
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = textured(
+        16,
+        target,
+        header(0x08, 2, 16, 16, source),
+        nearest_sampler(),
+    );
+    let mut r = Renderer::new(RenderConfig::default());
+    w.color_target(0, source, 16, 16, 0xD5);
+    clear_to(&mut r, &mut w, [1.0, 0.0, 0.0, 1.0], None);
+    // The title frees the memory and puts something else in it: a page of a pattern.
+    let pattern: Vec<u8> = (0..0x1000u32).map(|i| (i % 251) as u8 | 1).collect();
+    w.put(source, &pattern);
+    w.color_target(0, other, 16, 16, 0xD5);
+    for _ in 0..LONG {
+        clear_to(&mut r, &mut w, [0.0, 0.0, 1.0, 1.0], None);
+        r.finish().unwrap();
+    }
+    w.color_target(0, target, 16, 16, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let mut now = vec![0u8; pattern.len()];
+    assert!(w.mem.read(w.cpu(source), &mut now));
+    assert_eq!(now, pattern, "the target let go was not written over it");
+}
+
 #[test]
 fn the_header_swizzle_applies_to_a_render_target_read_as_a_texture() {
     if vulkan().is_none() {

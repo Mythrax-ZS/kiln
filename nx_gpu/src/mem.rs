@@ -58,6 +58,39 @@ pub trait GuestMemory: Send + Sync {
     }
 }
 
+/// A hash of up to `len` bytes of guest memory at `addr` as they are now, and how many of them
+/// could be read (the hash covers those). It is the hash that GPU memory is compared by (see
+/// [`crate::vm::AddressSpace::hash`]), for memory that is named by its guest address: the bytes are
+/// not copied when the memory can be reached by address.
+pub fn hash_memory(mem: &dyn GuestMemory, mut addr: u64, len: u64) -> (u64, u64) {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = K;
+    let mut done = 0u64;
+    while done < len {
+        let wanted = (len - done).min(1 << 20);
+        let (part, n) = match mem.host_run(addr, wanted) {
+            // SAFETY: `host_run` gives a pointer valid for the run it names, for as long as the
+            // process runs.
+            Some((ptr, run)) if run > 0 => unsafe {
+                let run = run.min(wanted);
+                (crate::shaders::hash_raw(ptr, run as usize), run)
+            },
+            _ => {
+                let mut copy = vec![0u8; wanted as usize];
+                if !mem.read(addr, &mut copy) {
+                    break;
+                }
+                (crate::shaders::hash_bytes(&copy), wanted)
+            }
+        };
+        h = (h ^ part).wrapping_mul(K);
+        h ^= h >> 32;
+        done += n;
+        addr += n;
+    }
+    (h ^ done, done)
+}
+
 /// Memory for tests: a few mapped ranges backed by vectors.
 #[cfg(test)]
 pub mod testing {
@@ -104,6 +137,33 @@ pub mod testing {
             }
             false
         }
+    }
+
+    #[test]
+    fn a_hash_of_memory_changes_with_the_bytes_and_says_how_many_it_covers() {
+        use super::hash_memory;
+        let m = TestMemory::new();
+        m.map(0x1000, 0x2000);
+        let (zero, n) = hash_memory(&m, 0x1000, 0x2000);
+        assert_eq!(n, 0x2000);
+        assert_eq!(
+            hash_memory(&m, 0x1000, 0x2000),
+            (zero, n),
+            "and it is stable"
+        );
+        for at in [0u64, 1, 0x7FF, 0x1000, 0x1FFF] {
+            assert!(m.write(0x1000 + at, &[1]));
+            assert_ne!(hash_memory(&m, 0x1000, 0x2000).0, zero, "byte {at:#x}");
+            assert!(m.write(0x1000 + at, &[0]));
+            assert_eq!(hash_memory(&m, 0x1000, 0x2000).0, zero, "and restored");
+        }
+        // Past the end of the memory only what is there is covered.
+        assert_eq!(
+            hash_memory(&m, 0x1000, 0x3000).1,
+            0,
+            "a read that is not all there is refused"
+        );
+        assert_eq!(hash_memory(&m, 0x9000, 0x100).1, 0);
     }
 
     #[test]

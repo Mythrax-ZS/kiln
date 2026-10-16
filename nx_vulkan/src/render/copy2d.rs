@@ -136,7 +136,9 @@ impl Core {
             src.transition(&self.vk, cmd, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
             src.image.image
         };
-        let dst = self.targets.get(&self.vk, &mut self.frame, dst_key)?;
+        self.targets.get(&self.vk, &mut self.frame, dst_key)?;
+        self.targets.note_memory(scene.mem, &dst_key);
+        let dst = self.targets.existing(&dst_key).expect("just made");
         dst.transition(&self.vk, cmd, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
         let layers = vk::ImageSubresourceLayers {
             aspect_mask: vk::ImageAspectFlags::COLOR,

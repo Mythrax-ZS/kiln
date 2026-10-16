@@ -136,6 +136,8 @@ struct Core {
     global_pending: bool,
     /// Draws recorded since the last batch was sent to the device.
     batch_draws: u32,
+    /// The submission counter when the targets nothing draws to were last looked at.
+    retired_at: u64,
     /// What the textures of the draw being recorded are, kept while draws wait for the device so
     /// that the one that loses it can say.
     last_textures: Vec<String>,
@@ -316,6 +318,7 @@ impl Renderer {
                     sync_on: false,
                     global_pending: false,
                     batch_draws: 0,
+                    retired_at: 0,
                     last_textures: Vec::new(),
                     write_back_causes: std::collections::HashMap::new(),
                     #[cfg(feature = "window")]
@@ -560,7 +563,9 @@ impl Core {
         let cmd = self.frame.cmd(&self.vk)?;
         let mut color_infos = Vec::new();
         for key in &wanted.colors {
-            let t = self.targets.get(&self.vk, &mut self.frame, *key)?;
+            self.targets.get(&self.vk, &mut self.frame, *key)?;
+            self.targets.note_memory(scene.mem, key);
+            let t = self.targets.existing(key).expect("just made");
             t.transition(&self.vk, cmd, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
             color_infos.push(
                 vk::RenderingAttachmentInfo::default()
@@ -717,6 +722,7 @@ impl Core {
             return Ok(());
         }
         self.depth_read_only = false;
+        self.retire_targets(scene)?;
         self.begin_pass(scene)?;
         let pass = self.pass.clone().expect("a pass was just begun");
         let values = scene.regs.clear_values();
@@ -837,15 +843,59 @@ impl Core {
         Ok(())
     }
 
-    /// Count a submission and let go of the targets nothing draws to any more.
+    /// Count a submission.
     fn submission_over(&mut self) {
         self.targets.submissions += 1;
-        let retired = self.targets.retire(&mut self.frame);
+    }
+
+    /// Let go of the targets nothing has drawn to for a long time, once a submission, with the first
+    /// command that has the memory to look at. A target whose pixels were never put into memory
+    /// (a title draws some text or a shape once into a small target and reads it for ever after)
+    /// would lose them: they are put there first, when the memory is as the target found it and so
+    /// nothing else has been put in it (docs/ASSUMPTIONS.md A-171).
+    fn retire_targets(&mut self, scene: &Scene<'_>) -> Result<(), String> {
+        if self.retired_at == self.targets.submissions {
+            return Ok(());
+        }
+        self.retired_at = self.targets.submissions;
+        let due = self.targets.due();
+        if due.is_empty() {
+            return Ok(());
+        }
+        let save: Vec<Key> = due
+            .iter()
+            .filter(|(key, dirty)| {
+                *dirty
+                    && crate::image::aspect_of(key.format) == vk::ImageAspectFlags::COLOR
+                    && self.targets.memory_unchanged(scene.mem, key)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        if !save.is_empty() {
+            self.end_pass();
+            // A target that cannot be written is let go all the same: the draw that comes next
+            // does not depend on it.
+            match self
+                .targets
+                .write_back(&self.vk, &mut self.frame, scene.mem, &save)
+            {
+                Ok(()) if self.debug.trace_textures => {
+                    for key in &save {
+                        eprintln!("[vulkan] the pixels of the render target {key:?} were put into its memory before it was let go");
+                    }
+                }
+                Ok(()) => {}
+                Err(e) => eprintln!("[vulkan] render targets could not be put into their memory before they were let go: {e}"),
+            }
+        }
+        let old: Vec<Key> = due.iter().map(|(key, _)| *key).collect();
+        self.targets.release(&old, &mut self.frame);
         if self.debug.trace_textures {
-            for key in retired {
+            for key in &old {
                 eprintln!("[vulkan] the render target {key:?} was let go (nothing drew to it for a long time)");
             }
         }
+        Ok(())
     }
 
     /// Send what was recorded to the device and go on recording while it runs (A-123).

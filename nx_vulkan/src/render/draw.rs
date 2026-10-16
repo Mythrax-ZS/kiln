@@ -152,6 +152,7 @@ impl Core {
         crate::alloc_stats::lap("outside the draws");
         self.last_textures.clear();
         self.depth_read_only = false;
+        self.retire_targets(scene)?;
         let regs = scene.regs;
         let raster = regs.raster();
         if !raster.enabled {

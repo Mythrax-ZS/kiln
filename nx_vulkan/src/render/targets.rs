@@ -64,6 +64,19 @@ pub struct Target {
     /// The order in which targets were last drawn to (the later one wins where two stand for the
     /// same memory).
     pub serial: u64,
+    /// A hash of the memory the target stands for as it was when the target was made, and after
+    /// each time its pixels were put there: memory that still has it has not been used for
+    /// anything else (docs/ASSUMPTIONS.md A-171). `None` when it was not taken.
+    pub baseline: Option<u64>,
+    /// Made and not yet looked at for its baseline.
+    pub fresh: bool,
+}
+
+/// A hash of the memory a color target stands for, if all of it can be read.
+fn memory_hash(mem: &dyn GuestMemory, key: &Key) -> Option<u64> {
+    let bytes = key.memory_bytes()?;
+    let (hash, done) = nx_gpu::mem::hash_memory(mem, key.address, bytes);
+    (done == bytes).then_some(hash)
 }
 
 impl Target {
@@ -263,6 +276,8 @@ impl Targets {
                 touched: 0,
                 dirty: false,
                 serial: 0,
+                baseline: None,
+                fresh: true,
             };
             match frame.cmd(vk) {
                 Ok(cmd) => target.zero(vk, cmd),
@@ -423,8 +438,10 @@ impl Targets {
                 };
                 self.write_backs.bytes += tiled.len() as u64;
                 mem.write(key.address, &tiled);
+                let baseline = memory_hash(mem, &key);
                 if let Some(t) = self.map.get_mut(&key) {
                     t.dirty = false;
+                    t.baseline = baseline;
                 }
             }
             vk.destroy_host_buffer(staging);
@@ -572,16 +589,39 @@ impl Targets {
             .map(|t| self.submissions.saturating_sub(t.touched))
     }
 
-    /// Let go of the targets nothing has drawn to for a long time, and say which they were. A
-    /// target that was drawn to and never read keeps its pixels waiting to be written to the
-    /// memory it stands for; when the title frees that memory and puts something else there, a
-    /// texture that happens to overlap it would make the write-back overwrite what lives there
-    /// now (docs/ASSUMPTIONS.md A-118). A target that was written back keeps what it holds for
-    /// much longer, for the title may draw on top of it again.
-    pub fn retire(&mut self, frame: &mut Frame) -> Vec<Key> {
+    /// Take the baseline of the memory of a target that was just made: its hash now, before
+    /// anything is drawn to it and put into the memory.
+    pub fn note_memory(&mut self, mem: &dyn GuestMemory, key: &Key) {
+        let Some(t) = self.map.get_mut(key) else {
+            return;
+        };
+        if t.fresh {
+            t.fresh = false;
+            if aspect_of(key.format) == vk::ImageAspectFlags::COLOR {
+                t.baseline = memory_hash(mem, key);
+            }
+        }
+    }
+
+    /// Whether the memory a color target stands for is as the target left it, or found it: nothing
+    /// else was put there since (the title still has what the target was drawn for in it).
+    pub fn memory_unchanged(&self, mem: &dyn GuestMemory, key: &Key) -> bool {
+        let Some(t) = self.map.get(key) else {
+            return false;
+        };
+        t.baseline.is_some() && t.baseline == memory_hash(mem, key)
+    }
+
+    /// The targets nothing has drawn to for a long time, and whether each still waits to have its
+    /// pixels put into memory. A target that was drawn to and never read keeps its pixels waiting
+    /// to be written to the memory it stands for; when the title frees that memory and puts
+    /// something else there, a texture that happens to overlap it would make the write-back
+    /// overwrite what lives there now (docs/ASSUMPTIONS.md A-118), so such a target is let go. A
+    /// target that was written back keeps what it holds for much longer, for the title may draw on
+    /// top of it again.
+    pub fn due(&self) -> Vec<(Key, bool)> {
         let now = self.submissions;
-        let old: Vec<Key> = self
-            .map
+        self.map
             .values()
             .filter(|t| {
                 let limit = if t.dirty {
@@ -591,9 +631,13 @@ impl Targets {
                 };
                 now.saturating_sub(t.touched) > limit
             })
-            .map(|t| t.key)
-            .collect();
-        for key in &old {
+            .map(|t| (t.key, t.dirty))
+            .collect()
+    }
+
+    /// Let go of the targets `old` (see [`Targets::due`]).
+    pub fn release(&mut self, old: &[Key], frame: &mut Frame) {
+        for key in old {
             if let Some(t) = self.map.remove(key) {
                 frame.garbage.push(Garbage::Image(t.image));
             }
@@ -608,7 +652,6 @@ impl Targets {
                 self.by_address.remove(&key.address);
             }
         }
-        old
     }
 
     /// The targets made so far, for messages.
