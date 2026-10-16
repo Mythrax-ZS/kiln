@@ -1206,14 +1206,19 @@ impl Core {
         }
         data[readable..].fill(0);
         if self.debug.trace_cbufs && self.traced().is_some() {
-            // The first words of the buffer, then the others that are not zero, as `word:value`.
+            // The first words of the buffer, then the others that are not zero, as `word:value`
+            // (`NX_TRACE_CBUF_WORDS` says how many, 64 by default).
+            let limit = std::env::var("NX_TRACE_CBUF_WORDS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(64);
             let words: Vec<String> = data
                 .as_chunks::<4>()
                 .0
                 .iter()
                 .enumerate()
                 .filter(|(i, c)| *i < 16 || **c != [0u8; 4])
-                .take(64)
+                .take(limit)
                 .map(|(i, c)| {
                     let w = u32::from_le_bytes(*c);
                     let f = f32::from_bits(w);

@@ -179,7 +179,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   (what `NX_TRACE_DRAWS` does), `NX_DUMP_PASSES=<dir>` writes a picture of each pass of a traced
   frame, `NX_DUMP_DRAWS=<dir>` with `NX_DUMP_FROM=<n>` and `NX_DUMP_UNTIL=<n>` one after each
   command, `NX_TRACE_COMPUTE=1` prints every compute launch with its descriptor and
-  `NX_TRACE_CBUFS=1` the constant buffers a traced draw or launch reads. With `NX_DUMP_DRAWS`,
+  `NX_TRACE_CBUFS=1` the constant buffers a traced draw or launch reads (`NX_TRACE_CBUF_WORDS=<n>`
+  says how many words of each, 64 by default). With `NX_DUMP_DRAWS`,
   `NX_PROBE_PIXELS=<x>:<y>[,...]` prints what those pixels of the first color target hold as numbers (a
   floating-point target is not clamped) and `NX_PROBE_EXTREME=<limit>` how many pixels hold a component
   above the limit or not a number, with the first few (and, with `NX_DUMP_TARGETS` at a presented frame,
@@ -192,7 +193,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   the pixels that go wrong, the program and the instruction). `NX_DUMP_TEXTURES=<dir>` writes every layer
   and level of each texture made as a picture, and its memory as it was (`.raw`;
   `NX_DUMP_TEXTURES_BELOW=<bytes>` keeps to the textures whose memory is smaller); `NX_TRACE_TEXTURES=1`
-  also says which texels of a floating-point texture are not numbers or huge and, in a traced frame, lists the cube maps
+  also says which texels of a floating-point texture are not numbers or huge, which render targets are let go
+  (and which of them had their pixels put into memory first, A-171) and, in a traced frame, lists the cube maps
   the texture header pool holds. `NX_INPUT_SCRIPT="<frame>
   <Action> [<frames>];..."` (or a file) presses actions of a keymap at presented frame numbers, for
   runs without a person (the frame rate decides when a menu is ready: a run that is 15 times faster
