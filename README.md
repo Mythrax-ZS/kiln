@@ -164,7 +164,9 @@ standard error, `NX_TRACE_LOG=1` prints what the program logs through the log ma
 `GetInfo` entropy) reproducible, and `NX_WATCHDOG=<seconds>` says what every guest thread is doing
 when no frame has been presented for that long. `kiln relink` links the objects of an earlier build against the
 current runtime and `--reuse-objects` skips recompiling unchanged code, which keeps the loop of
-trying a title short.
+trying a title short. A relink keeps the code the earlier build generated: a change of the code
+generator or of the analysis (a floating-point form lowered to native code, say) shows only after
+a new build.
 
 For the GPU: `NX_TRACE_GPU=1` prints every submission and, when the run ends, what the command
 processor counted (`NX_GPU_TOP=<n>` sets how many of the busiest methods it lists, 0 lists all);
