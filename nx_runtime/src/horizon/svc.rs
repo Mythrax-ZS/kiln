@@ -210,9 +210,56 @@ impl Kernel {
     /// Execute `SVC #imm` for `thread`. On entry `cpu.state.pc` is the instruction after it.
     /// `NX_TRACE_SVC` in the environment logs every call and its result on standard error.
     pub fn svc(self: &Arc<Kernel>, cpu: &mut NativeCpu, thread: u64, imm: u32) -> Flow {
+        // The watchdog's flight recorder notes the calls that lock, wait and signal.
+        if self.recording() && matches!(imm, 0x1A..=0x1D | 0x34 | 0x35) {
+            let args = [
+                cpu.state.x[0],
+                cpu.state.x[1],
+                cpu.state.x[2],
+                cpu.state.x[3],
+            ];
+            self.note_flight(thread, imm, args, false, 0);
+            let flow = self.svc_logged(cpu, thread, imm);
+            self.note_flight(thread, imm, args, true, cpu.state.x[0]);
+            return flow;
+        }
+        self.svc_logged(cpu, thread, imm)
+    }
+
+    fn svc_logged(self: &Arc<Kernel>, cpu: &mut NativeCpu, thread: u64, imm: u32) -> Flow {
         #[cfg(feature = "alloc_stats")]
         SVC_COUNTS[(imm & 0xFF) as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if !self.trace {
+            // The calls on the addresses of `NX_TRACE_ADDR`: ArbitrateLock, ArbitrateUnlock,
+            // WaitProcessWideKeyAtomic, SignalProcessWideKey, WaitForAddress, SignalToAddress.
+            if !self.trace_addrs.is_empty() && matches!(imm, 0x1A..=0x1D | 0x34 | 0x35) {
+                let args = [
+                    cpu.state.x[0],
+                    cpu.state.x[1],
+                    cpu.state.x[2],
+                    cpu.state.x[3],
+                ];
+                if args[..2].iter().any(|a| self.trace_addrs.contains(a)) {
+                    let pc = cpu.state.pc.wrapping_sub(4);
+                    let name = svc_name(imm).unwrap_or("?");
+                    let ms = |t: std::time::Instant| {
+                        t.duration_since(self.started).as_secs_f64() * 1000.0
+                    };
+                    eprintln!(
+                        "[addr {:.3}] thread {thread} at {pc:#x}: {name} x0..x3 = {:#x} {:#x} {:#x} {:#x}",
+                        ms(std::time::Instant::now()),
+                        args[0], args[1], args[2], args[3]
+                    );
+                    let flow = self.dispatch_noting_errors(cpu, thread, imm);
+                    eprintln!(
+                        "[addr {:.3}] thread {thread} at {pc:#x}: {name} -> x0 = {:#x} x1 = {:#x}",
+                        ms(std::time::Instant::now()),
+                        cpu.state.x[0],
+                        cpu.state.x[1]
+                    );
+                    return flow;
+                }
+            }
             // The calls that can block, with how long they took: sleeps, waits, locks, condition
             // variables, addresses and requests of services (`NX_TRACE_WAITS`).
             if let Some(least) = self.trace_waits {

@@ -150,16 +150,41 @@ pub(super) fn report_threads(kernel: &Kernel, label: &str) {
         .map(|(id, m)| (*id, Arc::clone(m)))
         .collect();
     let now = now_ms();
+    // The words that threads wait on through a lock or a condition variable (and the ones the
+    // main thread waits on at an address), for the history of what was done to them.
+    let mut words: Vec<u64> = Vec::new();
+    for (id, monitor) in &monitors {
+        let imm = monitor.svc.load(Ordering::Acquire).wrapping_sub(1);
+        if matches!(imm, 0x1A | 0x1C) || (imm == 0x34 && *id == 1) {
+            for slot in &monitor.args[..2] {
+                let a = slot.load(Ordering::Relaxed);
+                if a >= 0x10000 && !words.contains(&a) {
+                    words.push(a);
+                }
+            }
+        }
+    }
     for (id, monitor) in monitors {
         let (entry, arg, priority, core) = kernel.thread_entry(id).unwrap_or((0, 0, 0, 0));
         let svc = monitor.svc.load(Ordering::Acquire);
         let what = if svc > 0 {
             let imm = svc - 1;
-            let detail = monitor
+            let mut detail = monitor
                 .detail
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
+            // A thread that waits on a word says what the word holds now: one that no longer
+            // holds what the thread waits for is a wake-up that was lost.
+            if imm == 0x34 {
+                let addr = monitor.args[0].load(Ordering::Relaxed);
+                if let Some(word) = kernel.read_u32(addr) {
+                    if !detail.is_empty() {
+                        detail.push_str(", ");
+                    }
+                    detail.push_str(&format!("the word holds {word:#x} now"));
+                }
+            }
             format!(
                 "in {} ({imm:#x}) for {:.1} s, x0..x2 = {:#x} {:#x} {:#x}{}",
                 svc_name(imm).unwrap_or("an unknown call"),
@@ -211,5 +236,30 @@ pub(super) fn report_threads(kernel: &Kernel, label: &str) {
             "[{label}]   thread {id} (entry {entry:#x}, argument {arg:#x}, priority {priority}, \
              core {core}): {what}; {stack}"
         );
+    }
+    for word in words {
+        let calls = kernel.flight_about(&[word], 24);
+        if calls.is_empty() {
+            continue;
+        }
+        eprintln!("[{label}]   the last calls that name {word:#x} (microseconds since the start):");
+        for c in calls {
+            eprintln!(
+                "[{label}]     {:>12} thread {} {} {} x0..x3 = {:#x} {:#x} {:#x} {:#x}{}",
+                c.at_us,
+                c.thread,
+                svc_name(c.imm).unwrap_or("?"),
+                if c.done { "ended" } else { "began" },
+                c.args[0],
+                c.args[1],
+                c.args[2],
+                c.args[3],
+                if c.done {
+                    format!(", result {:#x}", c.result)
+                } else {
+                    String::new()
+                }
+            );
+        }
     }
 }

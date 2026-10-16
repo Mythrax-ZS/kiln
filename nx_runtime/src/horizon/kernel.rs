@@ -175,7 +175,11 @@ pub struct Kernel {
     /// Log the supervisor calls that block and took at least this long, with the thread and the
     /// time (`NX_TRACE_WAITS=<microseconds>`: where the threads of a program wait for each other).
     pub(super) trace_waits: Option<std::time::Duration>,
-    /// When the kernel was made, for the times `NX_TRACE_WAITS` prints.
+    /// Log the mutex, condition variable and address calls that name one of these guest addresses
+    /// as their first or second argument (`NX_TRACE_ADDR=<hex address>[,...]`: who locks, waits
+    /// on and signals one lock, in what order).
+    pub(super) trace_addrs: Vec<u64>,
+    /// When the kernel was made, for the times `NX_TRACE_WAITS` and `NX_TRACE_ADDR` print.
     pub(super) started: std::time::Instant,
     /// Print what the program logs through `lm` (`NX_TRACE_LOG`).
     trace_log: bool,
@@ -194,10 +198,27 @@ pub struct Kernel {
     /// The last supervisor calls that failed (not the waits that timed out and the like), for the
     /// report of a stop.
     recent_errors: Mutex<std::collections::VecDeque<String>>,
+    /// While a watchdog runs: the last mutex, condition variable and address calls of all the
+    /// threads, for its report of what happened to the words the threads wait on.
+    flight: Option<Mutex<std::collections::VecDeque<Flight>>>,
 }
 
 /// How many failed supervisor calls the stop report remembers.
 const RECENT_ERRORS: usize = 24;
+
+/// How many synchronization calls the watchdog's flight recorder keeps.
+const FLIGHT_CAPACITY: usize = 1 << 19;
+
+/// One synchronization call, noted when it begins (`done` false) and when it ends.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Flight {
+    pub at_us: u64,
+    pub thread: u64,
+    pub imm: u32,
+    pub args: [u64; 4],
+    pub done: bool,
+    pub result: u64,
+}
 
 impl Drop for Kernel {
     fn drop(&mut self) {
@@ -416,6 +437,15 @@ impl Kernel {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .map(std::time::Duration::from_micros),
+            trace_addrs: std::env::var("NX_TRACE_ADDR")
+                .map(|v| {
+                    v.split(',')
+                        .filter_map(|a| {
+                            u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             started: std::time::Instant::now(),
             trace_log: std::env::var_os("NX_TRACE_LOG").is_some(),
             finish_hooks: Mutex::new(Vec::new()),
@@ -425,7 +455,57 @@ impl Kernel {
             jitter: jitter_from_env(),
             jitter_state: std::sync::atomic::AtomicU64::new(0x9E37_79B9_7F4A_7C15),
             recent_errors: Mutex::new(std::collections::VecDeque::new()),
+            flight: super::watchdog::requested()
+                .map(|_| Mutex::new(std::collections::VecDeque::with_capacity(FLIGHT_CAPACITY))),
         })
+    }
+
+    /// Does the flight recorder run?
+    pub(super) fn recording(&self) -> bool {
+        self.flight.is_some()
+    }
+
+    /// Note a synchronization call in the flight recorder.
+    pub(super) fn note_flight(
+        &self,
+        thread: u64,
+        imm: u32,
+        args: [u64; 4],
+        done: bool,
+        result: u64,
+    ) {
+        if let Some(q) = &self.flight {
+            let mut q = q.lock().unwrap_or_else(|e| e.into_inner());
+            if q.len() >= FLIGHT_CAPACITY {
+                q.pop_front();
+            }
+            q.push_back(Flight {
+                at_us: self.started.elapsed().as_micros() as u64,
+                thread,
+                imm,
+                args,
+                done,
+                result,
+            });
+        }
+    }
+
+    /// The last `last` recorded calls that name one of `addrs` as their first or second argument,
+    /// oldest first.
+    pub(super) fn flight_about(&self, addrs: &[u64], last: usize) -> Vec<Flight> {
+        let Some(q) = &self.flight else {
+            return Vec::new();
+        };
+        let q = q.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<Flight> = q
+            .iter()
+            .rev()
+            .filter(|f| addrs.contains(&f.args[0]) || addrs.contains(&f.args[1]))
+            .take(last)
+            .copied()
+            .collect();
+        out.reverse();
+        out
     }
 
     /// The monitors of the running guest threads, by thread.

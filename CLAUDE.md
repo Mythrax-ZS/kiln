@@ -97,12 +97,16 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   `NX_TRACE_LOG=1` prints what it logs through `lm`;
   `NX_TRACE_WAITS=<microseconds>` logs every blocking supervisor call (sleep, wait, lock, condition
   variable, address, request of a service) that took that long, with the thread and the time in
-  milliseconds since the start, to see which threads wait for which;
+  milliseconds since the start, to see which threads wait for which; `NX_TRACE_ADDR=<hex
+  address>[,...]` logs the lock, condition variable and address calls that name those guest
+  addresses, with the times, to follow one lock;
   `NX_RANDOM_SEED=<n>` makes the kernel's entropy reproducible; `NX_ROMFS=<dir|image>` names the
   RomFS it reads at run time; `NX_WATCHDOG=<seconds>` says, when no frame has been presented for
   that long (and again every that many seconds), what every guest thread is doing (the supervisor
-  call, the service and command of a request, the return addresses as of its last call) and
-  where the command processor and the renderer are (`kiln symbols` names the addresses;
+  call, for a wait on an address what the word holds now, the service and command of a request,
+  the return addresses as of its last call), the last calls that named each word that the main
+  thread, or a thread waiting on a lock or a condition variable, waits on (a lost wake-up shows
+  there), and where the command processor and the renderer are (`kiln symbols` names the addresses;
   `NX_WATCHDOG_ALWAYS=1` reports every that many seconds whether frames come or not, for a title
   that presents the frames of a loading screen for ever). `NX_JITTER=<percent>[,<microseconds>]`
   makes that share of the supervisor calls sleep for up to that long first (500 by default), to stir
