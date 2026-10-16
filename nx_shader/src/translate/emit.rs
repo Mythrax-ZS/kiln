@@ -496,6 +496,20 @@ impl<'a> Tx<'a> {
         }
     }
 
+    /// When a control-flow instruction takes effect: its predicate holds and the condition code
+    /// flags pass its test `cc` (`None` when it always does).
+    pub fn control_condition(&mut self, g: Guard, cc: u8) -> R<Option<Id>> {
+        let predicate = self.guard_condition(g);
+        if cc == crate::cfg::CC_ALWAYS {
+            return Ok(predicate);
+        }
+        let test = super::alu::condition(self, u64::from(cc))?;
+        Ok(Some(match predicate {
+            Some(p) => self.land(p, test),
+            None => test,
+        }))
+    }
+
     /// Write a register as the instruction's guard says: the old value stays when the guard is false.
     pub fn write(&mut self, inst: Inst, r: u8, value: Id) {
         if r == RZ {

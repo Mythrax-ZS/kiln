@@ -2,8 +2,8 @@
 
 mod common;
 
-use common::{random_states, run, vulkan, Rng, State};
-use nx_shader::asm::{exit, Enc};
+use common::{random_states, run, run_with, vulkan, Extras, Rng, State};
+use nx_shader::asm::{bra, exit, mov32i, with_cc, Enc};
 use nx_shader::inst::{Guard, PT, RZ};
 use nx_shader::ops::Op;
 
@@ -727,6 +727,117 @@ fn iadd_with_cc_sets_the_flags_and_csetp_tests_them() {
                 got.preds & 1 != 0,
                 want,
                 "condition {code} after {a:#x} + {b:#x}"
+            );
+        }
+    }
+}
+
+/// The byte address of instruction `i` of a program laid out by the assembler.
+fn at(i: u32) -> u32 {
+    8 * (1 + i + i / 3)
+}
+
+#[test]
+fn a_jump_on_the_condition_code_goes_by_the_flags_of_the_last_addition() {
+    let Some(vk) = vulkan() else { return };
+    let mut inputs = random_states(60, 347);
+    for (a, b) in [
+        (0u32, 0u32),
+        (1, u32::MAX),
+        (u32::MAX, u32::MAX),
+        (0x7FFF_FFFF, 1),
+        (0x8000_0000, 0x8000_0000),
+        (5, 5u32.wrapping_neg()),
+    ] {
+        for preds in [0u32, 1] {
+            let mut s = State::default();
+            s.regs[1] = a;
+            s.regs[2] = b;
+            s.preds = preds;
+            inputs.push(s);
+        }
+    }
+    let p0 = Guard {
+        index: 0,
+        negated: false,
+    };
+    // R5 is 2 where the jump is taken and 1 where it is not.
+    for code in
+        (1..32u64).filter(|c| *c != 15 && condition(*c, (false, false, false, false)).is_some())
+    {
+        for guard in [Guard::ALWAYS, p0] {
+            let program = [
+                Enc::op(Op::IaddReg).rd(3).ra(1).rb(2).bit(47, true).build(),
+                with_cc(bra(at(1), at(4), guard), code as u8),
+                mov32i(5, 1),
+                exit(Guard::ALWAYS),
+                mov32i(5, 2),
+                exit(Guard::ALWAYS),
+            ];
+            for force_loop in [false, true] {
+                let out = run_with(
+                    &vk,
+                    &program,
+                    &inputs,
+                    &[],
+                    Extras {
+                        force_loop,
+                        ..Extras::default()
+                    },
+                )
+                .states;
+                for (inp, got) in inputs.iter().zip(&out) {
+                    let (a, b) = (inp.regs[1], inp.regs[2]);
+                    let passes = condition(code, add_flags(a, b, false)).unwrap();
+                    let taken = passes && (guard.is_always() || inp.preds & 1 != 0);
+                    assert_eq!(
+                        got.regs[5],
+                        if taken { 2 } else { 1 },
+                        "condition {code}, predicate {}, loop {force_loop}, after {a:#x} + {b:#x}",
+                        !guard.is_always()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn an_exit_on_the_condition_code_ends_the_program_by_the_flags() {
+    let Some(vk) = vulkan() else { return };
+    let mut inputs = random_states(60, 349);
+    for (a, b) in [(0u32, 0u32), (1, u32::MAX), (0x7FFF_FFFF, 1), (3, 4)] {
+        let mut s = State::default();
+        s.regs[1] = a;
+        s.regs[2] = b;
+        inputs.push(s);
+    }
+    // EXIT.EQ after the addition: R5 stays 7 where the sum is zero and becomes 8 elsewhere.
+    let program = [
+        Enc::op(Op::IaddReg).rd(3).ra(1).rb(2).bit(47, true).build(),
+        mov32i(5, 7),
+        with_cc(exit(Guard::ALWAYS), 2),
+        mov32i(5, 8),
+        exit(Guard::ALWAYS),
+    ];
+    for force_loop in [false, true] {
+        let out = run_with(
+            &vk,
+            &program,
+            &inputs,
+            &[],
+            Extras {
+                force_loop,
+                ..Extras::default()
+            },
+        )
+        .states;
+        for (inp, got) in inputs.iter().zip(&out) {
+            let sum = inp.regs[1].wrapping_add(inp.regs[2]);
+            assert_eq!(
+                got.regs[5],
+                if sum == 0 { 7 } else { 8 },
+                "loop {force_loop}"
             );
         }
     }

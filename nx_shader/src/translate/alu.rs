@@ -331,8 +331,9 @@ fn fsetp(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
     Ok(())
 }
 
+/// `FSET.cmp.bop Rd, Ra, B, Pc`, with `.CC` the zero and sign flags of the value it writes (and the
+/// carry and overflow flags clear; docs/ASSUMPTIONS.md A-169).
 fn fset(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
-    no_cc(tx, inst, 47)?;
     let a = tx.read_f(inst.ra());
     let a = fmods(tx, a, inst.bit(43), inst.bit(54));
     let b = src_b_f(tx, inst)?;
@@ -342,6 +343,9 @@ fn fset(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
     let r = bool_op(tx, inst.bits(45, 2), c, pc)?;
     let v = set_value(tx, r, inst.bit(52));
     tx.write(inst, inst.rd(), v);
+    if inst.bit(47) {
+        tx.set_zero_and_sign(inst, v, true);
+    }
     Ok(())
 }
 
@@ -1208,7 +1212,7 @@ fn p2r(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
 /// A test of the condition code flags by the 5-bit code of `CSETP` and the control-flow
 /// instructions (docs/ASSUMPTIONS.md A-107): `S` is the sign (negative) flag, `Z` zero, `C` carry
 /// and `O` overflow. The codes that name states of the hardware's own are refused.
-fn condition(tx: &mut Tx<'_>, code: u64) -> R<Id> {
+pub(super) fn condition(tx: &mut Tx<'_>, code: u64) -> R<Id> {
     if code == 15 {
         return Ok(tx.ctrue());
     }

@@ -31,6 +31,12 @@ pub fn bra(at: u32, to: u32, g: Guard) -> u64 {
     0xe240_0000_0000_000f | guard_bits(g) | branch_field(at, to)
 }
 
+/// The control-flow instruction `inst` (made with the test 15, always) with the condition code test
+/// `cc` in its low five bits.
+pub fn with_cc(inst: u64, cc: u8) -> u64 {
+    inst & !0x1f | u64::from(cc)
+}
+
 pub fn ssy(at: u32, to: u32) -> u64 {
     0xe290_0000_0000_0000 | 0x7 << 16 | branch_field(at, to)
 }

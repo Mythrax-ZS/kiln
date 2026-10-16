@@ -95,26 +95,38 @@ pub enum JumpKind {
 pub enum Term {
     /// The next block starts right after this one (it is a branch target).
     Fall(u32),
-    /// Jump to `target` when `guard` holds; otherwise continue at `next` (absent when the guard is
-    /// always true).
+    /// Jump to `target` when `guard` holds and the condition code passes `cc` (a test of the flags
+    /// the `.CC` instructions set; [`CC_ALWAYS`] when there is none); otherwise continue at `next`
+    /// (absent when the jump is unconditional).
     Jump {
         kind: JumpKind,
         guard: Guard,
+        cc: u8,
         target: u32,
         next: Option<u32>,
     },
-    /// Jump, when `guard` holds, to the address that register `reg` holds plus `base` (the
-    /// block's `targets` are the places it can be); otherwise continue at `next`.
+    /// Jump, when `guard` holds and the condition code passes `cc`, to the address that register
+    /// `reg` holds plus `base` (the block's `targets` are the places it can be); otherwise continue
+    /// at `next`.
     Indirect {
         guard: Guard,
+        cc: u8,
         reg: u8,
         base: u32,
         next: Option<u32>,
     },
-    /// End the invocation when `guard` holds.
-    Exit { guard: Guard, next: Option<u32> },
-    /// Discard the fragment when `guard` holds.
-    Kill { guard: Guard, next: Option<u32> },
+    /// End the invocation when `guard` holds and the condition code passes `cc`.
+    Exit {
+        guard: Guard,
+        cc: u8,
+        next: Option<u32>,
+    },
+    /// Discard the fragment when `guard` holds and the condition code passes `cc`.
+    Kill {
+        guard: Guard,
+        cc: u8,
+        next: Option<u32>,
+    },
     /// A kind of control flow not handled (the reason is in [`Cfg::issues`]).
     Unsupported,
 }
@@ -201,12 +213,15 @@ impl Cfg {
                 seen.insert(pc, st.clone());
                 let next = next_pc(pc);
                 let guard = guard_of(inst);
+                let op = inst.op();
+                let cc = cc_of(inst);
                 // An instruction that never executes does nothing.
-                if guard.is_never() {
+                if guard.is_never() || cc == CC_NEVER {
                     pc = next;
                     continue;
                 }
-                let op = inst.op();
+                // Nothing continues past an instruction that always takes effect.
+                let always = guard.is_always() && cc == CC_ALWAYS;
                 match op {
                     Some(Op::Ssy | Op::Pbk | Op::Pcnt) => {
                         let Some(t) = relative_target(code, pc, inst) else {
@@ -224,12 +239,6 @@ impl Cfg {
                         pc = next;
                     }
                     Some(Op::Bra) => {
-                        if !condition_is_always(inst) {
-                            cfg.issues.push(format!(
-                                "BRA at {pc:#x} on a condition code, not a predicate"
-                            ));
-                            break;
-                        }
                         let Some(t) = relative_target(code, pc, inst) else {
                             cfg.issues
                                 .push(format!("BRA at {pc:#x} to a place outside the code"));
@@ -237,18 +246,13 @@ impl Cfg {
                         };
                         leaders.insert(t);
                         work.push((t, st.clone()));
-                        if guard.is_always() {
+                        if always {
                             break;
                         }
                         leaders.insert(next);
                         pc = next;
                     }
                     Some(Op::Sync | Op::Brk | Op::Cont) => {
-                        if !condition_is_always(inst) {
-                            cfg.issues
-                                .push(format!("{} at {pc:#x} on a condition code", opname(op)));
-                            break;
-                        }
                         let mut after = st.clone();
                         let target = match op {
                             Some(Op::Sync) => after.ssy.pop(),
@@ -271,18 +275,13 @@ impl Cfg {
                         }
                         leaders.insert(t);
                         work.push((t, after));
-                        if guard.is_always() {
+                        if always {
                             break;
                         }
                         leaders.insert(next);
                         pc = next;
                     }
                     Some(Op::Brx) => {
-                        if !condition_is_always(inst) {
-                            cfg.issues
-                                .push(format!("BRX at {pc:#x} on a condition code"));
-                            break;
-                        }
                         let (targets, words) = match indirect_targets(code, pc, inst, constants) {
                             Ok(found) => found,
                             Err(issue) => {
@@ -300,19 +299,14 @@ impl Cfg {
                             work.push((*t, st.clone()));
                         }
                         indirect.insert(pc, targets);
-                        if guard.is_always() {
+                        if always {
                             break;
                         }
                         leaders.insert(next);
                         pc = next;
                     }
                     Some(Op::Exit | Op::Kil) => {
-                        if !condition_is_always(inst) {
-                            cfg.issues
-                                .push(format!("{} at {pc:#x} on a condition code", opname(op)));
-                            break;
-                        }
-                        if guard.is_always() {
+                        if always {
                             break;
                         }
                         leaders.insert(next);
@@ -353,19 +347,23 @@ impl Cfg {
                 let next = next_pc(pc);
                 let guard = guard_of(inst);
                 let op = inst.op();
+                let cc = cc_of(inst);
                 let ends = |term: Term| (Some(term), next);
-                let (term, end) = if guard.is_never() {
+                // The block goes on after an instruction that does not always take effect.
+                let after_it = (!(guard.is_always() && cc == CC_ALWAYS)).then_some(next);
+                let (term, end) = if guard.is_never() || cc == CC_NEVER {
                     (None, next)
                 } else {
                     match op {
                         Some(Op::Bra) => {
                             let t = relative_target(code, pc, inst);
                             match t {
-                                Some(target) if condition_is_always(inst) => ends(Term::Jump {
+                                Some(target) => ends(Term::Jump {
                                     kind: JumpKind::Bra,
                                     guard,
+                                    cc,
                                     target,
-                                    next: (!guard.is_always()).then_some(next),
+                                    next: after_it,
                                 }),
                                 _ => ends(Term::Unsupported),
                             }
@@ -378,16 +376,13 @@ impl Cfg {
                                 _ => (JumpKind::Cont, after.pcnt.pop()),
                             };
                             match target {
-                                Some(target)
-                                    if condition_is_always(inst) && valid_target(code, target) =>
-                                {
-                                    ends(Term::Jump {
-                                        kind,
-                                        guard,
-                                        target,
-                                        next: (!guard.is_always()).then_some(next),
-                                    })
-                                }
+                                Some(target) if valid_target(code, target) => ends(Term::Jump {
+                                    kind,
+                                    guard,
+                                    cc,
+                                    target,
+                                    next: after_it,
+                                }),
                                 _ => ends(Term::Unsupported),
                             }
                         }
@@ -395,21 +390,23 @@ impl Cfg {
                             let base = (i64::from(pc) + 8 + inst.sbits(20, 24)) as u32;
                             ends(Term::Indirect {
                                 guard,
+                                cc,
                                 reg: inst.ra(),
                                 base,
-                                next: (!guard.is_always()).then_some(next),
+                                next: after_it,
                             })
                         }
                         Some(Op::Brx) => ends(Term::Unsupported),
-                        Some(Op::Exit) if condition_is_always(inst) => ends(Term::Exit {
+                        Some(Op::Exit) => ends(Term::Exit {
                             guard,
-                            next: (!guard.is_always()).then_some(next),
+                            cc,
+                            next: after_it,
                         }),
-                        Some(Op::Kil) if condition_is_always(inst) => ends(Term::Kill {
+                        Some(Op::Kil) => ends(Term::Kill {
                             guard,
-                            next: (!guard.is_always()).then_some(next),
+                            cc,
+                            next: after_it,
                         }),
-                        Some(Op::Exit | Op::Kil) => ends(Term::Unsupported),
                         Some(op) if is_unsupported_flow(op) => ends(Term::Unsupported),
                         None => ends(Term::Unsupported),
                         Some(_) => (None, next),
@@ -511,9 +508,21 @@ fn is_unsupported_flow(op: Op) -> bool {
     )
 }
 
-/// The condition code test of a control-flow instruction must be "always" (15).
-fn condition_is_always(inst: Inst) -> bool {
-    inst.bits(0, 5) == 0xF
+/// The condition code test that always passes (`T`).
+pub const CC_ALWAYS: u8 = 15;
+/// The condition code test that never does (`F`).
+pub const CC_NEVER: u8 = 0;
+
+/// The condition code test of a control-flow instruction: the low five bits of `BRA`, `SYNC`,
+/// `BRK`, `CONT`, `BRX`, `EXIT` and `KIL` (what the tests are is in `translate`, docs/ASSUMPTIONS.md
+/// A-107). The other instructions do not have one.
+fn cc_of(inst: Inst) -> u8 {
+    match inst.op() {
+        Some(Op::Bra | Op::Sync | Op::Brk | Op::Cont | Op::Brx | Op::Exit | Op::Kil) => {
+            inst.bits(0, 5) as u8
+        }
+        _ => CC_ALWAYS,
+    }
 }
 
 /// What reading a jump table gives: the address each entry computes with the block that starts
@@ -799,6 +808,7 @@ mod tests {
             b.term,
             Term::Exit {
                 guard: ALWAYS,
+                cc: CC_ALWAYS,
                 next: None
             }
         );
@@ -835,6 +845,7 @@ mod tests {
             Term::Jump {
                 kind: JumpKind::Bra,
                 guard: P0,
+                cc: CC_ALWAYS,
                 target: at(6),
                 next: Some(at(3)),
             }
@@ -849,6 +860,7 @@ mod tests {
                 Term::Jump {
                     kind: JumpKind::Sync,
                     guard: ALWAYS,
+                    cc: CC_ALWAYS,
                     target: at(9),
                     next: None,
                 }
@@ -896,6 +908,7 @@ mod tests {
             Term::Jump {
                 kind: JumpKind::Brk,
                 guard: P0,
+                cc: CC_ALWAYS,
                 target: at(7),
                 next: Some(at(5)),
             }
@@ -929,6 +942,80 @@ mod tests {
             cfg.blocks[&24].term,
             Term::Exit { next: None, .. }
         ));
+    }
+
+    #[test]
+    fn a_test_of_the_condition_code_makes_a_jump_conditional() {
+        // `BRA.NEU` (13) with no predicate: taken or not by the flags, so the block goes on after it.
+        let at = |slot: u32| slot * 8;
+        let slots = [
+            (1, with_cc(bra(at(1), at(5), ALWAYS), 13)),
+            (2, mov()),
+            (3, exit(ALWAYS)),
+            (5, exit(ALWAYS)),
+        ];
+        let bytes = code_of(&slots);
+        let cfg = Cfg::discover(Code(&bytes));
+        assert!(cfg.issues.is_empty(), "{:?}", cfg.issues);
+        assert_eq!(
+            cfg.blocks[&8].term,
+            Term::Jump {
+                kind: JumpKind::Bra,
+                guard: ALWAYS,
+                cc: 13,
+                target: at(5),
+                next: Some(at(2)),
+            }
+        );
+        assert!(
+            cfg.blocks.contains_key(&at(2)),
+            "the path that does not branch is followed"
+        );
+        // The same with a predicate, and on an exit and a kill.
+        let bytes = assemble(&[
+            with_cc(bra(8, 40, P0), 2),
+            with_cc(kil(ALWAYS), 5),
+            with_cc(exit(ALWAYS), 22),
+            exit(ALWAYS),
+            mov(),
+            exit(ALWAYS),
+        ]);
+        let cfg = Cfg::discover(Code(&bytes));
+        assert!(cfg.issues.is_empty(), "{:?}", cfg.issues);
+        assert!(matches!(
+            cfg.blocks[&8].term,
+            Term::Jump {
+                guard: P0,
+                cc: 2,
+                next: Some(16),
+                ..
+            }
+        ));
+        assert!(matches!(
+            cfg.blocks[&16].term,
+            Term::Kill {
+                cc: 5,
+                next: Some(24),
+                ..
+            }
+        ));
+        assert!(matches!(
+            cfg.blocks[&24].term,
+            Term::Exit {
+                cc: 22,
+                next: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_test_that_never_passes_skips_the_instruction() {
+        // `BRA.F` goes nowhere: the target is not followed and the code goes on to the exit.
+        let bytes = assemble(&[with_cc(bra(8, 0x4000, ALWAYS), 0), exit(ALWAYS)]);
+        let cfg = Cfg::discover(Code(&bytes));
+        assert!(cfg.issues.is_empty(), "{:?}", cfg.issues);
+        assert_eq!(cfg.blocks.len(), 1);
     }
 
     #[test]

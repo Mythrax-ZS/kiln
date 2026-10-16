@@ -3,7 +3,7 @@
 
 use super::emit::{ExitState, Tx, R};
 use super::{alu, int, io};
-use crate::cfg::{Block, Cfg, Code, Term};
+use crate::cfg::{Block, Cfg, Code, Term, CC_ALWAYS};
 use crate::inst::Inst;
 use crate::ops::Op;
 use crate::spirv::{op, storage, Id};
@@ -19,7 +19,7 @@ pub(super) fn build(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg) -> R<()> {
     }
     let entry = &graph.blocks[&graph.entry];
     let straight = graph.blocks.len() == 1
-        && matches!(entry.term, Term::Exit { guard, .. } if guard.is_always());
+        && matches!(entry.term, Term::Exit { guard, cc, .. } if guard.is_always() && cc == CC_ALWAYS);
     if straight {
         body(tx, code, graph, entry)?;
         io::epilogue(tx)?;
@@ -158,10 +158,11 @@ fn activate(tx: &mut Tx<'_>, block: &Block, flags: &BTreeMap<u32, Id>) -> R<bool
         Term::Fall(next) => set(tx, next, None),
         Term::Jump {
             guard,
+            cc,
             target,
             next,
             ..
-        } => match (tx.guard_condition(guard), next) {
+        } => match (tx.control_condition(guard, cc)?, next) {
             (None, _) | (Some(_), None) => set(tx, target, None),
             (Some(cond), Some(next)) => {
                 set(tx, target, Some(cond));
@@ -171,12 +172,13 @@ fn activate(tx: &mut Tx<'_>, block: &Block, flags: &BTreeMap<u32, Id>) -> R<bool
         },
         Term::Indirect {
             guard,
+            cc,
             reg,
             base,
             next,
         } => {
             let address = indirect_address(tx, reg, base);
-            let taken = tx.guard_condition(guard);
+            let taken = tx.control_condition(guard, cc)?;
             for &(at, target) in &block.targets {
                 let place = tx.c32(at);
                 let hit = tx.cmp(op::I_EQUAL, address, place);
@@ -191,15 +193,15 @@ fn activate(tx: &mut Tx<'_>, block: &Block, flags: &BTreeMap<u32, Id>) -> R<bool
                 set(tx, next, Some(stay));
             }
         }
-        Term::Exit { guard, next } => {
-            if let (Some(cond), Some(next)) = (tx.guard_condition(guard), next) {
+        Term::Exit { guard, cc, next } => {
+            if let (Some(cond), Some(next)) = (tx.control_condition(guard, cc)?, next) {
                 let stay = tx.lnot(cond);
                 set(tx, next, Some(stay));
             }
         }
-        Term::Kill { guard, next } => {
+        Term::Kill { guard, cc, next } => {
             tx.info.kills = true;
-            match (tx.guard_condition(guard), next) {
+            match (tx.control_condition(guard, cc)?, next) {
                 (None, _) | (Some(_), None) => {
                     tx.f.emit(op::KILL, &[]);
                     return Ok(false);
@@ -311,12 +313,13 @@ fn terminate(
         Term::Fall(next) => goto(tx, next),
         Term::Jump {
             guard,
+            cc,
             target,
             next,
             ..
         } => {
             let _ = label_of(labels, target);
-            match (tx.guard_condition(guard), next) {
+            match (tx.control_condition(guard, cc)?, next) {
                 (None, _) | (Some(_), None) => goto(tx, target),
                 (Some(cond), Some(next)) => {
                     let t = tx.c32(target);
@@ -329,6 +332,7 @@ fn terminate(
         }
         Term::Indirect {
             guard,
+            cc,
             reg,
             base,
             next,
@@ -344,14 +348,14 @@ fn terminate(
                     pc = tx.select_u32(hit, to, pc);
                 }
             }
-            if let (Some(cond), Some(next)) = (tx.guard_condition(guard), next) {
+            if let (Some(cond), Some(next)) = (tx.control_condition(guard, cc)?, next) {
                 let n = tx.c32(next);
                 pc = tx.select_u32(cond, pc, n);
             }
             tx.f.store(pc_var, pc);
             tx.f.branch(cont);
         }
-        Term::Exit { guard, next } => match (tx.guard_condition(guard), next) {
+        Term::Exit { guard, cc, next } => match (tx.control_condition(guard, cc)?, next) {
             (None, _) | (Some(_), None) => tx.f.branch(exit),
             (Some(cond), Some(next)) => {
                 let leave = tx.m.id();
@@ -364,9 +368,9 @@ fn terminate(
                 goto(tx, next);
             }
         },
-        Term::Kill { guard, next } => {
+        Term::Kill { guard, cc, next } => {
             tx.info.kills = true;
-            match (tx.guard_condition(guard), next) {
+            match (tx.control_condition(guard, cc)?, next) {
                 (None, _) | (Some(_), None) => tx.f.emit(op::KILL, &[]),
                 (Some(cond), Some(next)) => {
                     let die = tx.m.id();

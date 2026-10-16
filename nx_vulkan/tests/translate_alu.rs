@@ -440,6 +440,69 @@ fn bool_op(code: u32, a: bool, b: bool) -> bool {
 }
 
 #[test]
+fn fset_with_cc_sets_the_zero_and_sign_flags_of_what_it_writes() {
+    let Some(vk) = vulkan() else { return };
+    let inputs = pair_states(&float_pool());
+    // The tests of the condition code, from its flags `(z, s, c, o)`: zero and sign are those of
+    // the 32-bit value, carry and overflow are clear.
+    let passes = |test: u64, z: bool, s: bool| match test {
+        1 => s && !z,
+        2 => !s && z,
+        5 => !z,
+        6 => !s,
+        10 => z,
+        13 => s || !z,
+        16 | 17 => true,
+        18 => !s,
+        21 => s,
+        22 | 23 => false,
+        _ => unreachable!(),
+    };
+    for cmp in [1u32, 2, 4, 5, 8, 13] {
+        for bf in [false, true] {
+            for test in [1u64, 2, 5, 6, 10, 13, 16, 17, 18, 21, 22, 23] {
+                // FSET.cmp.CC R3, R1, R2, PT; CSETP P0 from the flags.
+                let program = [
+                    Enc::op(Op::FsetReg)
+                        .rd(3)
+                        .ra(1)
+                        .rb(2)
+                        .field(48, 4, u64::from(cmp))
+                        .field(45, 2, 0)
+                        .bit(52, bf)
+                        .bit(47, true)
+                        .pred(39, 7, false)
+                        .build(),
+                    Enc::op(Op::CsetpCc)
+                        .field(0, 3, 7)
+                        .field(3, 3, 0)
+                        .field(8, 5, test)
+                        .field(39, 3, 7)
+                        .build(),
+                    exit(Guard::ALWAYS),
+                ];
+                let out = run(&vk, &program, &inputs, &[]);
+                for (inp, got) in inputs.iter().zip(&out) {
+                    let (a, b) = (f32::from_bits(inp.regs[1]), f32::from_bits(inp.regs[2]));
+                    let t = fcmp(cmp, a, b);
+                    let value = match (t, bf) {
+                        (false, _) => 0,
+                        (true, true) => 1.0f32.to_bits(),
+                        (true, false) => u32::MAX,
+                    };
+                    assert_eq!(got.regs[3], value, "cmp {cmp} bf {bf} on {a} and {b}");
+                    assert_eq!(
+                        got.preds & 1 != 0,
+                        passes(test, value == 0, value >> 31 != 0),
+                        "test {test} after cmp {cmp} bf {bf} on {a} and {b}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn float_comparisons_set_predicates_and_registers() {
     let Some(vk) = vulkan() else { return };
     let inputs = pair_states(&float_pool());
