@@ -752,6 +752,22 @@ pub fn shape_of(tic: &Tic, used: &TextureUse) -> Result<Shape, String> {
     }
 }
 
+/// How many texels of linear `data` in a floating-point format are not numbers (infinite or not a
+/// number in a component); 0 for a format that is not one of those.
+fn texels_that_are_not_numbers(format: vk::Format, data: &[u8]) -> usize {
+    let bytes = match format {
+        vk::Format::B10G11R11_UFLOAT_PACK32 | vk::Format::R32_SFLOAT => 4,
+        vk::Format::R16G16B16A16_SFLOAT => 8,
+        vk::Format::R32G32B32A32_SFLOAT => 16,
+        vk::Format::R16_SFLOAT => 2,
+        _ => return 0,
+    };
+    data.chunks_exact(bytes)
+        .filter_map(|px| super::targets::pixel_floats(format, px))
+        .filter(|c| c.iter().any(|v| !v.is_finite()))
+        .count()
+}
+
 /// Where the bytes of a texture are in memory and what image they make.
 struct Plan {
     width: u32,
@@ -1112,6 +1128,8 @@ impl Textures {
         })?;
         // Linear texels of every level and layer in upload order.
         let mut packed: Vec<u8> = Vec::new();
+        let mut not_numbers = 0usize;
+        let is_cube = matches!(shape.kind, Kind::Cube | Kind::CubeArray);
         let mut regions = Vec::new();
         for layer in 0..layers {
             let mut at = u64::from(layer) * layer_stride;
@@ -1180,6 +1198,9 @@ impl Textures {
                         );
                     }
                 }
+                if is_cube && !format.astc && format.block == (1, 1) {
+                    not_numbers += texels_that_are_not_numbers(format.vk, &linear);
+                }
                 let offset = (packed.len() as u64).next_multiple_of(16);
                 packed.resize(offset as usize, 0);
                 packed.extend_from_slice(&linear);
@@ -1199,6 +1220,16 @@ impl Textures {
                         }),
                 );
             }
+        }
+        if not_numbers > 0 {
+            // No environment map holds them: what the memory holds is not the map's, and the map
+            // is as empty as memory that was never written (docs/ASSUMPTIONS.md A-166).
+            eprintln!(
+                "[vulkan] the cube map at GPU address {:#x} ({width}x{height}, {:?}) holds {not_numbers} texels that are not numbers: it is read as zeros",
+                tic.address(),
+                format.vk
+            );
+            packed.fill(0);
         }
         let (buffer, base_offset) = frame.upload(vk, &packed, 16)?;
         for r in &mut regions {
@@ -1439,6 +1470,46 @@ mod tests {
         assert!(
             texture_format(0x08, 7, false).is_none(),
             "8-bit floats do not exist"
+        );
+    }
+
+    #[test]
+    fn texels_that_are_not_numbers_are_counted() {
+        // 11-bit floats: red in the low 11 bits, green above it, 10-bit blue on top; an exponent
+        // of 31 (infinity, or not a number with a mantissa) in any of them.
+        let numbers = 0x3f80_0000u32 >> 4;
+        let infinite_red = 31u32 << 6;
+        let not_a_number_green = (31u32 << 6 | 1) << 11;
+        let not_a_number_blue = (31u32 << 5 | 3) << 22;
+        let bytes: Vec<u8> = [
+            numbers,
+            infinite_red,
+            not_a_number_green,
+            0,
+            not_a_number_blue,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        assert_eq!(
+            texels_that_are_not_numbers(vk::Format::B10G11R11_UFLOAT_PACK32, &bytes),
+            3
+        );
+        // Half floats: 0x7C00 is infinity, 0x7E00 not a number.
+        let halves: Vec<u8> = [
+            0x3C00u16, 0, 0x4000, 0, 0x4000, 0x4200, 0x4400, 0x7E00, 0, 0, 0x7C00, 0,
+        ]
+        .iter()
+        .flat_map(|h| h.to_le_bytes())
+        .collect();
+        assert_eq!(
+            texels_that_are_not_numbers(vk::Format::R16G16B16A16_SFLOAT, &halves),
+            2
+        );
+        // The formats that cannot hold them.
+        assert_eq!(
+            texels_that_are_not_numbers(vk::Format::R8G8B8A8_UNORM, &bytes),
+            0
         );
     }
 
