@@ -268,6 +268,56 @@ counts. Counts alone had said "all white" for a frame that was in fact empty; se
   the game goes on (a frame dumped at 64,000 shows its HUD over a lit scene). The menu's scene, deleted when the game starts, had no effects in use, which is
   why that went through before.
 
+## A second title
+
+A second title, a platformer with 3D characters in 2D courses, was brought up on the same runtime
+from its extracted ExeFS and RomFS (2026-10-16; nothing of it is stored). Frames that were dumped and
+looked at show its start-up screens, the screen where a user is chosen, a story narration, its
+first plaza with the whole cast (a castle, hills, clouds, flowers, the characters lit and in color),
+a cutscene of a giant face above the cast, a golden transition effect and its first course, with
+scripted input (`NX_INPUT_SCRIPT`). A run of 7,200 presented frames ended at its frame limit with no
+draw and no compute launch failed. The 100 frames from frame 4,800 on took 2.9 to 3.5 s on the
+RTX 5070 Ti (3,300 draws a frame in the plaza; the renderer thread is busy for two thirds of that:
+per 100 frames the draws spent 0.8 s on textures, of which 0.4 s writing targets back to memory,
+0.5 s on the passes and 0.1 s on descriptors). Its sound was not looked at.
+
+What it showed, each with a test and an entry in `docs/ASSUMPTIONS.md`:
+
+- **The range of clip-space depth is a register of its own** (A-096): it is bit 0 of
+  `SET_VIEWPORT_Z_CLIP`, and the clip control register that was read for it says something else. Both
+  titles write 0 there; everything in front of the middle of the depth range was clipped away (the
+  terrain and the characters of the second title, the lighting of the first title's 3D menu).
+- **2D engine copies were dropped** (A-165): 1,548 in a run, one of them a 512 x 1 picture into the
+  memory of a lookup texture that stayed all zeros.
+- **Programs in the last megabyte of a mapping were not read** (A-168): a program is read a
+  megabyte at a time and a mapping can run past the memory behind it, so the read failed for them
+  ("a shader program of 0 bytes is shorter than its 80-byte header"): about 60 draws in the first
+  200 frames and four compute programs.
+- **Control flow that tests the condition code** (A-169) and **shared memory** (A-170): five compute
+  and two pixel programs branch on the flags that `FSET.CC` sets, and six compute programs keep a
+  private slice of shared memory per invocation.
+- **Render targets were let go before their pixels reached memory** (A-171): a target nothing drew
+  to for 300 submissions lost its pixels (A-118), and a title that draws the text of an interface once
+  into small 8-bit targets and reads them for ever after showed blank text: the first title's counters
+  had their underline and nothing else. The pixels are now put into the memory first when the memory
+  is as the target found it (961 targets in the first 3,600 frames of the first title). The first
+  title's first area, which the dumped frames had shown nearly black, now shows its stairs, railings
+  and character, and its counters their icons and numbers; the second title's environment probes, which
+  are drawn once, stopped reading as garbage (A-166).
+- **A request to send the play reports** (A-072) stopped the run of the second title after about 9,700
+  frames; it is accepted now.
+- **Found by running the programs the shader archives hold**: `ISCADD.CC` (A-107), a program that
+  always kills (three programs of the first title were invalid SPIR-V), a constant buffer bound
+  over more than is mapped (A-167). Every program cut out of the shader archives of the two titles
+  that looks like one (4,860 of 4,862 and 18,481 of 18,486) translates to SPIR-V that `spirv-val`
+  accepts; five are not programs and two use an attribute pointer form (`AL2P`, `IPA.IDX`) that is
+  not translated.
+
+What is not right in it: the leaves that fall in some of its courses have black blobs (a few a
+frame): each is one draw of a lit material program whose result comes out black while its albedo
+sample is fine. The cause was not found; `NX_DEBUG_PROBE_REGS` narrowed it to the lighting
+accumulation of that program.
+
 ## What is not done, and what is not checked
 
 - **What follows the opening cutscene is seen only as far as its first prompt.** The cutscene can

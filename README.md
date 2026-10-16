@@ -44,7 +44,8 @@ the title: the keys that stand for the directional pad and for the left stick mo
 of its menu, and confirming it started the title's introduction: a story card and then its opening
 cutscene (characters lit and in color, a flame effect, subtitles), which was looked at in dumped
 frames. After the cutscene the title loads its first area, and scripted input (`NX_INPUT_SCRIPT`)
-turns its camera and makes its character stand up and run, seen in dumped frames; a scripted run
+turns its camera and makes its character stand up and run, seen in dumped frames, with its interface
+(the counters with their numbers, the life gauge, the compass and the prompts of the controls); a scripted run
 with random inputs went through the menu and the first area for 120,000 presented frames (about
 30 minutes, flat memory), through the character's death (the screen closes on it, loads for a
 second and the game goes on) and ended at its frame limit. On that card the title runs at 40 to 60 frames
@@ -54,6 +55,24 @@ played (voices, ADPCM, mixes and the device sink; no reverb or other effects), b
 (`NX_AUDIO_DUMP=<file>` writes what is played to a WAV file), never listened to by a person. The
 title sometimes stops early: rare, and the report says what is known. Nothing here is a claim that
 a game is playable; what a person finds past the first area has not been tried.
+
+**A second title.** A second title (a platformer with 3D characters in 2D courses) boots on the same
+runtime. Frames that were dumped and looked at show its start-up screens, the screen where a user is
+chosen, a story narration, its first plaza with the whole cast (a castle, hills, clouds, flowers, the
+characters lit and in color), a cutscene of a giant face above the cast, a golden transition effect
+and its first course, with scripted input (`NX_INPUT_SCRIPT`). A run of 7,200 presented frames ended at
+its frame limit with no draw and no compute launch failed, and the 100 frames from frame 4,800 on took
+2.9 to 3.5 s on the RTX 5070 Ti (3,300 draws a frame in the plaza). Looking at its frames found what
+the code had wrong: the range of clip-space depth is the register that says so (docs/ASSUMPTIONS.md
+A-096), the copies of the 2D engine were dropped (A-165), programs in the last megabyte of a mapping
+were not read (A-168), some compute and pixel programs branch on the condition code or use shared memory
+(A-169, A-170), and a render target that nothing drew to for a while lost its pixels before they reached
+the memory that a later draw samples (A-171), which left the text of an interface blank (also in the
+first title). What is not right: the leaves that fall in some of its courses have black blobs (a lit
+material that comes out black, cause not found) and its sound was not checked. Every program cut out
+of the shader archives of the two titles that looks like one translates to SPIR-V that `spirv-val`
+accepts (23,341 of 23,348 candidates; five are not programs and two use an attribute pointer form that
+is not translated). Nothing here is a claim that a game is playable.
 
 ### Keys
 
