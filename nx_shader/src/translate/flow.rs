@@ -241,6 +241,11 @@ fn body(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg, block: &Block) -> R<()> {
         if inst.guard().is_never() && !matches!(inst.op(), Some(Op::Ssy | Op::Pbk | Op::Pcnt)) {
             continue;
         }
+        if let Some((at, regs)) = tx.cfg.probe_regs {
+            if at == pc {
+                tx.probe_registers(regs);
+            }
+        }
         instruction(tx, inst)?;
         tx.info.instructions += 1;
     }

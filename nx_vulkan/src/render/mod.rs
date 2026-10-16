@@ -450,6 +450,59 @@ impl Core {
         );
         crate::png::write_opaque_png(&path, w, h, &rgba)
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        if !self.debug.probe_pixels.is_empty() || self.debug.probe_extreme.is_some() {
+            let format = target.key.format;
+            let raw = targets::read_raw(&self.vk, &mut self.frame, target)?;
+            let pixel = raw.len() / (w as usize * h as usize);
+            for &(x, y) in &self.debug.probe_pixels {
+                let at = (y as usize * w as usize + x as usize) * pixel;
+                match raw
+                    .get(at..at + pixel)
+                    .and_then(|px| targets::pixel_floats(format, px))
+                {
+                    Some(c) => eprintln!("[vulkan]   pixel {x},{y}: {c:?}"),
+                    None => eprintln!("[vulkan]   pixel {x},{y}: not readable as numbers"),
+                }
+            }
+            if let Some(limit) = self.debug.probe_extreme {
+                let mut count = 0;
+                let mut first = Vec::new();
+                // The pixels `NX_DEBUG_FIRST_BAD` marked: (program tag, instruction offset).
+                let mut marked: std::collections::BTreeMap<(u32, u32), u32> = Default::default();
+                for (i, px) in raw.chunks_exact(pixel).enumerate() {
+                    let Some(c) = targets::pixel_floats(format, px) else {
+                        break;
+                    };
+                    if c.iter().any(|v| !v.is_finite() || *v > limit) {
+                        count += 1;
+                        if first.len() < 6 {
+                            first.push(format!("{},{} {c:?}", i % w as usize, i / w as usize));
+                        }
+                        let whole =
+                            |v: f32, lo: f32, hi: f32| v.fract() == 0.0 && v >= lo && v < hi;
+                        if whole(c[0], 64.0, 128.0)
+                            && whole(c[1], 64.0, 80.0)
+                            && whole(c[2], 64.0, 128.0)
+                        {
+                            let index = (c[0] as u32 - 64) + 64 * (c[1] as u32 - 64);
+                            *marked.entry((c[2] as u32 - 64, index * 8)).or_default() += 1;
+                        }
+                    }
+                }
+                eprintln!(
+                    "[vulkan]   {count} pixels hold a component above {limit} or not a number{}{}",
+                    if first.is_empty() { "" } else { ": " },
+                    first.join("; ")
+                );
+                if !marked.is_empty() {
+                    let list: Vec<String> = marked
+                        .iter()
+                        .map(|((tag, pc), n)| format!("tag {tag} at {pc:#x} x{n}"))
+                        .collect();
+                    eprintln!("[vulkan]   first bad results: {}", list.join(", "));
+                }
+            }
+        }
         // The depth the draws test against: what it holds, in numbers.
         if let Some(z) = scene.regs.depth_target() {
             if let Some((cpu, _)) = scene.host_address(z.address) {
@@ -594,7 +647,10 @@ impl Core {
                     t.array_pitch
                 );
                 if self.seen_targets.insert(said.clone()) {
-                    eprintln!("{said}");
+                    eprintln!(
+                        "{said} (presented frame {}, guest address {address:#x})",
+                        self.textures.frame
+                    );
                 }
             }
             let width = match t.layout {
@@ -843,6 +899,29 @@ impl Renderer {
                 result = Err(e);
             }
         }
+        if !core.debug.trace_draws_to.is_empty() {
+            let any = scene
+                .regs
+                .color_targets_in_use()
+                .into_iter()
+                .any(|(_, t)| core.debug.trace_draws_to.contains(&t.address));
+            if any {
+                eprintln!(
+                    "[vulkan] draw {:?} topology {} to {} (presented frame {}): {}",
+                    draw.source,
+                    draw.topology,
+                    first_target(scene),
+                    core.textures.frame,
+                    match &result {
+                        Ok(()) => "ok".to_string(),
+                        Err(e) => format!("FAILED: {e}"),
+                    }
+                );
+                for line in describe_draw(scene, draw) {
+                    eprintln!("[vulkan]     {line}");
+                }
+            }
+        }
         if let Some(frame) = core.traced() {
             let regs = scene.regs;
             let stages: Vec<String> = regs
@@ -1083,10 +1162,30 @@ impl Renderer {
             let Core {
                 vk, frame, targets, ..
             } = core;
-            for key in targets.color_keys().into_iter().take(16) {
+            let keep = if core.debug.probe_extreme.is_some() {
+                256
+            } else {
+                16
+            };
+            for key in targets.color_keys().into_iter().take(keep) {
                 let Some(t) = targets.existing(&key) else {
                     continue;
                 };
+                if let Some(limit) = core.debug.probe_extreme {
+                    // `NX_PROBE_EXTREME`: how many pixels of each target are not numbers or huge.
+                    if let Ok(raw) = targets::read_raw(vk, frame, t) {
+                        let pixel = raw.len() / (key.width as usize * key.height as usize).max(1);
+                        let extreme = raw
+                            .chunks_exact(pixel.max(1))
+                            .filter_map(|px| targets::pixel_floats(key.format, px))
+                            .filter(|c| c.iter().any(|v| !v.is_finite() || *v > limit))
+                            .count();
+                        eprintln!(
+                            "[vulkan] target {:#x} {}x{} {:?}: {extreme} pixels hold a component above {limit} or not a number",
+                            key.address, key.width, key.height, key.format
+                        );
+                    }
+                }
                 match targets::read_rgba(vk, frame, t) {
                     Ok(rgba) => {
                         if trace {

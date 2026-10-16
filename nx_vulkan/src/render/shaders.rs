@@ -35,6 +35,12 @@ impl Variation {
         c.target_classes = self.target_classes;
         c.depth_minus_one_to_one = self.depth_minus_one_to_one;
         c.force_loop = std::env::var_os("NX_DEBUG_DISPATCH_LOOP").is_some();
+        if stage == Stage::Pixel {
+            // `NX_DEBUG_FIRST_BAD=<limit>`: see `Config::probe_bad` (a million without a number).
+            c.probe_bad = std::env::var("NX_DEBUG_FIRST_BAD")
+                .ok()
+                .map(|v| v.parse().unwrap_or(1.0e6));
+        }
         c
     }
 }
@@ -267,6 +273,30 @@ impl Shaders {
         }
         let mut config = variation.config();
         config.constants = entry.constants.clone();
+        config.probe_tag = (entry.hash & 63) as u32;
+        if slot.kind == StageKind::Pixel {
+            // `NX_DEBUG_PROBE_REGS=<program address>:<offset>:<r>,<r>,<r>` (the address and the
+            // offset in hexadecimal): see `Config::probe_regs`.
+            config.probe_regs = std::env::var("NX_DEBUG_PROBE_REGS").ok().and_then(|v| {
+                let mut parts = v.split(':');
+                let address =
+                    u64::from_str_radix(parts.next()?.trim_start_matches("0x"), 16).ok()?;
+                let at = u32::from_str_radix(parts.next()?.trim_start_matches("0x"), 16).ok()?;
+                let regs: Vec<u8> = parts
+                    .next()?
+                    .split(',')
+                    .filter_map(|r| r.parse().ok())
+                    .collect();
+                (address == slot.address && regs.len() == 3)
+                    .then(|| (at, [regs[0], regs[1], regs[2]]))
+            });
+        }
+        if config.probe_bad.is_some() {
+            eprintln!(
+                "[vulkan] probe tag {}: the {name} program at {:#x}",
+                config.probe_tag, slot.address
+            );
+        }
         let _phase = nx_gpu::progress::enter(nx_gpu::progress::TRANSLATING);
         let translation = translate(Code(&entry.code), Some(&entry.sph), &config)
             .map_err(|e| format!("the {name} program at {:#x}: {e}", slot.address))?;

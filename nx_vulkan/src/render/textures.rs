@@ -1073,12 +1073,23 @@ impl Textures {
                 .filter(|b| **b != 0)
                 .count();
             eprintln!(
-                "[vulkan] a texture at GPU address {:#x}: {:?} {width}x{height} (depth {depth}, {layers} layers, {levels} levels) as {:?}; {filled} of {} bytes are not zero ({readable} could be read)",
+                "[vulkan] a texture at GPU address {:#x} (guest address {:x?}): {:?} {width}x{height} (depth {depth}, {layers} layers, {levels} levels) as {:?}; {filled} of {} bytes are not zero ({readable} could be read)",
                 tic.address(),
+                scene.host_address(tic.address()).map(|(cpu, _)| cpu),
                 format.vk,
                 shape.kind,
                 raw.len()
             );
+        }
+        if let Some(dir) = std::env::var_os("NX_DUMP_TEXTURES") {
+            // The bytes the memory held, as they are (the pictures are made level by level below).
+            let _ = std::fs::create_dir_all(&dir);
+            let path = std::path::Path::new(&dir).join(format!(
+                "tex_{:x}_{:?}_{width}x{height}.raw",
+                tic.address(),
+                shape.kind
+            ));
+            let _ = std::fs::write(path, &raw);
         }
         let components = tic.view_mapping();
         let image = vk.create_image(ImageInfo {
@@ -1130,6 +1141,44 @@ impl Textures {
                         format.block.1,
                         tic.srgb(),
                     );
+                }
+                if let Some(dir) = std::env::var_os("NX_DUMP_TEXTURES") {
+                    // `NX_DUMP_TEXTURES=<dir>`: every layer and level of each texture made, as a
+                    // picture (floats are clamped), for looking at what the memory held.
+                    let (w, h) = ((width >> level).max(1), (height >> level).max(1));
+                    if !format.astc && format.block == (1, 1) && depth == 1 {
+                        if let Some(rgba) = super::targets::to_rgba8(format.vk, &linear, w, h) {
+                            let _ = std::fs::create_dir_all(&dir);
+                            let path = std::path::Path::new(&dir).join(format!(
+                                "tex_{:x}_{:?}_{w}x{h}_layer{layer}_level{level}.png",
+                                tic.address(),
+                                shape.kind
+                            ));
+                            let _ = crate::png::write_opaque_png(&path, w, h, &rgba);
+                        }
+                    }
+                }
+                if self.trace && !format.astc && format.block == (1, 1) {
+                    // A floating-point texture that holds what is not a number, or is huge.
+                    let bytes = format.bytes as usize;
+                    let mut odd = 0;
+                    let mut sample = None;
+                    for (i, px) in linear.chunks_exact(bytes).enumerate() {
+                        if let Some(c) = super::targets::pixel_floats(format.vk, px) {
+                            if c.iter().any(|v| !v.is_finite() || *v > 65536.0) {
+                                odd += 1;
+                                sample.get_or_insert((i, c));
+                            }
+                        }
+                    }
+                    if odd > 0 {
+                        eprintln!(
+                            "[vulkan]   the texture at {:#x}: layer {layer} level {level}: {odd} of {} texels are not numbers or huge, the first {:?}",
+                            tic.address(),
+                            linear.len() / bytes,
+                            sample
+                        );
+                    }
                 }
                 let offset = (packed.len() as u64).next_multiple_of(16);
                 packed.resize(offset as usize, 0);

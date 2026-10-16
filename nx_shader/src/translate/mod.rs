@@ -87,6 +87,16 @@ pub struct Config {
     /// The words of constant buffers the program's indirect jumps find their targets in (see
     /// [`crate::cfg::Cfg::tables`]): the program is translated for these values.
     pub constants: Vec<crate::cfg::TableWord>,
+    /// Pixel stage, a bring-up switch: every pixel that gets a floating-point result that is not a
+    /// number, infinite or above this limit paints the offset of the first instruction that wrote
+    /// one in its first target (64 + the low six bits of the instruction number in red, 64 + the
+    /// next four in green, 64 plus `probe_tag` in blue).
+    pub probe_bad: Option<f32>,
+    /// A number below 64 that says which program painted (the low bits of its hash).
+    pub probe_tag: u32,
+    /// Pixel stage, a bring-up switch: the program paints, in its first target, the values three
+    /// registers hold before the instruction at an offset runs (zero where it does not run).
+    pub probe_regs: Option<(u32, [u8; 3])>,
 }
 
 impl Config {
@@ -101,6 +111,9 @@ impl Config {
             block: [1, 1, 1],
             force_loop: false,
             constants: Vec::new(),
+            probe_bad: None,
+            probe_tag: 0,
+            probe_regs: None,
         }
     }
 }

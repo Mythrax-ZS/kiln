@@ -305,6 +305,39 @@ fn epilogue_pixel(tx: &mut Tx<'_>) -> R<()> {
                 Class::Float => tx.as_f32(*bits),
             })
             .collect();
+        let mut converted = converted;
+        if let (Some(vars), 0, Class::Float) = (tx.probed, target, class) {
+            // The registers probed are the color.
+            let u32_ = tx.t.u32;
+            for (c, var) in vars.into_iter().enumerate() {
+                let bits = tx.f.load(&mut tx.m, u32_, var);
+                converted[c] = tx.as_f32(bits);
+            }
+        } else if let (Some(var), 0, Class::Float) = (tx.bad, target, class) {
+            // Where the program got a bad result, the color says which instruction was the first.
+            let u32_ = tx.t.u32;
+            let f32_ = tx.t.f32;
+            let number = tx.f.load(&mut tx.m, u32_, var);
+            let zero = tx.c32(0);
+            let found = tx.cmp(op::I_NOT_EQUAL, number, zero);
+            let minus_one = tx.c32(1);
+            let index = tx.isub(number, minus_one);
+            let low_mask = tx.c32(63);
+            let low = tx.and(index, low_mask);
+            let six = tx.c32(6);
+            let shifted = tx.shr(index, six);
+            let high_mask = tx.c32(15);
+            let high = tx.and(shifted, high_mask);
+            let base = tx.c32(64);
+            let red_bits = tx.iadd(base, low);
+            let green_bits = tx.iadd(base, high);
+            let red = tx.op1(op::CONVERT_U_TO_F, f32_, red_bits);
+            let green = tx.op1(op::CONVERT_U_TO_F, f32_, green_bits);
+            let blue = tx.cf32(64.0 + (tx.cfg.probe_tag & 63) as f32);
+            for (c, mark) in [red, green, blue].into_iter().enumerate() {
+                converted[c] = tx.select(f32_, found, mark, converted[c]);
+            }
+        }
         let ty = class_type(tx, class);
         let value =
             tx.f.emit_result(&mut tx.m, op::COMPOSITE_CONSTRUCT, ty, &converted);

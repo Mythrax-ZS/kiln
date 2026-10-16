@@ -95,6 +95,11 @@ pub(super) struct Tx<'a> {
     pub local_min_words: u32,
     /// The offset of the instruction being translated, for messages.
     pub pc: u32,
+    /// `Config::probe_bad`: the function-local variable holding the number of the first
+    /// instruction that wrote a result that is not a number, infinite or huge (0 for none).
+    pub bad: Option<Id>,
+    /// `Config::probe_regs`: the function-local variables the registers' values are kept in.
+    pub probed: Option<[Id; 3]>,
 }
 
 impl<'a> Tx<'a> {
@@ -144,6 +149,8 @@ impl<'a> Tx<'a> {
             local: None,
             local_min_words: 0,
             pc: 0,
+            bad: None,
+            probed: None,
         }
     }
 
@@ -505,8 +512,68 @@ impl<'a> Tx<'a> {
     }
 
     pub fn write_f(&mut self, inst: Inst, r: u8, value: Id) {
+        if let Some(limit) = self.cfg.probe_bad {
+            self.note_bad(inst, value, limit);
+        }
         let u = self.as_u32(value);
         self.write(inst, r, u);
+    }
+
+    /// `Config::probe_regs`: keep the values of `regs` as they are before the instruction runs.
+    pub fn probe_registers(&mut self, regs: [u8; 3]) {
+        let u32_ = self.t.u32;
+        let vars = match self.probed {
+            Some(v) => v,
+            None => {
+                let zero = self.c32(0);
+                let ptr = self.m.ty_pointer(storage::FUNCTION, u32_);
+                let mut ids = [zero; 3];
+                for id in &mut ids {
+                    *id = self.m.id();
+                    self.f.local_with_init(ptr, *id, zero);
+                }
+                self.probed = Some(ids);
+                ids
+            }
+        };
+        for (var, reg) in vars.into_iter().zip(regs) {
+            let value = self.read(reg);
+            self.f.store(var, value);
+        }
+    }
+
+    /// `Config::probe_bad`: remember this instruction if `value` is the first bad result.
+    fn note_bad(&mut self, inst: Inst, value: Id, limit: f32) {
+        let bool_ = self.t.bool_;
+        let u32_ = self.t.u32;
+        let nan = self.op1(op::IS_NAN, bool_, value);
+        let inf = self.op1(op::IS_INF, bool_, value);
+        let limit = self.cf32(limit);
+        let magnitude = self.fabs(value);
+        let huge = self.cmp(op::F_ORD_GREATER_THAN, magnitude, limit);
+        let odd = self.lor(nan, inf);
+        let bad = self.lor(odd, huge);
+        let var = match self.bad {
+            Some(v) => v,
+            None => {
+                let zero = self.c32(0);
+                let ptr = self.m.ty_pointer(storage::FUNCTION, u32_);
+                let id = self.m.id();
+                self.f.local_with_init(ptr, id, zero);
+                self.bad = Some(id);
+                id
+            }
+        };
+        let old = self.f.load(&mut self.m, u32_, var);
+        let zero = self.c32(0);
+        let unset = self.cmp(op::I_EQUAL, old, zero);
+        let mut cond = self.land(bad, unset);
+        if let Some(guard) = self.guard_condition(inst.guard()) {
+            cond = self.land(cond, guard);
+        }
+        let mark = self.c32(self.pc / 8 + 1);
+        let new = self.select_u32(cond, mark, old);
+        self.f.store(var, new);
     }
 
     /// Write a predicate as the instruction's guard says.

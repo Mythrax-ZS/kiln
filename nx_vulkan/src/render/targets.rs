@@ -733,16 +733,6 @@ pub fn to_rgba8(format: vk::Format, data: &[u8], width: u32, height: u32) -> Opt
                 // Unsigned floats of five bits of exponent: 11 bits for red and green (six of
                 // mantissa) and 10 for blue (five).
                 let w = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
-                let small_float = |bits: u32, mantissa_bits: u32| -> f32 {
-                    let exp = (bits >> mantissa_bits) & 0x1F;
-                    let frac =
-                        (bits & ((1 << mantissa_bits) - 1)) as f32 / (1 << mantissa_bits) as f32;
-                    match exp {
-                        0 => frac * 2f32.powi(-14),
-                        31 => f32::INFINITY,
-                        _ => (1.0 + frac) * 2f32.powi(exp as i32 - 15),
-                    }
-                };
                 [
                     to_byte(small_float(w & 0x7FF, 6)),
                     to_byte(small_float(w >> 11 & 0x7FF, 6)),
@@ -873,6 +863,14 @@ pub fn read_depth(vk: &Vk, frame: &mut Frame, target: &mut Target) -> Result<Vec
 /// Read a color target back as RGBA bytes: its contents as of the commands recorded so far (they
 /// are run first).
 pub fn read_rgba(vk: &Vk, frame: &mut Frame, target: &mut Target) -> Result<Vec<u8>, String> {
+    let key = target.key;
+    let raw = read_raw(vk, frame, target)?;
+    to_rgba8(key.format, &raw, key.width, key.height)
+        .ok_or_else(|| format!("a picture cannot be made of {:?}", key.format))
+}
+
+/// The pixels of a color target as the device holds them, row by row.
+pub fn read_raw(vk: &Vk, frame: &mut Frame, target: &mut Target) -> Result<Vec<u8>, String> {
     let _phase = nx_gpu::progress::enter(nx_gpu::progress::READING_BACK);
     let key = target.key;
     let Some(bpp) = pixel_bytes(key.format) else {
@@ -917,9 +915,46 @@ pub fn read_rgba(vk: &Vk, frame: &mut Frame, target: &mut Target) -> Result<Vec<
         );
     }
     frame.submit(vk)?;
-    let rgba = to_rgba8(key.format, staging.as_slice(), key.width, key.height);
+    let raw = staging.as_slice().to_vec();
     vk.destroy_host_buffer(staging);
-    rgba.ok_or_else(|| format!("a picture cannot be made of {:?}", key.format))
+    Ok(raw)
+}
+
+/// The components of one pixel of a floating-point format as numbers (not clamped), for tracing.
+pub fn pixel_floats(format: vk::Format, px: &[u8]) -> Option<[f32; 4]> {
+    let f32_at =
+        |i: usize| f32::from_le_bytes([px[4 * i], px[4 * i + 1], px[4 * i + 2], px[4 * i + 3]]);
+    let half_at = |i: usize| half_to_f32(u16::from_le_bytes([px[2 * i], px[2 * i + 1]]));
+    Some(match format {
+        vk::Format::B10G11R11_UFLOAT_PACK32 => {
+            let w = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+            [
+                small_float(w & 0x7FF, 6),
+                small_float(w >> 11 & 0x7FF, 6),
+                small_float(w >> 22 & 0x3FF, 5),
+                1.0,
+            ]
+        }
+        vk::Format::R16G16B16A16_SFLOAT => [half_at(0), half_at(1), half_at(2), half_at(3)],
+        vk::Format::R32G32B32A32_SFLOAT => [f32_at(0), f32_at(1), f32_at(2), f32_at(3)],
+        vk::Format::R32_SFLOAT => [f32_at(0), 0.0, 0.0, 1.0],
+        vk::Format::R16_SFLOAT => [half_at(0), 0.0, 0.0, 1.0],
+        _ => return None,
+    })
+}
+
+/// An unsigned float of five bits of exponent and `mantissa_bits` of mantissa (the components of
+/// `B10G11R11_UFLOAT`); the all-ones exponent is infinity, or not a number with a mantissa.
+fn small_float(bits: u32, mantissa_bits: u32) -> f32 {
+    let exp = (bits >> mantissa_bits) & 0x1F;
+    let mantissa = bits & ((1 << mantissa_bits) - 1);
+    let frac = mantissa as f32 / (1 << mantissa_bits) as f32;
+    match exp {
+        0 => frac * 2f32.powi(-14),
+        31 if mantissa == 0 => f32::INFINITY,
+        31 => f32::NAN,
+        _ => (1.0 + frac) * 2f32.powi(exp as i32 - 15),
+    }
 }
 
 #[cfg(test)]

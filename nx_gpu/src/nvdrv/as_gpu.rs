@@ -83,6 +83,9 @@ impl Nvdrv {
             }
             // u64 offset
             (UNMAP_BUFFER, 8) => {
+                if trace_as() {
+                    eprintln!("[as] UNMAP_BUFFER GPU {:#x}", args.u64(0));
+                }
                 self.space_mut(space)?.unmap_buffer(args.u64(0))?;
             }
             // u32 flags, u32 kind, u32 nvmap handle, u32 page_size, u64 buffer_offset,
@@ -103,6 +106,15 @@ impl Nvdrv {
                     offset: args.u64(32),
                 };
                 let at = self.space_mut(space)?.map_buffer(&req)?;
+                if trace_as() {
+                    eprintln!(
+                        "[as] MAP_BUFFER_EX handle {handle:#x} (cpu {cpu:#x}, {:#x} bytes) offset {:#x} size {:#x} flags {:#x}: GPU {at:#x}",
+                        h_size(&req),
+                        req.buffer_offset,
+                        req.mapping_size,
+                        req.flags
+                    );
+                }
                 args.set_u64(32, at);
             }
             // u32 flags, s32 as_fd, u32 big_page_size, u32 reserved, u64 va_range_start,
@@ -144,6 +156,16 @@ impl Nvdrv {
                             cacheable: flags & 4 != 0,
                         })
                     };
+                    if trace_as() {
+                        eprintln!(
+                            "[as] REMAP GPU {start:#x}..{:#x}: {}",
+                            start + len,
+                            match &target {
+                                Some(t) => format!("handle {:#x} at cpu {:#x}", t.handle, t.cpu),
+                                None => "unmapped".to_string(),
+                            }
+                        );
+                    }
                     self.space_mut(space)?.remap(start, len, target)?;
                 }
             }
@@ -172,6 +194,18 @@ impl Nvdrv {
             .get_mut(&id)
             .ok_or(Fail::Nv(NvError::INVALID_STATE))
     }
+}
+
+/// `NX_TRACE_AS=1` in the environment: say every mapping the program makes in the GPU's address
+/// space.
+fn trace_as() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NX_TRACE_AS").is_some())
+}
+
+fn h_size(req: &MapRequest) -> u64 {
+    req.handle_size
 }
 
 #[cfg(test)]

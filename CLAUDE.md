@@ -128,7 +128,11 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   with its surfaces and rectangles (A-165); `NX_MAX_FRAMES=<n>` ends the run after `n` presented
   frames; `NX_SAVE_DIR=<dir>` is where save data goes (default `./nx_save`). `kiln symbols --exefs <dir> [--match <text>]
   [<address>...]` names the function around an address, for reading the return addresses a stop
-  report ends with.
+  report ends with. `NX_TRACE_AS=1` says every mapping the program makes in the GPU's address space
+  (`MAP_BUFFER_EX`, `REMAP`, `UNMAP_BUFFER`) and `NX_TRACE_UPLOADS=<hex guest address>:<hex length>`
+  every inline upload that reaches that range of the guest's memory; with `NX_TRAP_WRITES` (the
+  writes of the program's own code) they say who fills a buffer or a texture, and when, against the
+  mappings.
 - Renderer: `nx_vulkan`'s tests need a Vulkan device (`NX_VULKAN_DEVICE` picks one; they print
   `SKIPPED` without one) and `spirv-val` for the translator's. `NX_RENDERER=vulkan` makes a
   produced program draw; `NX_TRACE_PERF=1` has the renderer say every 100 frames how long they took
@@ -138,7 +142,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   hashed); `NX_DUMP_FRAMES=<dir>` writes each displayed frame as a PNG (opaque, cropped
   to what is shown; `NX_DUMP_EVERY=<n>`, `NX_DUMP_COUNT=<n>`, `NX_DUMP_TARGETS=1` for every render
   target too: a PNG is uncompressed, so dump every n-th frame); `NX_TRACE_DRAWS=<frame>` lists the
-  draws and clears of one frame (with `NX_TRACE_STATE=1` their state and vertices, `NX_DUMP_DRAWS=<dir>`
+  draws and clears of one frame (with `NX_TRACE_STATE=1` their state and vertices (`NX_TRACE_DRAWS_TO=<hex GPU address>[,...]` does so for every draw,
+  in any frame, with a color target at one of those addresses), `NX_DUMP_DRAWS=<dir>`
   and `NX_DUMP_FROM=<n>` a picture after each); `NX_TRACE_COMPUTE=1` says how long the device took over
   each compute launch (timestamps); `NX_TRACE_TEXTURES=1`, `NX_TRACE_CBUFS=1`,
   `NX_DEBUG_NO_CULL=1`, `NX_DEBUG_FULL_VIEWPORT=1`, `NX_DEBUG_SOLID_PIXEL=1` (every pixel program writes
@@ -173,7 +178,19 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   (what `NX_TRACE_DRAWS` does), `NX_DUMP_PASSES=<dir>` writes a picture of each pass of a traced
   frame, `NX_DUMP_DRAWS=<dir>` with `NX_DUMP_FROM=<n>` and `NX_DUMP_UNTIL=<n>` one after each
   command, `NX_TRACE_COMPUTE=1` prints every compute launch with its descriptor and
-  `NX_TRACE_CBUFS=1` the constant buffers a traced draw or launch reads. `NX_INPUT_SCRIPT="<frame>
+  `NX_TRACE_CBUFS=1` the constant buffers a traced draw or launch reads. With `NX_DUMP_DRAWS`,
+  `NX_PROBE_PIXELS=<x>:<y>[,...]` prints what those pixels of the first color target hold as numbers (a
+  floating-point target is not clamped) and `NX_PROBE_EXTREME=<limit>` how many pixels hold a component
+  above the limit or not a number, with the first few (and, with `NX_DUMP_TARGETS` at a presented frame,
+  the count for every target). `NX_DEBUG_FIRST_BAD=<limit>` makes every pixel program record the first
+  instruction whose floating-point result is not a number or above the limit (a million without a
+  number) and paint its offset (64 plus the low six bits of the instruction number in red, 64 plus the
+  next four in green, 64 plus a number that names the program in blue; a message says which), and
+  `NX_DEBUG_PROBE_REGS=<hex program address>:<hex offset>:<r>,<r>,<r>` makes that program paint the
+  values of three registers before the instruction at the offset (with `NX_PROBE_EXTREME` these name
+  the pixels that go wrong, the program and the instruction). `NX_DUMP_TEXTURES=<dir>` writes every layer
+  and level of each texture made as a picture, and its memory as it was (`.raw`); `NX_TRACE_TEXTURES=1`
+  also says which texels of a floating-point texture are not numbers or huge. `NX_INPUT_SCRIPT="<frame>
   <Action> [<frames>];..."` (or a file) presses actions of a keymap at presented frame numbers, for
   runs without a person (the frame rate decides when a menu is ready: a run that is 15 times faster
   needs the press 15 times later). Never `NX_DUMP_FRAMES` without `NX_DUMP_EVERY` for a long run.

@@ -92,6 +92,18 @@ impl I2m {
         let Some(upload) = self.pending.take() else {
             return Ok(());
         };
+        if let Some((start, len)) = traced_range() {
+            // `NX_TRACE_UPLOADS`: say the uploads that reach a range of the guest's memory.
+            if let Some((cpu, _)) = cx.space.translate(upload.destination) {
+                let reach = upload.pitch * upload.lines as u64;
+                if cpu < start + len && cpu + reach > start {
+                    eprintln!(
+                        "[gpu] an inline upload of {} lines of {} bytes to GPU {:#x} (guest {cpu:#x}), pitch {}",
+                        upload.lines, upload.line_length, upload.destination, upload.pitch
+                    );
+                }
+            }
+        }
         for line in 0..upload.lines {
             let from = line * upload.line_length;
             cx.write(
@@ -103,6 +115,21 @@ impl I2m {
         cx.stats.inline_bytes += total as u64;
         Ok(())
     }
+}
+
+/// `NX_TRACE_UPLOADS=<hex guest address>:<hex length>` in the environment: the range of the guest's
+/// memory whose inline uploads are said.
+fn traced_range() -> Option<(u64, u64)> {
+    use std::sync::OnceLock;
+    static RANGE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let v = std::env::var("NX_TRACE_UPLOADS").ok()?;
+        let (a, l) = v.split_once(':')?;
+        Some((
+            u64::from_str_radix(a.trim_start_matches("0x"), 16).ok()?,
+            u64::from_str_radix(l.trim_start_matches("0x"), 16).ok()?,
+        ))
+    })
 }
 
 #[cfg(test)]

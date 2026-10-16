@@ -32,6 +32,15 @@ pub struct Debug {
     pub dump_passes: Option<PathBuf>,
     /// `NX_DUMP_UNTIL=<n>`: stop at command n (see `NX_DUMP_FROM`).
     pub dump_until: u64,
+    /// `NX_PROBE_PIXELS=<x>:<y>[,...]`: with `NX_DUMP_DRAWS`, also print what those pixels of the
+    /// first color target hold after each dumped command, as numbers (floats are not clamped).
+    pub probe_pixels: Vec<(u32, u32)>,
+    /// `NX_PROBE_EXTREME=<limit>`: with `NX_DUMP_DRAWS`, also say how many pixels of the first color
+    /// target hold a component that is not a number or is above the limit, and the first few.
+    pub probe_extreme: Option<f32>,
+    /// `NX_TRACE_DRAWS_TO=<hex GPU address>[,...]`: every draw with a color target at one of
+    /// these addresses is described (state included), in whatever frame it comes.
+    pub trace_draws_to: Vec<u64>,
     /// `NX_DUMP_TARGETS`: with `NX_DUMP_FRAMES`, also write every color target at each dump.
     pub dump_targets: bool,
     /// `NX_SPIRV_CHECK`: validate the translated programs with `spirv-val` when it is installed.
@@ -85,6 +94,20 @@ impl Debug {
             dump_draws: std::env::var_os("NX_DUMP_DRAWS").map(PathBuf::from),
             dump_from: number("NX_DUMP_FROM").unwrap_or(0),
             dump_until: number("NX_DUMP_UNTIL").unwrap_or(u64::MAX),
+            trace_draws_to: addresses("NX_TRACE_DRAWS_TO"),
+            probe_extreme: std::env::var("NX_PROBE_EXTREME")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            probe_pixels: std::env::var("NX_PROBE_PIXELS")
+                .map(|v| {
+                    v.split(',')
+                        .filter_map(|p| {
+                            let (x, y) = p.split_once(':')?;
+                            Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             dump_passes: std::env::var_os("NX_DUMP_PASSES").map(PathBuf::from),
             trace_after_busy: set("NX_TRACE_AFTER_BUSY"),
             dump_targets: set("NX_DUMP_TARGETS"),
