@@ -256,7 +256,7 @@ pub fn build_reply(r: &Reply) -> Option<[u8; MESSAGE_BYTES]> {
 }
 
 /// One line on standard error for a request a service answered (`NX_TRACE_SVC`).
-fn trace_request(service: &str, req: &Request, answer: &Result<Response, Stop>) {
+fn trace_request(current: u64, service: &str, req: &Request, answer: &Result<Response, Stop>) {
     let shape = format!(
         "{} data bytes, buffers A{} B{} X{} W{}, handles {} copied {} moved{}",
         req.data.len(),
@@ -276,7 +276,7 @@ fn trace_request(service: &str, req: &Request, answer: &Result<Response, Stop>) 
     };
     match answer {
         Ok(r) => eprintln!(
-            "[ipc] {service} command {}: {shape}{data} -> result {:#x}, {} data bytes, {} objects, {} handles",
+            "[ipc] {service} command {}: {shape}{data} -> result {:#x}, {} data bytes, {} objects, {} handles (thread {current})",
             req.command,
             r.result.0,
             r.data.len(),
@@ -284,7 +284,7 @@ fn trace_request(service: &str, req: &Request, answer: &Result<Response, Stop>) 
             r.copy_handles.len() + r.move_handles.len()
         ),
         Err(s) => eprintln!(
-            "[ipc] {service} command {}: {shape}, data {:02x?} -> stops the run: {}",
+            "[ipc] {service} command {}: {shape}, data {:02x?} -> stops the run: {} (thread {current})",
             req.command,
             &req.data[..req.data.len().min(32)],
             s.0
@@ -358,14 +358,26 @@ impl Kernel {
         {
             let mut st = self.lock();
             for o in response.copy_handles {
+                let kind = o.kind();
                 match st.handles.insert(o) {
-                    Ok(h) => copy_handles.push(h),
+                    Ok(h) => {
+                        if self.trace {
+                            eprintln!("[ipc]   copy handle {h:#x}: {kind}");
+                        }
+                        copy_handles.push(h);
+                    }
                     Err(e) => return Ok(e),
                 }
             }
             for o in response.move_handles {
+                let kind = o.kind();
                 match st.handles.insert(o) {
-                    Ok(h) => move_handles.push(h),
+                    Ok(h) => {
+                        if self.trace {
+                            eprintln!("[ipc]   move handle {h:#x}: {kind}");
+                        }
+                        move_handles.push(h);
+                    }
                     Err(e) => return Ok(e),
                 }
             }
@@ -436,7 +448,7 @@ impl Kernel {
                     if self.trace {
                         eprintln!(
                             "[ipc] domain message on `{}`: kind {kind}, object {target}, {} data \
-                             bytes, {nobjects} objects",
+                             bytes, {nobjects} objects (thread {current})",
                             sess.root.name(),
                             size
                         );
@@ -487,7 +499,7 @@ impl Kernel {
                 });
                 let answer = service.request(&req);
                 if self.trace {
-                    trace_request(service.name(), &req, &answer);
+                    trace_request(current, service.name(), &req, &answer);
                 }
                 match answer {
                     Ok(r) => Routed::Reply(r, domain),
@@ -518,7 +530,7 @@ impl Kernel {
                 });
                 let answer = service.request_tipc(&req);
                 if self.trace {
-                    trace_request(service.name(), &req, &answer);
+                    trace_request(current, service.name(), &req, &answer);
                 }
                 match answer {
                     Ok(r) => Routed::Tipc(r),
