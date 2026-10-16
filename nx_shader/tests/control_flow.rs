@@ -80,6 +80,21 @@ fn the_loop_can_be_asked_for_whatever_the_jumps_are() {
 }
 
 #[test]
+fn a_program_that_always_kills_is_valid() {
+    // A pixel program of a pass that is off: the first block ends with a kill nothing guards, and
+    // nothing follows it (the function ends with the kill).
+    for code in [
+        vec![kil(Guard::ALWAYS)],
+        vec![mov32i(0, 1), kil(Guard::ALWAYS)],
+    ] {
+        for force_loop in [false, true] {
+            let (_, spirv) = translated(Stage::Pixel, 5, &code, force_loop);
+            nx_shader::validate::assert_valid(&spirv);
+        }
+    }
+}
+
+#[test]
 fn a_kill_in_a_loop_free_program_is_valid() {
     // Kill when P0, otherwise go on (a conditional kill ends its block), then a kill that nothing
     // can follow.

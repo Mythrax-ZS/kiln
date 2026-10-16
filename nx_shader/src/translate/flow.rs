@@ -127,6 +127,10 @@ fn build_predicated(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg) -> R<()> {
                 tx.f.branch(after);
             }
             tx.f.label(after);
+        } else if !open {
+            // The entry ends the program (a kill nothing guards): nothing after it can run, and the
+            // function ends with the kill.
+            return Ok(());
         }
     }
     io::epilogue(tx)?;
