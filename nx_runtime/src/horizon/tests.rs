@@ -1906,6 +1906,50 @@ fn a_transfer_memory_locks_its_range_until_the_handle_is_closed() {
 }
 
 #[test]
+fn the_data_and_bss_of_a_module_can_be_lent_as_transfer_memory() {
+    // A title lends megabytes of its zero-filled static memory to a service: the kernel's
+    // states that allow a transfer are the heap and the writable data of a module, not its code
+    // or its constants.
+    let mut e = Env::with(
+        ProcessKind::Nso,
+        None,
+        vec![
+            Segment {
+                addr: CODE_BASE,
+                size: 0x1000,
+                perm: perm::R | perm::X,
+            },
+            Segment {
+                addr: CODE_BASE + 0x1000,
+                size: 0x1000,
+                perm: perm::R,
+            },
+            Segment {
+                addr: CODE_BASE + 0x2000,
+                size: 0x8000,
+                perm: perm::R | perm::W,
+            },
+        ],
+    );
+    // The segments are in the kernel's table; the pages of the data are real here.
+    let data = CODE_BASE + 0x2000;
+    let _ = rt().mem.unmap(data, 0x8000);
+    rt().mem.map(data, 0x8000, perm::R | perm::W).unwrap();
+    e.svc(0x15, &[0, CODE_BASE, 0x1000, 0]);
+    assert_eq!(e.r(), err::INVALID_CURRENT_MEMORY.0, "code");
+    e.svc(0x15, &[0, CODE_BASE + 0x1000, 0x1000, 0]);
+    assert_eq!(e.r(), err::INVALID_CURRENT_MEMORY.0, "constants");
+    e.svc(0x15, &[0, data + 0x2000, 0x4000, 0]);
+    assert_eq!(e.r(), 0, "data and bss");
+    let handle = e.x(1);
+    assert!(rt().mem.read(data + 0x2000, 8, Relaxed).is_err());
+    e.svc(0x16, &[handle]);
+    assert_eq!(e.r(), 0);
+    assert!(rt().mem.read(data + 0x2000, 8, Relaxed).is_ok());
+    let _ = rt().mem.unmap(data, 0x8000);
+}
+
+#[test]
 fn the_applet_manager_announces_focus_once_and_then_has_nothing_to_say() {
     let mut e = Env::new();
     super::services::register_defaults(&e.kernel);
@@ -3326,6 +3370,101 @@ fn audio_parameters() -> Vec<u8> {
         p[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
     p
+}
+
+#[test]
+fn an_audio_output_gives_each_buffer_back_when_its_time_has_been_played() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let audout = e.service("audout:u");
+    // One device, named.
+    let names = SCRATCH + 0x100;
+    let mut list = Message::new(0);
+    list.receive = vec![(names, 0x20)];
+    assert_eq!(e.call(audout, &list).data, 1u32.to_le_bytes());
+    assert_eq!(&e.read(names, 9), b"DeviceOut");
+    // OpenAudioOut(0 Hz, 0 channels) opens the device's own: 48 kHz, stereo, 16-bit, stopped.
+    let (process, _) = e.kernel.create_event().unwrap();
+    let mut open = Message::new(1);
+    open.pid = true;
+    open.copy_handles = vec![process];
+    open.payload = vec![0; 16];
+    open.send = vec![(names, 0x20)];
+    open.receive = vec![(names + 0x40, 0x20)];
+    let opened = e.call(audout, &open);
+    assert_eq!(opened.result, 0);
+    let words: Vec<u32> = opened
+        .data
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(words, [48_000, 2, 2, 1]);
+    assert_eq!(&e.read(names + 0x40, 9), b"DeviceOut");
+    let out = u64::from(opened.moved[0]);
+    assert_eq!(e.call(out, &Message::new(0)).data, 1u32.to_le_bytes());
+    let event = e.call(out, &Message::new(4)).copied[0];
+
+    // Two buffers of 10 ms and 5 ms: a descriptor each, the samples behind it.
+    let samples = SCRATCH + 0x2000;
+    e.write(samples, &vec![0x11; 480 * 4]);
+    let append = |e: &mut Env, tag: u64, frames: u64, at: u64| {
+        let mut descriptor = vec![0u8; 0x28];
+        descriptor[8..16].copy_from_slice(&samples.to_le_bytes());
+        descriptor[16..24].copy_from_slice(&0x1000u64.to_le_bytes());
+        descriptor[24..32].copy_from_slice(&(frames * 4).to_le_bytes());
+        e.write(at, &descriptor);
+        let mut m = Message::new(3);
+        m.payload = tag.to_le_bytes().to_vec();
+        m.send = vec![(at, 0x28)];
+        assert_eq!(e.call(out, &m).result, 0);
+    };
+    append(&mut e, 7, 480, SCRATCH + 0x1000);
+    append(&mut e, 8, 240, SCRATCH + 0x1100);
+    let contains = |e: &mut Env, tag: u64| {
+        let mut m = Message::new(6);
+        m.payload = tag.to_le_bytes().to_vec();
+        e.call(out, &m).data == 1u32.to_le_bytes()
+    };
+    assert!(contains(&mut e, 7) && contains(&mut e, 8) && !contains(&mut e, 9));
+    // Stopped, nothing is played: the buffers wait.
+    std::thread::sleep(Duration::from_millis(60));
+    let taken = SCRATCH + 0x3000;
+    let mut released = Message::new(5);
+    released.receive = vec![(taken, 0x40)];
+    assert_eq!(e.call(out, &released).data, 0u32.to_le_bytes());
+    assert_eq!(e.call(out, &Message::new(9)).data, 2u32.to_le_bytes());
+
+    // Started, they come back in order once their time is over, and the event says so.
+    assert_eq!(e.call(out, &Message::new(1)).result, 0);
+    let began = Instant::now();
+    e.write(SCRATCH + 0x400, &event.to_le_bytes());
+    e.svc(0x18, &[0, SCRATCH + 0x400, 1, 2_000_000_000]);
+    assert_eq!(e.r(), 0, "the buffer event is set");
+    assert!(
+        began.elapsed() >= Duration::from_millis(8),
+        "a buffer takes its time"
+    );
+    std::thread::sleep(Duration::from_millis(60));
+    let back = e.call(out, &released);
+    assert_eq!(back.data, 2u32.to_le_bytes());
+    assert_eq!(
+        e.read(taken, 16),
+        [7u64.to_le_bytes(), 8u64.to_le_bytes()].concat()
+    );
+    assert_eq!(
+        e.call(out, &Message::new(10)).data,
+        (480u64 + 240).to_le_bytes(),
+        "the frames played"
+    );
+    assert!(!contains(&mut e, 7));
+    // Flushing gives back what has not been played.
+    append(&mut e, 9, 480, SCRATCH + 0x1000);
+    assert_eq!(e.call(out, &Message::new(2)).result, 0);
+    append(&mut e, 10, 480, SCRATCH + 0x1100);
+    assert_eq!(e.call(out, &Message::new(11)).data, 1u32.to_le_bytes());
+    assert_eq!(e.call(out, &released).data, 2u32.to_le_bytes());
+    // A command nobody implemented stops the run.
+    assert!(e.send(out, &Message::new(99).bytes(), false).is_none());
 }
 
 #[test]

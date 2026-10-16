@@ -60,6 +60,10 @@ const SINK_OUT: usize = 0x20;
 const PERFORMANCE_OUT: usize = 0x10;
 const BEHAVIOR_OUT: usize = 0xB0;
 const BEHAVIOR_IN: usize = 0x10;
+/// From revision 5 on the answer ends with the render information: the number of audio frames
+/// the renderer has made so far, and a word that is not used (docs/ASSUMPTIONS.md A-176).
+const RENDER_INFO_OUT: usize = 0x10;
+const RENDER_INFO_REVISION: u32 = 5;
 
 // Memory pool states (`libnx`: `AudioRendererMemPoolState`).
 const POOL_REQUEST_DETACH: u32 = 2;
@@ -151,6 +155,8 @@ struct Core {
     /// `NX_TRACE_AUDIO`: what each effect entry said (type, new, enabled) and what was answered
     /// (removed) the last time it was reported, so that only changes are said.
     effect_said: Vec<Option<(u8, bool, bool, bool)>>,
+    /// The audio frames made so far, which the render information of the answer says.
+    frames: u64,
     mixer: Mixer,
     /// The interleaved stereo samples of the last frame, and whether it made any (it needs mixes
     /// and a device sink to play through).
@@ -188,6 +194,7 @@ impl Core {
             voices: (0..params.voice_count).map(|_| Voice::default()).collect(),
             effects: vec![EffectUse::Invalid; params.effect_count as usize],
             effect_said: vec![None; params.effect_count as usize],
+            frames: 0,
             mixer: Mixer::default(),
             audio: Vec::new(),
             sounding: false,
@@ -274,13 +281,19 @@ impl Core {
         let sinks_out = self.params.sink_count as usize * SINK_OUT;
         let out_pools = pool_count * MEMPOOL_OUT;
         let out_voices = voice_count * VOICE_OUT;
+        let render_info = if revision_number(revision) >= RENDER_INFO_REVISION {
+            RENDER_INFO_OUT
+        } else {
+            0
+        };
         let size = HEADER_SIZE
             + out_pools
             + out_voices
             + effect_out
             + sinks_out
             + PERFORMANCE_OUT
-            + BEHAVIOR_OUT;
+            + BEHAVIOR_OUT
+            + render_info;
         let mut out = vec![0u8; size];
         let put =
             |out: &mut [u8], o: usize, v: u32| out[o..o + 4].copy_from_slice(&v.to_le_bytes());
@@ -291,7 +304,13 @@ impl Core {
         put(&mut out, 0x14, effect_out as u32);
         put(&mut out, 0x1C, sinks_out as u32);
         put(&mut out, 0x20, PERFORMANCE_OUT as u32);
+        put(&mut out, 0x28, render_info as u32);
         put(&mut out, 0x3C, size as u32);
+        if render_info > 0 {
+            self.frames += u64::from(active);
+            out[size - render_info..size - render_info + 8]
+                .copy_from_slice(&self.frames.to_le_bytes());
+        }
 
         // Memory pools: a request to attach or detach is granted; any other state is left as it
         // is (the program reads "invalid" as "no change").
@@ -883,11 +902,46 @@ mod tests {
         );
         assert_eq!(u32_at(&out, 0x1C), SINK_OUT as u32);
         assert_eq!(u32_at(&out, 0x20), PERFORMANCE_OUT as u32);
+        assert_eq!(
+            u32_at(&out, 0x28),
+            RENDER_INFO_OUT as u32,
+            "from revision 5"
+        );
         assert_eq!(u32_at(&out, 0x3C) as usize, out.len());
         assert_eq!(
             out.len(),
+            HEADER_SIZE + 3 * 0x10 + 2 * 0x10 + 3 * 0x10 + 0x20 + 0x10 + 0xB0 + 0x10
+        );
+    }
+
+    #[test]
+    fn the_render_information_comes_from_revision_5_and_counts_the_frames_made() {
+        // Before revision 5 the answer ends with the behavior section.
+        let mut core = Core::new(params());
+        let old = core
+            .run(&update(
+                0x3456_4552,
+                &[0; 3],
+                &[voice(vec![]), voice(vec![])],
+            ))
+            .unwrap();
+        assert_eq!(u32_at(&old, 0x28), 0);
+        assert_eq!(
+            old.len(),
             HEADER_SIZE + 3 * 0x10 + 2 * 0x10 + 3 * 0x10 + 0x20 + 0x10 + 0xB0
         );
+        // From it on, the last 16 bytes say how many frames were made: one an update that runs.
+        let input = update(0x3856_4552, &[0; 3], &[voice(vec![]), voice(vec![])]);
+        // The render information starts where the answer of an older revision ends.
+        let at = old.len();
+        let counts: Vec<u64> = (0..3)
+            .map(|_| u64_at(&core.run(&input).unwrap(), at))
+            .collect();
+        assert_eq!(counts, [1, 2, 3]);
+        // An update of a renderer that was not started makes none.
+        let still = core.update(&input, &|_, _| false, false).unwrap();
+        let at = still.len() - RENDER_INFO_OUT;
+        assert_eq!(u64_at(&still, at), 3);
     }
 
     /// `base` with the effect entries `(type, new, enabled)` after its voices.
@@ -976,7 +1030,7 @@ mod tests {
         assert_eq!(u32_at(&out, 0x3C) as usize, out.len());
         assert_eq!(
             out.len(),
-            HEADER_SIZE + 3 * 0x10 + 2 * 0x10 + 3 * 0x90 + 0x20 + 0x10 + 0xB0
+            HEADER_SIZE + 3 * 0x10 + 2 * 0x10 + 3 * 0x90 + 0x20 + 0x10 + 0xB0 + 0x10
         );
         let states = |out: &[u8]| [0, 1, 2].map(|i| effect_state_of(out, i, EFFECT_OUT_V2));
         assert_eq!(states(&out), [EFFECT_IN_USE; 3]);

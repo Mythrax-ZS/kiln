@@ -30,6 +30,12 @@ impl std::fmt::Debug for Outputs {
 impl Outputs {
     /// The outputs the environment asks for, for samples at `rate`.
     pub fn open(rate: u32) -> Outputs {
+        Outputs::open_labeled(rate, "")
+    }
+
+    /// The same for a source with a name (`audout`): its WAV file is the one `NX_AUDIO_DUMP` names
+    /// with the label before the extension, so that two sources do not write the same file.
+    pub fn open_labeled(rate: u32, label: &str) -> Outputs {
         let mut list: Vec<Box<dyn Output>> = Vec::new();
         if std::env::var_os("NX_AUDIO").is_none_or(|v| v != "0") {
             if let Some(device) = open_device(rate) {
@@ -37,9 +43,19 @@ impl Outputs {
             }
         }
         if let Some(path) = std::env::var_os("NX_AUDIO_DUMP") {
-            match WavFile::create(std::path::Path::new(&path), rate) {
+            let mut path = std::path::PathBuf::from(path);
+            if !label.is_empty() {
+                let stem = path
+                    .file_stem()
+                    .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+                let extension = path
+                    .extension()
+                    .map_or_else(String::new, |s| format!(".{}", s.to_string_lossy()));
+                path.set_file_name(format!("{stem}.{label}{extension}"));
+            }
+            match WavFile::create(&path, rate) {
                 Ok(file) => list.push(Box::new(file)),
-                Err(e) => eprintln!("[audio] cannot write {}: {e}", path.to_string_lossy()),
+                Err(e) => eprintln!("[audio] cannot write {}: {e}", path.display()),
             }
         }
         Outputs { list }

@@ -40,7 +40,12 @@ impl Kernel {
         let covered: u64 = blocks.iter().map(|b| b.1).sum();
         if covered != size
             || blocks.iter().any(|(_, _, i)| {
-                i.mem_type != mem_type::NORMAL || i.attr != 0 || i.perm != perm::R | perm::W
+                // The heap and the data and `.bss` of a module (A-174).
+                !matches!(
+                    i.mem_type,
+                    mem_type::NORMAL | mem_type::CODE_DATA | mem_type::ALIAS_CODE_DATA
+                ) || i.attr != 0
+                    || i.perm != perm::R | perm::W
             })
         {
             return Err(err::INVALID_CURRENT_MEMORY);

@@ -8,6 +8,7 @@ pub(super) mod acc;
 mod aoc;
 mod apm;
 mod applet;
+mod audout;
 mod audren;
 mod bsd;
 mod ectx;
@@ -67,6 +68,7 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     });
     register(kernel, "acc:u0", acc::AccountService::new);
     register(kernel, "aoc:u", aoc::AddOnContent::new);
+    register(kernel, "audout:u", audout::Manager::new);
     register(kernel, "audren:u", audren::Manager::new);
     register(kernel, "bsd:u", |_| bsd::Client::new());
     register(kernel, "ectx:aw", |_| ectx::WriterForApplication);
