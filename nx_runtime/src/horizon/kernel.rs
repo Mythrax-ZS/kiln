@@ -1272,6 +1272,12 @@ impl Kernel {
         if st.exit.is_some() {
             return err::THREAD_TERMINATING;
         }
+        // The kernel tells user mode that somebody waits by setting the key word to 1; a failed
+        // write is not an error (Atmosphère's `KConditionVariable::Wait`). It comes before the
+        // mutex is released, as there: a thread that finds the mutex free signals only when the
+        // key word is set, and a signal skipped in the gap between the two writes would never
+        // wake this thread (docs/ASSUMPTIONS.md A-173).
+        let _ = self.write_u32(key, 1);
         let released = self.unlock_mutex_locked(&mut st, mutex);
         if !released.is_success() {
             return released;
@@ -1287,9 +1293,6 @@ impl Kernel {
             },
             mutex,
         });
-        // The kernel tells user mode that somebody waits by setting the key word to 1; a failed
-        // write is not an error (Atmosphère's `KConditionVariable::Wait`).
-        let _ = self.write_u32(key, 1);
         if let Some(t) = st.threads.get_mut(&current) {
             t.wake = None;
         }

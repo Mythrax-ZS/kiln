@@ -16,6 +16,7 @@ use crate::npdm::{builder, Npdm};
 use crate::rt::abi::{perm, stop, FuncEntry, NativeCpu, STOP_PC};
 use crate::rt::runtime::rt;
 use std::ffi::c_void;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -966,6 +967,49 @@ fn a_condition_variable_timeout_returns_without_the_mutex() {
     assert_eq!(word(m), 0, "the mutex was released and not taken back");
     // The waiter is gone: a later signal finds nobody.
     k.signal_process_wide_key(key, 1);
+}
+
+#[test]
+fn a_condition_variable_wait_sets_the_key_word_before_it_releases_the_mutex() {
+    // A thread that takes a mutex it finds free signals only when the key word says somebody
+    // waits. If the mutex were released first, a signal sent in the gap between the two writes
+    // would be skipped and the waiter would sleep for ever (the reader-writer lock of a title's
+    // resource manager stopped that way, once in about ten runs).
+    let e = Env::new();
+    let k = Arc::clone(&e.kernel);
+    // The two words are the halves of one aligned 8-byte word, which the observer reads in one
+    // access: it sees both as they are at one instant.
+    let (m, key) = (SCRATCH + 0x1C0, SCRATCH + 0x1C4);
+    let (w, _cpu) = second_thread(&k);
+    for round in 0..300 {
+        set_word(key, 0);
+        set_word(m, 0x333);
+        let stop = Arc::new(AtomicBool::new(false));
+        let gap = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(false));
+        let observer = {
+            let (stop, gap, running) = (Arc::clone(&stop), Arc::clone(&gap), Arc::clone(&running));
+            std::thread::spawn(move || {
+                while !stop.load(Relaxed) {
+                    running.store(true, Relaxed);
+                    if rt().mem.read(m, 8, Relaxed).unwrap() == 0 {
+                        gap.store(true, Relaxed);
+                    }
+                }
+            })
+        };
+        while !running.load(Relaxed) {
+            std::hint::spin_loop();
+        }
+        let r = k.wait_process_wide_key(w, m, key, 0x333, 1_000_000);
+        stop.store(true, Relaxed);
+        observer.join().unwrap();
+        assert_eq!(r, err::TIMED_OUT);
+        assert!(
+            !gap.load(Relaxed),
+            "round {round}: the mutex was seen free while the key word was still clear"
+        );
+    }
 }
 
 #[test]
