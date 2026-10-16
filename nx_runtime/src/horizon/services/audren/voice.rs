@@ -110,6 +110,8 @@ pub struct VoiceIn {
     pub head: usize,
     /// The mix the voice plays into (the final mix is 0) and its channel resources.
     pub dest_mix: u32,
+    /// The splitter it plays into instead, if any (`0x7FFF_FFFF`: none).
+    pub dest_splitter: u32,
     pub channel_ids: [u32; MAX_CHANNELS],
     /// The ADPCM coefficients: where they are and how many bytes.
     pub coefficients_at: u64,
@@ -140,6 +142,7 @@ impl VoiceIn {
             queued: (u32_at(info, 0x3C) as usize).min(WAVE_BUFFERS),
             head: (u16::from_le_bytes([info[0x40], info[0x41]]) as usize) % WAVE_BUFFERS,
             dest_mix: u32_at(info, 0x58),
+            dest_splitter: u32_at(info, 0x5C),
             channel_ids,
             coefficients_at: u64_at(info, 0x48),
             coefficients_size: u64_at(info, 0x50),

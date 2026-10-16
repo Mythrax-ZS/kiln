@@ -19,7 +19,7 @@ use super::super::kernel::Kernel;
 use super::super::object::KObject;
 use super::super::result::ResultCode;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
-use mixer::{Channel, Mixer, CHANNEL_SIZE, MIX_SIZE, SINK_SIZE};
+use mixer::{Channel, Mixer, CHANNEL_SIZE, SINK_SIZE};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -64,6 +64,8 @@ const BEHAVIOR_IN: usize = 0x10;
 /// the renderer has made so far, and a word that is not used (docs/ASSUMPTIONS.md A-176).
 const RENDER_INFO_OUT: usize = 0x10;
 const RENDER_INFO_REVISION: u32 = 5;
+/// From revision 7 on an update holds only the mixes that changed (docs/ASSUMPTIONS.md A-179).
+const DIRTY_MIXES_REVISION: u32 = 7;
 
 // Memory pool states (`libnx`: `AudioRendererMemPoolState`).
 const POOL_REQUEST_DETACH: u32 = 2;
@@ -165,6 +167,8 @@ struct Core {
     /// What has been said already, so that it is said once.
     said_header: bool,
     said_formats: u32,
+    /// `NX_TRACE_AUDIO`: the shape of the mix graph as last said, said again when it changes.
+    graph_said: Option<String>,
     /// `NX_TRACE_AUDIO`: say every second (200 updates) what the voices did.
     trace: bool,
     seen: Seen,
@@ -185,6 +189,8 @@ struct Seen {
     /// Updates that were mixed to the sink, and the largest sample of those.
     sounding: u32,
     peak: i32,
+    /// Where the started voices play: (mix, splitter) as their entries say.
+    destinations: std::collections::BTreeSet<(u32, u32)>,
 }
 
 impl Core {
@@ -200,6 +206,7 @@ impl Core {
             sounding: false,
             said_header: false,
             said_formats: 0,
+            graph_said: None,
             trace: std::env::var_os("NX_TRACE_AUDIO").is_some(),
             seen: Seen::default(),
         }
@@ -327,25 +334,52 @@ impl Core {
         }
 
         // The mixes and the sinks follow the voices and the effects in the input (and whatever
-        // the splitters take); a layout that does not add up plays nothing.
+        // the splitters take); a layout that does not add up plays nothing. From revision 7 on
+        // the mix section holds only the mixes that changed (A-179).
         let splitters = u32_at(input, 0x24) as usize;
         let mixes_at = voices_at + voices + effects + splitters;
         let sinks_at = mixes_at + mixes;
-        let graph = mixes.is_multiple_of(MIX_SIZE)
-            && sinks.is_multiple_of(SINK_SIZE)
-            && mixes > 0
-            && sinks > 0
-            && sinks_at + sinks <= total;
         let frame = self.params.sample_count as usize;
-        if graph {
-            self.mixer.read_graph(
+        let graph = sinks.is_multiple_of(SINK_SIZE)
+            && sinks > 0
+            && sinks_at + sinks <= total
+            && self.mixer.read_mixes(
                 &input[mixes_at..sinks_at],
-                &input[sinks_at..sinks_at + sinks],
+                revision_number(revision) >= DIRTY_MIXES_REVISION,
+                self.params.submix_count as usize + 1,
                 self.params.mix_buffer_count as usize,
                 frame,
             );
+        if graph {
+            self.mixer.read_sinks(&input[sinks_at..sinks_at + sinks]);
         } else {
             self.mixer.clear();
+        }
+        if self.trace {
+            let m = &self.mixer;
+            let sink_text: Vec<String> = m
+                .sinks
+                .iter()
+                .map(|s| format!("type {} used {} inputs {:?}", s.kind, s.used, s.inputs))
+                .collect();
+            let shape = format!(
+                "{} mixes ({} used, final mix {} buffers, destinations {:?}), sinks [{}], \
+                 effects {effects:#x} bytes, splitters {splitters:#x} bytes, mixes {mixes:#x}, \
+                 sinks {sinks:#x}, layout read {graph}",
+                m.mixes.len(),
+                m.mixes.iter().filter(|x| x.used).count(),
+                m.mixes.first().map_or(0, |x| x.buffers),
+                m.mixes
+                    .iter()
+                    .filter(|x| x.used)
+                    .map(|x| x.dest as i32)
+                    .collect::<Vec<_>>(),
+                sink_text.join("; "),
+            );
+            if self.graph_said.as_deref() != Some(shape.as_str()) {
+                eprintln!("[audio] graph: {shape}");
+                self.graph_said = Some(shape);
+            }
         }
         let resources: Vec<Channel> = input[channels_at..voices_at]
             .as_chunks::<CHANNEL_SIZE>()
@@ -376,6 +410,9 @@ impl Core {
                     Format::Adpcm => self.seen.adpcm += 1,
                     Format::Pcm16 => self.seen.pcm16 += 1,
                     _ => self.seen.other += 1,
+                }
+                if self.trace {
+                    self.seen.destinations.insert((v.dest_mix, v.dest_splitter));
                 }
             }
             if made && self.mixer.has_graph() {
@@ -461,7 +498,7 @@ impl Core {
         if self.trace && self.seen.updates >= 200 {
             let n = &self.seen;
             eprintln!(
-                "[audio] last {} updates: voices used {:.1}, started {:.1} (ADPCM {:.1}, PCM16 {:.1}, others {:.1}), made samples {:.1} on average; {} frames mixed to the sink, loudest sample {}",
+                "[audio] last {} updates: voices used {:.1}, started {:.1} (ADPCM {:.1}, PCM16 {:.1}, others {:.1}), made samples {:.1} on average; {} frames mixed to the sink, loudest sample {}; (mix, splitter) of started voices {:x?}",
                 n.updates,
                 f64::from(n.used) / f64::from(n.updates),
                 f64::from(n.started) / f64::from(n.updates),
@@ -470,7 +507,8 @@ impl Core {
                 f64::from(n.other) / f64::from(n.updates),
                 f64::from(n.made) / f64::from(n.updates),
                 n.sounding,
-                n.peak
+                n.peak,
+                n.destinations
             );
             self.seen = Seen::default();
         }

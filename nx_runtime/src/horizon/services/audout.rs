@@ -277,6 +277,14 @@ impl Service for AudioOut {
             1 | 2 => {
                 self.shared.lock().started = req.command == 1;
                 self.shared.wake.notify_all();
+                if std::env::var_os("NX_TRACE_AUDIO").is_some() {
+                    let what = if req.command == 1 {
+                        "started"
+                    } else {
+                        "stopped"
+                    };
+                    eprintln!("[audout] {what}");
+                }
                 Ok(Response::ok())
             }
             // AppendAudioOutBuffer(u64 tag, buffer descriptor), and its automatic form
@@ -367,6 +375,9 @@ fn play(
     // When the buffer that is playing ends: buffers follow each other without a gap, and after a
     // pause the clock starts again.
     let mut ends = Instant::now();
+    // `NX_TRACE_AUDIO`: buffers and frames played since the last line, and the loudest sample.
+    let trace = std::env::var_os("NX_TRACE_AUDIO").is_some();
+    let (mut said_buffers, mut said_frames, mut said_peak) = (0u32, 0u64, 0i32);
     loop {
         let item = {
             let mut s = shared.lock();
@@ -404,6 +415,19 @@ fn play(
             }
         }
         let frames = (item.samples.len() / 2) as u64;
+        if trace {
+            said_buffers += 1;
+            said_frames += frames;
+            let peak = item.samples.iter().map(|s| i32::from(*s).abs()).max();
+            said_peak = said_peak.max(peak.unwrap_or(0));
+            if said_frames >= u64::from(rate) {
+                eprintln!(
+                    "[audout] played {said_buffers} buffers, {said_frames} frames, loudest \
+                     sample {said_peak} (volume {volume})"
+                );
+                (said_buffers, said_frames, said_peak) = (0, 0, 0);
+            }
+        }
         let now = Instant::now();
         let start = ends.max(now);
         ends = start + Duration::from_secs_f64(frames as f64 / f64::from(rate.max(1)));

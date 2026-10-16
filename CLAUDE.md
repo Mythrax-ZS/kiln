@@ -126,10 +126,11 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   default; priorities are not modelled).
 - Audio: `NX_AUDIO=0` leaves the sound device out; `NX_AUDIO_DUMP=<file>` writes every sample the
   audio renderer mixes to a 16-bit stereo WAV file (kept readable while the program runs, so a killed
-  program leaves a good file); `NX_TRACE_AUDIO=1` says every second how many voices played, in which
-  formats, and how loud the mix was, and every change of what the program says of an effect and
-  what the renderer answers. The device test of `audio_out` feeds the machine's sound device
-  silence, and prints `SKIPPED` without a device.
+  program leaves a good file; what `audout` plays goes beside it, `<name>.audout.wav`); `NX_TRACE_AUDIO=1` says every
+  second how many voices played, in which formats, into which mixes, and how loud the mix was, every
+  change of the shape of the mix graph (mixes, sinks, section sizes) and of what the program says of
+  an effect and what the renderer answers, and what `audout` played. The device test of
+  `audio_out` feeds the machine's sound device silence, and prints `SKIPPED` without a device.
 - GPU front: `nx_gpu`'s unit tests need no external tool. `NX_TRACE_GPU=1` prints every submission
   of a produced program and, when it ends, what the command processor counted (`NX_GPU_TOP=<n>` is
   how many of the busiest methods it lists, 0 for all); `NX_TRACE_GPU=2` prints every method write

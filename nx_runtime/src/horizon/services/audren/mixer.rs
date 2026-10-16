@@ -17,6 +17,9 @@ const FOLD: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 /// One entry of the mix section of an update.
 pub const MIX_SIZE: usize = 0x930;
+/// From revision 7 on the mix section starts with a header of this size, whose second word counts
+/// the entries that follow: only the mixes that changed (docs/ASSUMPTIONS.md A-179).
+pub const DIRTY_HEADER: usize = 0x20;
 /// One entry of the sink section.
 pub const SINK_SIZE: usize = 0x140;
 /// One entry of the voice channel resources.
@@ -29,9 +32,11 @@ pub const FINAL_MIX: u32 = 0;
 pub const NO_MIX: u32 = 0x7FFF_FFFF;
 
 /// What an update says about a mix.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Mix {
     pub used: bool,
+    /// Which mix the entry is (0 the final mix): what a section of only the changed mixes goes by.
+    pub id: u32,
     pub volume: f32,
     pub buffers: usize,
     /// The mix this one plays into.
@@ -50,6 +55,7 @@ impl Mix {
         }
         Mix {
             used: entry[0x0C] != 0,
+            id: u32_at(entry, 0x10),
             volume: f32_at(entry, 0),
             buffers: (u32_at(entry, 0x08) as usize).min(MAX_MIX_BUFFERS),
             dest: u32_at(entry, 0x924),
@@ -63,6 +69,8 @@ impl Mix {
 #[derive(Clone, Debug, Default)]
 pub struct Sink {
     pub used: bool,
+    /// The type byte: 1 a device, 2 a circular buffer in the program's memory.
+    pub kind: u8,
     /// A device (not a circular buffer in the program's memory).
     pub device: bool,
     pub inputs: Vec<usize>,
@@ -79,6 +87,7 @@ impl Sink {
             .collect();
         Sink {
             used,
+            kind,
             device: kind == 1,
             inputs,
         }
@@ -116,15 +125,49 @@ pub struct Mixer {
 }
 
 impl Mixer {
-    /// Read the mixes of an update (the `count` entries of `section`) and the sinks.
-    pub fn read_graph(&mut self, mixes: &[u8], sinks: &[u8], buffer_count: usize, frame: usize) {
+    /// Read the mix section of an update. Up to revision 6 it lists every mix, in order, and
+    /// replaces what was known. From revision 7 on (`dirty_only`) it is a header with a count and
+    /// then only the mixes that changed, each naming itself, and the others keep what they had;
+    /// `mix_count` is how many mixes the renderer has (the final mix and the submixes). A section
+    /// of another layout forgets the graph and returns false.
+    pub fn read_mixes(
+        &mut self,
+        section: &[u8],
+        dirty_only: bool,
+        mix_count: usize,
+        buffer_count: usize,
+        frame: usize,
+    ) -> bool {
         self.frame = frame;
-        self.mixes = mixes
-            .as_chunks::<MIX_SIZE>()
-            .0
-            .iter()
-            .map(|entry| Mix::parse(entry))
-            .collect();
+        if dirty_only {
+            let count = u32_at(section, 4) as usize;
+            if section.len() < DIRTY_HEADER || section.len() != DIRTY_HEADER + count * MIX_SIZE {
+                self.clear();
+                return false;
+            }
+            if self.mixes.len() != mix_count {
+                self.mixes = vec![Mix::default(); mix_count];
+            }
+            for entry in section[DIRTY_HEADER..].as_chunks::<MIX_SIZE>().0 {
+                let mix = Mix::parse(entry);
+                let Some(slot) = self.mixes.get_mut(mix.id as usize) else {
+                    self.clear();
+                    return false;
+                };
+                *slot = mix;
+            }
+        } else {
+            if section.is_empty() || !section.len().is_multiple_of(MIX_SIZE) {
+                self.clear();
+                return false;
+            }
+            self.mixes = section
+                .as_chunks::<MIX_SIZE>()
+                .0
+                .iter()
+                .map(|entry| Mix::parse(entry))
+                .collect();
+        }
         // The buffers of the mixes are laid out one mix after another, in the order of the mixes.
         let mut offset = 0;
         for mix in &mut self.mixes {
@@ -133,15 +176,28 @@ impl Mixer {
                 offset += mix.buffers;
             }
         }
-        self.sinks = sinks
+        let want = buffer_count.max(offset) * frame;
+        self.buffers.clear();
+        self.buffers.resize(want, 0.0);
+        true
+    }
+
+    /// Read the sink section of an update.
+    pub fn read_sinks(&mut self, section: &[u8]) {
+        self.sinks = section
             .as_chunks::<SINK_SIZE>()
             .0
             .iter()
             .map(|entry| Sink::parse(entry))
             .collect();
-        let want = buffer_count.max(offset) * frame;
-        self.buffers.clear();
-        self.buffers.resize(want, 0.0);
+    }
+
+    /// The mixes of a section that lists them all, and the sinks.
+    #[cfg(test)]
+    pub fn read_graph(&mut self, mixes: &[u8], sinks: &[u8], buffer_count: usize, frame: usize) {
+        let count = mixes.len() / MIX_SIZE;
+        self.read_mixes(mixes, false, count, buffer_count, frame);
+        self.read_sinks(sinks);
     }
 
     /// Forget the graph: there is nothing to mix into.
@@ -298,6 +354,22 @@ mod tests {
         e
     }
 
+    /// `entry` naming itself mix `id`.
+    fn with_id(mut entry: Vec<u8>, id: u32) -> Vec<u8> {
+        entry[0x10..0x14].copy_from_slice(&id.to_le_bytes());
+        entry
+    }
+
+    /// A mix section of revision 7 and later: the header and the entries of the changed mixes.
+    fn dirty(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut section = vec![0u8; DIRTY_HEADER];
+        section[4..8].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        for e in entries {
+            section.extend_from_slice(e);
+        }
+        section
+    }
+
     /// A device sink entry whose inputs are the given buffers.
     pub fn sink_entry(inputs: &[u8]) -> Vec<u8> {
         let mut e = vec![0u8; SINK_SIZE];
@@ -366,6 +438,54 @@ mod tests {
         mixer.finish(&mut out);
         // Nothing on the left, half of the voice on the right.
         assert_eq!(out, vec![0, 16384, 0, 8192]);
+    }
+
+    /// One frame of two samples of a voice into mix 1 of `mixer`, as the device sink plays it.
+    fn play_into_mix_1(mixer: &mut Mixer) -> Vec<i16> {
+        mixer.add_voice_channel(1, &[1.0, 0.5], &gains(&[(0, 1.0)]), &gains(&[(0, 1.0)]));
+        let mut out = Vec::new();
+        assert!(mixer.finish(&mut out));
+        out
+    }
+
+    #[test]
+    fn from_revision_7_an_update_holds_only_the_mixes_that_changed() {
+        // The third title's renderer (revision 8) sent one changed mix an update, then only the
+        // header: the mixes it sent before go on as they were.
+        let mut mixer = Mixer::default();
+        let sink = sink_entry(&[0, 1]);
+        let final_mix = with_id(mix_entry(1.0, 2, NO_MIX, &[]), 0);
+        let half_right = with_id(mix_entry(1.0, 1, FINAL_MIX, &[(0, 1, 0.5)]), 1);
+        for section in [dirty(&[final_mix]), dirty(&[half_right])] {
+            assert!(mixer.read_mixes(&section, true, 2, 3, 2));
+            mixer.read_sinks(&sink);
+        }
+        assert_eq!(play_into_mix_1(&mut mixer), vec![0, 16384, 0, 8192]);
+        // Nothing changed: the header alone, and the same sound.
+        assert!(mixer.read_mixes(&dirty(&[]), true, 2, 3, 2));
+        assert_eq!(play_into_mix_1(&mut mixer), vec![0, 16384, 0, 8192]);
+        // The submix changes its gain; the final mix is not sent and stays.
+        let quarter_left = with_id(mix_entry(1.0, 1, FINAL_MIX, &[(0, 0, 0.25)]), 1);
+        assert!(mixer.read_mixes(&dirty(&[quarter_left]), true, 2, 3, 2));
+        assert_eq!(play_into_mix_1(&mut mixer), vec![8192, 0, 4096, 0]);
+    }
+
+    #[test]
+    fn a_changed_mix_the_renderer_does_not_have_or_a_short_section_is_not_read() {
+        let mut mixer = Mixer::default();
+        let final_mix = with_id(mix_entry(1.0, 2, NO_MIX, &[]), 0);
+        assert!(mixer.read_mixes(&dirty(std::slice::from_ref(&final_mix)), true, 2, 2, 2));
+        assert!(mixer.has_graph());
+        let beyond = with_id(mix_entry(1.0, 1, FINAL_MIX, &[]), 2);
+        assert!(!mixer.read_mixes(&dirty(&[beyond]), true, 2, 2, 2));
+        assert!(!mixer.has_graph(), "the graph is forgotten");
+        // A count that the section does not hold.
+        let mut short = dirty(&[final_mix]);
+        short[4] = 2;
+        assert!(!mixer.read_mixes(&short, true, 2, 2, 2));
+        assert!(!mixer.read_mixes(&[], true, 2, 2, 2));
+        // Up to revision 6 the section holds whole entries and nothing else.
+        assert!(!mixer.read_mixes(&dirty(&[]), false, 1, 2, 2));
     }
 
     #[test]
