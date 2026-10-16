@@ -4,7 +4,7 @@
 use super::args::{unimplemented, Args, Fail, IoResult, Ioctl};
 use super::{Node, Nvdrv};
 use crate::error::NvError;
-use crate::vm::{MapRequest, Remap};
+use crate::vm::{map_flags, MapRequest, Remap};
 
 /// The type byte of the address space ioctls (`'A'`).
 pub const TYPE: u32 = 0x41;
@@ -92,6 +92,23 @@ impl Nvdrv {
             // u64 mapping_size, u64 align (in) / offset (out)
             (MAP_BUFFER_EX, 40) => {
                 let handle = args.u32(8);
+                if args.u32(0) & map_flags::REMAP != 0 {
+                    // The remap flag: part of the mapping that starts at the address changes its
+                    // kind, whatever the handle says (docs/ASSUMPTIONS.md A-177); the address
+                    // comes back as it was.
+                    if trace_as() {
+                        eprintln!(
+                            "[as] MAP_BUFFER_EX kind {:#x} of {:#x} bytes at {:#x} of the mapping at GPU {:#x}",
+                            args.u32(4),
+                            args.u64(24),
+                            args.u64(16),
+                            args.u64(32)
+                        );
+                    }
+                    self.space_mut(space)?
+                        .modify_kind(args.u64(32), args.u64(16), args.u64(24))?;
+                    return Ok(());
+                }
                 let h = self.gpu.nvmap.get(handle).ok_or(NvError::BAD_VALUE)?;
                 let cpu = h.addr.ok_or(NvError::INVALID_STATE)?;
                 let req = MapRequest {
@@ -292,6 +309,43 @@ mod tests {
         long[16..20].copy_from_slice(&4u32.to_le_bytes());
         let (e, _) = call(&mut nv, fd, 0xC014_4114, &long);
         assert_eq!(e, NvError::BAD_VALUE, "1 + 4 pages of a 4-page handle");
+    }
+
+    #[test]
+    fn map_buffer_ex_with_no_handle_changes_the_kind_of_part_of_a_mapping() {
+        let (mut nv, nvmap, fd) = setup();
+        alloc_as_ex(&mut nv, fd);
+        let handle = backed_handle(&mut nv, nvmap, 0x200_0000, 0x4000_0000);
+        let map =
+            |nv: &mut Nvdrv, flags: u32, kind: u32, handle: u32, from: u64, size: u64, at: u64| {
+                let mut a = vec![0u8; 40];
+                a[0..4].copy_from_slice(&flags.to_le_bytes());
+                a[4..8].copy_from_slice(&kind.to_le_bytes());
+                a[8..12].copy_from_slice(&handle.to_le_bytes());
+                a[16..24].copy_from_slice(&from.to_le_bytes());
+                a[24..32].copy_from_slice(&size.to_le_bytes());
+                a[32..40].copy_from_slice(&at.to_le_bytes());
+                call(nv, fd, MAP_EX_CODE, &a)
+            };
+        let fixed = crate::vm::map_flags::FIXED_OFFSET;
+        let (e, out) = map(&mut nv, fixed, 0xFE, handle, 0, 0, 0x10_0000_0000);
+        assert_eq!(e, NvError::SUCCESS);
+        let base = out.u64(32);
+        // What a title does for a texture of a compressible kind: the kind of the part of the
+        // pool the texture is in, with the remap flag and no handle. It succeeds and the
+        // address comes back.
+        let remap = crate::vm::map_flags::REMAP;
+        let (e, out) = map(&mut nv, remap, 0xDB, 0, 0xCE_0000, 0x6_4000, base);
+        assert_eq!(e, NvError::SUCCESS);
+        assert_eq!(out.u64(32), base);
+        // Past the end of the mapping, and with nothing at that address: refused.
+        let (e, _) = map(&mut nv, remap, 0xDB, 0, 0x1FF_0000, 0x6_4000, base);
+        assert_eq!(e, NvError::BAD_VALUE);
+        let (e, _) = map(&mut nv, remap, 0xDB, 0, 0, 0x1000, base + 0x1000);
+        assert_eq!(e, NvError::BAD_VALUE);
+        // Without the flag a handle of 0 means nothing.
+        let (e, _) = map(&mut nv, fixed, 0xDB, 0, 0, 0x1000, base);
+        assert_eq!(e, NvError::BAD_VALUE);
     }
 
     #[test]

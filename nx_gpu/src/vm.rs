@@ -22,6 +22,8 @@ pub mod alloc_flags {
 pub mod map_flags {
     pub const FIXED_OFFSET: u32 = 1;
     pub const CACHEABLE: u32 = 4;
+    /// Map a part of a mapping that exists again (with another kind): the handle is not used.
+    pub const REMAP: u32 = 1 << 8;
 }
 
 /// The range an address space covers when the program never sets one (docs/ASSUMPTIONS.md).
@@ -339,6 +341,18 @@ impl AddressSpace {
         Ok(start)
     }
 
+    /// `MAP_BUFFER_EX` with the remap flag (what the driver library calls modifying a mapping):
+    /// the kind of `size` bytes, from `buffer_offset` into the mapping that starts at `offset`,
+    /// changes. Nothing here depends on a mapping's kind, so the range is
+    /// checked and that is all (docs/ASSUMPTIONS.md A-177).
+    pub fn modify_kind(&mut self, offset: u64, buffer_offset: u64, size: u64) -> NvResult<()> {
+        let m = self.maps.get(&offset).ok_or(NvError::BAD_VALUE)?;
+        match buffer_offset.checked_add(size) {
+            Some(end) if size > 0 && end <= m.len => Ok(()),
+            _ => Err(NvError::BAD_VALUE),
+        }
+    }
+
     /// `UNMAP_BUFFER`: remove the mapping that starts at `offset`.
     pub fn unmap_buffer(&mut self, offset: u64) -> NvResult<Mapping> {
         self.maps.remove(&offset).ok_or(NvError::BAD_VALUE)
@@ -566,6 +580,38 @@ mod tests {
             mapping_size: 0,
             offset: 0,
         }
+    }
+
+    #[test]
+    fn the_kind_of_part_of_a_mapping_can_be_changed_and_nothing_else_can() {
+        let mut a = AddressSpace::new();
+        a.initialize(1, 0x10000, 0x1_0000_0000, 0x2_0000_0000, 0x1_8000_0000)
+            .unwrap();
+        let at = a
+            .map_buffer(&MapRequest {
+                flags: map_flags::FIXED_OFFSET,
+                offset: 0x1_0000_0000,
+                ..req(1, 0x1000_0000, 0x40_0000)
+            })
+            .unwrap();
+        assert_eq!(at, 0x1_0000_0000);
+        assert_eq!(a.modify_kind(at, 0x2_0000, 0x10_0000), Ok(()));
+        assert_eq!(a.modify_kind(at, 0, 0x40_0000), Ok(()), "all of it");
+        assert_eq!(
+            a.modify_kind(at, 0x30_0000, 0x20_0000),
+            Err(NvError::BAD_VALUE),
+            "past the end"
+        );
+        assert_eq!(
+            a.modify_kind(at, 0x1000, 0),
+            Err(NvError::BAD_VALUE),
+            "nothing"
+        );
+        assert_eq!(
+            a.modify_kind(at + 0x10000, 0, 0x1000),
+            Err(NvError::BAD_VALUE),
+            "no mapping starts there"
+        );
     }
 
     #[test]
