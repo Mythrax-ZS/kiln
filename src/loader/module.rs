@@ -14,8 +14,8 @@ use nx_runtime::util::{u32_at, u64_at};
 /// Guest address the first module is mapped at (docs/ASSUMPTIONS.md A-006).
 pub const GUEST_BASE: u64 = 0x0800_0000;
 pub const PAGE: u64 = 0x1000;
-/// Sanity cap on a module's mapped size.
-pub const MAX_IMAGE: u64 = 1 << 30;
+/// Sanity cap on a module's mapped size (a title may ask for gigabytes of `.bss`).
+pub const MAX_IMAGE: u64 = 4 << 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Perm {

@@ -294,6 +294,22 @@ mod tests {
     }
 
     #[test]
+    fn a_bss_of_more_than_a_gigabyte_is_mapped() {
+        // A title may ask for gigabytes of zero-filled memory (the `.bss` of one is 1.9 GB).
+        let mut file = build_nso(&build_parts(&simple_spec()), NsoFlags::default());
+        let bss: u32 = 0x5000_0000;
+        file[0x3C..0x40].copy_from_slice(&bss.to_le_bytes());
+        let l = load_ok(&file);
+        let m = &l.module;
+        assert_eq!(m.image.len() as u64, 0x3000 + u64::from(bss));
+        let last = m.segments.last().unwrap();
+        assert_eq!(
+            (last.name, last.offset, last.size),
+            ("bss", 0x3000, u64::from(bss))
+        );
+    }
+
+    #[test]
     fn layout_segments_and_bss() {
         let l = load_ok(&build_nso(
             &build_parts(&simple_spec()),

@@ -310,8 +310,8 @@ fn modules_are_mapped_back_to_back_and_start_as_the_file_left_them() {
     assert_eq!(report.functions, 4, "{report:?}");
     assert_eq!(
         std::fs::metadata(&report.image).unwrap().len(),
-        0xA000,
-        "both modules are in the image"
+        0x6000,
+        "the code, constants and data of both modules are in the image, the zero-filled .bss is not"
     );
     let out = run(&report.exe);
     assert_eq!(

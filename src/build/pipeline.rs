@@ -130,12 +130,15 @@ pub fn analysis_inputs(modules: &[Module], hints: &[u64]) -> Result<(Vec<u64>, O
     Ok((roots, Options { ranges }))
 }
 
-/// The segments of module `m` for the descriptor; file offsets are relative to `origin`, the
-/// address the embedded image starts at.
-fn segment_infos(m: &Module, origin: u64) -> Vec<SegmentInfo> {
-    m.segments
-        .iter()
-        .map(|s| {
+/// The image the produced program embeds, and where each segment's bytes are in it: the bytes
+/// of every segment of every module as the kernel's loader would leave them in memory
+/// (unrelocated, unless `pre_relocated`), one segment after the other. Zero-filled memory (the
+/// `.bss`, which may be gigabytes) is not stored: the program maps it as zeros when it starts.
+fn process_image(program: &Program, pre_relocated: bool) -> (Vec<u8>, Vec<SegmentInfo>) {
+    let mut blob = Vec::new();
+    let mut infos = Vec::new();
+    for m in &program.modules {
+        for s in &m.segments {
             let mut p = 0;
             if s.perm.read {
                 p |= perm::R;
@@ -146,34 +149,36 @@ fn segment_infos(m: &Module, origin: u64) -> Vec<SegmentInfo> {
             if s.perm.exec {
                 p |= perm::X;
             }
-            let stored = (m.image.len() as u64).saturating_sub(s.offset).min(s.size);
-            SegmentInfo {
+            let stored = if s.name == "bss" {
+                0
+            } else {
+                (m.image.len() as u64).saturating_sub(s.offset).min(s.size)
+            };
+            let file_off = blob.len() as u64;
+            if stored > 0 {
+                let from = s.offset as usize;
+                let mut bytes = m.image[from..from + stored as usize].to_vec();
+                if !pre_relocated {
+                    // Put back what the relocations replaced, the earliest value last.
+                    for &(off, original) in m.relocs.originals.iter().rev() {
+                        let at = off as usize;
+                        if at >= from && at + 8 <= from + bytes.len() {
+                            bytes[at - from..at - from + 8].copy_from_slice(&original);
+                        }
+                    }
+                }
+                blob.extend_from_slice(&bytes);
+            }
+            infos.push(SegmentInfo {
                 addr: m.base + s.offset,
                 size: s.size,
                 perm: p,
-                file_off: m.base - origin + s.offset,
-                // Zero-filled memory is not stored.
-                file_size: if s.name == "bss" { 0 } else { stored },
-            }
-        })
-        .collect()
-}
-
-/// The image the produced program embeds: every module as the kernel's loader would leave it in
-/// memory (unrelocated, unless `pre_relocated`), from the first module's base to the end of the
-/// last.
-fn process_image(program: &Program, pre_relocated: bool) -> Vec<u8> {
-    let (start, end) = program.span();
-    let mut image = vec![0u8; (end - start) as usize];
-    for m in &program.modules {
-        let at = (m.base - start) as usize;
-        if pre_relocated {
-            image[at..at + m.image.len()].copy_from_slice(&m.image);
-        } else {
-            image[at..at + m.image.len()].copy_from_slice(&m.unrelocated_image());
+                file_off,
+                file_size: stored,
+            });
         }
     }
-    image
+    (blob, infos)
 }
 
 /// Split the functions into batches of about `unit_size` guest instructions.
@@ -365,18 +370,12 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
     tc.compile(&support_ll, &support_obj, opts.opt_level)?;
 
     let image = opts.out_dir.join(format!("{}.image", opts.name));
-    let image_bytes = process_image(program, opts.pre_relocated);
+    let (image_bytes, segments) = process_image(program, opts.pre_relocated);
     std::fs::write(&image, &image_bytes)?;
     let romfs_path = match &opts.romfs {
         Some(p) => std::path::absolute(p)?.to_string_lossy().into_owned(),
         None => String::new(),
     };
-    let (origin, _) = program.span();
-    let segments: Vec<SegmentInfo> = program
-        .modules
-        .iter()
-        .flat_map(|m| segment_infos(m, origin))
-        .collect();
     let exports: Vec<(String, u64)> = program
         .modules
         .iter()
