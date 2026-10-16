@@ -93,6 +93,10 @@ pub(super) struct Tx<'a> {
     pub local: Option<(Id, u32)>,
     /// The words of local memory the constant-offset accesses of the program reach.
     pub local_min_words: u32,
+    /// The shared memory variable and its length in words, made on first use.
+    pub shared: Option<(Id, u32)>,
+    /// The words of shared memory the constant-offset accesses of the program reach.
+    pub shared_min_words: u32,
     /// The offset of the instruction being translated, for messages.
     pub pc: u32,
     /// `Config::probe_bad`: the function-local variable holding the number of the first
@@ -148,6 +152,8 @@ impl<'a> Tx<'a> {
             gmap: None,
             local: None,
             local_min_words: 0,
+            shared: None,
+            shared_min_words: 0,
             pc: 0,
             bad: None,
             probed: None,
@@ -688,7 +694,8 @@ pub fn translate(code: Code<'_>, sph: Option<&Sph>, cfg: &Config) -> Result<Tran
     }
     let mut tx = Tx::new(cfg, sph);
     tx.texture_dims = super::tex::scan_dims(code, &graph);
-    tx.local_min_words = super::local::scan(code, &graph);
+    tx.local_min_words = super::local::scan(code, &graph, super::local::Space::Local);
+    tx.shared_min_words = super::local::scan(code, &graph, super::local::Space::Shared);
     super::flow::build(&mut tx, code, &graph)?;
     let Tx {
         mut m,

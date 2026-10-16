@@ -25,6 +25,29 @@ fn main() {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // A compute program has no header: its dump is the code alone (a name that starts COMPUTE).
+        // The size of its workgroups only changes what the invocation ids are made of.
+        if name.starts_with("COMPUTE") {
+            let mut cfg = Config::new(Stage::Kernel);
+            cfg.block = [64, 1, 1];
+            cfg.debug_names = true;
+            match translate(Code(&bytes), None, &cfg) {
+                Ok(t) => {
+                    let verdict = match validate::validate(&t.spirv) {
+                        Ok(Some(())) => "valid".to_string(),
+                        Ok(None) => "not validated (no spirv-val)".to_string(),
+                        Err(e) => format!("INVALID: {}", e.lines().next().unwrap_or("")),
+                    };
+                    println!(
+                        "{name}: Kernel, {} instructions, {} words of SPIR-V, {verdict}",
+                        t.info.instructions,
+                        t.spirv.len()
+                    );
+                }
+                Err(e) => println!("{name}: Kernel: {e}"),
+            }
+            continue;
+        }
         let sph = match Sph::parse(&bytes) {
             Ok(s) => s,
             Err(e) => {

@@ -81,6 +81,9 @@ pub struct Config {
     pub debug_names: bool,
     /// Kernel stage: the number of invocations of a workgroup in each dimension.
     pub block: [u32; 3],
+    /// Kernel stage: the bytes of shared memory a workgroup has (0: not said, which is as much as
+    /// the constant offsets the program reaches and at least 4 KiB).
+    pub shared_bytes: u32,
     /// Translate a program whose jumps all go forward with the loop around a `switch` on a program
     /// counter anyway (a bring-up switch: docs/ASSUMPTIONS.md A-114).
     pub force_loop: bool,
@@ -109,6 +112,7 @@ impl Config {
             flip_y_height: None,
             debug_names: false,
             block: [1, 1, 1],
+            shared_bytes: 0,
             force_loop: false,
             constants: Vec::new(),
             probe_bad: None,

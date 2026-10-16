@@ -52,6 +52,26 @@ fn translated(stage: Stage, stage_type: u32, code: &[u64], force_loop: bool) -> 
 }
 
 #[test]
+fn shared_memory_in_a_program_that_is_not_a_compute_program_is_refused() {
+    use nx_shader::asm::Enc;
+    use nx_shader::inst::RZ;
+    use nx_shader::ops::Op;
+    // STS.32 [RZ + 0], R1
+    let sts = Enc::op(Op::Sts)
+        .rd(1)
+        .ra(RZ)
+        .field(20, 24, 0)
+        .field(48, 3, 4)
+        .build();
+    let (sph, bytes) = program(1, &[sts, exit(Guard::ALWAYS)]);
+    let config = Config::new(Stage::Vertex);
+    let Err(e) = translate(Code(&bytes), Some(&sph), &config) else {
+        panic!("shared memory was translated in a vertex program");
+    };
+    assert!(e.to_string().contains("shared memory"), "{e}");
+}
+
+#[test]
 fn jumps_that_only_go_forward_need_no_loop() {
     let (loop_made, spirv) = translated(Stage::Vertex, 1, &forward_jumps(), false);
     assert!(!loop_made);

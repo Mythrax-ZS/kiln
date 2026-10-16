@@ -5,7 +5,7 @@
 mod common;
 
 use common::vulkan;
-use nx_shader::asm::{assemble, exit, Enc};
+use nx_shader::asm::{assemble, exit, mov32i, Enc};
 use nx_shader::cfg::Code;
 use nx_shader::inst::{Guard, RZ};
 use nx_shader::ops::Op;
@@ -132,6 +132,140 @@ fn each_thread_knows_its_place_in_its_block_and_the_block_its_place_in_the_grid(
     }
     // Nothing beyond the 24 threads was touched.
     assert!(memory[16 * 24..].iter().all(|b| *b == 0xEE));
+}
+
+/// `STS.size [Ra + imm], Rd` (size 0 to 6: u8, s8, u16, s16, 32, 64 and 128 bits).
+fn sts(rd: u8, ra: u8, imm: u32, size: u64) -> u64 {
+    Enc::op(Op::Sts)
+        .rd(rd)
+        .ra(ra)
+        .field(20, 24, u64::from(imm))
+        .field(48, 3, size)
+        .build()
+}
+
+/// `LDS.size Rd, [Ra + imm]`.
+fn lds(rd: u8, ra: u8, imm: u32, size: u64) -> u64 {
+    Enc::op(Op::Lds)
+        .rd(rd)
+        .ra(ra)
+        .field(20, 24, u64::from(imm))
+        .field(48, 3, size)
+        .build()
+}
+
+#[test]
+fn threads_keep_what_they_store_in_the_shared_memory_of_their_workgroup() {
+    let Some(vk) = vulkan() else { return };
+    // Thread t of block b (8 threads to a block) has the 32 bytes at 32 t of the workgroup's 256
+    // bytes of shared memory: it stores words, a pair, a quad, a byte and a half word into it, loads
+    // them back and writes (the quad, the two words with the parts stored, a byte, a signed byte)
+    // as 8 words at base + 32 (8 b + t).
+    let program = [
+        s2r(0, 0x21),
+        s2r(1, 0x25),
+        Enc::op(Op::IscaddReg)
+            .rd(2)
+            .ra(1)
+            .rb(0)
+            .field(39, 5, 3)
+            .build(),
+        Enc::op(Op::ShlImm20).rd(3).ra(0).imm20(5).build(),
+        // R10 = g + 0x100, R11 = g + 0x200, R12, R13 = the part words, R14, R15 the bytes around.
+        Enc::op(Op::Iadd32iImm32).rd(10).ra(2).imm32(0x100).build(),
+        Enc::op(Op::Iadd32iImm32).rd(11).ra(2).imm32(0x200).build(),
+        mov32i(12, 0x1122_3344),
+        mov32i(13, 0x5566_7788),
+        mov32i(14, 0xAB),
+        mov32i(15, 0xCDEF),
+        sts(10, 3, 0, 4),
+        sts(11, 3, 4, 4),
+        sts(10, 3, 8, 5),
+        sts(12, 3, 16, 4),
+        sts(13, 3, 20, 4),
+        sts(14, 3, 17, 0),
+        sts(15, 3, 22, 2),
+        // R16..R19 = words 0..3, R20 = word 4, R21 = word 5, R22 = byte 17, R23 = byte 17 signed.
+        lds(16, 3, 0, 6),
+        lds(20, 3, 16, 4),
+        lds(21, 3, 20, 4),
+        lds(22, 3, 17, 0),
+        lds(23, 3, 17, 1),
+        mov_cbuf(4, 0),
+        mov_cbuf(5, 4),
+        Enc::op(Op::ShlImm20).rd(6).ra(2).imm20(5).build(),
+        Enc::op(Op::IaddReg).rd(4).ra(4).rb(6).build(),
+        stg(16, 4, 0),
+        stg(17, 4, 4),
+        stg(18, 4, 8),
+        stg(19, 4, 12),
+        stg(20, 4, 16),
+        stg(21, 4, 20),
+        stg(22, 4, 24),
+        stg(23, 4, 28),
+        exit(Guard::ALWAYS),
+    ];
+    let code = assemble(&program);
+    let mut config = Config::new(Stage::Kernel);
+    config.block = [8, 1, 1];
+    config.shared_bytes = 256;
+    let t = translate(Code(&code), None, &config).unwrap();
+    nx_shader::validate::assert_valid(&t.spirv);
+
+    let mut parameters = [0u8; 16];
+    parameters[0..4].copy_from_slice(&(START as u32).to_le_bytes());
+    parameters[4..8].copy_from_slice(&((START >> 32) as u32).to_le_bytes());
+    let mut table = table();
+    let mut memory = vec![0xEEu8; 0x1000];
+    let mut scratch = vec![0u8; 4096];
+    let mut buffers: Vec<(u32, &mut [u8])> = vec![
+        (PARAMETERS, &mut parameters[..]),
+        (TABLE, &mut table[..]),
+        (200, &mut memory[..]),
+        (201, &mut scratch[..]),
+    ];
+    let patches = [
+        AddressPatch {
+            into: 1,
+            offset: 8,
+            of: 3,
+            addend: 0,
+        },
+        AddressPatch {
+            into: 1,
+            offset: 32,
+            of: 2,
+            addend: 0,
+        },
+    ];
+    vk.run_compute_with(&t.spirv, &mut buffers, &[], &patches, [3, 1, 1])
+        .unwrap();
+    for block in 0..3u32 {
+        for thread in 0..8u32 {
+            let g = 8 * block + thread;
+            let at = 32 * g as usize;
+            let word = |k: usize| {
+                u32::from_le_bytes(memory[at + 4 * k..at + 4 * k + 4].try_into().unwrap())
+            };
+            let (a, b) = (g + 0x100, g + 0x200);
+            let word4 = (0x1122_3344 & !0xFF00) | 0xAB00;
+            let word5 = (0x5566_7788 & 0xFFFF) | 0xCDEF << 16;
+            assert_eq!(
+                [word(0), word(1), word(2), word(3)],
+                [a, b, a, b],
+                "block {block} thread {thread}: words, a pair and a quad"
+            );
+            assert_eq!(word(4), word4, "block {block} thread {thread}: a byte");
+            assert_eq!(word(5), word5, "block {block} thread {thread}: a half word");
+            assert_eq!(word(6), 0xAB, "block {block} thread {thread}: u8");
+            assert_eq!(
+                word(7),
+                0xABu8 as i8 as i32 as u32,
+                "block {block} thread {thread}: s8"
+            );
+        }
+    }
+    assert!(memory[32 * 24..].iter().all(|b| *b == 0xEE));
 }
 
 #[test]

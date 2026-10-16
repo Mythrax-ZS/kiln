@@ -99,7 +99,7 @@ struct KernelEntry {
 pub struct Shaders {
     entries: FastMap<u64, Entry>,
     /// Compute programs by (address, workgroup size).
-    kernels: FastMap<(u64, [u32; 3]), KernelEntry>,
+    kernels: FastMap<(u64, [u32; 3], u32), KernelEntry>,
     next_id: u64,
     /// `NX_SPIRV_CHECK`: validate each translation.
     spirv_check: bool,
@@ -341,17 +341,19 @@ impl Shaders {
         Ok(program)
     }
 
-    /// The compute program at `address`, translated for workgroups of `block` invocations.
+    /// The compute program at `address`, translated for workgroups of `block` invocations with
+    /// `shared_bytes` bytes of shared memory.
     pub fn kernel(
         &mut self,
         vk: &Vk,
         scene: &Scene<'_>,
         address: u64,
         block: [u32; 3],
+        shared_bytes: u32,
         frame: u64,
     ) -> Result<Arc<Program>, String> {
         // The same program: unchanged if the bytes still hash the same (looked at once a frame).
-        if let Some(e) = self.kernels.get_mut(&(address, block)) {
+        if let Some(e) = self.kernels.get_mut(&(address, block, shared_bytes)) {
             if e.checked == frame {
                 return Ok(Arc::clone(&e.program));
             }
@@ -360,7 +362,7 @@ impl Shaders {
                 e.checked = frame;
                 return Ok(Arc::clone(&e.program));
             }
-            self.kernels.remove(&(address, block));
+            self.kernels.remove(&(address, block, shared_bytes));
         }
         let bytes = read_window(scene, address, WINDOW);
         if bytes.is_empty() {
@@ -378,6 +380,7 @@ impl Shaders {
         let size = cfg.extent as usize;
         let mut config = Config::new(Stage::Kernel);
         config.block = block;
+        config.shared_bytes = shared_bytes;
         let _phase = nx_gpu::progress::enter(nx_gpu::progress::TRANSLATING);
         let translation = translate(Code(&bytes[..size]), None, &config)
             .map_err(|e| format!("the compute program at {address:#x}: {e}"))?;
@@ -404,7 +407,7 @@ impl Shaders {
             id: self.next_id,
         });
         self.kernels.insert(
-            (address, block),
+            (address, block, shared_bytes),
             KernelEntry {
                 size,
                 hash: scene.hash(address, size as u64).0,

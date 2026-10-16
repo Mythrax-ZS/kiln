@@ -31,6 +31,8 @@ pub struct Dispatch {
     pub grid: [u32; 3],
     /// The number of invocations of a workgroup in each dimension.
     pub block: [u32; 3],
+    /// The bytes of shared memory a workgroup has (docs/ASSUMPTIONS.md A-170).
+    pub shared_bytes: u32,
     /// The constant buffers bound to slots 0..8.
     pub cbufs: [Option<CbufBinding>; 8],
 }
@@ -40,7 +42,8 @@ impl Dispatch {
     /// region the engine was given) plus the offset the descriptor holds.
     pub fn decode(qmd: u64, words: &[u32; QMD_WORDS], region: u64) -> Result<Dispatch, String> {
         // Word 8 the program's offset in the region; word 12 the grid's width (31 bits), word 13
-        // its height and depth (16 bits each); word 18 (high half) and word 19 the workgroup's
+        // its height and depth (16 bits each); word 17 (low 18 bits) the bytes of shared memory;
+        // word 18 (high half) and word 19 the workgroup's
         // size; word 20 (low byte) tells which constant buffers are bound, and from word 29 each
         // takes two words: the low 32 bits of the address, then the high 8 bits of the address
         // and, from bit 15, the size in bytes.
@@ -77,6 +80,7 @@ impl Dispatch {
             program: region + u64::from(words[8]),
             grid,
             block,
+            shared_bytes: words[17] & 0x3_FFFF,
             cbufs,
         })
     }
@@ -92,6 +96,7 @@ mod tests {
         w[8] = 0x2d8_0000;
         w[12] = 3;
         w[13] = 5 | 7 << 16;
+        w[17] = 0x1_2000 | 1 << 20;
         w[18] = 32 << 16 | 23;
         w[19] = 2 | 1 << 16;
         // Constant buffers 0 and 3 are bound.
@@ -112,6 +117,7 @@ mod tests {
         assert_eq!(d.program, 0x80_0200_0000 + 0x2d8_0000);
         assert_eq!(d.grid, [3, 5, 7]);
         assert_eq!(d.block, [32, 2, 1]);
+        assert_eq!(d.shared_bytes, 0x1_2000, "the field is 18 bits wide");
         assert_eq!(
             d.cbufs[0],
             Some(CbufBinding {
