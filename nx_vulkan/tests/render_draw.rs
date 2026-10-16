@@ -4,7 +4,7 @@
 mod render_common;
 
 use nx_gpu::render::{Backend, Draw, Source};
-use nx_shader::asm::{exit, Enc};
+use nx_shader::asm::{exit, mov32i, Enc};
 use nx_shader::inst::Guard;
 use nx_shader::ops::Op;
 use nx_vulkan::{RenderConfig, Renderer};
@@ -270,6 +270,83 @@ fn clip_z_runs_from_zero_to_w_when_the_z_clip_register_says_so() {
         0,
         "z 1.5 is behind the volume"
     );
+}
+
+/// A pixel program that is red as far as the first word of the constant buffer in slot 1 (`c[0]`) says,
+/// read through a register.
+fn red_from_a_constant_buffer() -> Vec<u8> {
+    pixel_program(
+        &[],
+        &[
+            mov32i(8, 0),
+            Enc::op(Op::Ldc)
+                .rd(0)
+                .ra(8)
+                .field(20, 16, 0)
+                .field(36, 5, 0)
+                .field(44, 2, 0)
+                .field(48, 3, 4)
+                .build(),
+            mov32i(1, 0),
+            mov32i(2, 0),
+            mov32i(3, 0x3F80_0000),
+            exit(Guard::ALWAYS),
+        ],
+    )
+}
+
+#[test]
+fn a_constant_buffer_bound_past_the_end_of_a_mapping_reads_what_is_mapped() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = scene(
+        &pass_through_vertex(),
+        &red_from_a_constant_buffer(),
+        16,
+        target,
+    );
+    // The buffer is 32 bytes before the end of the memory the GPU address space maps, and bound with
+    // the largest size, as a title binds a small buffer it sub-allocated: only 32 bytes are there.
+    let cbuf = GPU_BASE + SIZE - 32;
+    w.put(cbuf, &1.0f32.to_le_bytes());
+    w.cbufs.bind(4, 1, (cbuf, 65536));
+    let (rgba, _) = red_triangle(&mut w, target);
+    for px in rgba.as_chunks::<4>().0.iter().filter(|p| p[3] != 0) {
+        assert_eq!(px, &[255, 0, 0, 255]);
+    }
+    assert!(covered(&rgba) > 0);
+    // Nothing mapped at all is still refused.
+    let mut w = scene(
+        &pass_through_vertex(),
+        &red_from_a_constant_buffer(),
+        16,
+        target,
+    );
+    w.cbufs.bind(4, 1, (GPU_BASE + SIZE + 0x1000, 65536));
+    let red = [1.0, 0.0, 0.0, 1.0];
+    vertices(
+        &mut w,
+        GPU_BASE + 0x30_0000,
+        &[
+            ([-1.0, -1.0, 0.5, 1.0], red),
+            ([3.0, -1.0, 0.5, 1.0], red),
+            ([-1.0, 3.0, 0.5, 1.0], red),
+        ],
+    );
+    let mut r = Renderer::new(RenderConfig::default());
+    let e = r
+        .draw(
+            &w.scene(),
+            &Draw {
+                source: Source::Arrays { first: 0, count: 3 },
+                topology: 4,
+                instance: 0,
+            },
+        )
+        .unwrap_err();
+    assert!(e.contains("is not mapped"), "{e}");
 }
 
 #[test]

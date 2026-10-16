@@ -1191,14 +1191,19 @@ impl Core {
         let (buffer, offset, ptr) = self.frame.reserve(&self.vk, padded, align)?;
         // SAFETY: `reserve` gave `padded` writable bytes at `ptr`, which nothing else uses.
         let data = unsafe { std::slice::from_raw_parts_mut(ptr, padded as usize) };
-        let readable = scene.read(address, &mut data[..size as usize]);
-        if !readable {
+        // A program that indexes the buffer may reach all of what is bound, and the part of it that
+        // is mapped is all it can read: a binding of the largest size over a small buffer at the end
+        // of a mapping is a draw like any other (the rest reads as zeros; docs/ASSUMPTIONS.md A-167).
+        // A program that reaches a fixed offset needs that far to be mapped.
+        let readable = super::textures::read_partial(scene, address, &mut data[..size as usize]);
+        let needed = if want == u32::MAX { 16.min(size) } else { size } as usize;
+        if readable < needed {
             return Err(format!(
                 "the constant buffer of slot {slot} at GPU address {:#x} ({size} bytes) is not mapped",
                 address
             ));
         }
-        data[size as usize..].fill(0);
+        data[readable..].fill(0);
         if self.debug.trace_cbufs && self.traced().is_some() {
             // The first words of the buffer, then the others that are not zero, as `word:value`.
             let words: Vec<String> = data
