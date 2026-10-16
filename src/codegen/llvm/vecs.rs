@@ -5,10 +5,11 @@
 //! program runs most are done here instead, in a few instructions on the vector registers in the
 //! CPU structure:
 //!
-//! - register moves, the bitwise operations (`mov v.16b`, `eor`, `bsl`, ...), `FMOV`, `FABS`,
-//!   `FNEG`, `FCSEL`, the immediate and general-register forms of `FMOV`: exact, there is nothing
-//!   to get wrong;
-//! - the single-precision `FADD`, `FSUB`, `FMUL`, `FDIV` and `FCMP`: when `FPCR` is the default
+//! - register moves, the bitwise operations (`mov v.16b`, `eor`, `bsl`, ...), `MOVI`, `MVNI` and
+//!   `ORR`/`BIC` with an immediate, `FMOV`, `FABS`, `FNEG`, `FCSEL`, the immediate and
+//!   general-register forms of `FMOV`: exact, there is nothing to get wrong;
+//! - the single-precision `FADD`, `FSUB`, `FMUL`, `FDIV`, `FCMP`, `FCCMP`, `FMADD`, `FMSUB`,
+//!   `FNMADD`, `FNMSUB` and `FADDP`, and the vector forms: when `FPCR` is the default
 //!   (or has only flush-to-zero, default NaN and alternative half precision set, and then no
 //!   operand is a denormal), the operands are ordinary and the result is finite and not tiny, the
 //!   host's result is the architecture's, and the only flag it can raise is "inexact", which is
@@ -28,7 +29,7 @@ use nx_runtime::a64::fp::{Fmt, Rounding};
 use nx_runtime::a64::state::offsets as st;
 use nx_runtime::a64::vec::decode::{decode, decode_mem};
 use nx_runtime::a64::vec::exec::expand_imm;
-use nx_runtime::a64::vec::simd::{FpBin as SimdFp, Logic, Permute, SimdOp};
+use nx_runtime::a64::vec::simd::{FpBin as SimdFp, Logic, ModImm, Permute, SimdOp};
 use nx_runtime::a64::vec::{FpBinary, FpUnary, VMem, VOp};
 use std::fmt::Write;
 
@@ -72,7 +73,15 @@ fn lowering(op: &VOp) -> Lowering {
             ..
         } => Lowering::Guarded,
         VOp::FpCompare { fmt: Fmt::S, .. } => Lowering::Guarded,
-        VOp::Simd(SimdOp::Logic { .. }) => Lowering::Inline,
+        VOp::FpCondCompare { fmt: Fmt::S, .. } => Lowering::Guarded,
+        VOp::FpFused { fmt: Fmt::S, .. } => Lowering::Guarded,
+        VOp::Simd(SimdOp::FpPair {
+            op: SimdFp::Add,
+            fmt: Fmt::S,
+            lanes: 2 | 4,
+            ..
+        }) => Lowering::Guarded,
+        VOp::Simd(SimdOp::Logic { .. } | SimdOp::ModImm { .. }) => Lowering::Inline,
         VOp::Simd(
             SimdOp::DupElem { .. }
             | SimdOp::InsElem { .. }
@@ -88,7 +97,7 @@ fn lowering(op: &VOp) -> Lowering {
         VOp::Simd(SimdOp::FpElem {
             op: SimdFp::Mul | SimdFp::Mla | SimdFp::Mls,
             fmt: Fmt::S,
-            lanes: 2 | 4,
+            lanes: 1 | 2 | 4,
             ..
         }) => Lowering::Guarded,
         VOp::Simd(SimdOp::IntToFp {
@@ -324,6 +333,7 @@ impl Emitter<'_> {
                 self.write_scalar(rd, &wide);
             }
             (_, VOp::Simd(SimdOp::Logic { op, q, rd, rn, rm })) => self.logic(op, q, rd, rn, rm),
+            (_, VOp::Simd(SimdOp::ModImm { op, q, imm, rd })) => self.mod_imm(op, q, imm, rd),
             (
                 _,
                 VOp::FpBinary {
@@ -338,6 +348,41 @@ impl Emitter<'_> {
             }
             (_, VOp::FpCompare { rn, rm, .. }) => {
                 self.single_compare(b, split, v, word, src, nzcv, rn, rm);
+            }
+            (
+                _,
+                VOp::FpCondCompare {
+                    rn,
+                    rm,
+                    cond,
+                    nzcv: flags,
+                    ..
+                },
+            ) => {
+                self.single_cond_compare(b, split, v, word, src, nzcv, (rn, rm), (cond, flags));
+            }
+            (
+                _,
+                VOp::FpFused {
+                    neg_addend,
+                    neg_product,
+                    rd,
+                    rn,
+                    rm,
+                    ra,
+                    ..
+                },
+            ) => {
+                let negate = (neg_addend, neg_product);
+                self.single_fused(b, split, v, word, src, nzcv, negate, (rd, rn, rm, ra));
+            }
+            (
+                _,
+                VOp::Simd(SimdOp::FpPair {
+                    lanes, rd, rn, rm, ..
+                }),
+            ) => {
+                self.pair_add(b, split, v, word, src, nzcv, u32::from(lanes), (rd, rn, rm));
             }
             (_, VOp::Simd(SimdOp::DupElem { sh, idx, rd, rn })) => {
                 self.dup_elem(sh.esize, sh.lanes, idx, rd, rn);
@@ -561,6 +606,33 @@ impl Emitter<'_> {
                     self.line(&format!("{out} = xor i64 {masked}, {y}"));
                 }
             }
+            self.line(&format!("store i64 {out}, ptr {pd}"));
+        }
+    }
+
+    /// `MOVI`, `MVNI`, the vector `FMOV` and `ORR`/`BIC` with an immediate: the decoder gives the
+    /// immediate expanded to 64 bits, repeated over each half that is written. A register of 64
+    /// bits ends with its upper half clear, whatever the operation.
+    fn mod_imm(&mut self, op: ModImm, q: bool, imm: u64, rd: u8) {
+        for high in [false, true] {
+            let pd = self.vptr(rd, high);
+            if high && !q {
+                self.line(&format!("store i64 0, ptr {pd}"));
+                break;
+            }
+            let out = match op {
+                ModImm::Set => (imm as i64).to_string(),
+                ModImm::Orr | ModImm::Bic => {
+                    let d = self.load_to("i64", &pd, "ld");
+                    let t = self.temp("lr");
+                    if op == ModImm::Orr {
+                        self.line(&format!("{t} = or i64 {d}, {}", imm as i64));
+                    } else {
+                        self.line(&format!("{t} = and i64 {d}, {}", !imm as i64));
+                    }
+                    t
+                }
+            };
             self.line(&format!("store i64 {out}, ptr {pd}"));
         }
     }
@@ -813,6 +885,35 @@ impl Emitter<'_> {
         self.unguard(&labels, v, word, src, nzcv, "0");
     }
 
+    /// The operands of a scalar compare: register `rn`, and register `rm` or zero.
+    fn compare_operands(&mut self, rn: u8, rm: Option<u8>) -> (String, String) {
+        let pa = self.vptr(rn, false);
+        let a = self.load_to("float", &pa, "ca");
+        let bb = match rm {
+            Some(m) => {
+                let pb = self.vptr(m, false);
+                self.load_to("float", &pb, "cb")
+            }
+            None => ZERO.to_string(),
+        };
+        (a, bb)
+    }
+
+    /// The `NZCV` nibble (an `i64`) that comparing the ordinary singles `a` and `bb` gives.
+    fn compare_nibble(&mut self, a: &str, bb: &str) -> String {
+        let (lt, eq, mid, res) = (
+            self.temp("cl"),
+            self.temp("ce"),
+            self.temp("cm"),
+            self.temp("cr"),
+        );
+        self.line(&format!("{lt} = fcmp olt float {a}, {bb}"));
+        self.line(&format!("{eq} = fcmp oeq float {a}, {bb}"));
+        self.line(&format!("{mid} = select i1 {eq}, i64 6, i64 2"));
+        self.line(&format!("{res} = select i1 {lt}, i64 8, i64 {mid}"));
+        res
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn single_compare(
         &mut self,
@@ -825,31 +926,49 @@ impl Emitter<'_> {
         rn: u8,
         rm: Option<u8>,
     ) {
-        let pa = self.vptr(rn, false);
-        let a = self.load_to("float", &pa, "ca");
-        let bb = match rm {
-            Some(m) => {
-                let pb = self.vptr(m, false);
-                self.load_to("float", &pb, "cb")
-            }
-            None => ZERO.to_string(),
-        };
+        let (a, bb) = self.compare_operands(rn, rm);
         let ord = self.temp("co");
         self.line(&format!("{ord} = fcmp ord float {a}, {bb}"));
         let fp0 = self.scalar_fpcr_ok(&[&a, &bb]);
         let go = self.temp("cg");
         self.line(&format!("{go} = and i1 {ord}, {fp0}"));
         let labels = self.guard(b, split, &go);
-        let (lt, eq, mid, res) = (
-            self.temp("cl"),
-            self.temp("ce"),
-            self.temp("cm"),
-            self.temp("cr"),
-        );
-        self.line(&format!("{lt} = fcmp olt float {a}, {bb}"));
-        self.line(&format!("{eq} = fcmp oeq float {a}, {bb}"));
-        self.line(&format!("{mid} = select i1 {eq}, i64 6, i64 2"));
-        self.line(&format!("{res} = select i1 {lt}, i64 8, i64 {mid}"));
+        let res = self.compare_nibble(&a, &bb);
+        self.unguard(&labels, v, word, src, nzcv, &res);
+    }
+
+    /// `FCCMP` of singles: the flags of the compare when `cond` holds, the immediate `flags`
+    /// when it does not (then nothing is compared and nothing can be raised, so the fast form
+    /// needs no test of the operands).
+    #[allow(clippy::too_many_arguments)]
+    fn single_cond_compare(
+        &mut self,
+        b: BlockId,
+        split: &mut u32,
+        v: ValueId,
+        word: u32,
+        src: &str,
+        nzcv: &str,
+        regs: (u8, u8),
+        condition: (u8, u8),
+    ) {
+        let (rn, rm) = regs;
+        let (cond, flags) = condition;
+        let holds = self.condition(cond, nzcv);
+        let (a, bb) = self.compare_operands(rn, Some(rm));
+        let ord = self.temp("co");
+        self.line(&format!("{ord} = fcmp ord float {a}, {bb}"));
+        let fp0 = self.scalar_fpcr_ok(&[&a, &bb]);
+        let (ok, skipped, go) = (self.temp("cg"), self.temp("cs"), self.temp("ci"));
+        self.line(&format!("{ok} = and i1 {ord}, {fp0}"));
+        self.line(&format!("{skipped} = xor i1 {holds}, true"));
+        self.line(&format!("{go} = or i1 {skipped}, {ok}"));
+        let labels = self.guard(b, split, &go);
+        let compared = self.compare_nibble(&a, &bb);
+        let res = self.temp("cr");
+        self.line(&format!(
+            "{res} = select i1 {holds}, i64 {compared}, i64 {flags}"
+        ));
         self.unguard(&labels, v, word, src, nzcv, &res);
     }
 
@@ -1085,14 +1204,113 @@ impl Emitter<'_> {
         self.store_vec(rd, size, "i8", size * 8, &r);
     }
 
-    /// Vector `FADD`, `FSUB`, `FMUL`, `FMLA` and `FMLS` on single-precision lanes, the second
-    /// operand a register or, with `elem`, one lane of a register broadcast. As for the scalar
-    /// forms (`single_arith`), the fast form needs a default `FPCR` and lanes that are all finite
-    /// and not tiny; the fused forms are worked out in double precision, which holds a product of
-    /// two singles exactly, with the one case where rounding twice could differ (the sum lands
-    /// exactly between two singles after rounding to a double) left to the call.
+    /// `a + o` on `lanes` single-precision lanes, and per lane whether the sum is inexact: the
+    /// error of the sum is worked out exactly (an error-free transformation) and the sum is
+    /// inexact when it is not zero.
+    fn sum_with_error(&mut self, lanes: u32, a: &str, o: &str) -> (String, String) {
+        let f = format!("<{lanes} x float>");
+        let zero_f = splat(lanes, "float", ZERO);
+        let t = |this: &mut Self, h: &str| this.temp(h);
+        let r = t(self, "xr");
+        self.line(&format!("{r} = fadd {f} {a}, {o}"));
+        let (v1, v2, e1, e2, e) = (
+            t(self, "xv"),
+            t(self, "xt"),
+            t(self, "xe"),
+            t(self, "xf"),
+            t(self, "xg"),
+        );
+        self.line(&format!("{v1} = fsub {f} {r}, {a}"));
+        self.line(&format!("{v2} = fsub {f} {r}, {v1}"));
+        self.line(&format!("{e1} = fsub {f} {a}, {v2}"));
+        self.line(&format!("{e2} = fsub {f} {o}, {v1}"));
+        self.line(&format!("{e} = fadd {f} {e1}, {e2}"));
+        let inexact = t(self, "xi");
+        self.line(&format!("{inexact} = fcmp une {f} {e}, {zero_f}"));
+        (r, inexact)
+    }
+
+    /// `-x` on `lanes` single-precision lanes.
+    fn negate(&mut self, lanes: u32, x: &str) -> String {
+        let n = self.temp("xn");
+        self.line(&format!("{n} = fneg <{lanes} x float> {x}"));
+        n
+    }
+
+    /// The products of the lanes of `a` and `bb` as doubles: two 24-bit significands fit in one,
+    /// so they are exact.
+    fn product_in_double(&mut self, lanes: u32, a: &str, bb: &str) -> String {
+        let (f, d) = (format!("<{lanes} x float>"), format!("<{lanes} x double>"));
+        let (ad, bd, pd) = (self.temp("xd"), self.temp("xe"), self.temp("xp"));
+        self.line(&format!("{ad} = fpext {f} {a} to {d}"));
+        self.line(&format!("{bd} = fpext {f} {bb} to {d}"));
+        self.line(&format!("{pd} = fmul {d} {ad}, {bd}"));
+        pd
+    }
+
+    /// `acc + a * bb` on `lanes` single-precision lanes, rounded once as a fused multiply-add is:
+    /// the product and the sum are worked out in double precision, the error of the sum exactly,
+    /// and the sum is rounded to a single. Returns the result, per lane whether it is inexact and
+    /// whether a sum that was rounded to a double lies exactly between two singles, where rounding
+    /// it again might go the wrong way.
+    fn fused_sum(&mut self, lanes: u32, a: &str, bb: &str, acc: &str) -> (String, String, String) {
+        let (f, d) = (format!("<{lanes} x float>"), format!("<{lanes} x double>"));
+        let zero_d = splat(lanes, "double", "0.0");
+        let t = |this: &mut Self, h: &str| this.temp(h);
+        let pd = self.product_in_double(lanes, a, bb);
+        let dd = t(self, "xc");
+        self.line(&format!("{dd} = fpext {f} {acc} to {d}"));
+        let s = t(self, "xs");
+        self.line(&format!("{s} = fadd {d} {pd}, {dd}"));
+        // The error of that sum, exactly (it is of doubles, which hold it).
+        let (v1, v2, e1, e2, e) = (
+            t(self, "xv"),
+            t(self, "xt"),
+            t(self, "xe"),
+            t(self, "xf"),
+            t(self, "xg"),
+        );
+        self.line(&format!("{v1} = fsub {d} {s}, {pd}"));
+        self.line(&format!("{v2} = fsub {d} {s}, {v1}"));
+        self.line(&format!("{e1} = fsub {d} {pd}, {v2}"));
+        self.line(&format!("{e2} = fsub {d} {dd}, {v1}"));
+        self.line(&format!("{e} = fadd {d} {e1}, {e2}"));
+        let sum_inexact = t(self, "xk");
+        self.line(&format!("{sum_inexact} = fcmp une {d} {e}, {zero_d}"));
+        let (r, back) = (t(self, "xr"), t(self, "xb"));
+        self.line(&format!("{r} = fptrunc {d} {s} to {f}"));
+        self.line(&format!("{back} = fpext {f} {r} to {d}"));
+        let narrow_inexact = t(self, "xj");
+        self.line(&format!("{narrow_inexact} = fcmp une {d} {back}, {s}"));
+        let inexact = t(self, "xi");
+        self.line(&format!(
+            "{inexact} = or <{lanes} x i1> {sum_inexact}, {narrow_inexact}"
+        ));
+        // A sum that was rounded to a double and lies exactly between two singles might round the
+        // wrong way when it is rounded again.
+        let (bits, low, tie, hazard) = (t(self, "xz"), t(self, "xl"), t(self, "xm"), t(self, "xh"));
+        self.line(&format!("{bits} = bitcast {d} {s} to <{lanes} x i64>"));
+        self.line(&format!(
+            "{low} = and <{lanes} x i64> {bits}, {}",
+            splat(lanes, "i64", "536870911")
+        ));
+        self.line(&format!(
+            "{tie} = icmp eq <{lanes} x i64> {low}, {}",
+            splat(lanes, "i64", "268435456")
+        ));
+        self.line(&format!(
+            "{hazard} = and <{lanes} x i1> {sum_inexact}, {tie}"
+        ));
+        (r, inexact, hazard)
+    }
+
+    /// The end of a guarded operation on `lanes` single-precision lanes whose result `r` is
+    /// worked out (`inexact_v` per lane whether it lost something, `hazard_v` where rounding twice
+    /// might differ): the fast form runs when every lane is finite and not tiny (a zero only when
+    /// exact), no lane is a hazard, and `FPCR` allows it for `inputs`; it writes `r` to `rd` and
+    /// raises "inexact". The call is the other way.
     #[allow(clippy::too_many_arguments)]
-    fn vector_single(
+    fn finish_single(
         &mut self,
         b: BlockId,
         split: &mut u32,
@@ -1100,139 +1318,18 @@ impl Emitter<'_> {
         word: u32,
         src: &str,
         nzcv: &str,
-        op: SimdFp,
         lanes: u32,
-        regs: (u8, u8, u8),
-        elem: Option<u8>,
+        rd: u8,
+        result: (&str, &str, Option<&str>),
+        inputs: &[&str],
     ) {
-        let (rd, rn, rm) = regs;
-        let (f, d) = (format!("<{lanes} x float>"), format!("<{lanes} x double>"));
+        let (r, inexact_v, hazard_v) = result;
+        let f = format!("<{lanes} x float>");
+        let zero_f = splat(lanes, "float", ZERO);
         self.intrinsic(format!(
             "declare <{lanes} x float> @llvm.fabs.v{lanes}f32(<{lanes} x float>)"
         ));
         let t = |this: &mut Self, h: &str| this.temp(h);
-        let mut a = self.load_vec(rn, lanes, "float");
-        let bb = match elem {
-            None => self.load_vec(rm, lanes, "float"),
-            Some(idx) => {
-                let whole = self.load_vec(rm, 4, "float");
-                let x = t(self, "ex");
-                self.line(&format!(
-                    "{x} = extractelement <4 x float> {whole}, i32 {idx}"
-                ));
-                let one = t(self, "ei");
-                self.line(&format!(
-                    "{one} = insertelement {f} poison, float {x}, i32 0"
-                ));
-                let all = t(self, "es");
-                self.line(&format!(
-                    "{all} = shufflevector {f} {one}, {f} poison, <{lanes} x i32> zeroinitializer"
-                ));
-                all
-            }
-        };
-        let zero_f = splat(lanes, "float", ZERO);
-        let zero_d = splat(lanes, "double", "0.0");
-        // The accumulator of a multiply-add is an operand too.
-        let mut accumulator = None;
-        let (r, inexact_v, hazard_v) = match op {
-            SimdFp::Add | SimdFp::Sub => {
-                let o = if op == SimdFp::Sub {
-                    let nb = t(self, "xn");
-                    self.line(&format!("{nb} = fneg {f} {bb}"));
-                    nb
-                } else {
-                    bb.clone()
-                };
-                let r = t(self, "xr");
-                self.line(&format!("{r} = fadd {f} {a}, {o}"));
-                let (v1, v2, e1, e2, e) = (
-                    t(self, "xv"),
-                    t(self, "xt"),
-                    t(self, "xe"),
-                    t(self, "xf"),
-                    t(self, "xg"),
-                );
-                self.line(&format!("{v1} = fsub {f} {r}, {a}"));
-                self.line(&format!("{v2} = fsub {f} {r}, {v1}"));
-                self.line(&format!("{e1} = fsub {f} {a}, {v2}"));
-                self.line(&format!("{e2} = fsub {f} {o}, {v1}"));
-                self.line(&format!("{e} = fadd {f} {e1}, {e2}"));
-                let inexact = t(self, "xi");
-                self.line(&format!("{inexact} = fcmp une {f} {e}, {zero_f}"));
-                (r, inexact, None)
-            }
-            SimdFp::Mul | SimdFp::Mla | SimdFp::Mls => {
-                if op == SimdFp::Mls {
-                    let na = t(self, "xn");
-                    self.line(&format!("{na} = fneg {f} {a}"));
-                    a = na;
-                }
-                let (ad, bd, pd) = (t(self, "xd"), t(self, "xe"), t(self, "xp"));
-                self.line(&format!("{ad} = fpext {f} {a} to {d}"));
-                self.line(&format!("{bd} = fpext {f} {bb} to {d}"));
-                // Two 24-bit significands: the product is exact in a double.
-                self.line(&format!("{pd} = fmul {d} {ad}, {bd}"));
-                if op == SimdFp::Mul {
-                    let (r, rd2) = (t(self, "xr"), t(self, "xs"));
-                    self.line(&format!("{r} = fptrunc {d} {pd} to {f}"));
-                    self.line(&format!("{rd2} = fpext {f} {r} to {d}"));
-                    let inexact = t(self, "xi");
-                    self.line(&format!("{inexact} = fcmp une {d} {rd2}, {pd}"));
-                    (r, inexact, None)
-                } else {
-                    // The accumulator is the destination register as it is now.
-                    let acc = self.load_vec(rd, lanes, "float");
-                    accumulator = Some(acc.clone());
-                    let dd = t(self, "xc");
-                    self.line(&format!("{dd} = fpext {f} {acc} to {d}"));
-                    let s = t(self, "xs");
-                    self.line(&format!("{s} = fadd {d} {pd}, {dd}"));
-                    // The error of that sum, exactly (it is of doubles, which hold it).
-                    let (v1, v2, e1, e2, e) = (
-                        t(self, "xv"),
-                        t(self, "xt"),
-                        t(self, "xe"),
-                        t(self, "xf"),
-                        t(self, "xg"),
-                    );
-                    self.line(&format!("{v1} = fsub {d} {s}, {pd}"));
-                    self.line(&format!("{v2} = fsub {d} {s}, {v1}"));
-                    self.line(&format!("{e1} = fsub {d} {pd}, {v2}"));
-                    self.line(&format!("{e2} = fsub {d} {dd}, {v1}"));
-                    self.line(&format!("{e} = fadd {d} {e1}, {e2}"));
-                    let sum_inexact = t(self, "xk");
-                    self.line(&format!("{sum_inexact} = fcmp une {d} {e}, {zero_d}"));
-                    let (r, back) = (t(self, "xr"), t(self, "xb"));
-                    self.line(&format!("{r} = fptrunc {d} {s} to {f}"));
-                    self.line(&format!("{back} = fpext {f} {r} to {d}"));
-                    let narrow_inexact = t(self, "xj");
-                    self.line(&format!("{narrow_inexact} = fcmp une {d} {back}, {s}"));
-                    let inexact = t(self, "xi");
-                    self.line(&format!(
-                        "{inexact} = or <{lanes} x i1> {sum_inexact}, {narrow_inexact}"
-                    ));
-                    // A sum that was rounded to a double and lies exactly between two singles
-                    // might round the wrong way when it is rounded again.
-                    let (bits, low, tie, hazard) =
-                        (t(self, "xz"), t(self, "xl"), t(self, "xm"), t(self, "xh"));
-                    self.line(&format!("{bits} = bitcast {d} {s} to <{lanes} x i64>"));
-                    self.line(&format!(
-                        "{low} = and <{lanes} x i64> {bits}, {}",
-                        splat(lanes, "i64", "536870911")
-                    ));
-                    self.line(&format!(
-                        "{tie} = icmp eq <{lanes} x i64> {low}, {}",
-                        splat(lanes, "i64", "268435456")
-                    ));
-                    self.line(&format!(
-                        "{hazard} = and <{lanes} x i1> {sum_inexact}, {tie}"
-                    ));
-                    (r, inexact, Some(hazard))
-                }
-            }
-            _ => unreachable!("lowering() and vector_single() list the same operations"),
-        };
         // The fast form's conditions, in every lane.
         let ar = t(self, "ya");
         self.line(&format!("{ar} = call {f} @llvm.fabs.v{lanes}f32({f} {r})"));
@@ -1262,26 +1359,186 @@ impl Emitter<'_> {
         self.line(&format!("{sz} = or <{lanes} x i1> {big}, {zok}"));
         self.line(&format!("{okv} = and <{lanes} x i1> {fin}, {sz}"));
         let all_ok = self.reduce("and", lanes, &okv);
-        let any_inexact = self.reduce("or", lanes, &inexact_v);
+        let any_inexact = self.reduce("or", lanes, inexact_v);
         let mut go = all_ok;
         if let Some(h) = hazard_v {
-            let any = self.reduce("or", lanes, &h);
+            let any = self.reduce("or", lanes, h);
             let none = t(self, "yn");
             self.line(&format!("{none} = xor i1 {any}, true"));
             let both = t(self, "yc");
             self.line(&format!("{both} = and i1 {go}, {none}"));
             go = both;
         }
-        let mut inputs = vec![a.clone(), bb.clone()];
-        inputs.extend(accumulator);
-        let inputs: Vec<&str> = inputs.iter().map(String::as_str).collect();
-        let fp0 = self.vector_fpcr_ok(lanes, &inputs);
+        let fp0 = self.vector_fpcr_ok(lanes, inputs);
         let all = t(self, "yg");
         self.line(&format!("{all} = and i1 {go}, {fp0}"));
         let labels = self.guard(b, split, &all);
-        self.store_vec(rd, lanes, "float", lanes * 32, &r);
+        self.store_vec(rd, lanes, "float", lanes * 32, r);
         self.set_inexact(&any_inexact);
         self.unguard(&labels, v, word, src, nzcv, "0");
+    }
+
+    /// Vector `FADD`, `FSUB`, `FMUL`, `FMLA` and `FMLS` on single-precision lanes (and the scalar
+    /// forms of `FMUL`, `FMLA` and `FMLS` by element, of one lane), the second operand a register
+    /// or, with `elem`, one lane of a register broadcast. As for the scalar forms
+    /// (`single_arith`), the fast form needs a default `FPCR` and lanes that are all finite and not
+    /// tiny; the fused forms are worked out in double precision, which holds a product of two
+    /// singles exactly, with the one case where rounding twice could differ (the sum lands
+    /// exactly between two singles after rounding to a double) left to the call.
+    #[allow(clippy::too_many_arguments)]
+    fn vector_single(
+        &mut self,
+        b: BlockId,
+        split: &mut u32,
+        v: ValueId,
+        word: u32,
+        src: &str,
+        nzcv: &str,
+        op: SimdFp,
+        lanes: u32,
+        regs: (u8, u8, u8),
+        elem: Option<u8>,
+    ) {
+        let (rd, rn, rm) = regs;
+        let (f, d) = (format!("<{lanes} x float>"), format!("<{lanes} x double>"));
+        let t = |this: &mut Self, h: &str| this.temp(h);
+        let mut a = self.load_vec(rn, lanes, "float");
+        let bb = match elem {
+            None => self.load_vec(rm, lanes, "float"),
+            Some(idx) => {
+                let whole = self.load_vec(rm, 4, "float");
+                let x = t(self, "ex");
+                self.line(&format!(
+                    "{x} = extractelement <4 x float> {whole}, i32 {idx}"
+                ));
+                let one = t(self, "ei");
+                self.line(&format!(
+                    "{one} = insertelement {f} poison, float {x}, i32 0"
+                ));
+                let all = t(self, "es");
+                self.line(&format!(
+                    "{all} = shufflevector {f} {one}, {f} poison, <{lanes} x i32> zeroinitializer"
+                ));
+                all
+            }
+        };
+        // The accumulator of a multiply-add is an operand too.
+        let mut accumulator = None;
+        let (r, inexact_v, hazard_v) = match op {
+            SimdFp::Add | SimdFp::Sub => {
+                let o = if op == SimdFp::Sub {
+                    self.negate(lanes, &bb)
+                } else {
+                    bb.clone()
+                };
+                let (r, inexact) = self.sum_with_error(lanes, &a, &o);
+                (r, inexact, None)
+            }
+            SimdFp::Mul => {
+                let pd = self.product_in_double(lanes, &a, &bb);
+                let (r, rd2) = (t(self, "xr"), t(self, "xs"));
+                self.line(&format!("{r} = fptrunc {d} {pd} to {f}"));
+                self.line(&format!("{rd2} = fpext {f} {r} to {d}"));
+                let inexact = t(self, "xi");
+                self.line(&format!("{inexact} = fcmp une {d} {rd2}, {pd}"));
+                (r, inexact, None)
+            }
+            SimdFp::Mla | SimdFp::Mls => {
+                if op == SimdFp::Mls {
+                    a = self.negate(lanes, &a);
+                }
+                // The accumulator is the destination register as it is now.
+                let acc = self.load_vec(rd, lanes, "float");
+                accumulator = Some(acc.clone());
+                let (r, inexact, hazard) = self.fused_sum(lanes, &a, &bb, &acc);
+                (r, inexact, Some(hazard))
+            }
+            _ => unreachable!("lowering() and vector_single() list the same operations"),
+        };
+        let mut inputs = vec![a.clone(), bb.clone()];
+        inputs.extend(accumulator);
+        let inputs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+        let result = (r.as_str(), inexact_v.as_str(), hazard_v.as_deref());
+        self.finish_single(b, split, v, word, src, nzcv, lanes, rd, result, &inputs);
+    }
+
+    /// `FMADD`, `FMSUB`, `FNMADD` and `FNMSUB` of singles: `±ra ± rn * rm`, rounded once, as the
+    /// fused vector forms are (`fused_sum`).
+    #[allow(clippy::too_many_arguments)]
+    fn single_fused(
+        &mut self,
+        b: BlockId,
+        split: &mut u32,
+        v: ValueId,
+        word: u32,
+        src: &str,
+        nzcv: &str,
+        negate: (bool, bool),
+        regs: (u8, u8, u8, u8),
+    ) {
+        let (neg_addend, neg_product) = negate;
+        let (rd, rn, rm, ra) = regs;
+        let mut a = self.load_vec(rn, 1, "float");
+        let bb = self.load_vec(rm, 1, "float");
+        let mut acc = self.load_vec(ra, 1, "float");
+        if neg_product {
+            a = self.negate(1, &a);
+        }
+        if neg_addend {
+            acc = self.negate(1, &acc);
+        }
+        let (r, inexact, hazard) = self.fused_sum(1, &a, &bb, &acc);
+        let result = (r.as_str(), inexact.as_str(), Some(hazard.as_str()));
+        self.finish_single(
+            b,
+            split,
+            v,
+            word,
+            src,
+            nzcv,
+            1,
+            rd,
+            result,
+            &[&a, &bb, &acc],
+        );
+    }
+
+    /// `FADDP Vd.T, Vn.T, Vm.T` of singles: the sums of the pairs of lanes of `Vm:Vn`.
+    #[allow(clippy::too_many_arguments)]
+    fn pair_add(
+        &mut self,
+        b: BlockId,
+        split: &mut u32,
+        v: ValueId,
+        word: u32,
+        src: &str,
+        nzcv: &str,
+        lanes: u32,
+        regs: (u8, u8, u8),
+    ) {
+        let (rd, rn, rm) = regs;
+        let f = format!("<{lanes} x float>");
+        let n = self.load_vec(rn, lanes, "float");
+        let m = self.load_vec(rm, lanes, "float");
+        // Of the lanes of `Vn` and then `Vm`, the even ones are the first of a pair.
+        let pick = |first: u32| -> String {
+            (0..lanes)
+                .map(|i| format!("i32 {}", 2 * i + first))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let (firsts, seconds) = (self.temp("pa"), self.temp("pb"));
+        self.line(&format!(
+            "{firsts} = shufflevector {f} {n}, {f} {m}, <{lanes} x i32> <{}>",
+            pick(0)
+        ));
+        self.line(&format!(
+            "{seconds} = shufflevector {f} {n}, {f} {m}, <{lanes} x i32> <{}>",
+            pick(1)
+        ));
+        let (r, inexact) = self.sum_with_error(lanes, &firsts, &seconds);
+        let result = (r.as_str(), inexact.as_str(), None);
+        self.finish_single(b, split, v, word, src, nzcv, lanes, rd, result, &[&n, &m]);
     }
 
     /// `SCVTF` and `UCVTF` of 32-bit integers (the lanes of a register, or a general register) to

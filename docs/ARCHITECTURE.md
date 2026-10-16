@@ -62,12 +62,13 @@ The hot forms are lowered to LLVM IR instead (`src/codegen/llvm/vecs.rs`: the em
 word with the runtime's own decoder, and the call stays as the slow form of anything that is not
 on the fast path):
 
-- *Exact by construction, inline*: register moves, the bitwise operations, `FMOV`, `FABS`, `FNEG`,
-  `FCSEL`, the immediate and general-register forms of `FMOV`, `DUP`/`INS` of an element, `ZIP`,
-  `UZP`, `TRN`, `EXT`.
-- *Guarded*: the single-precision `FADD`, `FSUB`, `FMUL`, `FDIV`, `FCMP`, the vector `FADD`, `FSUB`,
-  `FMUL`, `FMLA`, `FMLS` (also by element), `SCVTF`/`UCVTF` of 32-bit integers and `FCVTZS`/`FCVTZU`
-  to a 32-bit register. The fast form runs when `FPCR` is zero (or has only flush-to-zero, default
+- *Exact by construction, inline*: register moves, the bitwise operations, `MOVI`, `MVNI`,
+  `ORR`/`BIC` with an immediate, `FMOV`, `FABS`, `FNEG`, `FCSEL`, the immediate and
+  general-register forms of `FMOV`, `DUP`/`INS` of an element, `ZIP`, `UZP`, `TRN`, `EXT`.
+- *Guarded*: the single-precision `FADD`, `FSUB`, `FMUL`, `FDIV`, `FCMP`, `FCCMP`, `FMADD`, `FMSUB`,
+  `FNMADD`, `FNMSUB`, the vector `FADD`, `FSUB`, `FMUL`, `FMLA`, `FMLS` (also by element, and the
+  scalar forms by element), `FADDP`, `SCVTF`/`UCVTF` of 32-bit integers and `FCVTZS`/`FCVTZU` to a
+  32-bit register. The fast form runs when `FPCR` is zero (or has only flush-to-zero, default
   NaN and alternative half precision set, and then no operand is a denormal: the architecture would
   read it as zero and raise `IDC`) and every result is finite and not tiny (zero results only when
   exact); then the host's answer is the architecture's, and the one flag it can raise, inexact, is
@@ -82,7 +83,7 @@ on the fast path):
 The native differential tests (`src/native_tests.rs`) compare all of it with the interpreter over
 random operands (ordinary numbers, exact ones and the special values) and states, `FPSR` and the
 flags included; a mutation of any of these lowerings fails them. Everything else (double
-precision, the fused scalar forms, the other conversions and the rest of SIMD) is the call.
+precision, the other conversions and the rest of SIMD) is the call.
 
 ## The Horizon layer
 

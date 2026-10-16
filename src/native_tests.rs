@@ -623,6 +623,30 @@ fn single_precision_arithmetic_and_compares_match_the_interpreter_natively() {
             words.push(0x1E20_2000 | rm << 16 | rn << 5 | opcode2);
         }
     }
+    // FMADD, FMSUB, FNMADD, FNMSUB (single): the destination is the addend, a factor, or neither.
+    for (o1, o0) in [(0u32, 0u32), (0, 1), (1, 0), (1, 1)] {
+        for (rd, rn, rm, ra) in [
+            (0, 1, 2, 3),
+            (3, 3, 4, 5),
+            (1, 2, 2, 1),
+            (6, 6, 6, 6),
+            (2, 0, 1, 2),
+            (7, 7, 7, 0),
+        ] {
+            words.push(0x1F00_0000 | o1 << 21 | rm << 16 | o0 << 15 | ra << 10 | rn << 5 | rd);
+        }
+    }
+    // FCCMP, FCCMPE (single) for every condition and a few flag immediates.
+    for cond in 0u32..16 {
+        for (op, flags, rn, rm) in [
+            (0u32, 0u32, 0u32, 1u32),
+            (0, 5, 2, 2),
+            (1, 15, 3, 0),
+            (1, 9, 1, 3),
+        ] {
+            words.push(0x1E20_0400 | rm << 16 | cond << 12 | rn << 5 | op << 4 | flags);
+        }
+    }
     let states = env_count("KILN_FLOAT_STATES", 600);
     check_float_words(&words, states, 0xF10A7);
 }
@@ -796,6 +820,23 @@ fn vector_single_precision_arithmetic_matches_the_interpreter_natively() {
         for u in [0u32, 1] {
             words.push(0x0E21_D800 | q << 30 | u << 29 | 1 << 5 | 2);
         }
+        // FADDP (vector): the destination is a source or not.
+        for (rd, rn, rm) in [
+            (0u32, 1u32, 2u32),
+            (3, 3, 4),
+            (5, 6, 6),
+            (7, 7, 7),
+            (1, 0, 0),
+        ] {
+            words.push(0x2E20_D400 | q << 30 | rm << 16 | rn << 5 | rd);
+        }
+    }
+    // FMUL, FMLA, FMLS by element, on one lane (scalar), every index.
+    for opcode in [0x9u32, 0x1, 0x5] {
+        for idx in 0u32..4 {
+            let (h, l) = (idx >> 1, idx & 1);
+            words.push(0x5F80_0000 | l << 21 | 2 << 16 | opcode << 12 | h << 11 | 1 << 5 | 3);
+        }
     }
     // SCVTF, UCVTF (scalar, vector register and general register), FCVTZS, FCVTZU (to W).
     for u in [0u32, 1] {
@@ -805,6 +846,39 @@ fn vector_single_precision_arithmetic_matches_the_interpreter_natively() {
     }
     let states = env_count("KILN_FLOAT_STATES", 600);
     check_lane_words(&words, states, 0x5EC7);
+}
+
+#[test]
+fn modified_immediates_match_the_interpreter_natively() {
+    let mut words = Vec::new();
+    // MOVI, MVNI, ORR, BIC and the vector FMOV: every `cmode`, both `op`, a few immediates, a
+    // 64-bit and a 128-bit register, a destination that holds an operand and one that does not.
+    for q in [0u32, 1] {
+        for op in [0u32, 1] {
+            for cmode in 0u32..16 {
+                if cmode == 15 && op == 1 && q == 0 {
+                    // The double-precision FMOV has no 64-bit form.
+                    continue;
+                }
+                for imm8 in [0x00u32, 0x5A, 0xA5, 0xFF] {
+                    let (abc, defgh) = (imm8 >> 5, imm8 & 0x1F);
+                    for rd in [2u32, 9] {
+                        words.push(
+                            0x0F00_0400
+                                | q << 30
+                                | op << 29
+                                | abc << 16
+                                | cmode << 12
+                                | defgh << 5
+                                | rd,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let states = env_count("KILN_FLOAT_STATES", 600) / 6;
+    check_lane_words(&words, states.max(8), 0x30D1);
 }
 
 #[test]
