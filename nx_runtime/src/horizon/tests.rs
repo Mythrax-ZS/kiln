@@ -1950,6 +1950,28 @@ fn the_data_and_bss_of_a_module_can_be_lent_as_transfer_memory() {
 }
 
 #[test]
+fn the_idle_time_detection_extension_is_kept() {
+    let mut e = Env::new();
+    super::services::register_defaults(&e.kernel);
+    let applet = e.service("appletOE");
+    let mut open = Message::new(0);
+    open.pid = true;
+    open.copy_handles = vec![CURRENT_PROCESS];
+    open.payload = vec![0; 8];
+    let proxy = u64::from(e.call(applet, &open).moved[0]);
+    // GetSelfController, then SetIdleTimeDetectionExtension(1) and GetIdleTimeDetectionExtension.
+    let own = u64::from(e.call(proxy, &Message::new(1)).moved[0]);
+    assert_eq!(e.call(own, &Message::new(63)).data, 0u32.to_le_bytes());
+    let mut set = Message::new(62);
+    set.payload = 1u32.to_le_bytes().to_vec();
+    assert_eq!(e.call(own, &set).result, 0);
+    assert_eq!(e.call(own, &Message::new(63)).data, 1u32.to_le_bytes());
+    // A value the console does not know stops the run.
+    set.payload = 7u32.to_le_bytes().to_vec();
+    assert!(e.send(own, &set.bytes(), false).is_none());
+}
+
+#[test]
 fn the_applet_manager_announces_focus_once_and_then_has_nothing_to_say() {
     let mut e = Env::new();
     super::services::register_defaults(&e.kernel);

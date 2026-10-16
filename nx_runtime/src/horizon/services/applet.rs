@@ -49,6 +49,9 @@ pub struct AppletState {
     pub display: Option<Arc<super::vi::Shared>>,
     /// Has the pre-selected user been popped? A launch parameter can be popped once.
     preselected_popped: bool,
+    /// What `SetIdleTimeDetectionExtension` was given: how much longer the console waits before
+    /// dimming the screen. Nothing dims it here.
+    idle_extension: u32,
 }
 
 pub type Shared = Arc<Mutex<AppletState>>;
@@ -288,6 +291,17 @@ impl Service for SelfController {
                     "SetManagedDisplayLayerSeparationMode was given {other}; it takes 0 or 1"
                 ))),
             },
+            // SetIdleTimeDetectionExtension(u32 0, 1 or 2), GetIdleTimeDetectionExtension() -> u32
+            62 => match req.u32_at(0) {
+                v @ 0..=2 => {
+                    lock(&self.shared).idle_extension = v;
+                    Ok(Response::ok())
+                }
+                other => Err(Stop(format!(
+                    "SetIdleTimeDetectionExtension was given {other}; it takes 0, 1 or 2"
+                ))),
+            },
+            63 => Ok(Response::ok().with_u32(lock(&self.shared).idle_extension)),
             other => Err(Stop::unknown_command("ISelfController", other)),
         }
     }
