@@ -3236,9 +3236,11 @@ fn play_reports_are_accepted_and_discarded_and_nothing_else_is_offered() {
         save.send = vec![(SCRATCH + 0x100, 8), (SCRATCH + 0x200, 0x10)];
         assert_eq!(e.call(prepo, &save).result, 0, "command {command}");
     }
-    assert!(e.send(prepo, &Message::new(10200).bytes(), false).is_none());
+    // A request to send them at once is a request, and an offline console has nothing to send with.
+    assert_eq!(e.call(prepo, &Message::new(10200)).result, 0);
+    assert!(e.send(prepo, &Message::new(10300).bytes(), false).is_none());
     match e.kernel.exit_state() {
-        Some(Exit::Fatal(m)) => assert!(m.contains("prepo:u") && m.contains("10200"), "{m}"),
+        Some(Exit::Fatal(m)) => assert!(m.contains("prepo:u") && m.contains("10300"), "{m}"),
         other => panic!("{other:?}"),
     }
 }

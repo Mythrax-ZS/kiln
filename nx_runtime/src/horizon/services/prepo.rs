@@ -1,8 +1,9 @@
 //! `prepo:u`, the play report service (Switchbrew, "Play Report services").
 //!
 //! A play report is telemetry for the console's maker. The console here is offline
-//! (docs/ASSUMPTIONS.md A-072): a report is accepted and thrown away, and every other command
-//! (sending them, reading the storage) stops the run.
+//! (docs/ASSUMPTIONS.md A-072): a report is accepted and thrown away, a request to send the reports
+//! at once is accepted and has nothing to send them with, and every other command (the state of a
+//! transmission, the storage) stops the run.
 
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
 
@@ -26,6 +27,8 @@ impl Service for Prepo {
             // SaveReport and SaveReportWithUser, in the forms of every firmware: the event and the
             // report are buffers, and there is no output
             10100..=10107 => Ok(Response::ok()),
+            // RequestImmediateTransmission: a request, which an offline console cannot act on.
+            10200 => Ok(Response::ok()),
             other => Err(Stop::unknown_command("prepo:u", other)),
         }
     }
