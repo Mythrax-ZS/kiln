@@ -190,7 +190,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   values of three registers before the instruction at the offset (with `NX_PROBE_EXTREME` these name
   the pixels that go wrong, the program and the instruction). `NX_DUMP_TEXTURES=<dir>` writes every layer
   and level of each texture made as a picture, and its memory as it was (`.raw`); `NX_TRACE_TEXTURES=1`
-  also says which texels of a floating-point texture are not numbers or huge. `NX_INPUT_SCRIPT="<frame>
+  also says which texels of a floating-point texture are not numbers or huge and, in a traced frame, lists the cube maps
+  the texture header pool holds. `NX_INPUT_SCRIPT="<frame>
   <Action> [<frames>];..."` (or a file) presses actions of a keymap at presented frame numbers, for
   runs without a person (the frame rate decides when a menu is ready: a run that is 15 times faster
   needs the press 15 times later). Never `NX_DUMP_FRAMES` without `NX_DUMP_EVERY` for a long run.

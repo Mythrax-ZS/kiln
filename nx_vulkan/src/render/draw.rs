@@ -725,6 +725,49 @@ impl Core {
             .ok_or_else(|| format!("{len} bytes of GPU memory at {va:#x}, which is not all mapped"))
     }
 
+    /// `NX_TRACE_TEXTURES` in the traced frame: the cube maps the header pool names (once).
+    fn say_texture_pool(&mut self, scene: &Scene<'_>, pools: &nx_gpu::draw_state::TexturePools) {
+        if !self
+            .seen_targets
+            .insert("the texture pool of the traced frame".to_string())
+        {
+            return;
+        }
+        let bytes = 32 * pools.header_count as usize;
+        let Some(raw) = scene.read_vec(pools.header_address, bytes) else {
+            eprintln!(
+                "[vulkan] the texture header pool at {:#x} ({} headers) is not all mapped",
+                pools.header_address, pools.header_count
+            );
+            return;
+        };
+        let mut cubes = 0;
+        for (id, entry) in raw.as_chunks::<32>().0.iter().enumerate() {
+            let words: [u32; 8] = std::array::from_fn(|i| {
+                u32::from_le_bytes(entry[4 * i..4 * i + 4].try_into().unwrap())
+            });
+            let tic = Tic(words);
+            if !matches!(tic.texture_type(), 3 | 8) || words[1] == 0 {
+                continue;
+            }
+            cubes += 1;
+            eprintln!(
+                "[vulkan] header {id}: a cube map at GPU address {:#x} (guest address {:x?}), {}x{}, {} levels, format {:#x}, type {}",
+                tic.address(),
+                scene.host_address(tic.address()).map(|(cpu, _)| cpu),
+                tic.width(),
+                tic.height(),
+                tic.levels(),
+                tic.components(),
+                tic.texture_type()
+            );
+        }
+        eprintln!(
+            "[vulkan] the texture header pool at {:#x} holds {cubes} cube maps in {} headers",
+            pools.header_address, pools.header_count
+        );
+    }
+
     /// The descriptors (binding and image info) of the textures program `p` samples: for each,
     /// from its handle (with a description of where the handle came from, for messages), the
     /// headers of the pools, the image and the sampler.
@@ -738,6 +781,9 @@ impl Core {
         out: &mut Vec<(u32, vk::DescriptorImageInfo)>,
     ) -> Result<(), String> {
         let base = 64 * p.stage.index();
+        if self.debug.trace_textures && self.traced().is_some() {
+            self.say_texture_pool(scene, pools);
+        }
         for (used, (handle, from)) in p.info.textures.iter().zip(handles) {
             let handle = *handle;
             let (tic_id, tsc_id) = (handle & 0xF_FFFF, handle >> 20);
