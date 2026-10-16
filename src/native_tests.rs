@@ -609,10 +609,16 @@ fn check_float_words(words: &[u32], states: usize, seed: u64) {
 #[test]
 fn single_precision_arithmetic_and_compares_match_the_interpreter_natively() {
     let mut words = Vec::new();
-    // FMUL, FDIV, FADD, FSUB (single): Sd = Sn op Sm.
-    for opcode in [0u32, 1, 2, 3] {
+    // FMUL, FDIV, FADD, FSUB, FMAX, FMIN, FMAXNM, FMINNM, FNMUL (single): Sd = Sn op Sm.
+    for opcode in [0u32, 1, 2, 3, 4, 5, 6, 7, 8] {
         for (rd, rn, rm) in [(0, 1, 2), (3, 3, 4), (5, 6, 6), (7, 7, 7), (1, 0, 0)] {
             words.push(0x1E20_0800 | opcode << 12 | rm << 16 | rn << 5 | rd);
+        }
+    }
+    // FSQRT, FRINTN, FRINTP, FRINTM, FRINTZ, FRINTA, FRINTX, FRINTI (single).
+    for opcode in [3u32, 8, 9, 10, 11, 12, 14, 15] {
+        for (rd, rn) in [(0u32, 1u32), (2, 2), (5, 7)] {
+            words.push(0x1E20_4000 | opcode << 15 | rn << 5 | rd);
         }
     }
     // FCMP, FCMPE against a register and against zero.

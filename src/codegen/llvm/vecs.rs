@@ -9,7 +9,7 @@
 //!   `ORR`/`BIC` with an immediate, `FMOV`, `FABS`, `FNEG`, `FCSEL`, the immediate and
 //!   general-register forms of `FMOV`: exact, there is nothing to get wrong;
 //! - the single-precision `FADD`, `FSUB`, `FMUL`, `FDIV`, `FCMP`, `FCCMP`, `FMADD`, `FMSUB`,
-//!   `FNMADD`, `FNMSUB` and `FADDP`, and the vector forms: when `FPCR` is the default
+//!   `FNMADD`, `FNMSUB`, `FNMUL` and `FADDP`, and the vector forms: when `FPCR` is the default
 //!   (or has only flush-to-zero, default NaN and alternative half precision set, and then no
 //!   operand is a denormal), the operands are ordinary and the result is finite and not tiny, the
 //!   host's result is the architecture's, and the only flag it can raise is "inexact", which is
@@ -25,7 +25,7 @@
 
 use super::{Emitter, Op};
 use crate::lift::ir::{BlockId, ValueId};
-use nx_runtime::a64::fp::{Fmt, Rounding};
+use nx_runtime::a64::fp::{Fmt, MinMax, Rounding};
 use nx_runtime::a64::state::offsets as st;
 use nx_runtime::a64::vec::decode::{decode, decode_mem};
 use nx_runtime::a64::vec::exec::expand_imm;
@@ -68,7 +68,34 @@ fn lowering(op: &VOp) -> Lowering {
         VOp::FmovToGeneral { .. } | VOp::FmovFromGeneral { .. } => Lowering::Inline,
         VOp::FpSelect { fmt, .. } if scalar(fmt) => Lowering::Inline,
         VOp::FpBinary {
-            op: FpBinary::Add | FpBinary::Sub | FpBinary::Mul | FpBinary::Div,
+            op: FpBinary::Add | FpBinary::Sub | FpBinary::Mul | FpBinary::Div | FpBinary::Nmul,
+            fmt: Fmt::S,
+            ..
+        } => Lowering::Guarded,
+        VOp::FpBinary {
+            op: FpBinary::MinMax(_),
+            fmt: Fmt::S,
+            ..
+        } => Lowering::Guarded,
+        VOp::FpUnary {
+            op: FpUnary::Sqrt,
+            fmt: Fmt::S,
+            ..
+        } => Lowering::Guarded,
+        VOp::FpUnary {
+            op:
+                FpUnary::Round {
+                    mode:
+                        None
+                        | Some(
+                            Rounding::Nearest
+                            | Rounding::PlusInf
+                            | Rounding::MinusInf
+                            | Rounding::Zero
+                            | Rounding::NearestAway,
+                        ),
+                    exact: false,
+                },
             fmt: Fmt::S,
             ..
         } => Lowering::Guarded,
@@ -259,6 +286,29 @@ impl Emitter<'_> {
             (_, VOp::FpMov { fmt, rd, rn }) => {
                 let bits = self.read_scalar_bits(rn, fmt);
                 self.write_scalar(rd, &bits);
+            }
+            (
+                _,
+                VOp::FpUnary {
+                    op: unary @ (FpUnary::Sqrt | FpUnary::Round { .. }),
+                    rd,
+                    rn,
+                    ..
+                },
+            ) => {
+                self.single_unary(b, split, v, word, src, nzcv, unary, rd, rn);
+            }
+            (
+                _,
+                VOp::FpBinary {
+                    op: FpBinary::MinMax(kind),
+                    rd,
+                    rn,
+                    rm,
+                    ..
+                },
+            ) => {
+                self.single_minmax(b, split, v, word, src, nzcv, kind, (rd, rn, rm));
             }
             (
                 _,
@@ -816,7 +866,7 @@ impl Emitter<'_> {
                 self.line(&format!("{inexact} = fcmp une float {e}, {ZERO}"));
                 (r, inexact)
             }
-            FpBinary::Mul => {
+            FpBinary::Mul | FpBinary::Nmul => {
                 let (ad, bd, pd) = (t(self, "xd"), t(self, "xe"), t(self, "xp"));
                 self.line(&format!("{ad} = fpext float {a} to double"));
                 self.line(&format!("{bd} = fpext float {bb} to double"));
@@ -827,7 +877,14 @@ impl Emitter<'_> {
                 self.line(&format!("{rd2} = fpext float {r} to double"));
                 let inexact = t(self, "xi");
                 self.line(&format!("{inexact} = fcmp une double {rd2}, {pd}"));
-                (r, inexact)
+                if op == FpBinary::Nmul {
+                    // The negated product: the sign flips, nothing else does.
+                    let n = t(self, "xn");
+                    self.line(&format!("{n} = fneg float {r}"));
+                    (n, inexact)
+                } else {
+                    (r, inexact)
+                }
             }
             _ => {
                 let r = t(self, "xr");
@@ -970,6 +1027,129 @@ impl Emitter<'_> {
             "{res} = select i1 {holds}, i64 {compared}, i64 {flags}"
         ));
         self.unguard(&labels, v, word, src, nzcv, &res);
+    }
+
+    /// `FSQRT` and `FRINT*` (the forms that raise nothing but "inexact") of a single. The root is
+    /// for a positive normal operand and a default rounding, as the runtime's own fast path is:
+    /// the host's root is the correctly rounded one, and it is inexact when its square is not the
+    /// operand (a double holds the square of a single exactly). The rounding to an integral
+    /// value is exact for a number that is not a NaN or an infinity.
+    #[allow(clippy::too_many_arguments)]
+    fn single_unary(
+        &mut self,
+        b: BlockId,
+        split: &mut u32,
+        v: ValueId,
+        word: u32,
+        src: &str,
+        nzcv: &str,
+        op: FpUnary,
+        rd: u8,
+        rn: u8,
+    ) {
+        let p = self.vptr(rn, false);
+        let x = self.load_to("float", &p, "ux");
+        let t = |this: &mut Self, h: &str| this.temp(h);
+        let (go, intrinsic) = if let FpUnary::Round { mode, .. } = op {
+            self.intrinsic("declare float @llvm.fabs.f32(float)".to_string());
+            let name = match mode {
+                None | Some(Rounding::Nearest) => "roundeven",
+                Some(Rounding::PlusInf) => "ceil",
+                Some(Rounding::MinusInf) => "floor",
+                Some(Rounding::Zero) => "trunc",
+                _ => "round",
+            };
+            let (ax, fin) = (t(self, "ua"), t(self, "uf"));
+            self.line(&format!("{ax} = call float @llvm.fabs.f32(float {x})"));
+            self.line(&format!("{fin} = fcmp olt float {ax}, {INF}"));
+            let fp0 = self.scalar_fpcr_ok(&[&x]);
+            let go = t(self, "ug");
+            self.line(&format!("{go} = and i1 {fin}, {fp0}"));
+            (go, name)
+        } else {
+            // A positive normal operand: flush-to-zero has nothing to flush.
+            let (plain, _) = self.fpcr_modes();
+            let (big, fin, positive) = (t(self, "ub"), t(self, "uf"), t(self, "up"));
+            self.line(&format!("{big} = fcmp oge float {x}, {MIN_NORMAL}"));
+            self.line(&format!("{fin} = fcmp olt float {x}, {INF}"));
+            self.line(&format!("{positive} = and i1 {big}, {fin}"));
+            let go = t(self, "ug");
+            self.line(&format!("{go} = and i1 {positive}, {plain}"));
+            (go, "sqrt")
+        };
+        self.intrinsic(format!("declare float @llvm.{intrinsic}.f32(float)"));
+        let labels = self.guard(b, split, &go);
+        let r = t(self, "ur");
+        self.line(&format!(
+            "{r} = call float @llvm.{intrinsic}.f32(float {x})"
+        ));
+        let bits = t(self, "ub");
+        self.line(&format!("{bits} = bitcast float {r} to i32"));
+        let wide = t(self, "uw");
+        self.line(&format!("{wide} = zext i32 {bits} to i64"));
+        self.write_scalar(rd, &wide);
+        if op == FpUnary::Sqrt {
+            let (rd2, sq, xd, inexact) =
+                (t(self, "us"), t(self, "uq"), t(self, "ud"), t(self, "ui"));
+            self.line(&format!("{rd2} = fpext float {r} to double"));
+            self.line(&format!("{sq} = fmul double {rd2}, {rd2}"));
+            self.line(&format!("{xd} = fpext float {x} to double"));
+            self.line(&format!("{inexact} = fcmp une double {sq}, {xd}"));
+            self.set_inexact(&inexact);
+        }
+        self.unguard(&labels, v, word, src, nzcv, "0");
+    }
+
+    /// `FMAX`, `FMIN`, `FMAXNM` and `FMINNM` of singles that are not NaNs: the larger or the
+    /// smaller, and for two zeros of different signs the positive one for a maximum and the
+    /// negative one for a minimum (equal values differ only in the signs of zeros, so their bits
+    /// are combined). Nothing is raised.
+    #[allow(clippy::too_many_arguments)]
+    fn single_minmax(
+        &mut self,
+        b: BlockId,
+        split: &mut u32,
+        v: ValueId,
+        word: u32,
+        src: &str,
+        nzcv: &str,
+        kind: MinMax,
+        regs: (u8, u8, u8),
+    ) {
+        let (rd, rn, rm) = regs;
+        let maximum = matches!(kind, MinMax::Max | MinMax::MaxNum);
+        let (pa, pb) = (self.vptr(rn, false), self.vptr(rm, false));
+        let a = self.load_to("float", &pa, "ma");
+        let bb = self.load_to("float", &pb, "mb");
+        let ord = self.temp("mo");
+        self.line(&format!("{ord} = fcmp ord float {a}, {bb}"));
+        let fp0 = self.scalar_fpcr_ok(&[&a, &bb]);
+        let go = self.temp("mg");
+        self.line(&format!("{go} = and i1 {ord}, {fp0}"));
+        let labels = self.guard(b, split, &go);
+        let t = |this: &mut Self, h: &str| this.temp(h);
+        let (better, same) = (t(self, "mc"), t(self, "me"));
+        let compare = if maximum { "ogt" } else { "olt" };
+        self.line(&format!("{better} = fcmp {compare} float {a}, {bb}"));
+        self.line(&format!("{same} = fcmp oeq float {a}, {bb}"));
+        let (ia, ib, both, tie) = (t(self, "mi"), t(self, "mj"), t(self, "mk"), t(self, "ml"));
+        self.line(&format!("{ia} = bitcast float {a} to i32"));
+        self.line(&format!("{ib} = bitcast float {bb} to i32"));
+        let combine = if maximum { "and" } else { "or" };
+        self.line(&format!("{both} = {combine} i32 {ia}, {ib}"));
+        self.line(&format!("{tie} = bitcast i32 {both} to float"));
+        let (rest, pick) = (t(self, "mr"), t(self, "mp"));
+        self.line(&format!(
+            "{rest} = select i1 {same}, float {tie}, float {bb}"
+        ));
+        self.line(&format!(
+            "{pick} = select i1 {better}, float {a}, float {rest}"
+        ));
+        let (bits, wide) = (t(self, "mw"), t(self, "mx"));
+        self.line(&format!("{bits} = bitcast float {pick} to i32"));
+        self.line(&format!("{wide} = zext i32 {bits} to i64"));
+        self.write_scalar(rd, &wide);
+        self.unguard(&labels, v, word, src, nzcv, "0");
     }
 
     /// Lower a vector load or store of one or two registers. Returns false when the instruction

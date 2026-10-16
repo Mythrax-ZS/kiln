@@ -65,17 +65,20 @@ on the fast path):
 - *Exact by construction, inline*: register moves, the bitwise operations, `MOVI`, `MVNI`,
   `ORR`/`BIC` with an immediate, `FMOV`, `FABS`, `FNEG`, `FCSEL`, the immediate and
   general-register forms of `FMOV`, `DUP`/`INS` of an element, `ZIP`, `UZP`, `TRN`, `EXT`.
-- *Guarded*: the single-precision `FADD`, `FSUB`, `FMUL`, `FDIV`, `FCMP`, `FCCMP`, `FMADD`, `FMSUB`,
-  `FNMADD`, `FNMSUB`, the vector `FADD`, `FSUB`, `FMUL`, `FMLA`, `FMLS` (also by element, and the
-  scalar forms by element), `FADDP`, `SCVTF`/`UCVTF` of 32-bit integers and `FCVTZS`/`FCVTZU` to a
-  32-bit register. The fast form runs when `FPCR` is zero (or has only flush-to-zero, default
-  NaN and alternative half precision set, and then no operand is a denormal: the architecture would
-  read it as zero and raise `IDC`) and every result is finite and not tiny (zero results only when
+- *Guarded*: the single-precision `FADD`, `FSUB`, `FMUL`, `FDIV`, `FNMUL`, `FMAX`, `FMIN`, `FMAXNM`,
+  `FMINNM`, `FSQRT`, `FRINTN`/`P`/`M`/`Z`/`A`, `FCMP`, `FCCMP`, `FMADD`, `FMSUB`, `FNMADD`,
+  `FNMSUB`, the vector `FADD`, `FSUB`, `FMUL`, `FMLA`, `FMLS` (also by element, and the scalar
+  forms by element), `FADDP`, `SCVTF`/`UCVTF` of 32-bit integers and `FCVTZS`/`FCVTZU` to a 32-bit
+  register. The fast form runs when `FPCR` is zero (or has only flush-to-zero, default NaN and
+  alternative half precision set, and then no operand is a denormal: the architecture would read
+  it as zero and raise `IDC`) and every result is finite and not tiny (zero results only when
   exact); then the host's answer is the architecture's, and the one flag it can raise, inexact, is
   worked out exactly (a sum by error-free transformation, a product, a quotient or a fused sum in
-  double precision, which holds a product of two singles exactly, leaving to the call the one case
-  where rounding twice could differ) so that `FPSR` ends as the soft-float leaves it. NaNs,
-  infinities, denormals, overflow and other rounding modes take the call. The conversions to an
+  double precision, which holds a product of two singles exactly, a root by its square, leaving to
+  the call the one case where rounding twice could differ) so that `FPSR` ends as the soft-float
+  leaves it. NaNs, infinities, denormals, overflow and other rounding modes take the call. The
+  maximum and minimum are for operands that are not NaNs, the roundings to an integral value
+  those that raise nothing (not `FRINTX`/`FRINTI`) of a finite operand. The conversions to an
   integer keep the strict test (`FPCR` zero).
 - *Memory*: the loads and stores of one or two registers of 1 to 16 bytes are 64-bit (or narrower)
   accesses through the same `nx_ld*`/`nx_st*` as the integer ones.
