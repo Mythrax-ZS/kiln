@@ -165,7 +165,7 @@ mod tests {
         assert_eq!(ll.matches("call void @nx_vecmem(").count(), 0, "{ll}");
         // A 128-bit load is two 64-bit loads, each followed by the test of the fault flag.
         assert_eq!(ll.matches("@nx_ld64(ptr %cpu").count(), 2, "{ll}");
-        assert_eq!(ll.matches("icmp ne i32").count(), 2, "{ll}");
+        assert_eq!(ll.matches(", label %fault, label").count(), 2, "{ll}");
     }
 
     #[test]

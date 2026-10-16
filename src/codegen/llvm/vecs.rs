@@ -8,13 +8,14 @@
 //! - register moves, the bitwise operations (`mov v.16b`, `eor`, `bsl`, ...), `FMOV`, `FABS`,
 //!   `FNEG`, `FCSEL`, the immediate and general-register forms of `FMOV`: exact, there is nothing
 //!   to get wrong;
-//! - the single-precision `FADD`, `FSUB`, `FMUL`, `FDIV` and `FCMP`: when `FPCR` is the default,
-//!   the operands are ordinary and the result is finite and not tiny, the host's result is the
-//!   architecture's, and the only flag it can raise is "inexact", which is worked out exactly (a
-//!   sum by error-free transformation, a product or quotient by the exact double-precision
-//!   product), so `FPSR` ends up as the runtime would leave it. Anything else, NaNs, infinities,
-//!   denormals, other rounding or flush modes, overflow, takes the call, which is also the
-//!   result's source of truth in the differential tests;
+//! - the single-precision `FADD`, `FSUB`, `FMUL`, `FDIV` and `FCMP`: when `FPCR` is the default
+//!   (or has only flush-to-zero, default NaN and alternative half precision set, and then no
+//!   operand is a denormal), the operands are ordinary and the result is finite and not tiny, the
+//!   host's result is the architecture's, and the only flag it can raise is "inexact", which is
+//!   worked out exactly (a sum by error-free transformation, a product or quotient by the exact
+//!   double-precision product), so `FPSR` ends up as the runtime would leave it. Anything else,
+//!   NaNs, infinities, denormals, other rounding modes, overflow, takes the call, which is also
+//!   the result's source of truth in the differential tests;
 //! - the loads and stores of one or two registers of 1 to 16 bytes (`LDR`/`STR`/`LDP`/`STP` of
 //!   `B`, `H`, `S`, `D`, `Q`), as 64-bit (or narrower) accesses through the same runtime
 //!   functions the integer ones use.
@@ -35,6 +36,13 @@ use std::fmt::Write;
 const INF: &str = "0x7FF0000000000000";
 const ZERO: &str = "0x0000000000000000";
 const SMALL: &str = "0x3820000000000000";
+/// 2^-126, the smallest normal `float`: anything below it (and not zero) is a denormal.
+const MIN_NORMAL: &str = "0x3810000000000000";
+/// The `FPCR` bits the fast forms accept besides a rounding to nearest: flush-to-zero (bit 24),
+/// default NaN (25) and alternative half precision (26).
+const FPCR_ALLOWED: u32 = 0x0700_0000;
+/// Flush-to-zero: operands that are denormal are read as zero.
+const FPCR_FZ: u32 = 0x0100_0000;
 
 /// How a floating-point or vector instruction is lowered.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -596,6 +604,90 @@ impl Emitter<'_> {
         ));
     }
 
+    /// Is `FPCR` clear but for flush-to-zero, default NaN and alternative half precision (the
+    /// rounding is to nearest), and is flush-to-zero set? A result that is a NaN or a denormal
+    /// takes the call whatever the modes are, so only the operands of flush-to-zero need a look.
+    fn fpcr_modes(&mut self) -> (String, String) {
+        let p = self.ptr(st::FPCR);
+        let w = self.load_to("i32", &p, "fc");
+        let rest = self.temp("f1");
+        self.line(&format!("{rest} = and i32 {w}, {}", !FPCR_ALLOWED as i32));
+        let plain = self.temp("f2");
+        self.line(&format!("{plain} = icmp eq i32 {rest}, 0"));
+        let fz = self.temp("f3");
+        self.line(&format!("{fz} = and i32 {w}, {}", FPCR_FZ as i32));
+        let flushing = self.temp("f4");
+        self.line(&format!("{flushing} = icmp ne i32 {fz}, 0"));
+        (plain, flushing)
+    }
+
+    /// May the fast form of a scalar single-precision operation on `operands` (LLVM values or
+    /// constants) run? `FPCR` is the default, or has only the modes of `FPCR_ALLOWED`, and when
+    /// flush-to-zero is set no operand is a denormal (the architecture reads it as zero).
+    fn scalar_fpcr_ok(&mut self, operands: &[&str]) -> String {
+        self.intrinsic("declare float @llvm.fabs.f32(float)".to_string());
+        let (plain, flushing) = self.fpcr_modes();
+        let mut normal = "true".to_string();
+        for x in operands {
+            let (ax, big, zero, nd, both) = (
+                self.temp("n1"),
+                self.temp("n2"),
+                self.temp("n3"),
+                self.temp("n4"),
+                self.temp("n5"),
+            );
+            self.line(&format!("{ax} = call float @llvm.fabs.f32(float {x})"));
+            self.line(&format!("{big} = fcmp oge float {ax}, {MIN_NORMAL}"));
+            self.line(&format!("{zero} = fcmp oeq float {x}, {ZERO}"));
+            self.line(&format!("{nd} = or i1 {big}, {zero}"));
+            self.line(&format!("{both} = and i1 {normal}, {nd}"));
+            normal = both;
+        }
+        self.fpcr_verdict(&plain, &flushing, &normal)
+    }
+
+    /// The same for the lanes of the vectors `operands`.
+    fn vector_fpcr_ok(&mut self, lanes: u32, operands: &[&str]) -> String {
+        let f = format!("<{lanes} x float>");
+        self.intrinsic(format!(
+            "declare <{lanes} x float> @llvm.fabs.v{lanes}f32(<{lanes} x float>)"
+        ));
+        let (plain, flushing) = self.fpcr_modes();
+        let mut normal = "true".to_string();
+        for x in operands {
+            let (ax, big, zero, nd) = (
+                self.temp("n1"),
+                self.temp("n2"),
+                self.temp("n3"),
+                self.temp("n4"),
+            );
+            self.line(&format!("{ax} = call {f} @llvm.fabs.v{lanes}f32({f} {x})"));
+            self.line(&format!(
+                "{big} = fcmp oge {f} {ax}, {}",
+                splat(lanes, "float", MIN_NORMAL)
+            ));
+            self.line(&format!(
+                "{zero} = fcmp oeq {f} {x}, {}",
+                splat(lanes, "float", ZERO)
+            ));
+            self.line(&format!("{nd} = or <{lanes} x i1> {big}, {zero}"));
+            let all = self.reduce("and", lanes, &nd);
+            let both = self.temp("n5");
+            self.line(&format!("{both} = and i1 {normal}, {all}"));
+            normal = both;
+        }
+        self.fpcr_verdict(&plain, &flushing, &normal)
+    }
+
+    /// `plain` and (`flushing` implies `normal`).
+    fn fpcr_verdict(&mut self, plain: &str, flushing: &str, normal: &str) -> String {
+        let (idle, either, ok) = (self.temp("v1"), self.temp("v2"), self.temp("v3"));
+        self.line(&format!("{idle} = xor i1 {flushing}, true"));
+        self.line(&format!("{either} = or i1 {idle}, {normal}"));
+        self.line(&format!("{ok} = and i1 {plain}, {either}"));
+        ok
+    }
+
     /// Is `FPCR` zero: the rounding to nearest, no flush to zero, no other modes?
     fn default_fpcr(&mut self) -> String {
         let p = self.ptr(st::FPCR);
@@ -701,7 +793,7 @@ impl Emitter<'_> {
         self.line(&format!("{zok} = and i1 {zero}, {exact}"));
         self.line(&format!("{sz} = or i1 {big}, {zok}"));
         self.line(&format!("{ok} = and i1 {fin}, {sz}"));
-        let fp0 = self.default_fpcr();
+        let fp0 = self.scalar_fpcr_ok(&[&a, &bb]);
         let go = t(self, "yg");
         self.line(&format!("{go} = and i1 {ok}, {fp0}"));
         let labels = self.guard(b, split, &go);
@@ -744,7 +836,7 @@ impl Emitter<'_> {
         };
         let ord = self.temp("co");
         self.line(&format!("{ord} = fcmp ord float {a}, {bb}"));
-        let fp0 = self.default_fpcr();
+        let fp0 = self.scalar_fpcr_ok(&[&a, &bb]);
         let go = self.temp("cg");
         self.line(&format!("{go} = and i1 {ord}, {fp0}"));
         let labels = self.guard(b, split, &go);
@@ -1041,6 +1133,8 @@ impl Emitter<'_> {
         };
         let zero_f = splat(lanes, "float", ZERO);
         let zero_d = splat(lanes, "double", "0.0");
+        // The accumulator of a multiply-add is an operand too.
+        let mut accumulator = None;
         let (r, inexact_v, hazard_v) = match op {
             SimdFp::Add | SimdFp::Sub => {
                 let o = if op == SimdFp::Sub {
@@ -1089,6 +1183,7 @@ impl Emitter<'_> {
                 } else {
                     // The accumulator is the destination register as it is now.
                     let acc = self.load_vec(rd, lanes, "float");
+                    accumulator = Some(acc.clone());
                     let dd = t(self, "xc");
                     self.line(&format!("{dd} = fpext {f} {acc} to {d}"));
                     let s = t(self, "xs");
@@ -1177,7 +1272,10 @@ impl Emitter<'_> {
             self.line(&format!("{both} = and i1 {go}, {none}"));
             go = both;
         }
-        let fp0 = self.default_fpcr();
+        let mut inputs = vec![a.clone(), bb.clone()];
+        inputs.extend(accumulator);
+        let inputs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+        let fp0 = self.vector_fpcr_ok(lanes, &inputs);
         let all = t(self, "yg");
         self.line(&format!("{all} = and i1 {go}, {fp0}"));
         let labels = self.guard(b, split, &all);
@@ -1233,7 +1331,8 @@ impl Emitter<'_> {
         self.line(&format!("{back} = fpext {ft} {r} to {dt}"));
         self.line(&format!("{inexact_v} = fcmp une {dt} {back}, {exact}"));
         let any = self.reduce("or", lanes, &inexact_v);
-        let go = self.default_fpcr();
+        // An integer converts to a normal number or zero: flush-to-zero has nothing to flush.
+        let (go, _) = self.fpcr_modes();
         let labels = self.guard(b, split, &go);
         self.store_vec(rd, lanes, "float", lanes * 32, &r);
         self.set_inexact(&any);

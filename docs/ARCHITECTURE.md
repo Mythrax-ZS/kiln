@@ -67,13 +67,15 @@ on the fast path):
   `UZP`, `TRN`, `EXT`.
 - *Guarded*: the single-precision `FADD`, `FSUB`, `FMUL`, `FDIV`, `FCMP`, the vector `FADD`, `FSUB`,
   `FMUL`, `FMLA`, `FMLS` (also by element), `SCVTF`/`UCVTF` of 32-bit integers and `FCVTZS`/`FCVTZU`
-  to a 32-bit register. The fast form runs when `FPCR` is zero and every result is finite and not
-  tiny (zero results only when exact); then the host's answer is the architecture's, and the one
-  flag it can raise, inexact, is worked out exactly (a sum by error-free transformation, a
-  product, a quotient or a fused sum in double precision, which holds a product of two singles
-  exactly, leaving to the call the one case where rounding twice could differ) so that `FPSR`
-  ends as the soft-float leaves it. NaNs, infinities, denormals, overflow, other rounding and flush
-  modes take the call.
+  to a 32-bit register. The fast form runs when `FPCR` is zero (or has only flush-to-zero, default
+  NaN and alternative half precision set, and then no operand is a denormal: the architecture would
+  read it as zero and raise `IDC`) and every result is finite and not tiny (zero results only when
+  exact); then the host's answer is the architecture's, and the one flag it can raise, inexact, is
+  worked out exactly (a sum by error-free transformation, a product, a quotient or a fused sum in
+  double precision, which holds a product of two singles exactly, leaving to the call the one case
+  where rounding twice could differ) so that `FPSR` ends as the soft-float leaves it. NaNs,
+  infinities, denormals, overflow and other rounding modes take the call. The conversions to an
+  integer keep the strict test (`FPCR` zero).
 - *Memory*: the loads and stores of one or two registers of 1 to 16 bytes are 64-bit (or narrower)
   accesses through the same `nx_ld*`/`nx_st*` as the integer ones.
 

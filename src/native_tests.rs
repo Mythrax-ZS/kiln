@@ -541,8 +541,13 @@ fn float_state(g: &mut Gen, base: u64) -> CpuState {
         let rest = u128::from(g.rng.next_u64()) << 32 | u128::from(g.rng.next_u32()) << 96;
         cpu.set_vreg(n, low | rest);
     }
-    if !g.rng.chance(10) {
-        cpu.fpcr = 0;
+    match g.rng.below(10) {
+        0..=5 => cpu.fpcr = 0,
+        // Flush-to-zero, with default NaN and alternative half precision or without them: the fast
+        // forms run under these modes when no operand is a denormal.
+        6..=8 => cpu.fpcr = (1 << 24) | ((g.rng.below(4) as u32) << 25),
+        // What the state was given: any of the writable bits.
+        _ => {}
     }
     if g.rng.chance(2) {
         cpu.fpsr = 0;
