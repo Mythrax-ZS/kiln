@@ -10,6 +10,7 @@
 //! get the names of the functions. A call chain is reported the first time it is seen and again
 //! when it has been seen 10, 100, 1000... times, so a loop that fills a page is one line.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -18,6 +19,17 @@ use std::sync::Mutex;
 const CHAIN: usize = 14;
 /// How many different call chains are told about.
 const MAX_CHAINS: usize = 400;
+
+thread_local! {
+    /// The guest address of the instruction whose store the thread is making, as the store
+    /// helpers of generated code say it (0 when they did not).
+    static PC: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Say which guest instruction the store the thread is about to make belongs to.
+pub fn note_pc(pc: u64) {
+    PC.with(|c| c.set(pc));
+}
 
 #[derive(Default)]
 pub struct Traps {
@@ -97,8 +109,14 @@ impl Traps {
         }
         let value = value.map_or(String::new(), |v| format!(" (value {v:#x})"));
         let chain: Vec<String> = chain.iter().map(|r| format!("+{r:#x}")).collect();
+        let pc = PC.with(Cell::get);
+        let at = if pc == 0 {
+            String::new()
+        } else {
+            format!(" (instruction {pc:#x})")
+        };
         eprintln!(
-            "[trap] write of {len} bytes at {addr:#x}{value} by thread {}, seen {times} times: {}",
+            "[trap] write of {len} bytes at {addr:#x}{value}{at} by thread {}, seen {times} times: {}",
             host::thread_id(),
             chain.join(" ")
         );

@@ -37,12 +37,15 @@ fn skip_or_fail(why: &str) {
     eprintln!("SKIPPED: {why}");
 }
 
-const STACK_TOP: u64 = 0x4010_0000;
+// Above 4 GiB: a title may have gigabytes of `.bss` after its code.
+const STACK_TOP: u64 = 0x1_4010_0000;
 const STACK_SIZE: u64 = 0x10_0000;
-const TLS: u64 = 0x5000_0000;
+const TLS: u64 = 0x1_5000_0000;
 const TLS_SIZE: u64 = 0x4000;
-const SCRATCH: u64 = 0x5100_0000;
+const SCRATCH: u64 = 0x1_5100_0000;
 const SCRATCH_SIZE: u64 = 0x1_0000;
+/// How much of a writable segment the comparison reads back.
+const MAX_COMPARED: u64 = 16 << 20;
 
 struct Lib {
     lib: Library,
@@ -223,7 +226,8 @@ fn real_functions_run_the_same_natively_and_interpreted() {
     ];
     for s in &m.segments {
         if s.perm.write {
-            ranges.push((m.base + s.offset, s.size));
+            // A title may have gigabytes of `.bss`: the first megabytes are compared.
+            ranges.push((m.base + s.offset, s.size.min(MAX_COMPARED)));
         }
     }
     // Random bytes in the scratch area and thread block, once.
@@ -262,7 +266,16 @@ fn real_functions_run_the_same_natively_and_interpreted() {
     let set_counter: Symbol<unsafe extern "C" fn(u64)> = l.sym("nx_rt_set_counter");
     let steps = env_count("KILN_REAL_STEPS", 300_000) as u64;
 
-    let all = std::env::var_os("KILN_REAL_ALL").is_some();
+    // `KILN_REAL_ONLY=<hex address>,...`: just these functions, in this order.
+    let only: Vec<u64> = std::env::var("KILN_REAL_ONLY")
+        .map(|v| {
+            v.split(',')
+                .filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let all = std::env::var_os("KILN_REAL_ALL").is_some() || !only.is_empty();
+    let entries = if only.is_empty() { entries } else { only };
     let functions = if all {
         entries.len()
     } else {
@@ -271,6 +284,7 @@ fn real_functions_run_the_same_natively_and_interpreted() {
     let states = env_count("KILN_REAL_STATES", 3);
     let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut failures = Vec::new();
+    let mut told: Vec<u64> = Vec::new();
     let data_lo = m.base;
     let data_len = m.image.len() as u64;
     for index in 0..functions {
@@ -347,7 +361,9 @@ fn real_functions_run_the_same_natively_and_interpreted() {
                     *tally.entry(key).or_default() += 1;
                 }
                 Some(why) => {
-                    if failures.len() < 10 {
+                    // The first difference of each function, up to forty functions.
+                    if failures.len() < 40 && !told.contains(&entry) {
+                        told.push(entry);
                         failures.push(format!("function {entry:#x}: {why}"));
                     }
                     *tally.entry("MISMATCH").or_default() += 1;

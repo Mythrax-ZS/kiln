@@ -933,3 +933,99 @@ fn lane_moves_and_permutes_match_the_interpreter_natively() {
     let states = env_count("KILN_FLOAT_STATES", 600) / 2;
     check_lane_words(&words, states.max(20), 0xA27E);
 }
+
+/// Opt-in (`KILN_TITLE_DIR`, a folder holding `exefs/`): the distinct instruction words of a
+/// title's code, each run natively and in the interpreter on random states, to find the forms the
+/// two do not agree on. `KILN_REAL_WORDS` (default 20,000) words are sampled. Only counts and the
+/// names of instruction forms are printed; nothing of the title is stored.
+#[test]
+fn the_instruction_words_of_a_title_run_the_same_natively_and_interpreted() {
+    let Some(dir) = std::env::var_os("KILN_TITLE_DIR") else {
+        eprintln!("SKIPPED: KILN_TITLE_DIR is not set");
+        return;
+    };
+    let Some(tc) = toolchain_or_skip() else {
+        return;
+    };
+    let main = std::fs::read(std::path::Path::new(&dir).join("exefs").join("main"))
+        .expect("exefs/main of the title");
+    let loaded = crate::loader::nso::load(
+        &main,
+        "main",
+        crate::loader::module::GUEST_BASE,
+        &crate::loader::nso::LoadOptions::default(),
+    )
+    .expect("the NSO loads");
+    let text = loaded.module.segment_bytes("text").expect("a text segment");
+    let mut words: Vec<u32> = text
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| u32::from_le_bytes(c))
+        .collect();
+    words.sort_unstable();
+    words.dedup();
+    // Straight-line words only: a branch leaves the program for an address nothing maps.
+    words.retain(|&w| !decode(w).is_branch());
+    let mut rng = Rng::new(0x71713);
+    for i in (1..words.len()).rev() {
+        let j = rng.below(i as u64 + 1) as usize;
+        words.swap(i, j);
+    }
+    words.truncate(env_count("KILN_REAL_WORDS", 20_000));
+    let states = env_count("KILN_NATIVE_STATES", 4);
+    let mut g = Gen::new(0x71713);
+    // Per instruction form: how many words differed, and the first one with the difference.
+    let mut forms: std::collections::BTreeMap<String, (usize, u32, String)> = Default::default();
+    let mut checked = 0usize;
+    for chunk in words.chunks(400) {
+        let programs: Vec<Program> = chunk
+            .iter()
+            .map(|&w| Program::new(vec![w, asm::svc(0)]))
+            .collect();
+        let batch = Batch::build(&tc, &programs).unwrap();
+        for (i, p) in programs.iter().enumerate() {
+            let base = batch.base(i);
+            for _ in 0..states {
+                let cpu = g.state_at(base);
+                let data = g.data();
+                let mut expect = run_interpreter_at(base, &p.words, &cpu, &data, 50_000);
+                let mut got = batch.run(i, &cpu, &data);
+                if matches!(expect.outcome, Outcome::Exited) {
+                    expect.cpu.pc = EXIT;
+                }
+                if matches!(got.outcome, Outcome::Exited) {
+                    got.cpu.pc = EXIT;
+                }
+                if let Some(why) = compare(&expect, &got) {
+                    let debug = format!("{:?}", decode(p.words[0]));
+                    let form = debug
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    let entry = forms
+                        .entry(form)
+                        .or_insert_with(|| (0, p.words[0], format!("{debug}: {why}")));
+                    entry.0 += 1;
+                    break;
+                }
+            }
+            checked += 1;
+        }
+    }
+    eprintln!(
+        "{checked} distinct instruction words of the title, {states} states each: {} forms differ",
+        forms.len()
+    );
+    for (form, (count, word, example)) in &forms {
+        eprintln!(
+            "  {form}: {count} words differ, e.g. {word:08x}: {}",
+            example.chars().take(400).collect::<String>()
+        );
+    }
+    assert!(
+        forms.is_empty(),
+        "the native code and the interpreter differ"
+    );
+}

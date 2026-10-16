@@ -84,7 +84,13 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
 - Real title (opt-in, `KILN_TITLE_DIR` = a folder holding `exefs/`): `tests/real_title.rs` checks
   the loader; `tests/real_code.rs` recompiles `main` and compares native with interpreted runs of
   sampled functions (`KILN_REAL_FUNCTIONS`, `KILN_REAL_STATES`, `KILN_REAL_ALL=1` for every
-  function). Only aggregate numbers are printed; nothing from the title is stored.
+  function, `KILN_REAL_ONLY=<hex address>,...` for just those); it says the first difference of
+  each function that differs. A function that asks for entropy or the time differs by nature, and
+  so do the flags and the scratch registers a returning function leaves. The `kiln` unit test
+  `the_instruction_words_of_a_title_run_the_same_natively_and_interpreted` runs the distinct
+  straight-line instruction words of `main` (`KILN_REAL_WORDS` of them, default 20,000, each on
+  `KILN_NATIVE_STATES` random states) both ways and names the forms that differ. Only aggregate
+  numbers and names of instruction forms are printed; nothing from the title is stored.
 - Unicorn differential test sizes: `KILN_DIFF_CASES` replaces the default number of cases of every
   group in `unicorn_diff`, `unicorn_fp` and `unicorn_simd` (the random-words test draws that many
   words).
@@ -237,7 +243,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   those pages: every guest write to them is reported once per call chain (and again at the 10th,
   100th... time) with the thread, the address, the value and the return addresses as offsets in
   the image, which the link map (`KILN_LINK_MAP`) names (`f_<guest address>` is a generated
-  function). A page nobody writes says nothing; a page the guest writes through another address
+  function), and, for the plain stores of generated code, the guest instruction. A page nobody
+  writes says nothing; a page the guest writes through another address
   (an alias) is not seen.
   `pwsh -File tools/game_window.ps1 -ProcessId <pid> [-Capture <png>] [-Keys "F13:200,..."]` takes a
   picture of the program's own window (never of the screen) and posts keys to its message queue;

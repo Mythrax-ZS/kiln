@@ -43,6 +43,7 @@ fn do_load(p: *mut NativeCpu, addr: u64, pc: u64, size: u8, order: Ordering) -> 
 #[inline(never)]
 fn do_store(p: *mut NativeCpu, addr: u64, pc: u64, size: u8, value: u64, order: Ordering) {
     let c = cpu(p);
+    super::trap::note_pc(pc);
     if let Err(k) = rt().store(c.ctl.thread_id, addr, size, u128::from(value), order) {
         record_fault(c, addr, pc, true, k);
     }
