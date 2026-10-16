@@ -40,6 +40,8 @@ pub struct Config {
     pub dump_every: u64,
     /// Stop dumping after this many pictures (`NX_DUMP_COUNT`).
     pub dump_limit: Option<u64>,
+    /// Dump nothing before this presented frame (`NX_DUMP_START`, default 0).
+    pub dump_start: u64,
     /// Dump the first frame that has this many draws or more, with every render target
     /// (`NX_DUMP_BUSY`): finds a busy scene whatever frame number it comes at.
     pub dump_busy: Option<u64>,
@@ -67,6 +69,7 @@ impl Config {
             dump_dir: std::env::var_os("NX_DUMP_FRAMES").map(PathBuf::from),
             dump_every: number("NX_DUMP_EVERY").unwrap_or(1).max(1),
             dump_limit: number("NX_DUMP_COUNT"),
+            dump_start: number("NX_DUMP_START").unwrap_or(0),
             dump_busy: number("NX_DUMP_BUSY"),
             window,
             window_title: std::env::var("NX_WINDOW_TITLE").unwrap_or_else(|_| "kiln".to_string()),
@@ -1178,7 +1181,10 @@ impl Renderer {
         let Some(dir) = config.dump_dir.as_ref() else {
             return Ok(());
         };
-        if !busy && !p.frame.is_multiple_of(config.dump_every) && p.frame != 1 {
+        if !busy
+            && (p.frame < config.dump_start
+                || (!p.frame.is_multiple_of(config.dump_every) && p.frame != 1))
+        {
             return Ok(());
         }
         if config.dump_limit.is_some_and(|n| core.dumped >= n) {
