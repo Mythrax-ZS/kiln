@@ -185,6 +185,27 @@ pub(super) fn report_threads(kernel: &Kernel, label: &str) {
                     detail.push_str(&format!("the word holds {word:#x} now"));
                 }
             }
+            // A thread in a lock or a condition variable says what the mutex and the key hold:
+            // the library of a program keeps counts in the same word as the owner's handle.
+            if imm == 0x1C || imm == 0x1A {
+                let (mutex, key) = if imm == 0x1C {
+                    (
+                        monitor.args[0].load(Ordering::Relaxed),
+                        monitor.args[1].load(Ordering::Relaxed),
+                    )
+                } else {
+                    (monitor.args[1].load(Ordering::Relaxed), 0)
+                };
+                if let Some(word) = kernel.guest_word(mutex) {
+                    if !detail.is_empty() {
+                        detail.push_str(", ");
+                    }
+                    detail.push_str(&format!("the mutex word holds {word:#x} now"));
+                }
+                if let Some(word) = kernel.guest_word(key) {
+                    detail.push_str(&format!(", the key {word:#x}"));
+                }
+            }
             format!(
                 "in {} ({imm:#x}) for {:.1} s, x0..x2 = {:#x} {:#x} {:#x}{}",
                 svc_name(imm).unwrap_or("an unknown call"),
@@ -226,8 +247,9 @@ pub(super) fn report_threads(kernel: &Kernel, label: &str) {
                 String::new()
             };
             format!(
-                "pc {:#x} at its last call{regs}, return addresses {}",
+                "pc {:#x} at its last call, fpcr {:#x}{regs}, return addresses {}",
                 cpu.state.pc,
+                cpu.state.fpcr,
                 frames.join(" ")
             )
         };
@@ -245,7 +267,7 @@ pub(super) fn report_threads(kernel: &Kernel, label: &str) {
         eprintln!("[{label}]   the last calls that name {word:#x} (microseconds since the start):");
         for c in calls {
             eprintln!(
-                "[{label}]     {:>12} thread {} {} {} x0..x3 = {:#x} {:#x} {:#x} {:#x}{}",
+                "[{label}]     {:>12} thread {} {} {} x0..x3 = {:#x} {:#x} {:#x} {:#x}{}, words {:#x} {:#x}",
                 c.at_us,
                 c.thread,
                 svc_name(c.imm).unwrap_or("?"),
@@ -258,7 +280,9 @@ pub(super) fn report_threads(kernel: &Kernel, label: &str) {
                     format!(", result {:#x}", c.result)
                 } else {
                     String::new()
-                }
+                },
+                c.words[0],
+                c.words[1]
             );
         }
     }

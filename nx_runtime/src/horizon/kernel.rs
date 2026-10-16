@@ -201,6 +201,9 @@ pub struct Kernel {
     /// While a watchdog runs: the last mutex, condition variable and address calls of all the
     /// threads, for its report of what happened to the words the threads wait on.
     flight: Option<Mutex<std::collections::VecDeque<Flight>>>,
+    /// The same for the calls on mutexes and condition variables, which are far fewer than the
+    /// ones on addresses and so reach back further.
+    lock_flight: Option<Mutex<std::collections::VecDeque<Flight>>>,
 }
 
 /// How many failed supervisor calls the stop report remembers.
@@ -218,6 +221,9 @@ pub(super) struct Flight {
     pub args: [u64; 4],
     pub done: bool,
     pub result: u64,
+    /// The 8 bytes of guest memory at each of the first two arguments when they are addresses
+    /// (`u64::MAX` when they are not or cannot be read): what the word held at that moment.
+    pub words: [u64; 2],
 }
 
 impl Drop for Kernel {
@@ -457,12 +463,22 @@ impl Kernel {
             recent_errors: Mutex::new(std::collections::VecDeque::new()),
             flight: super::watchdog::requested()
                 .map(|_| Mutex::new(std::collections::VecDeque::with_capacity(FLIGHT_CAPACITY))),
+            lock_flight: super::watchdog::requested()
+                .map(|_| Mutex::new(std::collections::VecDeque::with_capacity(FLIGHT_CAPACITY))),
         })
     }
 
     /// Does the flight recorder run?
     pub(super) fn recording(&self) -> bool {
         self.flight.is_some()
+    }
+
+    /// The first 8 bytes of guest memory at `addr`, if it can be read (the watchdog's view of a
+    /// word that a thread waits on).
+    pub(super) fn guest_word(&self, addr: u64) -> Option<u64> {
+        let lo = self.read_u32(addr)?;
+        let hi = self.read_u32(addr + 4)?;
+        Some(u64::from(lo) | u64::from(hi) << 32)
     }
 
     /// Note a synchronization call in the flight recorder.
@@ -474,11 +490,25 @@ impl Kernel {
         done: bool,
         result: u64,
     ) {
-        if let Some(q) = &self.flight {
+        let ring = if matches!(imm, 0x1A..=0x1D) {
+            &self.lock_flight
+        } else {
+            &self.flight
+        };
+        if let Some(q) = ring {
             let mut q = q.lock().unwrap_or_else(|e| e.into_inner());
             if q.len() >= FLIGHT_CAPACITY {
                 q.pop_front();
             }
+            let word = |a: u64| {
+                if a < 0x10000 {
+                    return u64::MAX;
+                }
+                match (self.read_u32(a), self.read_u32(a + 4)) {
+                    (Some(lo), Some(hi)) => u64::from(lo) | u64::from(hi) << 32,
+                    _ => u64::MAX,
+                }
+            };
             q.push_back(Flight {
                 at_us: self.started.elapsed().as_micros() as u64,
                 thread,
@@ -486,6 +516,7 @@ impl Kernel {
                 args,
                 done,
                 result,
+                words: [word(args[0]), word(args[1])],
             });
         }
     }
@@ -493,18 +524,20 @@ impl Kernel {
     /// The last `last` recorded calls that name one of `addrs` as their first or second argument,
     /// oldest first.
     pub(super) fn flight_about(&self, addrs: &[u64], last: usize) -> Vec<Flight> {
-        let Some(q) = &self.flight else {
-            return Vec::new();
-        };
-        let q = q.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out: Vec<Flight> = q
-            .iter()
-            .rev()
-            .filter(|f| addrs.contains(&f.args[0]) || addrs.contains(&f.args[1]))
-            .take(last)
-            .copied()
-            .collect();
-        out.reverse();
+        let mut out: Vec<Flight> = Vec::new();
+        for ring in [&self.flight, &self.lock_flight].into_iter().flatten() {
+            let q = ring.lock().unwrap_or_else(|e| e.into_inner());
+            out.extend(
+                q.iter()
+                    .rev()
+                    .filter(|f| addrs.contains(&f.args[0]) || addrs.contains(&f.args[1]))
+                    .take(last)
+                    .copied(),
+            );
+        }
+        out.sort_by_key(|f| f.at_us);
+        let skip = out.len().saturating_sub(last);
+        out.drain(..skip);
         out
     }
 
