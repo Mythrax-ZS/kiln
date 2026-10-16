@@ -28,6 +28,12 @@ impl Scene<'_> {
         self.space.read(self.mem, va, out)
     }
 
+    /// Read GPU memory at `va` into the start of `out` as far as it can be read, and say how many
+    /// bytes that is (see [`AddressSpace::read_prefix`]).
+    pub fn read_prefix(&self, va: u64, out: &mut [u8]) -> usize {
+        self.space.read_prefix(self.mem, va, out)
+    }
+
     /// A hash of up to `len` bytes of GPU memory at `va` as they are now, and how many of them
     /// are mapped (see [`AddressSpace::hash`]).
     pub fn hash(&self, va: u64, len: u64) -> (u64, u64) {

@@ -174,22 +174,21 @@ impl Shaders {
 
 /// Read up to `max` bytes at GPU address `va`, as many as are mapped.
 fn read_window(scene: &Scene<'_>, va: u64, max: usize) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut at = va;
-    while out.len() < max {
-        let Some((cpu, avail)) = scene.host_address(at) else {
-            break;
-        };
-        let n = (max - out.len()).min(avail as usize);
-        let start = out.len();
-        out.resize(start + n, 0);
-        if !scene.mem.read(cpu, &mut out[start..]) {
-            out.truncate(start);
-            break;
-        }
-        at += n as u64;
-    }
+    let mut out = vec![0u8; max];
+    let n = scene.read_prefix(va, &mut out);
+    out.truncate(n);
     out
+}
+
+/// Why nothing could be read at `va`: the GPU address is not mapped, or it is and the memory it
+/// maps to cannot be read.
+fn unreadable(scene: &Scene<'_>, va: u64) -> String {
+    match scene.host_address(va) {
+        None => "its GPU address is not mapped".to_string(),
+        Some((cpu, avail)) => format!(
+            "its GPU address maps to {cpu:#x} ({avail:#x} bytes of the mapping are left) and nothing can be read there"
+        ),
+    }
 }
 
 impl Shaders {
@@ -227,6 +226,13 @@ impl Shaders {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(v) => {
                 let bytes = read_window(scene, slot.address, WINDOW);
+                if bytes.is_empty() {
+                    return Err(format!(
+                        "the {name} program at {:#x}: {}",
+                        slot.address,
+                        unreadable(scene, slot.address)
+                    ));
+                }
                 let sph = Sph::parse(&bytes)
                     .map_err(|e| format!("the {name} program at {:#x}: {e}", slot.address))?;
                 let code = &bytes[SPH_BYTES..];
@@ -357,6 +363,12 @@ impl Shaders {
             self.kernels.remove(&(address, block));
         }
         let bytes = read_window(scene, address, WINDOW);
+        if bytes.is_empty() {
+            return Err(format!(
+                "the compute program at {address:#x}: {}",
+                unreadable(scene, address)
+            ));
+        }
         let cfg = Cfg::discover(Code(&bytes));
         if let Some(issue) = cfg.issues.first() {
             return Err(format!(

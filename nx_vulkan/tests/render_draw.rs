@@ -350,6 +350,43 @@ fn a_constant_buffer_bound_past_the_end_of_a_mapping_reads_what_is_mapped() {
 }
 
 #[test]
+fn programs_in_a_mapping_that_runs_past_its_memory_are_read() {
+    use nx_gpu::mem::GuestMemory;
+    use nx_gpu::vm::{map_flags, MapRequest};
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = scene(&pass_through_vertex(), &flat_color_pixel(), 16, target);
+    // The programs are in the last two pages of the memory, mapped as a 64 KiB window the way a
+    // title maps a buffer of a size that is not a whole big page: the rest of the window is not
+    // backed by anything, and a program is read a megabyte at a time (docs/ASSUMPTIONS.md A-069).
+    let window = GPU_BASE + SIZE + 0x10_0000;
+    w.space
+        .map_buffer(&MapRequest {
+            flags: map_flags::FIXED_OFFSET,
+            kind: 0,
+            handle: 2,
+            handle_cpu: CPU_BASE + SIZE - 0x2000,
+            handle_size: 0x2000,
+            page_size: 0,
+            buffer_offset: 0,
+            mapping_size: 0x1_0000,
+            offset: window,
+        })
+        .unwrap();
+    let base = CPU_BASE + SIZE - 0x2000;
+    assert!(w.mem.write(base + VERTEX_PROGRAM, &pass_through_vertex()));
+    assert!(w.mem.write(base + PIXEL_PROGRAM, &flat_color_pixel()));
+    w.set_address(0x1608, window);
+    let (rgba, _) = red_triangle(&mut w, target);
+    assert!(covered(&rgba) > 0, "nothing was drawn");
+    for px in rgba.as_chunks::<4>().0.iter().filter(|p| p[3] != 0) {
+        assert_eq!(px, &[255, 0, 0, 255]);
+    }
+}
+
+#[test]
 fn a_viewport_without_width_draws_nothing() {
     if vulkan().is_none() {
         return;

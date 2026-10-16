@@ -363,15 +363,9 @@ fn dump_compute_program(cx: &Cx<'_>, address: u64) {
     {
         return;
     }
-    let mut code = Vec::new();
-    let mut chunk = [0u8; 0x100];
-    while code.len() < 0x8000
-        && cx
-            .space
-            .read(cx.mem, address + code.len() as u64, &mut chunk)
-    {
-        code.extend_from_slice(&chunk);
-    }
+    let mut code = vec![0u8; 0x8000];
+    let n = cx.space.read_prefix(cx.mem, address, &mut code);
+    code.truncate(n);
     let dir = std::path::PathBuf::from(dir);
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join(format!("COMPUTE_{address:x}.bin")), code);

@@ -501,6 +501,36 @@ impl AddressSpace {
         true
     }
 
+    /// Read GPU memory into the start of `out` as far as it can be read, and say how many bytes
+    /// that is. A mapping can run past the memory behind it (a buffer of 0x134000 bytes mapped as
+    /// 0x140000; docs/ASSUMPTIONS.md A-069), and [`GuestMemory::read`] refuses a run of which any
+    /// byte is not there, so such a run is read again page by page up to the first page that is
+    /// not.
+    pub fn read_prefix(&self, mem: &dyn GuestMemory, mut va: u64, out: &mut [u8]) -> usize {
+        let page = u64::from(SMALL_PAGE);
+        let mut done = 0;
+        while done < out.len() {
+            let Some((cpu, avail)) = self.translate(va) else {
+                break;
+            };
+            let n = (out.len() - done).min(avail as usize);
+            if !mem.read(cpu, &mut out[done..done + n]) {
+                let mut at = 0;
+                while at < n {
+                    let from = cpu + at as u64;
+                    let step = ((from | (page - 1)) + 1 - from).min((n - at) as u64) as usize;
+                    if !mem.read(from, &mut out[done + at..done + at + step]) {
+                        return done + at;
+                    }
+                    at += step;
+                }
+            }
+            done += n;
+            va += n as u64;
+        }
+        done
+    }
+
     /// Write GPU memory, across mappings that touch. `false` when any byte is unmapped.
     pub fn write(&self, mem: &dyn GuestMemory, mut va: u64, data: &[u8]) -> bool {
         let mut done = 0;
@@ -939,6 +969,45 @@ mod tests {
             "nothing is mapped there"
         );
         assert_eq!(a.hash(&mem, 0x500_0000, 0).1, 0);
+    }
+
+    #[test]
+    fn a_read_takes_what_the_memory_behind_a_mapping_holds() {
+        // A buffer of two pages mapped as three (A-069): the third page is mapped and not there.
+        let mem = Direct::new(0x1000_0000, 0x2000);
+        let mut a = AddressSpace::new();
+        let mut r = req(1, 0x1000_0000, 0x2000);
+        r.flags = map_flags::FIXED_OFFSET;
+        r.offset = 0x500_0000;
+        r.mapping_size = 0x3000;
+        a.map_buffer(&r).unwrap();
+        let pattern: Vec<u8> = (0..0x2000u32).map(|i| (i * 5 + i / 97) as u8).collect();
+        assert!(mem.write(0x1000_0000, &pattern));
+
+        let mut whole = vec![0xEEu8; 0x3000];
+        assert!(
+            !a.read(&mem, 0x500_0000, &mut whole),
+            "the strict read fails"
+        );
+        assert_eq!(a.read_prefix(&mem, 0x500_0000, &mut whole), 0x2000);
+        assert_eq!(&whole[..0x2000], &pattern[..]);
+        assert!(
+            whole[0x2000..].iter().all(|&b| b == 0xEE),
+            "the rest is left as it was"
+        );
+
+        // Starting inside the last page that is there, and past it.
+        let mut tail = vec![0u8; 0x1000];
+        assert_eq!(a.read_prefix(&mem, 0x500_1800, &mut tail), 0x800);
+        assert_eq!(&tail[..0x800], &pattern[0x1800..]);
+        assert_eq!(a.read_prefix(&mem, 0x500_2000, &mut tail), 0);
+        assert_eq!(a.read_prefix(&mem, 0x600_0000, &mut tail), 0, "unmapped");
+
+        // A read that is all there is the same as the strict one, and an empty one reads nothing.
+        let mut inside = vec![0u8; 0x1100];
+        assert_eq!(a.read_prefix(&mem, 0x500_0F00, &mut inside), 0x1100);
+        assert_eq!(&inside[..], &pattern[0xF00..]);
+        assert_eq!(a.read_prefix(&mem, 0x500_0000, &mut []), 0);
     }
 
     #[test]

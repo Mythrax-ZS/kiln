@@ -1344,18 +1344,7 @@ impl Textures {
 /// Read as much of `out.len()` bytes at GPU address `va` as is mapped, in order; the number of
 /// bytes read (the rest of `out` is left as it was).
 pub(super) fn read_partial(scene: &Scene<'_>, va: u64, out: &mut [u8]) -> usize {
-    let mut done = 0;
-    while done < out.len() {
-        let Some((cpu, avail)) = scene.host_address(va + done as u64) else {
-            break;
-        };
-        let n = (out.len() - done).min(avail as usize);
-        if !scene.mem.read(cpu, &mut out[done..done + n]) {
-            break;
-        }
-        done += n;
-    }
-    done
+    scene.read_prefix(va, out)
 }
 
 #[cfg(test)]

@@ -80,21 +80,9 @@ pub unsafe fn hash_raw(ptr: *const u8, len: usize) -> u64 {
 
 /// Read up to `max` bytes at GPU address `va`, as many as are mapped.
 pub fn read_window(cx: &Cx<'_>, va: u64, max: usize) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut at = va;
-    while out.len() < max {
-        let Some((cpu, avail)) = cx.space.translate(at) else {
-            break;
-        };
-        let n = (max - out.len()).min(avail as usize);
-        let start = out.len();
-        out.resize(start + n, 0);
-        if !cx.mem.read(cpu, &mut out[start..]) {
-            out.truncate(start);
-            break;
-        }
-        at += n as u64;
-    }
+    let mut out = vec![0u8; max];
+    let n = cx.space.read_prefix(cx.mem, va, &mut out);
+    out.truncate(n);
     out
 }
 
