@@ -49,6 +49,13 @@ const VOICE_OUT: usize = 0x10;
 const CHANNEL_IN: usize = CHANNEL_SIZE;
 const EFFECT_IN: usize = 0xC0;
 const EFFECT_OUT: usize = 0x10;
+/// From revision 9 on an effect's answer is 0x90 bytes: the state, then the statistics of a
+/// limiter (docs/ASSUMPTIONS.md A-127).
+const EFFECT_OUT_V2: usize = 0x90;
+const EFFECT_V2_REVISION: u32 = 9;
+/// What the first byte of an effect's answer says: still in use, or removed.
+const EFFECT_IN_USE: u8 = 3;
+const EFFECT_REMOVED: u8 = 4;
 const SINK_OUT: usize = 0x20;
 const PERFORMANCE_OUT: usize = 0x10;
 const BEHAVIOR_OUT: usize = 0xB0;
@@ -141,6 +148,9 @@ struct Core {
     /// What the renderer has done with each effect so far (an `EffectUse`): effects are not run,
     /// but a program that removes one waits for the renderer to say it is gone.
     effects: Vec<EffectUse>,
+    /// `NX_TRACE_AUDIO`: what each effect entry said (type, new, enabled) and what was answered
+    /// (removed) the last time it was reported, so that only changes are said.
+    effect_said: Vec<Option<(u8, bool, bool, bool)>>,
     mixer: Mixer,
     /// The interleaved stereo samples of the last frame, and whether it made any (it needs mixes
     /// and a device sink to play through).
@@ -177,6 +187,7 @@ impl Core {
             params,
             voices: (0..params.voice_count).map(|_| Voice::default()).collect(),
             effects: vec![EffectUse::Invalid; params.effect_count as usize],
+            effect_said: vec![None; params.effect_count as usize],
             mixer: Mixer::default(),
             audio: Vec::new(),
             sounding: false,
@@ -254,7 +265,12 @@ impl Core {
         let channels_at = pools_at + pools;
         let voices_at = channels_at + channels;
 
-        let effect_out = self.params.effect_count as usize * EFFECT_OUT;
+        let effect_entry = if revision_number(revision) >= EFFECT_V2_REVISION {
+            EFFECT_OUT_V2
+        } else {
+            EFFECT_OUT
+        };
+        let effect_out = self.params.effect_count as usize * effect_entry;
         let sinks_out = self.params.sink_count as usize * SINK_OUT;
         let out_pools = pool_count * MEMPOOL_OUT;
         let out_voices = voice_count * VOICE_OUT;
@@ -396,7 +412,18 @@ impl Core {
             } else {
                 *usage != EffectUse::New
             };
-            out[at + i * EFFECT_OUT] = u8::from(removed);
+            out[at + i * effect_entry] = if removed {
+                EFFECT_REMOVED
+            } else {
+                EFFECT_IN_USE
+            };
+            if self.trace && self.effect_said[i] != Some((kind, is_new, enabled, removed)) {
+                self.effect_said[i] = Some((kind, is_new, enabled, removed));
+                eprintln!(
+                    "[audio] effect {i}: type {kind}, new {is_new}, enabled {enabled}: answered {}",
+                    if removed { "removed" } else { "in use" }
+                );
+            }
             if active && *usage != EffectUse::Invalid {
                 *usage = if enabled {
                     EffectUse::Enabled
@@ -604,12 +631,16 @@ impl Service for Device {
     }
 }
 
+/// The number of a revision: its top byte is a character, '1' to '9', then ':' for 10, ';' for 11.
+fn revision_number(revision: u32) -> u32 {
+    (revision >> 24).wrapping_sub(u32::from(b'0'))
+}
+
 /// A program that asks for a revision newer than the layouts known here stops the run: its update
 /// buffers would be read wrongly.
 fn check_revision(params: &Parameters) -> Result<(), Stop> {
     let tag_ok = params.revision & 0x00FF_FFFF == REVISION_TAG;
-    // The revision number is the top byte as a character: '1' to '9', then ':' for 10, ';' for 11.
-    let number = (params.revision >> 24).wrapping_sub(u32::from(b'0'));
+    let number = revision_number(params.revision);
     match (tag_ok, number) {
         (true, n) if (1..=LAST_KNOWN_REVISION).contains(&n) => Ok(()),
         _ => Err(Stop(format!(
@@ -881,9 +912,14 @@ mod tests {
         base
     }
 
-    /// The state the answer gives for effect `i` (renderers with 3 pools and 2 voices).
+    /// The state the answer gives for effect `i` (renderers with 3 pools and 2 voices) when the
+    /// answer has `entry` bytes for each effect.
+    fn effect_state_of(out: &[u8], i: usize, entry: usize) -> u8 {
+        out[HEADER_SIZE + 3 * MEMPOOL_OUT + 2 * VOICE_OUT + i * entry]
+    }
+
     fn effect_state(out: &[u8], i: usize) -> u8 {
-        out[HEADER_SIZE + 3 * MEMPOOL_OUT + 2 * VOICE_OUT + i * EFFECT_OUT]
+        effect_state_of(out, i, EFFECT_OUT)
     }
 
     #[test]
@@ -900,15 +936,55 @@ mod tests {
         );
         // In use, and an empty slot is not reported removed.
         let out = core.run(&on).unwrap();
-        assert_eq!([effect_state(&out, 0), effect_state(&out, 1)], [0, 0]);
-        assert_eq!(effect_state(&core.run(&on).unwrap(), 0), 0);
+        assert_eq!(
+            [effect_state(&out, 0), effect_state(&out, 1)],
+            [EFFECT_IN_USE, EFFECT_IN_USE]
+        );
+        assert_eq!(effect_state(&core.run(&on).unwrap(), 0), EFFECT_IN_USE);
         // Switched off: the frame before still had it, the next says it is gone.
-        assert_eq!(effect_state(&core.run(&off).unwrap(), 0), 0);
-        assert_eq!(effect_state(&core.run(&off).unwrap(), 0), 1);
+        assert_eq!(effect_state(&core.run(&off).unwrap(), 0), EFFECT_IN_USE);
+        assert_eq!(effect_state(&core.run(&off).unwrap(), 0), EFFECT_REMOVED);
         assert_eq!(
             effect_state(&core.run(&off).unwrap(), 0),
-            1,
+            EFFECT_REMOVED,
             "and it stays gone"
+        );
+    }
+
+    #[test]
+    fn from_revision_9_an_effect_has_0x90_bytes_in_the_answer() {
+        // The title that stopped for ever in a scene it left (A-127) asked for revision 11: the
+        // library reads the effects of the answer 0x90 bytes apart, and found the states of the
+        // third effect and the ones after it in the sections that follow.
+        let revision = 0x3b56_4552;
+        let mut core = Core::new(Parameters {
+            revision,
+            effect_count: 3,
+            ..params()
+        });
+        let base = update(revision, &[0; 3], &[voice(vec![]), voice(vec![])]);
+        let on = with_effects(
+            base.clone(),
+            &[(6, true, true), (6, true, true), (6, true, true)],
+        );
+        let off = with_effects(
+            base,
+            &[(6, false, false), (6, false, true), (6, false, false)],
+        );
+        let out = core.run(&on).unwrap();
+        assert_eq!(u32_at(&out, 0x14), 3 * EFFECT_OUT_V2 as u32);
+        assert_eq!(u32_at(&out, 0x3C) as usize, out.len());
+        assert_eq!(
+            out.len(),
+            HEADER_SIZE + 3 * 0x10 + 2 * 0x10 + 3 * 0x90 + 0x20 + 0x10 + 0xB0
+        );
+        let states = |out: &[u8]| [0, 1, 2].map(|i| effect_state_of(out, i, EFFECT_OUT_V2));
+        assert_eq!(states(&out), [EFFECT_IN_USE; 3]);
+        // Two of them are switched off: they are gone an update later, the third is not.
+        assert_eq!(states(&core.run(&off).unwrap()), [EFFECT_IN_USE; 3]);
+        assert_eq!(
+            states(&core.run(&off).unwrap()),
+            [EFFECT_REMOVED, EFFECT_IN_USE, EFFECT_REMOVED]
         );
     }
 
@@ -921,17 +997,21 @@ mod tests {
             &[(4, true, true), (0, false, false), (0, false, false)],
         );
         let out = core.update(&fresh, &|_, _| false, false).unwrap();
-        assert_eq!(effect_state(&out, 0), 0, "a new effect is in use");
+        assert_eq!(
+            effect_state(&out, 0),
+            EFFECT_IN_USE,
+            "a new effect is in use"
+        );
         // The program switches it off, but without the DSP running nothing makes it removed.
         let off = with_effects(
             base,
             &[(4, false, false), (0, false, false), (0, false, false)],
         );
         let out = core.update(&off, &|_, _| false, false).unwrap();
-        assert_eq!(effect_state(&out, 0), 0);
+        assert_eq!(effect_state(&out, 0), EFFECT_IN_USE);
         // Started, the update after the next one says it is gone.
-        assert_eq!(effect_state(&core.run(&off).unwrap(), 0), 0);
-        assert_eq!(effect_state(&core.run(&off).unwrap(), 0), 1);
+        assert_eq!(effect_state(&core.run(&off).unwrap(), 0), EFFECT_IN_USE);
+        assert_eq!(effect_state(&core.run(&off).unwrap(), 0), EFFECT_REMOVED);
     }
 
     #[test]
