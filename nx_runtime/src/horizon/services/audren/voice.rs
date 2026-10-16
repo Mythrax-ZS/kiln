@@ -583,13 +583,9 @@ mod tests {
         let mut voice = Voice::default();
         assert!(voice.play_frame(&v, 48_000, 24, &mem));
         // One source sample for two output samples: 0, 500, 1000, 1500 ...
-        for n in 0..19 {
+        for (n, got) in voice.out[0][..19].iter().enumerate() {
             let want = n as f32 * 500.0 / 32768.0;
-            assert!(
-                (voice.out[0][n] - want).abs() < 1e-5,
-                "{n}: {}",
-                voice.out[0][n]
-            );
+            assert!((got - want).abs() < 1e-5, "{n}: {got}");
         }
         // After the last sample the value stays (nothing to interpolate with), then there is
         // silence, and the buffer was consumed.
