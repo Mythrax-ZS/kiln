@@ -277,6 +277,24 @@ fn a_handle_that_names_no_header_stops_the_draw_with_what_it_named() {
     assert!(err.contains("header 100 of 8"), "{err}");
 }
 
+#[test]
+fn a_slot_whose_header_is_all_zeros_samples_zeros() {
+    if vulkan().is_none() {
+        return;
+    }
+    // A title leaves the slots of a material it does not use with handle 0, whose header (entry 0
+    // of the pool) is all zeros: the draw goes on, and what it samples there is zero.
+    let target = GPU_BASE + 0x20_0000;
+    let w = textured(8, target, header(0x08, 2, 4, 4, TEXELS), nearest_sampler());
+    put_rgba_texture(&w, |_, _| [200, 100, 50, 255]);
+    put_words(&w, HEADERS, &[0; 8]);
+    w.put(HANDLES, &(2u32 << 20).to_le_bytes());
+    let mut r = Renderer::new(RenderConfig::default());
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    assert_eq!(&rgba[..4], [0, 0, 0, 0]);
+}
+
 fn clear_to(r: &mut Renderer, w: &mut World, rgba: [f32; 4], rect: Option<(u32, u32, u32, u32)>) {
     for (i, v) in rgba.iter().enumerate() {
         w.set(0xd80 + 4 * i as u32, v.to_bits());

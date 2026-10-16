@@ -869,6 +869,8 @@ pub struct Textures {
     pub trace: bool,
     /// How many bytes of memory a texture takes (see [`Textures::span`]), by header and shape.
     spans: FastMap<(Tic, Shape), Option<u64>>,
+    /// What a slot whose header is all zeros samples, by kind and by whether it is a depth.
+    nulls: FastMap<(Kind, bool), Image>,
 }
 
 /// A texture's `checked` that matches no frame: it is compared with memory again.
@@ -913,6 +915,15 @@ impl Textures {
         used: &TextureUse,
         overlays: &[Overlay],
     ) -> Result<(Bound, Vec<Copy>), String> {
+        if tic.0 == [0; 8] {
+            // A slot the title leaves empty: its header is all zeros (docs/ASSUMPTIONS.md A-178).
+            let bound = Bound {
+                view: self.null_view(vk, frame, used)?,
+                sampler: self.sampler(vk, tsc, used.shadow)?,
+                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            };
+            return Ok((bound, Vec::new()));
+        }
         let shape = shape_of(&tic, used)?;
         let view = self.texture(vk, frame, scene, tic, shape)?;
         let mut copies = Vec::new();
@@ -960,6 +971,122 @@ impl Textures {
             sampler: self.sampler(vk, tsc, used.shadow)?,
             layout,
         })
+    }
+
+    /// The view of one texel of zeros, of the kind a shader samples as `used` (a depth for a
+    /// shader that compares): what a slot whose header is all zeros reads.
+    fn null_view(
+        &mut self,
+        vk: &Vk,
+        frame: &mut Frame,
+        used: &TextureUse,
+    ) -> Result<vk::ImageView, String> {
+        let kind = match (used.dim, used.arrayed) {
+            (Dim::D1, _) => Kind::D1,
+            (Dim::D2, false) => Kind::D2,
+            (Dim::D2, true) => Kind::D2Array,
+            (Dim::Cube, false) => Kind::Cube,
+            (Dim::Cube, true) => Kind::CubeArray,
+            (Dim::D3, _) => Kind::D3,
+        };
+        if let Some(image) = self.nulls.get(&(kind, used.shadow)) {
+            return Ok(image.view);
+        }
+        let (view_type, layers) = match kind {
+            Kind::D1 => (vk::ImageViewType::TYPE_1D, 1),
+            Kind::D2 => (vk::ImageViewType::TYPE_2D, 1),
+            Kind::D2Array => (vk::ImageViewType::TYPE_2D_ARRAY, 1),
+            Kind::Cube => (vk::ImageViewType::CUBE, 6),
+            Kind::CubeArray => (vk::ImageViewType::CUBE_ARRAY, 6),
+            Kind::D3 => (vk::ImageViewType::TYPE_3D, 1),
+        };
+        let format = if used.shadow {
+            vk::Format::D32_SFLOAT
+        } else {
+            vk::Format::R8G8B8A8_UNORM
+        };
+        let image = vk.create_image(ImageInfo {
+            format,
+            width: 1,
+            height: 1,
+            depth: 1,
+            layers,
+            levels: 1,
+            usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            view_type,
+            components: vk::ComponentMapping::default(),
+        })?;
+        let aspect = aspect_of(format);
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: aspect,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: layers,
+        };
+        let barrier = |from, to, src, dst| {
+            vk::ImageMemoryBarrier::default()
+                .old_layout(from)
+                .new_layout(to)
+                .src_access_mask(src)
+                .dst_access_mask(dst)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image.image)
+                .subresource_range(range)
+        };
+        let cmd = frame.upload_cmd(vk)?;
+        // SAFETY: the upload command buffer is recording; the image was just made.
+        unsafe {
+            vk.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                )],
+            );
+            if used.shadow {
+                vk.device.cmd_clear_depth_stencil_image(
+                    cmd,
+                    image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearDepthStencilValue::default(),
+                    &[range],
+                );
+            } else {
+                vk.device.cmd_clear_color_image(
+                    cmd,
+                    image.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue::default(),
+                    &[range],
+                );
+            }
+            vk.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier(
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::SHADER_READ,
+                )],
+            );
+        }
+        let view = image.view;
+        self.nulls.insert((kind, used.shadow), image);
+        Ok(view)
     }
 
     /// The sampler of a header. A shader that compares against a depth needs a sampler that does
@@ -1335,6 +1462,9 @@ impl Textures {
     pub fn destroy(&mut self, vk: &Vk) {
         for (_, t) in self.map.drain() {
             vk.destroy_image(t.image);
+        }
+        for (_, image) in self.nulls.drain() {
+            vk.destroy_image(image);
         }
         for (_, s) in self.samplers.drain() {
             // SAFETY: nothing uses the sampler any more.
