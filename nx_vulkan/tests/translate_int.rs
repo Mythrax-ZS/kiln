@@ -733,6 +733,57 @@ fn iadd_with_cc_sets_the_flags_and_csetp_tests_them() {
 }
 
 #[test]
+fn iscadd_with_cc_sets_the_flags_of_the_addition_of_the_shifted_operand() {
+    let Some(vk) = vulkan() else { return };
+    let mut inputs = random_states(200, 331);
+    // Shifted operands that carry and overflow, and sums that are zero.
+    for (a, b) in [
+        (0x2000_0000u32, 0x8000_0000u32),
+        (0x1000_0000, 0x7FFF_FFFF),
+        (0x0000_0003, 0u32.wrapping_sub(24)),
+        (0, 0),
+        (u32::MAX, 1),
+    ] {
+        let mut s = State::default();
+        s.regs[1] = a;
+        s.regs[2] = b;
+        inputs.push(s);
+    }
+    for (shift, negate_b) in [(3u64, false), (0, false), (31, false), (2, true)] {
+        for code in [2u64, 10, 17, 21, 22, 23, 1, 4, 6] {
+            let mut add = Enc::op(Op::IscaddReg)
+                .rd(3)
+                .ra(1)
+                .rb(2)
+                .field(39, 5, shift)
+                .bit(47, true);
+            if negate_b {
+                add = add.bit(48, true);
+            }
+            let program = [add.build(), csetp(0, code).build(), exit(Guard::ALWAYS)];
+            let out = run(&vk, &program, &inputs, &[]);
+            for (inp, got) in inputs.iter().zip(&out) {
+                let a = inp.regs[1] << shift;
+                let b = inp.regs[2];
+                let (want, flags) = if negate_b {
+                    (a.wrapping_sub(b), add_flags(a, !b, true))
+                } else {
+                    (a.wrapping_add(b), add_flags(a, b, false))
+                };
+                assert_eq!(got.regs[3], want, "{a:#x} {b:#x} shift {shift}");
+                assert_eq!(
+                    got.preds & 1 != 0,
+                    condition(code, flags).unwrap(),
+                    "condition {code} after ({:#x} << {shift}) {} {b:#x}",
+                    inp.regs[1],
+                    if negate_b { "-" } else { "+" }
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn a_subtraction_with_cc_sets_the_flags_of_a_minus_b() {
     let Some(vk) = vulkan() else { return };
     let mut inputs = random_states(200, 317);

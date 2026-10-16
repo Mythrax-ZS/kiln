@@ -752,9 +752,16 @@ pub(super) fn set_add_flags(
     tx.write_flag(inst, flags.s, negative);
 }
 
+/// `ISCADD`: `rd = (ra << shift) + rb`, with `.CC` the flags of that addition (as `IADD.CC` sets
+/// them; docs/ASSUMPTIONS.md A-107).
 fn iscadd(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
     let is32 = opc == Op::Iscadd32iImm32;
-    no_cc(tx, inst, if is32 { 52 } else { 47 })?;
+    let cc = inst.bit(if is32 { 52 } else { 47 });
+    let (neg_a, neg_b) = if is32 {
+        (false, false)
+    } else {
+        (inst.bit(49), inst.bit(48))
+    };
     let mut a = tx.read(inst.ra());
     let mut b = src_b(tx, inst)?;
     let shift = if is32 {
@@ -762,18 +769,32 @@ fn iscadd(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
     } else {
         inst.bits(39, 5)
     } as u32;
-    if !is32 {
-        if inst.bit(49) {
-            a = tx.ineg(a);
-        }
-        if inst.bit(48) {
-            b = tx.ineg(b);
-        }
+    if cc && neg_a {
+        return tx.fail("ISCADD with a negated first operand and the carry flag");
+    }
+    if neg_a {
+        a = tx.ineg(a);
     }
     let s = tx.c32(shift);
     let shifted = tx.shl(a, s);
-    let r = tx.iadd(shifted, b);
-    tx.write(inst, inst.rd(), r);
+    if !cc {
+        if neg_b {
+            b = tx.ineg(b);
+        }
+        let r = tx.iadd(shifted, b);
+        tx.write(inst, inst.rd(), r);
+        return Ok(());
+    }
+    // A subtraction with the carry flag is a + !b + 1.
+    let cin = if neg_b {
+        b = tx.not(b);
+        Some(tx.ctrue())
+    } else {
+        None
+    };
+    let (sum, carry) = add_carry(tx, shifted, b, cin);
+    tx.write(inst, inst.rd(), sum);
+    set_add_flags(tx, inst, shifted, b, sum, carry, false);
     Ok(())
 }
 
