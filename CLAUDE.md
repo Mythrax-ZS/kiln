@@ -124,7 +124,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   and macro call (`NX_TRACE_GPU_WINDOW=<first frame>:<last frame>[:<level>]` does so only while those
   frames are shown); `NX_TRACE_REGISTER=<hex byte offset>[,...]` prints every write to those 3D registers
   (with the draw count and the macro it came from) and `NX_TRACE_MACRO=<id>` every call of that macro
-  with the writes it makes and its code, once; `NX_MAX_FRAMES=<n>` ends the run after `n` presented
+  with the writes it makes and its code, once; `NX_TRACE_2D=1` prints every copy of the 2D engine
+  with its surfaces and rectangles (A-165); `NX_MAX_FRAMES=<n>` ends the run after `n` presented
   frames; `NX_SAVE_DIR=<dir>` is where save data goes (default `./nx_save`). `kiln symbols --exefs <dir> [--match <text>]
   [<address>...]` names the function around an address, for reading the return addresses a stop
   report ends with.

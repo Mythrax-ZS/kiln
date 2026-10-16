@@ -16,6 +16,7 @@ use crate::render::{Backend, Clear, Draw, Scene, Source};
 use crate::shaders::Inventory;
 use crate::state::{CbufBindings, Regs};
 use crate::syncpt::Syncpoints;
+use crate::twod;
 use crate::vm::AddressSpace;
 use std::collections::BTreeMap;
 
@@ -64,6 +65,8 @@ pub struct Stats {
     pub inline_bytes: u64,
     /// Compute launches.
     pub compute_launches: u64,
+    /// Copies made with the 2D engine.
+    pub blits: u64,
     /// The shader programs the draws used.
     pub shaders: Inventory,
     /// What the renderer could not do (when the run goes on past that): the message and how often.
@@ -123,6 +126,9 @@ impl Stats {
         }
         if self.compute_launches > 0 {
             s.push_str(&format!("  compute launches: {}\n", self.compute_launches));
+        }
+        if self.blits > 0 {
+            s.push_str(&format!("  2D copies: {}\n", self.blits));
         }
         let d = &self.draws;
         s.push_str(&format!(
@@ -326,6 +332,13 @@ fn traced_register(class_num: u32, method: u32) -> bool {
     !list.is_empty() && list.contains(&(method * 4))
 }
 
+/// `NX_TRACE_2D` in the environment: print every copy made with the 2D engine.
+fn trace_2d() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NX_TRACE_2D").is_some())
+}
+
 /// `NX_TRACE_COMPUTE` in the environment: print every compute launch and its descriptor.
 fn trace_compute() -> bool {
     use std::sync::OnceLock;
@@ -502,6 +515,9 @@ impl Engine {
                 _ => {}
             }
         }
+        if self.class == class::TWOD && method * 4 == twod::reg::PIXELS_FROM_MEMORY_SRC_Y0_INT {
+            self.blit_2d(cx)?;
+        }
         // A launch: the descriptor `SEND_PCAS_A` named is scheduled (bit 1 of the signal; bit 0
         // only invalidates what was cached of descriptors).
         if self.class == class::COMPUTE
@@ -511,6 +527,28 @@ impl Engine {
             self.launch_compute(cx, data)?;
         }
         Ok(())
+    }
+
+    /// A copy was started on the 2D engine: describe it and give it to the renderer.
+    fn blit_2d(&mut self, cx: &mut Cx<'_>) -> Result<(), String> {
+        let blit = Regs(&self.regs).blit();
+        cx.stats.blits += 1;
+        if cx.level >= 1 || trace_2d() {
+            eprintln!("[gpu] 2D copy {}: {blit:?}", cx.stats.blits);
+        }
+        let Some(backend) = cx.backend.as_mut() else {
+            return Ok(());
+        };
+        let scene = Scene {
+            regs: Regs(&self.regs),
+            cbufs: &self.cbufs,
+            mem: cx.mem,
+            space: cx.space,
+        };
+        match backend.blit(&scene, &blit) {
+            Ok(()) => Ok(()),
+            Err(why) => cx.renderer_failed("a 2D copy", why),
+        }
     }
 
     /// A compute launch was signalled: read the descriptor and give the launch to the renderer.

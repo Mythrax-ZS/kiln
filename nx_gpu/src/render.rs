@@ -10,6 +10,7 @@
 use crate::compute::Dispatch;
 use crate::mem::GuestMemory;
 use crate::state::{CbufBindings, Regs};
+pub use crate::twod::Blit;
 use crate::vm::AddressSpace;
 
 /// What a renderer reads the world with: the registers of the 3D engine, the constant buffers the
@@ -159,6 +160,12 @@ pub trait Backend: Send {
     /// pools) and the memory; what the program writes is in memory when this returns.
     fn dispatch(&mut self, _scene: &Scene<'_>, _dispatch: &Dispatch) -> Result<(), String> {
         Err("this renderer does not run compute programs".to_string())
+    }
+
+    /// A copy made with the 2D engine. The scene holds the register file of that engine; what is
+    /// copied is in memory, or in a render target of the renderer, when this returns.
+    fn blit(&mut self, _scene: &Scene<'_>, _blit: &Blit) -> Result<(), String> {
+        Err("this renderer does not copy surfaces".to_string())
     }
 }
 

@@ -32,6 +32,7 @@ pub mod render;
 pub mod shaders;
 pub mod state;
 pub mod syncpt;
+pub mod twod;
 pub mod vm;
 
 pub use error::{NvError, NvResult};

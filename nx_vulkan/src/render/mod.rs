@@ -9,6 +9,7 @@
 mod blit;
 mod compute;
 mod convert;
+mod copy2d;
 mod debug;
 #[cfg(feature = "window")]
 mod display;
@@ -26,7 +27,7 @@ use debug::Debug;
 use frame::Frame;
 use nx_gpu::compute::Dispatch;
 use nx_gpu::draw_state::Layout;
-use nx_gpu::render::{Backend, Clear, Draw, Present, Scene};
+use nx_gpu::render::{Backend, Blit, Clear, Draw, Present, Scene};
 use std::path::PathBuf;
 use targets::{Key, Targets, Tiling};
 
@@ -1145,6 +1146,10 @@ impl Backend for Renderer {
 
     fn present(&mut self, p: &Present) -> Result<(), String> {
         self.present_command(p)
+    }
+
+    fn blit(&mut self, scene: &Scene<'_>, blit: &Blit) -> Result<(), String> {
+        self.core().and_then(|core| core.copy_surface(scene, blit))
     }
 
     fn dispatch(&mut self, scene: &Scene<'_>, dispatch: &Dispatch) -> Result<(), String> {
