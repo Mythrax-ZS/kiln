@@ -1097,7 +1097,12 @@ impl Textures {
                 raw.len()
             );
         }
-        if let Some(dir) = std::env::var_os("NX_DUMP_TEXTURES") {
+        // `NX_DUMP_TEXTURES_BELOW=<bytes>`: only the textures whose memory is smaller than that.
+        let small_enough = std::env::var("NX_DUMP_TEXTURES_BELOW")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_none_or(|limit| raw.len() < limit);
+        if let Some(dir) = std::env::var_os("NX_DUMP_TEXTURES").filter(|_| small_enough) {
             // The bytes the memory held, as they are (the pictures are made level by level below).
             let _ = std::fs::create_dir_all(&dir);
             let path = std::path::Path::new(&dir).join(format!(
@@ -1160,7 +1165,7 @@ impl Textures {
                         tic.srgb(),
                     );
                 }
-                if let Some(dir) = std::env::var_os("NX_DUMP_TEXTURES") {
+                if let Some(dir) = std::env::var_os("NX_DUMP_TEXTURES").filter(|_| small_enough) {
                     // `NX_DUMP_TEXTURES=<dir>`: every layer and level of each texture made, as a
                     // picture (floats are clamped), for looking at what the memory held.
                     let (w, h) = ((width >> level).max(1), (height >> level).max(1));

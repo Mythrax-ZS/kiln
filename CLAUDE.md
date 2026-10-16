@@ -173,7 +173,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   `NX_VULKAN_VALIDATE=1` turns the validation layer on; `NX_SHADER_DUMP=<dir>` writes the programs
   draws use and the compute programs launched, as `COMPUTE_<address>.bin` without a header (read
   them with `cargo run --release -p nx_shader --example sass -- <file>`; the `audit` example lists
-  what the translator lacks). To find why a frame is wrong: `NX_DUMP_BUSY=<draws>` dumps the first
+  what the translator lacks and the `translate` example translates a dump and runs `spirv-val` on
+  it, a `COMPUTE_*` one too). To find why a frame is wrong: `NX_DUMP_BUSY=<draws>` dumps the first
   frame with that many draws and every target, `NX_TRACE_AFTER_BUSY=1` traces the frame after it
   (what `NX_TRACE_DRAWS` does), `NX_DUMP_PASSES=<dir>` writes a picture of each pass of a traced
   frame, `NX_DUMP_DRAWS=<dir>` with `NX_DUMP_FROM=<n>` and `NX_DUMP_UNTIL=<n>` one after each
@@ -189,7 +190,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   `NX_DEBUG_PROBE_REGS=<hex program address>:<hex offset>:<r>,<r>,<r>` makes that program paint the
   values of three registers before the instruction at the offset (with `NX_PROBE_EXTREME` these name
   the pixels that go wrong, the program and the instruction). `NX_DUMP_TEXTURES=<dir>` writes every layer
-  and level of each texture made as a picture, and its memory as it was (`.raw`); `NX_TRACE_TEXTURES=1`
+  and level of each texture made as a picture, and its memory as it was (`.raw`;
+  `NX_DUMP_TEXTURES_BELOW=<bytes>` keeps to the textures whose memory is smaller); `NX_TRACE_TEXTURES=1`
   also says which texels of a floating-point texture are not numbers or huge and, in a traced frame, lists the cube maps
   the texture header pool holds. `NX_INPUT_SCRIPT="<frame>
   <Action> [<frames>];..."` (or a file) presses actions of a keymap at presented frame numbers, for
