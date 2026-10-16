@@ -62,14 +62,23 @@ chosen, a story narration, its first plaza with the whole cast (a castle, hills,
 characters lit and in color), a cutscene of a giant face above the cast, a golden transition effect
 and its first course, with scripted input (`NX_INPUT_SCRIPT`). A run of 7,200 presented frames ended at
 its frame limit with no draw and no compute launch failed, and the 100 frames from frame 4,800 on took
-2.9 to 3.5 s on the RTX 5070 Ti (3,300 draws a frame in the plaza). Looking at its frames found what
+2.9 to 3.5 s on the RTX 5070 Ti (3,300 draws a frame in the plaza). With a game that had progress
+saved, a run of 15,900 presented frames (7 minutes, scripted input) went from its title through the
+map of its first world and a course card into a course (a tree, a pipe, blocks, enemies, the
+counters) and back to the map after the lives ran out, with no draw failed and nothing stalled
+(frames dumped every 500 were looked at). That run first stopped twice at the course, and both causes
+are fixed: the audio renderer answered an effect with the layout of an older revision, so the title
+waited for ever for effects that were gone (A-127), and the pixels of a render target drawn to a
+few frames earlier were put over data that the title had stored in the same memory (A-171).
+Looking at its frames found what
 the code had wrong: the range of clip-space depth is the register that says so (docs/ASSUMPTIONS.md
 A-096), the copies of the 2D engine were dropped (A-165), programs in the last megabyte of a mapping
 were not read (A-168), some compute and pixel programs branch on the condition code or use shared memory
 (A-169, A-170), and a render target that nothing drew to for a while lost its pixels before they reached
 the memory that a later draw samples (A-171), which left the text of an interface blank (also in the
-first title). What is not right: the leaves that fall in some of its courses have black blobs (a lit
-material that comes out black, cause not found) and its sound was not checked. Every program cut out
+first title). What is not right: the leaves that fell in the course after the plaza had black blobs
+in one run (a lit material that came out black, cause not found; the frames of the saved game's
+course that were looked at show none) and its sound was not checked. Every program cut out
 of the shader archives of the two titles that looks like one translates to SPIR-V that `spirv-val`
 accepts (23,341 of 23,348 candidates; five are not programs and two use an attribute pointer form that
 is not translated). Nothing here is a claim that a game is playable.

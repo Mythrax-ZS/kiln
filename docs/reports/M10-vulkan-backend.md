@@ -281,6 +281,13 @@ RTX 5070 Ti (3,300 draws a frame in the plaza; the renderer thread is busy for t
 per 100 frames the draws spent 0.8 s on textures, of which 0.4 s writing targets back to memory,
 0.5 s on the passes and 0.1 s on descriptors). Its sound was not looked at.
 
+With a game that had progress saved, a run of 15,900 presented frames (420 s, scripted input,
+about 1,000 draws a frame in the course and 36 frames a second) went from the title through the
+map of its first world and a course card into a course (a tree, a pipe, blocks, enemies, the
+counters of coins and lives), and back to the map with a character's speech after the lives ran
+out; no draw failed and nothing stalled. Frames dumped every 500 were looked at (the course, the
+cards, the map). The run had stopped twice at that course before the two entries below.
+
 What it showed, each with a test and an entry in `docs/ASSUMPTIONS.md`:
 
 - **The range of clip-space depth is a register of its own** (A-096): it is bit 0 of
@@ -304,6 +311,20 @@ What it showed, each with a test and an entry in `docs/ASSUMPTIONS.md`:
   title's first area, which the dumped frames had shown nearly black, now shows its stairs, railings
   and character, and its counters their icons and numbers; the second title's environment probes, which
   are drawn once, stopped reading as garbage (A-166).
+- **The audio renderer answered the effects with an older layout** (A-127, corrected): the second
+  title asks for revision 11, from revision 9 on the answer for an effect is 0x90 bytes (the
+  state, then the statistics of a limiter) and the state is 3 for in use and 4 for removed. With
+  entries of 0x10 bytes the audio library of the title read the states of its third effect and
+  the ones after it from the sections that follow, found none removed, and the scene it left
+  (the first course, entered with a saved game) polled ten effects every 5 ms for ever: the run
+  stopped presenting frames at frame ~1,550. Found by reading the live process (the list of the
+  title's effects and the busy flag of each) and the audio library inside its own binary.
+- **A stale render target overwrote data of the title** (A-171, extended): a target drawn to a
+  frame or two before was written to memory when a texture over the same memory was read, over
+  data the title had put there meanwhile (8 KiB of zeros over the descriptors of a graphics
+  buffer), and about 60 s into the first course a worker thread read a null pointer there. The
+  pixels of a target are now written only when the memory is still as the target found it or
+  left it, found by trapping the guest's and the renderer's writes to that memory.
 - **A request to send the play reports** (A-072) stopped the run of the second title after about 9,700
   frames; it is accepted now.
 - **Found by running the programs the shader archives hold**: `ISCADD.CC` (A-107), a program that
@@ -313,10 +334,11 @@ What it showed, each with a test and an entry in `docs/ASSUMPTIONS.md`:
   accepts; five are not programs and two use an attribute pointer form (`AL2P`, `IPA.IDX`) that is
   not translated.
 
-What is not right in it: the leaves that fall in some of its courses have black blobs (a few a
-frame): each is one draw of a lit material program whose result comes out black while its albedo
-sample is fine. The cause was not found; `NX_DEBUG_PROBE_REGS` narrowed it to the lighting
-accumulation of that program.
+What is not right in it: the leaves that fell in the course after the plaza had black blobs in
+one run (a few a frame): each was one draw of a lit material program whose result came out black
+while its albedo sample was fine. The cause was not found; `NX_DEBUG_PROBE_REGS` narrowed it to the
+lighting accumulation of that program. The frames looked at of the course of the saved game show
+no such blobs.
 
 ## What is not done, and what is not checked
 
