@@ -497,6 +497,8 @@ pub fn texture_format(components: u32, data_type: u32, srgb: bool) -> Option<Tex
         0x2A => (F::X8_D24_UNORM_PACK32, one, 4),
         // ZF32: 32-bit floating point depth, sampled as a depth image.
         0x2F => (F::D32_SFLOAT, one, 4),
+        // Z16: 16-bit depth, in memory as plain unsigned 16-bit values.
+        0x3A => (F::D16_UNORM, one, 2),
         _ => return None,
     };
     tf(format, block, bytes)
@@ -1777,6 +1779,7 @@ mod tests {
             texture_format(0x2A, 2, false).unwrap().vk,
             F::X8_D24_UNORM_PACK32
         );
+        assert_eq!(texture_format(0x3A, 2, false).unwrap().vk, F::D16_UNORM);
         // The header a title makes for S8Z24 whose shader reads the second component into x, y
         // and z: the depth, which the depth view has first.
         let s8z24 = tic_with(&[

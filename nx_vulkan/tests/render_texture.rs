@@ -510,6 +510,23 @@ fn sampled_depth(r: &mut Renderer, w: &World, target: u64) -> u8 {
 }
 
 #[test]
+fn a_16_bit_depth_target_is_sampled_as_a_texture_by_a_later_pass() {
+    if vulkan().is_none() {
+        return;
+    }
+    let depth = GPU_BASE + 0x60_0000;
+    let target = GPU_BASE + 0x20_0000;
+    // Z16 as a zeta format (0x13) and as a texture format (0x3A).
+    let mut w = textured(8, target, header(0x3A, 2, 8, 8, depth), nearest_sampler());
+    let mut r = Renderer::new(RenderConfig::default());
+    depth_target(&mut w, depth, 8, 0x13);
+    clear_depth(&mut r, &mut w, 0.5);
+    w.set(0x1538, 0);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    assert!(sampled_depth(&mut r, &w, target).abs_diff(128) <= 1);
+}
+
+#[test]
 fn a_depth_target_is_sampled_as_a_texture_by_a_later_pass() {
     if vulkan().is_none() {
         return;
