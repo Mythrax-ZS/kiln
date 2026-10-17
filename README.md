@@ -134,7 +134,9 @@ command line in a window: pick a game's already extracted folder (the one that h
 `romfs`, or a homebrew `.nro`) or drop it on the window, choose how hard the compiler works, and
 press Recompile. The output of `kiln` streams into the window; the finished game appears in the
 Library, which keeps one folder per game and the settings each is run with (window and sound, keys, frame limit, save data
-and RomFS locations, the logging and GPU trace switches, extra environment variables), and starts
+and RomFS locations, the logging and GPU trace switches, extra environment variables), shows each game with a picture
+(`icon.png` or `icon.jpg` in its folder: chosen with the Icon button, or copied from an `icon*` PNG or JPEG beside the
+input when it is recompiled; otherwise its initial), and starts
 the game (drawn in a window with the sound on, unless the settings say otherwise) with the output shown beside them. The Settings screen names the `kiln` program, the C
 compiler and the runtime library to use; the header shows whether each was found. The GUI finds
 `kiln` beside itself or on the `PATH`. It reads no keys and opens no NSP, XCI or NCA files, as

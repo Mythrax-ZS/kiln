@@ -4,9 +4,11 @@ use super::{central, empty_state, setting_row};
 use crate::app::{App, Target};
 use crate::game::{self, Game, RunSettings};
 use crate::theme::{self, Icon};
+use eframe::egui::epaint::RectShape;
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, CornerRadius, DragValue, FontFamily, FontId, Frame, Label,
-    Margin, Panel, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, Ui,
+    Margin, Panel, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, TextureHandle,
+    Ui,
 };
 use std::path::PathBuf;
 
@@ -29,16 +31,32 @@ fn tile_color(name: &str) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
-fn paint_tile(painter: &egui::Painter, rect: Rect, name: &str) {
+/// A game's tile: its picture, cropped to a square, or else its initial on a color of its own.
+fn paint_tile(painter: &egui::Painter, rect: Rect, name: &str, icon: Option<&TextureHandle>) {
+    let radius = CornerRadius::same((rect.width() * 0.24) as u8);
+    if let Some(icon) = icon {
+        let [w, h] = icon.size();
+        let (w, h) = (w as f32, h as f32);
+        // The middle square of a picture that is not square.
+        let (x, y) = (
+            (1.0 - (h / w).min(1.0)) / 2.0,
+            (1.0 - (w / h).min(1.0)) / 2.0,
+        );
+        let uv = Rect::from_min_max(pos2(x, y), pos2(1.0 - x, 1.0 - y));
+        painter.add(RectShape::filled(rect, radius, Color32::WHITE).with_texture(icon.id(), uv));
+        painter.rect_stroke(
+            rect,
+            radius,
+            Stroke::new(1.0, theme::BORDER_STRONG),
+            StrokeKind::Inside,
+        );
+        return;
+    }
     let c = tile_color(name);
-    painter.rect_filled(
-        rect,
-        CornerRadius::same((rect.width() * 0.24) as u8),
-        theme::mix(c, Color32::BLACK, 0.35),
-    );
+    painter.rect_filled(rect, radius, theme::mix(c, Color32::BLACK, 0.35));
     painter.rect_stroke(
         rect,
-        CornerRadius::same((rect.width() * 0.24) as u8),
+        radius,
         Stroke::new(1.0, theme::alpha(c, 160)),
         StrokeKind::Inside,
     );
@@ -142,7 +160,11 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let (tile, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
-                    paint_tile(ui.painter(), tile, &game.meta.name);
+                    let icon = game
+                        .icon
+                        .as_deref()
+                        .and_then(|p| theme::picture_texture(ui.ctx(), p));
+                    paint_tile(ui.painter(), tile, &game.meta.name, icon.as_ref());
                     ui.vertical(|ui| {
                         ui.add_space(2.0);
                         ui.label(theme::bold(&game.meta.name, 25.0));
@@ -181,6 +203,18 @@ impl App {
                         .clicked()
                     {
                         action = Some(Action::Relink);
+                    }
+                    let icon_button = theme::button(ui, Some(Icon::File), "Icon").on_hover_text(
+                        if game.icon.is_some() {
+                            "Choose another picture for the game (PNG or JPEG); right-click to go back to its initial"
+                        } else {
+                            "Choose a picture for the game (PNG or JPEG)"
+                        },
+                    );
+                    if icon_button.clicked() {
+                        action = Some(Action::Icon);
+                    } else if icon_button.secondary_clicked() && game.icon.is_some() {
+                        action = Some(Action::RemoveIcon);
                     }
                     theme::right(ui, |ui| {
                         if theme::button_ex(
@@ -252,6 +286,13 @@ impl App {
             Some(Action::Stop) => self.stop_game(),
             Some(Action::Folder) => self.reveal(&game.dir),
             Some(Action::Relink) => self.relink(&game.dir),
+            Some(Action::Icon) => {
+                self.pick_file(Target::GameIcon, "Picture", &["png", "jpg", "jpeg"])
+            }
+            Some(Action::RemoveIcon) => {
+                game::remove_icon(&game.dir);
+                self.rescan();
+            }
             Some(Action::Delete) => self.confirm_delete = Some(game.dir.clone()),
             None => {}
         }
@@ -264,6 +305,8 @@ enum Action {
     Stop,
     Folder,
     Relink,
+    Icon,
+    RemoveIcon,
     Delete,
 }
 
@@ -303,7 +346,11 @@ fn game_card(ui: &mut Ui, g: &Game, selected: bool, running: bool) -> (bool, boo
         pos2(rect.left() + 14.0, rect.center().y - 25.0),
         vec2(50.0, 50.0),
     );
-    paint_tile(painter, tile, &g.meta.name);
+    let icon = g
+        .icon
+        .as_deref()
+        .and_then(|p| theme::picture_texture(ui.ctx(), p));
+    paint_tile(painter, tile, &g.meta.name, icon.as_ref());
     let x = tile.right() + 14.0;
     let title = painter.layout_no_wrap(
         g.meta.name.clone(),

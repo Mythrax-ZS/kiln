@@ -36,6 +36,8 @@ pub enum Target {
     SaveDir,
     GameRomfs,
     ShaderDump,
+    /// A picture for the selected game's tile.
+    GameIcon,
 }
 
 pub struct BuildRun {
@@ -273,6 +275,14 @@ impl App {
                 self.settings.runtime_lib = s;
                 self.save_settings();
                 self.probe_toolchain();
+            }
+            Target::GameIcon => {
+                if let Some(g) = self.selected_game() {
+                    match game::set_icon(&g.dir, &path) {
+                        Ok(_) => self.rescan(),
+                        Err(e) => self.tell(e, Status::Bad),
+                    }
+                }
             }
             Target::SaveDir | Target::GameRomfs | Target::ShaderDump => {
                 if let Some(g) = self.selected_game_mut() {
@@ -520,6 +530,14 @@ impl App {
             };
             if let Err(e) = game::write_meta(&dir, &meta) {
                 self.build_console.error(e);
+            }
+            // A picture beside the input becomes the game's icon, unless it has one already.
+            if game::icon_path(&dir).is_none() {
+                if let Some(picture) = game::icon_beside(&plan.input) {
+                    if let Err(e) = game::set_icon(&dir, &picture) {
+                        self.build_console.error(e);
+                    }
+                }
             }
             self.build_console
                 .info(format!("Done in {}.", game::human_duration(seconds)));

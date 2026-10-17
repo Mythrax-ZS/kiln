@@ -544,6 +544,73 @@ pub fn write_meta(dir: &Path, meta: &GameMeta) -> Result<(), String> {
     Ok(())
 }
 
+/// The names a game's icon may have in its folder, in the order they are looked for.
+pub const ICON_NAMES: [&str; 3] = ["icon.png", "icon.jpg", "icon.jpeg"];
+
+/// The picture shown for a game: `icon.png`, `icon.jpg` or `icon.jpeg` in its folder.
+pub fn icon_path(dir: &Path) -> Option<PathBuf> {
+    ICON_NAMES.iter().map(|n| dir.join(n)).find(|p| p.is_file())
+}
+
+/// A picture beside a game's input, to copy into its folder: `icon.png`, `icon.jpg` or
+/// `icon.jpeg`, else any `icon*` file that is a PNG or a JPEG (a dump tool writes the console's
+/// JPEG icon as `icon_<language>.dat`).
+pub fn icon_beside(input: &Input) -> Option<PathBuf> {
+    let dir = match input {
+        Input::Exefs { exefs, .. } => exefs.parent()?,
+        Input::Nro(p) => p.parent()?,
+    };
+    if let Some(p) = icon_path(dir) {
+        return Some(p);
+    }
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                .is_some_and(|n| n.starts_with("icon"))
+                && p.is_file()
+                && picture_name(p).is_some()
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+/// `icon.png` or `icon.jpg` by the first bytes of the file, `None` for anything else.
+fn picture_name(path: &Path) -> Option<&'static str> {
+    let mut head = [0u8; 4];
+    let mut f = std::fs::File::open(path).ok()?;
+    std::io::Read::read_exact(&mut f, &mut head).ok()?;
+    match head {
+        [0x89, b'P', b'N', b'G'] => Some("icon.png"),
+        [0xFF, 0xD8, _, _] => Some("icon.jpg"),
+        _ => None,
+    }
+}
+
+/// Copy `picture` into `dir` as the game's icon, in place of the one it had. Says what the
+/// copy is called, or why the file is not a PNG or a JPEG picture.
+pub fn set_icon(dir: &Path, picture: &Path) -> Result<PathBuf, String> {
+    let name = picture_name(picture)
+        .ok_or_else(|| format!("{} is not a PNG or JPEG picture", picture.display()))?;
+    let bytes =
+        std::fs::read(picture).map_err(|e| format!("reading {}: {e}", picture.display()))?;
+    remove_icon(dir);
+    let to = dir.join(name);
+    std::fs::write(&to, bytes).map_err(|e| format!("writing {}: {e}", to.display()))?;
+    Ok(to)
+}
+
+/// Take a game's icon away: its tile shows its initial again.
+pub fn remove_icon(dir: &Path) {
+    for n in ICON_NAMES {
+        let _ = std::fs::remove_file(dir.join(n));
+    }
+}
+
 /// A game of the library.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Game {
@@ -551,6 +618,8 @@ pub struct Game {
     pub meta: GameMeta,
     pub exe: PathBuf,
     pub exe_size: u64,
+    /// Its picture, when its folder holds one ([`icon_path`]).
+    pub icon: Option<PathBuf>,
 }
 
 impl Game {
@@ -614,6 +683,7 @@ pub fn scan(root: &Path) -> Vec<Game> {
         }
         let exe_size = file_size(&exe);
         games.push(Game {
+            icon: icon_path(&dir),
             dir,
             meta,
             exe,
@@ -695,6 +765,67 @@ mod tests {
     fn touch(p: &Path) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, b"x").unwrap();
+    }
+
+    #[test]
+    fn an_icon_is_copied_by_what_its_bytes_say_and_taken_away_again() {
+        let dir = temp("icon");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("art.dat"), [0x89, b'P', b'N', b'G', 1, 2, 3]).unwrap();
+        std::fs::write(src.join("photo.bin"), [0xFF, 0xD8, 0xFF, 0xE0, 9]).unwrap();
+        std::fs::write(src.join("note.txt"), b"not a picture").unwrap();
+        let game = dir.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        assert_eq!(icon_path(&game), None);
+        assert_eq!(
+            set_icon(&game, &src.join("art.dat")).unwrap(),
+            game.join("icon.png")
+        );
+        assert_eq!(icon_path(&game), Some(game.join("icon.png")));
+        // A JPEG takes the place of the PNG.
+        assert_eq!(
+            set_icon(&game, &src.join("photo.bin")).unwrap(),
+            game.join("icon.jpg")
+        );
+        assert!(!game.join("icon.png").exists());
+        assert_eq!(icon_path(&game), Some(game.join("icon.jpg")));
+        let err = set_icon(&game, &src.join("note.txt")).unwrap_err();
+        assert!(err.contains("not a PNG or JPEG"), "{err}");
+        assert_eq!(icon_path(&game), Some(game.join("icon.jpg")), "kept");
+        remove_icon(&game);
+        assert_eq!(icon_path(&game), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_icon_beside_an_input_is_an_icon_file_that_is_a_picture() {
+        let dir = temp("icon_beside");
+        let exefs = dir.join("exefs");
+        touch(&exefs.join("main"));
+        let input = Input::Exefs {
+            exefs: exefs.clone(),
+            romfs: None,
+        };
+        assert_eq!(icon_beside(&input), None);
+        std::fs::write(dir.join("icon_AmericanEnglish.dat"), b"junk").unwrap();
+        assert_eq!(icon_beside(&input), None, "not a picture");
+        std::fs::write(
+            dir.join("icon_AmericanEnglish.dat"),
+            [0xFF, 0xD8, 0xFF, 0xDB],
+        )
+        .unwrap();
+        assert_eq!(
+            icon_beside(&input),
+            Some(dir.join("icon_AmericanEnglish.dat"))
+        );
+        std::fs::write(dir.join("icon.png"), [0x89, b'P', b'N', b'G']).unwrap();
+        assert_eq!(
+            icon_beside(&input),
+            Some(dir.join("icon.png")),
+            "a plain icon comes first"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

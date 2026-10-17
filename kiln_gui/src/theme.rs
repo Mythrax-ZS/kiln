@@ -10,6 +10,7 @@ use eframe::egui::{
     Frame, Layout, Margin, Painter, Rect, Response, RichText, Sense, Shape, Stroke, StrokeKind,
     TextEdit, TextStyle, Ui,
 };
+use std::path::Path;
 use std::sync::Arc;
 
 pub const BG: Color32 = Color32::from_rgb(0x0d, 0x10, 0x16);
@@ -921,6 +922,34 @@ fn art_texture(
         egui::ColorImage::from_rgba_unmultiplied([image.width, image.height], &image.rgba),
         egui::TextureOptions::NEAREST,
     );
+    ctx.data_mut(|d| d.insert_temp(id, texture.clone()));
+    texture
+}
+
+/// The picture in the file at `path` (PNG or JPEG) as a texture, made once for each state of the
+/// file and kept in the context; `None` when the file cannot be read as a picture. A large
+/// picture is shrunk to fit 512 by 512 first.
+pub fn picture_texture(ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let id = egui::Id::new(("kiln-picture", path, modified));
+    if let Some(texture) = ctx.data(|d| d.get_temp::<Option<egui::TextureHandle>>(id)) {
+        return texture;
+    }
+    let texture = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| image::load_from_memory(&bytes).ok())
+        .map(|picture| {
+            let picture = picture.thumbnail(512, 512).to_rgba8();
+            let (w, h) = picture.dimensions();
+            ctx.load_texture(
+                path.to_string_lossy(),
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    picture.as_raw(),
+                ),
+                egui::TextureOptions::LINEAR,
+            )
+        });
     ctx.data_mut(|d| d.insert_temp(id, texture.clone()));
     texture
 }

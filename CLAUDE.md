@@ -18,7 +18,9 @@ Crates:
 - `nx_vulkan` (`nx_vulkan/`): the Vulkan device, the compute harness the translator is tested
   with, and the renderer (a `Backend`) with the ASTC decoder (`ash`, loaded at run time).
 - `kiln_gui` (`kiln_gui/`): the desktop front end (`egui`); it runs `kiln` and the games as
-  processes. Run `cargo run -p kiln_gui`; `KILN_GUI_SCREENSHOT=<png>` saves its window. Its look (the
+  processes. Run `cargo run -p kiln_gui`; `KILN_GUI_SCREENSHOT=<png>` saves its window. A game's
+  tile shows `icon.png`/`icon.jpg` from its folder (the Library's Icon button, or an `icon*` picture
+  beside the input, copied when it is recompiled), else its initial. Its look (the
   icon, the mascot Cinder, the lettering) is pixel art in `kiln_gui/src/brand.rs`; `cargo run -p
   kiln_gui --example brand` writes `assets/brand/` and `dist/linux/kiln.png` from it, and
   `kiln_gui/build.rs` puts `assets/brand/kiln.ico` into `kiln-gui.exe`.

@@ -1593,6 +1593,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1730,6 +1732,7 @@ name = "kiln_gui"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "image",
  "png",
  "rfd",
  "serde",
