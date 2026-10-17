@@ -223,7 +223,10 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   runs without a person (the frame rate decides when a menu is ready: a run that is 15 times faster
   needs the press 15 times later). Never `NX_DUMP_FRAMES` without `NX_DUMP_EVERY` for a long run.
 - Window and input: `NX_WINDOW=1` (with `NX_RENDERER=vulkan`) shows the frames in a window
-  (`NX_WINDOW_SIZE=<w>x<h>`, `NX_WINDOW_TITLE`, `NX_PRESENT_MODE=fifo|mailbox|immediate`); no test
+  (`NX_WINDOW_SIZE=<w>x<h>`, `NX_WINDOW_TITLE`, `NX_PRESENT_MODE=mailbox|fifo|immediate`: mailbox by
+  default, each refresh of the screen showing the newest frame; `fifo` queues frames and plays them
+  one per refresh, which stutters on a screen that is not 60 or 120 Hz; `immediate` shows a frame at
+  once and may tear); no test
   opens one. A program shows at most 60 frames a second (60 divided by the swap interval it asks
   for, as the console's display does, A-181), in a window or not; `NX_UNPACED=1` lets it go as fast
   as it can, for headless runs with scripted input. The window opens when the program starts (not when it first draws, seconds later),

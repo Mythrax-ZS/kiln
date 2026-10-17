@@ -1,8 +1,9 @@
 //! Showing displayed buffers in a window: a swapchain, and the blit of the buffer's crop into the
 //! image it hands out (`blit.rs`).
 //!
-//! The present mode is FIFO unless `NX_PRESENT_MODE` says `mailbox` or `immediate`; with FIFO the
-//! wait for a free image paces the guest at the display's refresh rate, as a console's vsync does.
+//! The present mode is mailbox (the newest frame at each refresh of the screen) unless the surface
+//! has none or `NX_PRESENT_MODE` says `fifo` or `immediate`; the guest is paced to 60 frames a
+//! second by the display service (A-181), not by the window.
 
 use super::blit;
 use super::targets::Target;
@@ -72,10 +73,14 @@ impl Display {
             ));
         }
         let swapchain_loader = khr::swapchain::Device::new(&vk.instance, &vk.device);
+        // Mailbox by default: each refresh of the screen shows the newest frame, and frames that
+        // come close together are never played back one per refresh as a FIFO queue plays them
+        // (which, on a screen that does not refresh 60 times a second, shows as stutter). FIFO
+        // when the surface has no mailbox, or when asked for.
         let mode = match std::env::var("NX_PRESENT_MODE").as_deref() {
             Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
-            Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
-            _ => vk::PresentModeKHR::FIFO,
+            Ok("fifo") => vk::PresentModeKHR::FIFO,
+            _ => vk::PresentModeKHR::MAILBOX,
         };
         // SAFETY: plain object creation; destroyed in `destroy`.
         unsafe {
