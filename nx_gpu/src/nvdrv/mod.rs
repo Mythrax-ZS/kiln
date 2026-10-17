@@ -75,6 +75,8 @@ pub struct Nvdrv {
     next_token: EventToken,
     signals: Vec<Signal>,
     trace: bool,
+    /// The media engines (decoder.rs, [`crate::media`]).
+    pub media: crate::media::Media,
 }
 
 impl Nvdrv {
@@ -88,6 +90,7 @@ impl Nvdrv {
             next_token: 1,
             signals: Vec::new(),
             trace: std::env::var_os("NX_TRACE_GPU").is_some(),
+            media: crate::media::Media::new(),
         }
     }
 

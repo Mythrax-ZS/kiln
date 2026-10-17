@@ -49,6 +49,12 @@ impl Nvdrv {
             // u32 handle, u32 pad, u64 address (out), u32 size (out), u32 flags (out)
             FREE => {
                 let freed = self.gpu.nvmap.free(args.u32(0))?;
+                if freed.addr != 0 {
+                    // The decoder's frames in that memory go with it.
+                    self.media
+                        .vp9
+                        .forget(freed.addr..freed.addr + u64::from(freed.size));
+                }
                 args.set_u64(8, freed.addr);
                 args.set_u32(16, freed.size);
                 args.set_u32(20, freed.flags);
