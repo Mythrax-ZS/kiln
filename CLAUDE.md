@@ -178,7 +178,7 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   `NX_DEBUG_EQUAL_AS_LEQUAL=1`, `NX_DEBUG_NO_DEPTH_TEST=1`, `NX_DEBUG_FLIP_FRONT=1`,
   `NX_TRACE_TARGETS=1` (each render target configuration, the first time it is drawn to) and
   `NX_GPU_SYNC=1` runs the commands of a submission in the call that makes it (with a renderer they
-  otherwise run on a thread of their own, A-124); `NX_GPU_LENIENT=1` skips a draw the renderer
+  otherwise run on a thread of their own, A-124, and so do the media engines' jobs, A-184); `NX_GPU_LENIENT=1` skips a draw the renderer
   cannot make (counted in the report of every 100 frames, and said once) instead of stopping the
   run: development runs set it, and so does `kiln-gui` for a game it starts to be played (its
   "Stop at a draw that cannot be rendered" setting turns that off);
