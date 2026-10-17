@@ -896,9 +896,20 @@ pub fn decode_parts(
         }
     }
     let mut state = tile::FrameState::new(hdr, probs, inputs);
+    let began = std::time::Instant::now();
     state.decode_tiles(tiles)?;
+    let tiles_done = std::time::Instant::now();
     if hdr.lf.level != 0 {
         filter::loop_filter(&mut state);
+    }
+    // `NX_TRACE_MEDIA=2`: the two phases of each decode.
+    static PHASES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PHASES.get_or_init(|| std::env::var_os("NX_TRACE_MEDIA").is_some_and(|v| v == "2")) {
+        eprintln!(
+            "[vp9] tiles {:.1} ms, loop filter {:.1} ms",
+            tiles_done.duration_since(began).as_secs_f64() * 1000.0,
+            tiles_done.elapsed().as_secs_f64() * 1000.0
+        );
     }
     Ok(state.finish())
 }

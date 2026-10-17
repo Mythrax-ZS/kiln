@@ -45,6 +45,10 @@ pub struct Config {
     /// Dump the first frame that has this many draws or more, with every render target
     /// (`NX_DUMP_BUSY`): finds a busy scene whatever frame number it comes at.
     pub dump_busy: Option<u64>,
+    /// Print a hash of each frame that would be dumped, and whether it is the same picture as
+    /// the frame before, instead of writing it (`NX_DUMP_HASH`): the rhythm of what is shown,
+    /// without the cost of the pictures, which slows a run below its frame rate.
+    pub dump_hash: bool,
     /// Show the displayed buffers in a window of this size in pixels (`NX_WINDOW`, with
     /// `NX_WINDOW_SIZE=<width>x<height>`, 1280x720 by default). Needs the `window` feature.
     pub window: Option<(u32, u32)>,
@@ -71,6 +75,7 @@ impl Config {
             dump_limit: number("NX_DUMP_COUNT"),
             dump_start: number("NX_DUMP_START").unwrap_or(0),
             dump_busy: number("NX_DUMP_BUSY"),
+            dump_hash: std::env::var_os("NX_DUMP_HASH").is_some(),
             window,
             window_title: std::env::var("NX_WINDOW_TITLE").unwrap_or_else(|_| "kiln".to_string()),
             input: None,
@@ -1205,6 +1210,25 @@ impl Renderer {
         let rgba = targets::read_rgba(vk, frame, target)?;
         // What the display shows is the producer's crop of the buffer.
         let (rgba, w, h) = targets::crop_rgba(&rgba, w, h, p.crop);
+        if config.dump_hash {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST: AtomicU64 = AtomicU64::new(0);
+            let hash = rgba.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            });
+            let same = LAST.swap(hash, Ordering::Relaxed) == hash;
+            eprintln!(
+                "[vulkan] frame {}: picture {hash:016x}, {}",
+                p.frame,
+                if same {
+                    "the same as the frame before"
+                } else {
+                    "new"
+                }
+            );
+            core.dumped += 1;
+            return Ok(());
+        }
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let path = dir.join(format!("frame_{:05}.png", p.frame));
         if core.debug.trace_gpu {

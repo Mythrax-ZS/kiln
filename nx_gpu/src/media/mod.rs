@@ -123,13 +123,20 @@ pub trait MediaQueue: Send + Sync {
 }
 
 /// What running jobs changes: the decoder's frames. Owned by whoever runs the jobs.
-#[derive(Default)]
 pub struct Engines {
     vp9: vp9::nvdec::Engine,
     /// `NX_TRACE_MEDIA`: every decode and conversion.
     trace: bool,
     /// When the last decode began, for the trace.
     last_decode: Option<Instant>,
+    /// When the engines were made: the trace's times count from it.
+    origin: Instant,
+}
+
+impl Default for Engines {
+    fn default() -> Engines {
+        Engines::new()
+    }
 }
 
 fn ms(since: Instant) -> f64 {
@@ -142,6 +149,7 @@ impl Engines {
             vp9: vp9::nvdec::Engine::new(),
             trace: std::env::var_os("NX_TRACE_MEDIA").is_some(),
             last_decode: None,
+            origin: Instant::now(),
         }
     }
 
@@ -162,10 +170,11 @@ impl Engines {
                     Ok(f) => {
                         if self.trace {
                             eprintln!(
-                                "[media] decoded a {}x{} VP9 frame into {out:#x} in {:.1} ms, {since_last:.1} ms after the one before",
+                                "[media] decoded a {}x{} VP9 frame into {out:#x} in {:.1} ms, {since_last:.1} ms after the one before, at {:.1} ms",
                                 f.width,
                                 f.height,
-                                ms(began)
+                                ms(began),
+                                ms(self.origin) - ms(began)
                             );
                         }
                     }
@@ -196,13 +205,14 @@ impl Engines {
                         .filter(|p| p[0] | p[1] | p[2] != 0)
                         .count();
                     eprintln!(
-                        "[media] converted {input:#x} into a {}x{} surface at {out:#x} ({:#x} bytes, format {:#x}, kind {}) in {:.1} ms: {lit} pixels not black",
+                        "[media] converted {input:#x} into a {}x{} surface at {out:#x} ({:#x} bytes, format {:#x}, kind {}) in {:.1} ms at {:.1} ms: {lit} pixels not black",
                         config.width,
                         config.height,
                         pixels.len(),
                         config.format,
                         config.block_kind,
-                        ms(began)
+                        ms(began),
+                        ms(self.origin) - ms(began)
                     );
                 }
             }

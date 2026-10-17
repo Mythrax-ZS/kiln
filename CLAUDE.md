@@ -161,7 +161,9 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   the allocations of the draws' steps and the guest's calls too, and says how often memory was
   hashed); `NX_DUMP_FRAMES=<dir>` writes each displayed frame as a PNG (opaque, cropped
   to what is shown; `NX_DUMP_EVERY=<n>`, `NX_DUMP_COUNT=<n>`, `NX_DUMP_START=<frame>` to begin late, `NX_DUMP_TARGETS=1` for every render
-  target too: a PNG is uncompressed, so dump every n-th frame); `NX_TRACE_DRAWS=<frame>` lists the
+  target too: a PNG is uncompressed, so dump every n-th frame; `NX_DUMP_HASH=1` prints a hash of each
+  frame that would be dumped and whether it is the same picture as the frame before, instead of
+  writing it, which shows the rhythm of a video without slowing the run); `NX_TRACE_DRAWS=<frame>` lists the
   draws and clears of one frame (with `NX_TRACE_STATE=1` their state and vertices (`NX_TRACE_DRAWS_TO=<hex GPU address>[,...]` does so for every draw,
   in any frame, with a color target at one of those addresses), `NX_DUMP_DRAWS=<dir>`
   and `NX_DUMP_FROM=<n>` a picture after each); `NX_TRACE_COMPUTE=1` says how long the device took over

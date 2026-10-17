@@ -312,7 +312,7 @@ impl std::fmt::Debug for Nvdrv {
 
 /// The first bytes of a buffer in hexadecimal, for the trace.
 fn hex(bytes: &[u8]) -> String {
-    const SHOWN: usize = 48;
+    const SHOWN: usize = 128;
     let mut s: String = bytes
         .iter()
         .take(SHOWN)
