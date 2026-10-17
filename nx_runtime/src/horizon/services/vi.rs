@@ -57,13 +57,12 @@ impl Shared {
     /// had its time on screen: the call returns no sooner than `interval` vsync periods after the
     /// one before it, so a program shows at most 60 / `interval` frames a second, as on the
     /// console, whatever the refresh rate of the machine's screen. A program that is late is not
-    /// held, and does not catch up. Interval 0 is not held.
-    fn pace(&self, interval: u32) {
-        let Some(last) = &self.pacing else {
-            return;
-        };
+    /// held, and does not catch up. Interval 0 is not held. Returns the tick of the grid the
+    /// frame was held to (`None` when it was not held), for the moment it is to reach the screen.
+    fn pace(&self, interval: u32) -> Option<Instant> {
+        let last = self.pacing.as_ref()?;
         if interval == 0 {
-            return;
+            return None;
         }
         let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
@@ -78,6 +77,7 @@ impl Shared {
         } else {
             *last = Some(now);
         }
+        *last
     }
 
     /// Connect the display to the driver, so displayed buffers reach the renderer.
@@ -375,16 +375,19 @@ impl BinderDriver {
         }
         if code == nx_gpu::display::code::QUEUE_BUFFER {
             let frame = self.shared.comp().last_frame_of(binder);
+            // The frame is held to the grid first; it is to reach the screen one period after
+            // its tick, whatever it takes to draw (A-181).
+            let tick = frame
+                .as_ref()
+                .and_then(|f| self.shared.pace(f.input.swap_interval));
             if let (Some(frame), Some(gpu)) = (&frame, self.shared.gpu()) {
-                gpu.present(frame).map_err(|why| {
-                    Stop(format!(
-                        "the renderer could not show frame {}: {why}",
-                        frame.number
-                    ))
-                })?;
-            }
-            if let Some(frame) = &frame {
-                self.shared.pace(frame.input.swap_interval);
+                gpu.present(frame, tick.map(|t| t + VSYNC_PERIOD))
+                    .map_err(|why| {
+                        Stop(format!(
+                            "the renderer could not show frame {}: {why}",
+                            frame.number
+                        ))
+                    })?;
             }
         }
         if code == nx_gpu::display::code::QUEUE_BUFFER {

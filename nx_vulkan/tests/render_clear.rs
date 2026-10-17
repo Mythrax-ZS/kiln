@@ -109,6 +109,7 @@ fn a_displayed_buffer_is_dumped_as_a_picture_when_asked() {
         block_height_log2: 4,
         crop: [0; 4],
         frame: 7,
+        due: None,
     })
     .unwrap();
     let png = std::fs::read(dir.join("frame_00007.png")).expect("the picture was written");

@@ -328,18 +328,22 @@ impl Shared {
     }
 
     /// The title queued a buffer for display: tell the renderer (if there is one).
-    pub fn present(&self, frame: &nx_gpu::display::Frame) -> Result<(), String> {
+    pub fn present(
+        &self,
+        frame: &nx_gpu::display::Frame,
+        due: Option<std::time::Instant>,
+    ) -> Result<(), String> {
         let Some(worker) = &self.worker else {
             let mut core = self.lock();
             core.gpu.note_frame(frame.number);
-            return core.gpu.present(frame);
+            return core.gpu.present(frame, due);
         };
         // The buffer is shown after the commands queued before it have run.
         worker.wait_for_room(true);
         let request = {
             let mut core = self.lock();
             core.gpu.note_frame(frame.number);
-            core.gpu.present_request(frame)?
+            core.gpu.present_request(frame, due)?
         };
         if let Some(request) = request {
             worker.push(Task::Present(request));
@@ -414,34 +418,56 @@ fn run_worker(shared: Weak<Shared>, worker: Arc<Worker>) {
             return;
         };
         let is_present = matches!(task, Task::Present(_));
-        let outcome = loop {
-            // A call of the program that is waiting for the driver goes first.
-            let made_way = std::time::Instant::now();
-            let mut yielded = false;
-            if shared.callers.load(Ordering::Acquire) > 0 {
-                yielded = true;
-                shared.wait_for_calls();
-            }
-            let locking = std::time::Instant::now();
-            let mut core = shared.core.lock().unwrap_or_else(|e| e.into_inner());
-            let running = std::time::Instant::now();
-            let stepped = core.gpu.run_task(&mut task);
-            if trace {
-                spent[1] += locking.duration_since(made_way);
-                spent[2] += running.duration_since(locking);
-                spent[3] += running.elapsed();
-                steps += 1;
-                yields += u64::from(yielded);
-            }
-            match stepped {
-                Ok(None) => {}
-                Ok(Some(done)) => {
-                    core.wake(done.woken);
-                    break Ok(());
+        // A frame that is not yet due to reach the screen waits for its moment; the submissions
+        // that arrive behind it meanwhile are run, so that their drawing is not held up (A-181).
+        if let Task::Present(p) = &task {
+            if let Some(due) = p.due {
+                while std::time::Instant::now() < due {
+                    let next = {
+                        let mut b = worker.lock();
+                        if matches!(b.tasks.front(), Some(Task::Submit(_))) {
+                            b.tasks.pop_front()
+                        } else {
+                            None
+                        }
+                    };
+                    match next {
+                        Some(mut early) => {
+                            let outcome = run_to_end(
+                                &shared,
+                                &mut early,
+                                trace,
+                                &mut spent,
+                                &mut steps,
+                                &mut yields,
+                            );
+                            tasks_run += 1;
+                            finish(&shared, outcome);
+                            // The backlog has room for one more.
+                            worker.changed.notify_all();
+                        }
+                        None => {
+                            let b = worker.lock();
+                            let now = std::time::Instant::now();
+                            if now < due {
+                                let _ = worker
+                                    .changed
+                                    .wait_timeout(b, due - now)
+                                    .unwrap_or_else(|e| e.into_inner());
+                            }
+                        }
+                    }
                 }
-                Err(e) => break Err(e),
             }
-        };
+        }
+        let outcome = run_to_end(
+            &shared,
+            &mut task,
+            trace,
+            &mut spent,
+            &mut steps,
+            &mut yields,
+        );
         tasks_run += 1;
         if trace && reported.elapsed() >= Duration::from_secs(2) {
             eprintln!(
@@ -500,22 +526,7 @@ fn run_worker(shared: Weak<Shared>, worker: Arc<Worker>) {
             calls_before = shared.calls.load(Ordering::Relaxed);
             reported = std::time::Instant::now();
         }
-        match outcome {
-            Ok(()) => {
-                let kernel = shared
-                    .kernel
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .upgrade();
-                if let Some(kernel) = kernel {
-                    shared.deliver_signals(&kernel);
-                }
-            }
-            Err(e) => shared.fail(match e {
-                SubmitError::Nv(e) => format!("a submission failed with {e:?}"),
-                SubmitError::Unimplemented(why) => why,
-            }),
-        }
+        finish(&shared, outcome);
         let mut b = worker.lock();
         if is_present {
             b.presents -= 1;
@@ -523,6 +534,67 @@ fn run_worker(shared: Weak<Shared>, worker: Arc<Worker>) {
         b.running = false;
         drop(b);
         worker.changed.notify_all();
+    }
+}
+
+/// Run `task` to its end: a step of it at a time, with the driver let go of between two steps so
+/// that the calls of the program get in. `spent`, `steps` and `yields` count where the time went
+/// (`NX_TRACE_PERF`).
+fn run_to_end(
+    shared: &Shared,
+    task: &mut Task,
+    trace: bool,
+    spent: &mut [Duration; 4],
+    steps: &mut u64,
+    yields: &mut u64,
+) -> Result<(), SubmitError> {
+    loop {
+        // A call of the program that is waiting for the driver goes first.
+        let made_way = std::time::Instant::now();
+        let mut yielded = false;
+        if shared.callers.load(Ordering::Acquire) > 0 {
+            yielded = true;
+            shared.wait_for_calls();
+        }
+        let locking = std::time::Instant::now();
+        let mut core = shared.core.lock().unwrap_or_else(|e| e.into_inner());
+        let running = std::time::Instant::now();
+        let stepped = core.gpu.run_task(task);
+        if trace {
+            spent[1] += locking.duration_since(made_way);
+            spent[2] += running.duration_since(locking);
+            spent[3] += running.elapsed();
+            *steps += 1;
+            *yields += u64::from(yielded);
+        }
+        match stepped {
+            Ok(None) => {}
+            Ok(Some(done)) => {
+                core.wake(done.woken);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// What the end of a task means for the program: its events set, or the run stopped.
+fn finish(shared: &Shared, outcome: Result<(), SubmitError>) {
+    match outcome {
+        Ok(()) => {
+            let kernel = shared
+                .kernel
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .upgrade();
+            if let Some(kernel) = kernel {
+                shared.deliver_signals(&kernel);
+            }
+        }
+        Err(e) => shared.fail(match e {
+            SubmitError::Nv(e) => format!("a submission failed with {e:?}"),
+            SubmitError::Unimplemented(why) => why,
+        }),
     }
 }
 

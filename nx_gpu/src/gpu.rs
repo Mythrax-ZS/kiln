@@ -124,8 +124,12 @@ impl Gpu {
     /// The title queued a buffer for display: tell the renderer where it is. The `nvmap` handle
     /// is resolved to the address of its memory in the guest process, which is how a render
     /// target is matched with the buffer that shows it.
-    pub fn present(&mut self, frame: &crate::display::Frame) -> Result<(), String> {
-        let Some(request) = self.present_request(frame)? else {
+    pub fn present(
+        &mut self,
+        frame: &crate::display::Frame,
+        due: Option<std::time::Instant>,
+    ) -> Result<(), String> {
+        let Some(request) = self.present_request(frame, due)? else {
             return Ok(());
         };
         match self.backend.as_deref_mut() {
@@ -150,6 +154,7 @@ impl Gpu {
     pub fn present_request(
         &self,
         frame: &crate::display::Frame,
+        due: Option<std::time::Instant>,
     ) -> Result<Option<crate::render::Present>, String> {
         if self.backend.is_none() {
             return Ok(None);
@@ -184,6 +189,7 @@ impl Gpu {
             block_height_log2: buffer.block_height_log2(),
             crop: frame.input.crop,
             frame: frame.number,
+            due,
         }))
     }
 

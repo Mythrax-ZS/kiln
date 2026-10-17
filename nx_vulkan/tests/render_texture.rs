@@ -256,6 +256,7 @@ fn a_texture_is_compared_with_memory_once_a_frame() {
         block_height_log2: 4,
         crop: [0; 4],
         frame: 1,
+        due: None,
     })
     .unwrap();
     r.draw(&w.scene(), &DRAW).unwrap();

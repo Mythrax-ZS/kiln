@@ -146,6 +146,10 @@ pub struct Present {
     pub crop: [i32; 4],
     /// The number of this frame (counting from 1).
     pub frame: u64,
+    /// When the frame is to reach the screen: one display period after the tick at which the
+    /// program queued it (A-181), so that the frames reach the screen as evenly as they were
+    /// queued, whatever each took to draw. `None` when the program is not paced.
+    pub due: Option<std::time::Instant>,
 }
 
 /// Something that turns the commands of the processor into pictures. An error stops the run with

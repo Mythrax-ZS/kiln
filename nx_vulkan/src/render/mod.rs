@@ -1173,6 +1173,11 @@ impl Renderer {
         }
         #[cfg(feature = "window")]
         if let Some(display) = core.display.as_mut() {
+            // The frame reaches the window at its moment, not when it happened to be drawn: the
+            // frames then come as evenly as the program queued them (A-181).
+            if let Some(due) = p.due {
+                nx_gpu::time::sleep_until(due);
+            }
             if let Some(target) = core.targets.at_address(p.address) {
                 if let Err(e) = display.show(&core.vk, target, p.crop) {
                     // A window that cannot be shown to does not stop the game.
@@ -1217,14 +1222,24 @@ impl Renderer {
                 (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
             });
             let same = LAST.swap(hash, Ordering::Relaxed) == hash;
+            // When this frame reached the window, and how long after the one before.
+            static FIRST: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            static LAST_AT: AtomicU64 = AtomicU64::new(0);
+            let at = FIRST
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_micros() as u64;
+            let before = LAST_AT.swap(at, Ordering::Relaxed);
             eprintln!(
-                "[vulkan] frame {}: picture {hash:016x}, {}",
+                "[vulkan] frame {}: picture {hash:016x}, {}, at {:.1} ms, {:.1} ms after the frame before",
                 p.frame,
                 if same {
                     "the same as the frame before"
                 } else {
                     "new"
-                }
+                },
+                at as f64 / 1000.0,
+                at.saturating_sub(before) as f64 / 1000.0
             );
             core.dumped += 1;
             return Ok(());
