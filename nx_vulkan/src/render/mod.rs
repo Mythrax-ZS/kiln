@@ -1230,8 +1230,34 @@ impl Renderer {
                 .elapsed()
                 .as_micros() as u64;
             let before = LAST_AT.swap(at, Ordering::Relaxed);
+            // How much a new picture differs from the new picture before it (the mean absolute
+            // difference of a 64 by 36 sample of the gray levels): the pictures of a video step
+            // evenly, a skipped one steps twice as far and an older one shown again steps back.
+            static THUMB: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+            let mut motion = 0.0;
+            if !same {
+                let (tw, th) = (64usize, 36usize);
+                let thumb: Vec<u8> = (0..tw * th)
+                    .map(|i| {
+                        let (x, y) = ((i % tw) * w as usize / tw, (i / tw) * h as usize / th);
+                        let p = (y * w as usize + x) * 4;
+                        ((u32::from(rgba[p]) + u32::from(rgba[p + 1]) + u32::from(rgba[p + 2])) / 3)
+                            as u8
+                    })
+                    .collect();
+                let mut last = THUMB.lock().unwrap_or_else(|e| e.into_inner());
+                if last.len() == thumb.len() {
+                    let sum: u64 = thumb
+                        .iter()
+                        .zip(last.iter())
+                        .map(|(&a, &b)| u64::from(a.abs_diff(b)))
+                        .sum();
+                    motion = sum as f64 / thumb.len() as f64;
+                }
+                *last = thumb;
+            }
             eprintln!(
-                "[vulkan] frame {}: picture {hash:016x}, {}, at {:.1} ms, {:.1} ms after the frame before",
+                "[vulkan] frame {}: picture {hash:016x}, {}, at {:.1} ms, {:.1} ms after the frame before, motion {motion:.2}",
                 p.frame,
                 if same {
                     "the same as the frame before"
