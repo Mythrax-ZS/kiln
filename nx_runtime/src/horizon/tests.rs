@@ -3670,3 +3670,22 @@ fn no_nfc_device_is_attached_and_the_friends_service_has_no_account_to_serve() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn a_sleep_ends_at_its_moment_not_a_timer_tick_later() {
+    use std::time::{Duration, Instant};
+    // Twenty sleeps of 3 ms, each from the end of the one before: never early, and together well
+    // under the 20 ticks of a coarse timer they would take if each were a millisecond late.
+    let began = Instant::now();
+    for _ in 0..20 {
+        let at = Instant::now();
+        super::kernel::sleep_until(at + Duration::from_millis(3));
+        assert!(
+            at.elapsed() >= Duration::from_millis(3),
+            "{:?}",
+            at.elapsed()
+        );
+    }
+    let took = began.elapsed();
+    assert!(took < Duration::from_millis(75), "{took:?}");
+}

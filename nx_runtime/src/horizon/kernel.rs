@@ -264,6 +264,34 @@ pub fn deadline_of(timeout_ns: i64) -> Option<Instant> {
     }
 }
 
+/// Sleep until `deadline`, as exactly as the machine allows (docs/ASSUMPTIONS.md A-186): the
+/// system's sleep, which returns a millisecond or so late, until a margin before the moment, then
+/// yielding until it. The margin follows how late the system's sleeps have been returning.
+pub fn sleep_until(deadline: Instant) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    /// How late the system's sleep has been returning, in microseconds (a running average).
+    static LATE_US: AtomicU64 = AtomicU64::new(1000);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let remaining = deadline - now;
+        let margin = Duration::from_micros(LATE_US.load(Ordering::Relaxed) + 100);
+        if remaining > margin {
+            let asked = remaining - margin;
+            let began = Instant::now();
+            std::thread::sleep(asked);
+            let late = began.elapsed().saturating_sub(asked).as_micros() as u64;
+            let old = LATE_US.load(Ordering::Relaxed);
+            let new = ((old * 7 + late.min(10_000)) / 8).clamp(100, 5_000);
+            LATE_US.store(new, Ordering::Relaxed);
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
 pub(super) enum Waited<R> {
     Ready(R),
     TimedOut,
@@ -1193,14 +1221,24 @@ impl Kernel {
         ResultCode::SUCCESS
     }
 
-    /// Sleep, or yield for the special values 0, -1 and -2.
+    /// Sleep, or yield for the special values 0, -1 and -2. The sleep is exact (A-186): a long
+    /// one waits on the kernel's clock first, so that a process that ends wakes it, and its last
+    /// part, like a short one, is slept to the moment.
     pub fn sleep(&self, ns: i64) {
         if ns <= 0 {
             std::thread::yield_now();
             return;
         }
-        let st = self.lock();
-        let (_st, _out) = self.wait_until(st, deadline_of(ns), |_| None::<()>);
+        const EXACT: Duration = Duration::from_millis(50);
+        let deadline = Instant::now() + Duration::from_nanos(ns as u64);
+        if ns > 2 * EXACT.as_nanos() as i64 {
+            let st = self.lock();
+            let (_st, out) = self.wait_until(st, Some(deadline - EXACT), |_| None::<()>);
+            if matches!(out, Waited::Terminating) {
+                return;
+            }
+        }
+        sleep_until(deadline);
     }
 
     // ---- mutexes, condition variables, address arbitration ----

@@ -747,8 +747,11 @@ impl Renderer {
         let event = kernel.new_event();
         let stop = Arc::new(AtomicBool::new(false));
         let (weak, writable, flag) = (Arc::downgrade(kernel), event.0.clone(), stop.clone());
+        // The frames are kept on a grid, so that no lateness adds up (A-186).
+        let mut next = std::time::Instant::now();
         std::thread::spawn(move || loop {
-            std::thread::sleep(FRAME_PERIOD);
+            next += FRAME_PERIOD;
+            crate::horizon::kernel::sleep_until(next);
             let Some(kernel) = weak.upgrade() else {
                 break;
             };
