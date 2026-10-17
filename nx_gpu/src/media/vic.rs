@@ -150,15 +150,17 @@ impl Config {
             })
             .collect();
         let m = self.matrix.map(|row| row.map(i64::from));
-        if self.slot_enabled && l <= r {
-            for oy in (t as usize)..=(b as usize).min(h.saturating_sub(1)) {
-                let row = &mut linear[(oy * w + l) * 4..(oy * w + r + 1) * 4];
+        let (top, bottom) = (t as usize, (b as usize).min(h.saturating_sub(1)));
+        if self.slot_enabled && l <= r && top <= bottom {
+            // One row of the output from the frame.
+            let convert_row = |oy: usize, row: &mut [u8]| {
                 let sy = (st + (oy as f64 - f64::from(t) + 0.5) * sh / dh - 0.5)
                     .round()
                     .clamp(0.0, (fh - 1) as f64) as usize;
                 let y_row = &y_plane.data[sy * y_plane.stride..];
                 let u_row = &u_plane.data[(sy / 2) * u_plane.stride..];
                 let v_row = &v_plane.data[(sy / 2) * v_plane.stride..];
+                let row = &mut row[l * 4..(r + 1) * 4];
                 for (px, &sx) in row.as_chunks_mut::<4>().0.iter_mut().zip(&columns) {
                     let yv = i64::from(y_row[sx]);
                     let uv = i64::from(u_row[sx / 2]);
@@ -172,7 +174,21 @@ impl Config {
                         px[k] = pixel[o];
                     }
                 }
-            }
+            };
+            // The rows in bands, a thread each: the rows are independent of one another.
+            let rows = &mut linear[top * w * 4..(bottom + 1) * w * 4];
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
+            let band = (bottom + 1 - top).div_ceil(threads).max(1);
+            std::thread::scope(|scope| {
+                for (k, rows) in rows.chunks_mut(band * w * 4).enumerate() {
+                    let convert_row = &convert_row;
+                    scope.spawn(move || {
+                        for (i, row) in rows.chunks_exact_mut(w * 4).enumerate() {
+                            convert_row(top + k * band + i, row);
+                        }
+                    });
+                }
+            });
         }
         if self.block_kind == 0 {
             return Ok(linear);

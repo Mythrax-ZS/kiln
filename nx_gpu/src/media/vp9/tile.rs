@@ -176,57 +176,132 @@ impl<'a> FrameState<'a> {
         &self.mi[row * self.mi_cols + col]
     }
 
-    /// `decode_tiles( sz )` (section 6.4).
+    /// `decode_tiles( sz )` (section 6.4). The tile columns are decoded on threads of their own,
+    /// each into a frame state of its own, and put together afterwards: what a block reads of
+    /// its neighbours stops at the tile column's edges (`is_inside`, the availability of the
+    /// intra edges), so the columns are independent until the loop filter.
     pub fn decode_tiles(&mut self, data: &[u8]) -> Result<(), Error> {
         let tile_cols = 1usize << self.hdr.tile_cols_log2;
         let tile_rows = 1usize << self.hdr.tile_rows_log2;
-        let mut at = 0usize;
-        for tile_row in 0..tile_rows {
-            for tile_col in 0..tile_cols {
-                let last = tile_row == tile_rows - 1 && tile_col == tile_cols - 1;
-                let size = if last {
-                    data.len() - at
-                } else {
-                    let b = data
-                        .get(at..at + 4)
-                        .ok_or(Error::Stream("a tile size past the end of the data"))?;
-                    at += 4;
-                    u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize
-                };
-                let tile = data
-                    .get(at..at + size)
-                    .ok_or(Error::Stream("a tile past the end of the data"))?;
-                at += size;
-                let rows = (
-                    tile_offset(tile_row, self.mi_rows, self.hdr.tile_rows_log2),
-                    tile_offset(tile_row + 1, self.mi_rows, self.hdr.tile_rows_log2),
-                );
-                self.mi_col_start = tile_offset(tile_col, self.mi_cols, self.hdr.tile_cols_log2);
-                self.mi_col_end = tile_offset(tile_col + 1, self.mi_cols, self.hdr.tile_cols_log2);
-                if tile_row == 0 && tile_col == 0 {
-                    // clear_above_context
-                    for p in &mut self.above_nonzero {
-                        p.iter_mut().for_each(|v| *v = false);
-                    }
-                    self.above_partition.iter_mut().for_each(|v| *v = 0);
-                    self.above_seg_pred.iter_mut().for_each(|v| *v = false);
-                }
-                let mut bd = BoolDecoder::new(tile)?;
-                for r in (rows.0..rows.1).step_by(8) {
-                    // clear_left_context
-                    for p in &mut self.left_nonzero {
-                        p.iter_mut().for_each(|v| *v = false);
-                    }
-                    self.left_partition.iter_mut().for_each(|v| *v = 0);
-                    self.left_seg_pred.iter_mut().for_each(|v| *v = false);
-                    for c in (self.mi_col_start..self.mi_col_end).step_by(8) {
-                        self.decode_partition(&mut bd, r, c, BLOCK_64X64)?;
-                    }
-                }
-                bd.finish()?;
+        let tiles = self.tile_data(data, tile_cols, tile_rows)?;
+        if tile_cols == 1 {
+            return self.decode_tile_column(0, &tiles, tile_cols, tile_rows);
+        }
+        let (hdr, probs, inputs) = (self.hdr, self.probs, self.inputs);
+        std::thread::scope(|scope| {
+            let tiles = &tiles;
+            let others: Vec<_> = (1..tile_cols)
+                .map(|col| {
+                    scope.spawn(move || {
+                        let mut state = FrameState::new(hdr, probs, inputs);
+                        state.decode_tile_column(col, tiles, tile_cols, tile_rows)?;
+                        Ok::<FrameState<'a>, Error>(state)
+                    })
+                })
+                .collect();
+            self.decode_tile_column(0, tiles, tile_cols, tile_rows)?;
+            for (col, other) in (1..tile_cols).zip(others) {
+                let other = other
+                    .join()
+                    .map_err(|_| Error::Stream("a tile column's thread panicked"))??;
+                self.absorb_column(&other, col);
             }
+            Ok(())
+        })
+    }
+
+    /// The tiles' data, in the order of the stream: each but the last led by its size.
+    fn tile_data<'d>(
+        &self,
+        data: &'d [u8],
+        tile_cols: usize,
+        tile_rows: usize,
+    ) -> Result<Vec<&'d [u8]>, Error> {
+        let mut tiles = Vec::with_capacity(tile_cols * tile_rows);
+        let mut at = 0usize;
+        for i in 0..tile_cols * tile_rows {
+            let size = if i == tile_cols * tile_rows - 1 {
+                data.len() - at
+            } else {
+                let b = data
+                    .get(at..at + 4)
+                    .ok_or(Error::Stream("a tile size past the end of the data"))?;
+                at += 4;
+                u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize
+            };
+            tiles.push(
+                data.get(at..at + size)
+                    .ok_or(Error::Stream("a tile past the end of the data"))?,
+            );
+            at += size;
+        }
+        Ok(tiles)
+    }
+
+    /// Decode the tiles of column `col`, top to bottom (the above context runs on from one tile
+    /// row to the next; a fresh state starts with it clear).
+    fn decode_tile_column(
+        &mut self,
+        col: usize,
+        tiles: &[&[u8]],
+        tile_cols: usize,
+        tile_rows: usize,
+    ) -> Result<(), Error> {
+        self.mi_col_start = tile_offset(col, self.mi_cols, self.hdr.tile_cols_log2);
+        self.mi_col_end = tile_offset(col + 1, self.mi_cols, self.hdr.tile_cols_log2);
+        for tile_row in 0..tile_rows {
+            let tile = tiles[tile_row * tile_cols + col];
+            let rows = (
+                tile_offset(tile_row, self.mi_rows, self.hdr.tile_rows_log2),
+                tile_offset(tile_row + 1, self.mi_rows, self.hdr.tile_rows_log2),
+            );
+            let mut bd = BoolDecoder::new(tile)?;
+            for r in (rows.0..rows.1).step_by(8) {
+                // clear_left_context
+                for p in &mut self.left_nonzero {
+                    p.iter_mut().for_each(|v| *v = false);
+                }
+                self.left_partition.iter_mut().for_each(|v| *v = 0);
+                self.left_seg_pred.iter_mut().for_each(|v| *v = false);
+                for c in (self.mi_col_start..self.mi_col_end).step_by(8) {
+                    self.decode_partition(&mut bd, r, c, BLOCK_64X64)?;
+                }
+            }
+            bd.finish()?;
         }
         Ok(())
+    }
+
+    /// Take tile column `col` of `other` (decoded on another thread): its pixels, modes,
+    /// segment ids and counts.
+    fn absorb_column(&mut self, other: &FrameState, col: usize) {
+        let c0 = tile_offset(col, self.mi_cols, self.hdr.tile_cols_log2);
+        let c1 = tile_offset(col + 1, self.mi_cols, self.hdr.tile_cols_log2);
+        for (plane, (mine, theirs)) in self
+            .cur
+            .planes
+            .iter_mut()
+            .zip(&other.cur.planes)
+            .enumerate()
+        {
+            // The chroma planes are half as wide (4:2:0).
+            let shift = usize::from(plane > 0);
+            let (x0, x1) = ((c0 * 8) >> shift, ((c1 * 8) >> shift).min(mine.stride));
+            for (row, src) in mine
+                .data
+                .chunks_exact_mut(mine.stride)
+                .zip(theirs.data.chunks_exact(theirs.stride))
+            {
+                row[x0..x1].copy_from_slice(&src[x0..x1]);
+            }
+        }
+        for row in 0..self.mi_rows {
+            let at = row * self.mi_cols;
+            self.mi[at + c0..at + c1].clone_from_slice(&other.mi[at + c0..at + c1]);
+            self.segment_ids[at + c0..at + c1]
+                .copy_from_slice(&other.segment_ids[at + c0..at + c1]);
+        }
+        self.counts.add(&other.counts);
     }
 
     /// `decode_partition` (section 6.4.3).

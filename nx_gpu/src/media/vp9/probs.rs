@@ -281,6 +281,55 @@ pub struct Counts {
     pub more_coefs: CoefTable<u32, 2>,
 }
 
+/// Adding the counts of one table to another, element by element.
+trait Accumulate {
+    fn accumulate(&mut self, other: &Self);
+}
+
+impl Accumulate for u32 {
+    fn accumulate(&mut self, other: &Self) {
+        *self += *other;
+    }
+}
+
+impl<T: Accumulate, const N: usize> Accumulate for [T; N] {
+    fn accumulate(&mut self, other: &Self) {
+        for (a, b) in self.iter_mut().zip(other) {
+            a.accumulate(b);
+        }
+    }
+}
+
+impl Counts {
+    /// Add what another part of the frame (a tile column decoded apart) counted.
+    pub fn add(&mut self, o: &Counts) {
+        self.intra_mode.accumulate(&o.intra_mode);
+        self.uv_mode.accumulate(&o.uv_mode);
+        self.partition.accumulate(&o.partition);
+        self.interp_filter.accumulate(&o.interp_filter);
+        self.inter_mode.accumulate(&o.inter_mode);
+        self.tx32.accumulate(&o.tx32);
+        self.tx16.accumulate(&o.tx16);
+        self.tx8.accumulate(&o.tx8);
+        self.is_inter.accumulate(&o.is_inter);
+        self.comp_mode.accumulate(&o.comp_mode);
+        self.single_ref.accumulate(&o.single_ref);
+        self.comp_ref.accumulate(&o.comp_ref);
+        self.skip.accumulate(&o.skip);
+        self.mv_joint.accumulate(&o.mv_joint);
+        self.mv_sign.accumulate(&o.mv_sign);
+        self.mv_class.accumulate(&o.mv_class);
+        self.mv_class0_bit.accumulate(&o.mv_class0_bit);
+        self.mv_class0_fr.accumulate(&o.mv_class0_fr);
+        self.mv_class0_hp.accumulate(&o.mv_class0_hp);
+        self.mv_bits.accumulate(&o.mv_bits);
+        self.mv_fr.accumulate(&o.mv_fr);
+        self.mv_hp.accumulate(&o.mv_hp);
+        self.token.accumulate(&o.token);
+        self.more_coefs.accumulate(&o.more_coefs);
+    }
+}
+
 // The trees of the syntax elements (section 9.3.1), with a leaf as minus its value.
 pub const PARTITION_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 pub const COLS_PARTITION_TREE: [i8; 2] = [-1, -3];

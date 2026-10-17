@@ -2,8 +2,8 @@
 //! superblocks in raster order, and in each the planes, the vertical edges, then the horizontal.
 
 use super::tables::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};
-use super::tile::{uv_tx_size, FrameState, NEARESTMV, NEARMV, NEWMV};
-use super::{INTRA_FRAME, SEG_LVL_ALT_L};
+use super::tile::{uv_tx_size, FrameState, ModeInfo, NEARESTMV, NEARMV, NEWMV};
+use super::{FrameHeader, Plane, INTRA_FRAME, SEG_LVL_ALT_L};
 
 const BLOCK_16X16: u8 = 6;
 const MAX_LOOP_FILTER: i32 = 63;
@@ -46,23 +46,45 @@ fn levels(s: &FrameState) -> [[[u8; 2]; 4]; 8] {
     out
 }
 
-/// Filter the frame.
-pub fn loop_filter(s: &mut FrameState) {
-    let lvl = levels(s);
-    for row in (0..s.mi_rows).step_by(8) {
-        for col in (0..s.mi_cols).step_by(8) {
-            for plane in 0..3 {
-                for pass in 0..2 {
-                    superblock(s, &lvl, plane, pass, row, col);
-                }
-            }
-        }
-    }
+/// What the filter reads of the frame besides the plane it changes.
+#[derive(Clone, Copy)]
+struct Modes<'a> {
+    hdr: &'a FrameHeader,
+    mi: &'a [ModeInfo],
+    mi_cols: usize,
+    mi_rows: usize,
 }
 
-/// The superblock loop filter process (section 8.8.2).
+/// Filter the frame. The planes are filtered on threads of their own: the filtering of one
+/// plane reads and writes that plane alone, in the specification's order within it.
+pub fn loop_filter(s: &mut FrameState) {
+    let lvl = levels(s);
+    let modes = Modes {
+        hdr: s.hdr,
+        mi: &s.mi,
+        mi_cols: s.mi_cols,
+        mi_rows: s.mi_rows,
+    };
+    std::thread::scope(|scope| {
+        for (plane, p) in s.cur.planes.iter_mut().enumerate() {
+            let lvl = &lvl;
+            scope.spawn(move || {
+                for row in (0..modes.mi_rows).step_by(8) {
+                    for col in (0..modes.mi_cols).step_by(8) {
+                        for pass in 0..2 {
+                            superblock(modes, p, lvl, plane, pass, row, col);
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// The superblock loop filter process (section 8.8.2) for one plane.
 fn superblock(
-    s: &mut FrameState,
+    s: Modes,
+    p: &mut Plane,
     lvl: &[[[u8; 2]; 4]; 8],
     plane: usize,
     pass: usize,
@@ -162,7 +184,6 @@ fn superblock(
             };
             let blimit = 2 * (level + 2) + limit;
             let thresh = level >> 4;
-            let p = &mut s.cur.planes[plane];
             sample_filter(
                 p.data.as_mut_slice(),
                 p.stride,
