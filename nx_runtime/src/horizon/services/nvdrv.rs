@@ -11,7 +11,7 @@ use crate::rt::runtime::rt;
 use nx_gpu::gpu::{Queue, SubmitError, Task};
 use nx_gpu::media::{Batch, Engines, MediaQueue};
 use nx_gpu::nvdrv::args::Fail;
-use nx_gpu::nvdrv::{EventToken, Nvdrv};
+use nx_gpu::nvdrv::{EventToken, Nvdrv, SyncptWait};
 use nx_gpu::{GuestMemory, NvError};
 use std::collections::{HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
@@ -606,6 +606,45 @@ impl NvDrv {
         self.shared.lock()
     }
 
+    /// Wait, outside the driver, for a syncpoint a thread of the runtime is still to increment
+    /// (A-185): the error the call ends with (success, or a timeout) and the value then.
+    fn wait_syncpoint(&self, wait: SyncptWait) -> Result<(NvError, u32), Stop> {
+        // An endless wait is capped: a syncpoint nothing will increment would hang the process,
+        // so the run stops and says so instead.
+        const ENDLESS: Duration = Duration::from_secs(20);
+        let endless = wait.timeout < 0 || wait.timeout == i32::MAX;
+        let limit = if endless {
+            ENDLESS
+        } else {
+            Duration::from_millis(u64::from(wait.timeout.unsigned_abs()))
+        };
+        let began = std::time::Instant::now();
+        loop {
+            let value = {
+                let core = self.core();
+                if core.gpu.syncpoints.is_reached(wait.id, wait.threshold) {
+                    return Ok((
+                        NvError::SUCCESS,
+                        core.gpu.syncpoints.value(wait.id).unwrap_or(0),
+                    ));
+                }
+                core.gpu.syncpoints.value(wait.id).unwrap_or(0)
+            };
+            if began.elapsed() >= limit {
+                if endless {
+                    return Err(stop(format!(
+                        "nvdrv: an endless wait for syncpoint {} to reach {} (it is at {value}, and nothing has incremented it for {} s)",
+                        wait.id,
+                        wait.threshold,
+                        ENDLESS.as_secs()
+                    )));
+                }
+                return Ok((NvError::TIMEOUT, value));
+            }
+            std::thread::sleep(Duration::from_micros(500));
+        }
+    }
+
     /// An ioctl with up to two input and two output buffers (`Ioctl`, `Ioctl2`, `Ioctl3`).
     fn ioctl(&mut self, req: &Request, variant: u32) -> ServiceResult {
         let kernel = self.kernel.upgrade().ok_or_else(gone)?;
@@ -637,11 +676,18 @@ impl NvDrv {
             Vec::new()
         };
         self.shared.wait_for_room();
-        let reply = self
+        let mut reply = self
             .core()
             .ioctl(fd, code, &input, &extra_in)
             .map_err(|why| stop(format!("nvdrv: {why}")))?;
         self.shared.deliver_signals(&kernel);
+        if let Some(wait) = reply.wait.take() {
+            let (error, value) = self.wait_syncpoint(wait)?;
+            reply.error = error;
+            if wait.writes_value {
+                reply.args.set_u32(12, value);
+            }
+        }
         if ioctl.has_output() {
             if let Some(b) = req.output_buffer(0).filter(|b| b.size > 0) {
                 let n = (b.size as usize).min(ioctl.size()).min(reply.args.len());

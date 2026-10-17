@@ -65,6 +65,21 @@ pub struct IoctlReply {
     pub args: Args,
     /// The second output buffer of `Ioctl3`.
     pub extra_out: Vec<u8>,
+    /// A wait for a syncpoint the call asked for and the driver could not finish, because a
+    /// thread of the runtime (the renderer's, the media engines') is still to increment it: the
+    /// caller waits outside the driver and settles the error (A-185).
+    pub wait: Option<SyncptWait>,
+}
+
+/// A blocking wait for a syncpoint to reach a threshold (`SYNCPT_WAIT`, `SYNCPT_WAITEX`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncptWait {
+    pub id: u32,
+    pub threshold: u32,
+    /// In milliseconds; negative for ever.
+    pub timeout: i32,
+    /// `SYNCPT_WAITEX`: the value at the end goes into the argument at 12.
+    pub writes_value: bool,
 }
 
 pub struct Nvdrv {
@@ -77,6 +92,8 @@ pub struct Nvdrv {
     trace: bool,
     /// The media engines (decoder.rs, [`crate::media`]).
     pub media: crate::media::Media,
+    /// A wait the call being served asked for, for its reply (A-185).
+    pending_wait: Option<SyncptWait>,
 }
 
 impl Nvdrv {
@@ -91,7 +108,14 @@ impl Nvdrv {
             signals: Vec::new(),
             trace: std::env::var_os("NX_TRACE_GPU").is_some(),
             media: crate::media::Media::new(),
+            pending_wait: None,
         }
+    }
+
+    /// Whether threads of the runtime run work for the driver (the renderer's commands, the
+    /// media engines' jobs), so that a syncpoint may be incremented after a call returns.
+    pub fn has_threads(&self) -> bool {
+        self.gpu.queue.is_some() || self.media.queue.is_some()
     }
 
     /// `Open`: a descriptor for the device at `path`.
@@ -175,6 +199,7 @@ impl Nvdrv {
                     error: NvError::BAD_PARAMETER,
                     args,
                     extra_out,
+                    wait: None,
                 })
             }
         };
@@ -216,6 +241,7 @@ impl Nvdrv {
             error,
             args,
             extra_out,
+            wait: self.pending_wait.take(),
         })
     }
 

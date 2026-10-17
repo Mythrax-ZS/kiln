@@ -111,6 +111,17 @@ impl Nvdrv {
                 if self.gpu.syncpoints.is_reached(id, threshold) {
                     return Ok(());
                 }
+                // A thread of the runtime may still increment the counter: the caller waits for
+                // it outside the driver (A-185).
+                if self.has_threads() {
+                    self.pending_wait = Some(super::SyncptWait {
+                        id,
+                        threshold,
+                        timeout,
+                        writes_value: code.0 == SYNCPT_WAITEX,
+                    });
+                    return Ok(());
+                }
                 // Everything the GPU was asked to do has been done, so only another thread of the
                 // program could still increment the counter. A finite wait ends in a timeout; an
                 // endless one would hang the process, so it stops the run instead.
@@ -331,5 +342,45 @@ mod tests {
             nv.query_event(fd, 0x25),
             Err(Fail::Unimplemented(_))
         ));
+    }
+
+    /// A queue that drops what it is given: a thread of the runtime stands in.
+    struct Elsewhere;
+
+    impl crate::media::MediaQueue for Elsewhere {
+        fn push(&self, _: crate::media::Batch) {}
+    }
+
+    #[test]
+    fn a_wait_for_a_fence_a_thread_will_reach_is_left_to_the_caller() {
+        let (mut nv, _) = nvdrv();
+        let fd = nv.open("/dev/nvhost-ctrl").unwrap();
+        let id = nv.gpu.syncpoints.allocate().unwrap();
+        nv.gpu.syncpoints.promise(id, 1);
+        // Without a thread the wait ends at once, in a timeout.
+        let reply = nv
+            .ioctl(fd, SYNCPT_WAITEX, &u32s(&[id, 1, 10, 0]), &[])
+            .unwrap();
+        assert_eq!(reply.error, NvError::TIMEOUT);
+        assert!(reply.wait.is_none());
+        // With one the caller waits, and settles the error.
+        nv.media.queue = Some(std::sync::Arc::new(Elsewhere));
+        let reply = nv
+            .ioctl(fd, SYNCPT_WAITEX, &u32s(&[id, 1, 10, 0]), &[])
+            .unwrap();
+        assert_eq!(reply.error, NvError::SUCCESS);
+        assert_eq!(
+            reply.wait,
+            Some(super::super::SyncptWait {
+                id,
+                threshold: 1,
+                timeout: 10,
+                writes_value: true
+            })
+        );
+        // A fence already reached needs no wait.
+        nv.gpu.syncpoints.increment(id, 1);
+        let reply = nv.ioctl(fd, SYNCPT_WAIT, &u32s(&[id, 1, 10]), &[]).unwrap();
+        assert_eq!((reply.error, reply.wait), (NvError::SUCCESS, None));
     }
 }
