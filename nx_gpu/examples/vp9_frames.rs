@@ -95,6 +95,19 @@ fn main() {
         }
         match dec.decode(chunk) {
             Ok(frames) => {
+                if std::env::var_os("VP9_HEADERS").is_some() {
+                    for (h, _) in dec.take_headers() {
+                        eprintln!(
+                            "chunk {i}: {}x{} key {} show {} tile columns log2 {} rows log2 {}",
+                            h.width,
+                            h.height,
+                            h.key_frame,
+                            h.show_frame,
+                            h.tile_cols_log2,
+                            h.tile_rows_log2
+                        );
+                    }
+                }
                 for f in frames {
                     for p in &f.planes {
                         out.write_all(&p.visible()).unwrap();
