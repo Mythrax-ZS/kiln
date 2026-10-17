@@ -69,7 +69,19 @@ impl Shared {
         let now = Instant::now();
         let due = last.map_or(now, |t| t + VSYNC_PERIOD * interval);
         if due > now {
-            std::thread::sleep(due - now);
+            // A sleep overruns by a millisecond or so: sleep until shortly before, then wait out
+            // the rest, so that the frames keep to the period.
+            let margin = Duration::from_micros(1500);
+            if due - now > margin {
+                std::thread::sleep(due - now - margin);
+            }
+            while Instant::now() < due {
+                std::thread::yield_now();
+            }
+            *last = Some(due);
+        } else if now - due < VSYNC_PERIOD {
+            // Late by less than a period: the next frame is due on the same grid, so the lateness
+            // does not add up from one frame to the next.
             *last = Some(due);
         } else {
             *last = Some(now);
