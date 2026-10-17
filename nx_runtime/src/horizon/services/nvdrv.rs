@@ -9,6 +9,7 @@ use super::super::object::KObject;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
 use crate::rt::runtime::rt;
 use nx_gpu::gpu::{Queue, SubmitError, Task};
+use nx_gpu::media::{Batch, Engines, MediaQueue};
 use nx_gpu::nvdrv::args::Fail;
 use nx_gpu::nvdrv::{EventToken, Nvdrv};
 use nx_gpu::{GuestMemory, NvError};
@@ -161,6 +162,23 @@ impl Queue for Worker {
     }
 }
 
+/// The queue the media engines' jobs wait in for the thread that runs them (A-184).
+struct MediaWorker {
+    backlog: Mutex<VecDeque<Batch>>,
+    /// Signaled when a batch arrives.
+    changed: Condvar,
+}
+
+impl MediaQueue for MediaWorker {
+    fn push(&self, batch: Batch) {
+        self.backlog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(batch);
+        self.changed.notify_all();
+    }
+}
+
 /// The renderer `NX_RENDERER` asks for: `vulkan`, or nothing (the default: the commands are
 /// decoded and counted, not drawn).
 fn renderer() -> Option<Box<dyn nx_gpu::render::Backend>> {
@@ -214,6 +232,16 @@ impl Shared {
         if let Some(w) = &worker {
             core.gpu.queue = Some(w.clone());
         }
+        // The media engines' jobs run on a thread of their own by the same rule (A-184).
+        let media = queued.then(|| {
+            Arc::new(MediaWorker {
+                backlog: Mutex::new(VecDeque::new()),
+                changed: Condvar::new(),
+            })
+        });
+        if let Some(m) = &media {
+            core.media.queue = Some(m.clone());
+        }
         Arc::new_cyclic(|weak: &Weak<Shared>| {
             if let Some(w) = &worker {
                 let (weak, w) = (weak.clone(), w.clone());
@@ -221,6 +249,13 @@ impl Shared {
                     .name("gpu".to_string())
                     .spawn(move || run_worker(weak, w))
                     .expect("the thread that runs the renderer's commands");
+            }
+            if let Some(m) = &media {
+                let (weak, m) = (weak.clone(), m.clone());
+                std::thread::Builder::new()
+                    .name("media".to_string())
+                    .spawn(move || run_media(weak, m))
+                    .expect("the thread that runs the media engines' jobs");
             }
             Shared {
                 core: Mutex::new(core),
@@ -488,6 +523,53 @@ fn run_worker(shared: Weak<Shared>, worker: Arc<Worker>) {
         b.running = false;
         drop(b);
         worker.changed.notify_all();
+    }
+}
+
+/// The thread that runs the media engines' jobs, batch after batch, in order: the jobs without
+/// the driver (a frame takes milliseconds to decode), then, with it, the syncpoint increments the
+/// submission asked for, so that the program's fences complete when the frames are there (A-184).
+fn run_media(shared: Weak<Shared>, worker: Arc<MediaWorker>) {
+    let mut engines = Engines::new();
+    let mem = ProcessMemory;
+    loop {
+        let batch = {
+            let mut b = worker.backlog.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(batch) = b.pop_front() {
+                    break batch;
+                }
+                b = worker.changed.wait(b).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        for job in &batch.jobs {
+            if let Err(e) = engines.run(job, &mem) {
+                shared.fail(e);
+                return;
+            }
+        }
+        if batch.increments.is_empty() {
+            continue;
+        }
+        {
+            let mut core = shared.core.lock().unwrap_or_else(|e| e.into_inner());
+            let mut woken = Vec::new();
+            for &(id, by) in &batch.increments {
+                woken.extend(core.gpu.syncpoints.increment(id, by));
+            }
+            core.wake(woken);
+        }
+        let kernel = shared
+            .kernel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade();
+        if let Some(kernel) = kernel {
+            shared.deliver_signals(&kernel);
+        }
     }
 }
 

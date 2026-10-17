@@ -4,16 +4,17 @@
 //! A program that plays a video opens the video decoder and the compositor, maps the buffers they
 //! work with (`MAP_CMD_BUFFER`, which gives each buffer an address of the engines' own), gets the
 //! syncpoints, and submits command buffers: the engines' methods, among them the addresses of the
-//! buffers shifted right by 8, then the method that starts a job. Here a submission's commands
-//! are run at once ([`crate::media`]: a VP9 frame is decoded, a frame is converted into the
-//! program's output surface), its syncpoints incremented as asked and its fences filled in
-//! (docs/ASSUMPTIONS.md A-119, A-182, A-183).
+//! buffers shifted right by 8, then the method that starts a job. Here a submission's jobs are
+//! prepared in the call ([`crate::media`]: a VP9 frame to decode, a frame to convert into the
+//! program's output surface), its fences filled in, and the jobs run and the syncpoints
+//! incremented on the media thread when there is one, else before the call returns
+//! (docs/ASSUMPTIONS.md A-119, A-182, A-183, A-184).
 
 use super::args::{unimplemented, Args, Fail, IoResult, Ioctl};
 use super::{Node, Nvdrv};
 use crate::error::NvError;
 use crate::media::host1x::{Channel, Write};
-use crate::media::EXECUTE;
+use crate::media::{Batch, Job, EXECUTE};
 use std::collections::HashMap;
 
 /// The type byte of the channel commands (0) and of `SET_NVMAP_FD` (`'H'`).
@@ -178,13 +179,16 @@ impl Nvdrv {
                         return Err(NvError::BAD_VALUE.into());
                     }
                 }
-                self.run_commands(fd, args, buffers, relocs)?;
-                // The work is promised, and done by now.
+                let jobs = self.run_commands(fd, args, buffers, relocs)?;
+                // The work is promised; it is done on the media thread when there is one
+                // (A-184), else here, before the call returns.
                 let mut woken = Vec::new();
                 let mut promised = Vec::new();
+                let mut increments = Vec::new();
                 for i in 0..incrs {
                     let (id, by) = (args.u32(at_incr(i)), args.u32(at_incr(i) + 4));
                     promised.push((id, self.gpu.syncpoints.promise(id, by)));
+                    increments.push((id, by));
                 }
                 for i in 0..fences {
                     let id = args.u32(at_fence(i));
@@ -197,8 +201,16 @@ impl Nvdrv {
                         .unwrap_or(0);
                     args.set_u32(at_fence(i) + 4, value);
                 }
-                for i in 0..incrs {
-                    let (id, by) = (args.u32(at_incr(i)), args.u32(at_incr(i) + 4));
+                if let Some(queue) = &self.media.queue {
+                    queue.push(Batch { jobs, increments });
+                    return Ok(());
+                }
+                for job in &jobs {
+                    if let Err(e) = self.media.engines.run(job, self.gpu.mem.as_ref()) {
+                        return unimplemented(e);
+                    }
+                }
+                for (id, by) in increments {
                     woken.extend(self.gpu.syncpoints.increment(id, by));
                 }
                 self.signal(woken);
@@ -214,8 +226,15 @@ impl Nvdrv {
     }
 
     /// Run the command buffers of a submission: read each, fill in its relocations, and give the
-    /// engine methods to the node, starting the engine's job at each `EXECUTE`.
-    fn run_commands(&mut self, fd: u32, args: &Args, buffers: usize, relocs: usize) -> IoResult {
+    /// engine methods to the node, preparing the engine's job at each `EXECUTE`.
+    fn run_commands(
+        &mut self,
+        fd: u32,
+        args: &Args,
+        buffers: usize,
+        relocs: usize,
+    ) -> Result<Vec<Job>, Fail> {
+        let mut jobs = Vec::new();
         let relocs_at = 16 + 12 * buffers;
         let shifts_at = relocs_at + 16 * relocs;
         for b in 0..buffers {
@@ -282,18 +301,20 @@ impl Nvdrv {
                 };
                 node.regs.insert(offset, value);
                 if offset == EXECUTE {
-                    if let Err(e) = self.media.execute(
+                    match self.media.prepare(
                         class,
                         &node.regs,
                         &self.gpu.nvmap,
                         self.gpu.mem.as_ref(),
                     ) {
-                        return unimplemented(e);
+                        Ok(Some(job)) => jobs.push(job),
+                        Ok(None) => {}
+                        Err(e) => return unimplemented(e),
                     }
                 }
             }
         }
-        Ok(())
+        Ok(jobs)
     }
 }
 

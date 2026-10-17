@@ -52,7 +52,6 @@ impl Nvdrv {
                 if freed.addr != 0 {
                     // The decoder's frames in that memory go with it.
                     self.media
-                        .vp9
                         .forget(freed.addr..freed.addr + u64::from(freed.size));
                 }
                 args.set_u64(8, freed.addr);

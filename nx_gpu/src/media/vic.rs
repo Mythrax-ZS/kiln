@@ -99,6 +99,16 @@ impl Config {
         })
     }
 
+    /// How many bytes [`Config::convert`] writes: the output surface, as the kind lays it out.
+    pub fn output_size(&self) -> usize {
+        let (w, h) = (self.width as usize, self.height as usize);
+        if self.block_kind == 0 {
+            return w * h * 4;
+        }
+        let block_rows = 8usize << self.block_height_log2;
+        (w * 4).div_ceil(64) * h.div_ceil(block_rows) * (512usize << self.block_height_log2)
+    }
+
     /// The bytes of the output surface: its pixels converted from `frame`, laid out as the
     /// configuration says.
     pub fn convert(&self, frame: &Frame) -> Result<Vec<u8>, String> {
@@ -116,7 +126,11 @@ impl Config {
         let offset: [i64; 3] = std::array::from_fn(|r| {
             (f64::from(self.matrix[r][3]) * 255.0 / (256.0 * 1023.0) * 131_072.0).round() as i64
         });
+        // Black, opaque, everywhere the frame does not reach.
         let mut linear = vec![0u8; w * h * 4];
+        for px in linear.as_chunks_mut::<4>().0 {
+            px[3] = 255;
+        }
         let [l, t, r, b] = self.dst;
         let (dw, dh) = (
             (r.saturating_sub(l) + 1) as f64,
@@ -126,36 +140,37 @@ impl Config {
         let (sw, sh) = (sr - sl + 1.0, sb - st + 1.0);
         let (y_plane, u_plane, v_plane) = (&frame.planes[0], &frame.planes[1], &frame.planes[2]);
         let (fw, fh) = (frame.width.max(1), frame.height.max(1));
-        for oy in 0..h {
-            let row = &mut linear[oy * w * 4..(oy + 1) * w * 4];
-            let inside_y = (oy as u32) >= t && (oy as u32) <= b;
-            let sy = (st + (oy as f64 - f64::from(t) + 0.5) * sh / dh - 0.5)
-                .round()
-                .clamp(0.0, (fh - 1) as f64) as usize;
-            for ox in 0..w {
-                let px = &mut row[ox * 4..ox * 4 + 4];
-                if !inside_y || (ox as u32) < l || (ox as u32) > r || !self.slot_enabled {
-                    px.copy_from_slice(&[0, 0, 0, 255]);
-                    continue;
-                }
-                let sx = (sl + (ox as f64 - f64::from(l) + 0.5) * sw / dw - 0.5)
+        // The sample column of each destination column, once for every row.
+        let (l, r) = (l as usize, (r as usize).min(w.saturating_sub(1)));
+        let columns: Vec<usize> = (l..=r)
+            .map(|ox| {
+                (sl + (ox as f64 - l as f64 + 0.5) * sw / dw - 0.5)
                     .round()
-                    .clamp(0.0, (fw - 1) as f64) as usize;
-                let yv = i64::from(y_plane.at(sx, sy));
-                let uv = i64::from(u_plane.at(sx / 2, sy / 2));
-                let vv = i64::from(v_plane.at(sx / 2, sy / 2));
-                let mut rgb = [0u8; 3];
-                for (c, out) in rgb.iter_mut().enumerate() {
-                    let m = &self.matrix[c];
-                    let s = i64::from(m[0]) * yv
-                        + i64::from(m[1]) * uv
-                        + i64::from(m[2]) * vv
-                        + offset[c];
-                    *out = ((s + (1 << 16)) >> 17).clamp(0, 255) as u8;
-                }
-                let pixel = [rgb[0], rgb[1], rgb[2], 255];
-                for (k, &o) in order.iter().enumerate() {
-                    px[k] = pixel[o];
+                    .clamp(0.0, (fw - 1) as f64) as usize
+            })
+            .collect();
+        let m = self.matrix.map(|row| row.map(i64::from));
+        if self.slot_enabled && l <= r {
+            for oy in (t as usize)..=(b as usize).min(h.saturating_sub(1)) {
+                let row = &mut linear[(oy * w + l) * 4..(oy * w + r + 1) * 4];
+                let sy = (st + (oy as f64 - f64::from(t) + 0.5) * sh / dh - 0.5)
+                    .round()
+                    .clamp(0.0, (fh - 1) as f64) as usize;
+                let y_row = &y_plane.data[sy * y_plane.stride..];
+                let u_row = &u_plane.data[(sy / 2) * u_plane.stride..];
+                let v_row = &v_plane.data[(sy / 2) * v_plane.stride..];
+                for (px, &sx) in row.as_chunks_mut::<4>().0.iter_mut().zip(&columns) {
+                    let yv = i64::from(y_row[sx]);
+                    let uv = i64::from(u_row[sx / 2]);
+                    let vv = i64::from(v_row[sx / 2]);
+                    let mut pixel = [0u8, 0, 0, 255];
+                    for (c, out) in pixel[..3].iter_mut().enumerate() {
+                        let s = m[c][0] * yv + m[c][1] * uv + m[c][2] * vv + offset[c];
+                        *out = ((s + (1 << 16)) >> 17).clamp(0, 255) as u8;
+                    }
+                    for (k, &o) in order.iter().enumerate() {
+                        px[k] = pixel[o];
+                    }
                 }
             }
         }
