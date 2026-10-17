@@ -141,10 +141,10 @@ impl Probs {
         p.mv_hp.copy_from_slice(&t[0x54A..0x54C]);
         p.mv_class[0].copy_from_slice(&t[0x54C..0x556]);
         p.mv_class[1].copy_from_slice(&t[0x556..0x560]);
-        for c in 0..2 {
-            for b in 0..2 {
+        for (c, comp) in p.mv_class0_fr.iter_mut().enumerate() {
+            for (b, probs) in comp.iter_mut().enumerate() {
                 let at = 0x560 + c * 6 + b * 3;
-                p.mv_class0_fr[c][b].copy_from_slice(&t[at..at + 3]);
+                probs.copy_from_slice(&t[at..at + 3]);
             }
         }
         p.mv_bits[0].copy_from_slice(&t[0x56C..0x576]);
@@ -223,10 +223,10 @@ impl Probs {
         t[0x54A..0x54C].copy_from_slice(&self.mv_hp);
         t[0x54C..0x556].copy_from_slice(&self.mv_class[0]);
         t[0x556..0x560].copy_from_slice(&self.mv_class[1]);
-        for c in 0..2 {
-            for b in 0..2 {
+        for (c, comp) in self.mv_class0_fr.iter().enumerate() {
+            for (b, probs) in comp.iter().enumerate() {
                 let at = 0x560 + c * 6 + b * 3;
-                t[at..at + 3].copy_from_slice(&self.mv_class0_fr[c][b]);
+                t[at..at + 3].copy_from_slice(probs);
             }
         }
         t[0x56C..0x576].copy_from_slice(&self.mv_bits[0]);

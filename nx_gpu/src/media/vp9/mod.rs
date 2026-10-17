@@ -309,6 +309,8 @@ impl Decoder {
     }
 
     /// Decode one coded frame (section 6.1); returns it if it is to be shown.
+    // The loops below index as the specification's pseudocode does, to be read against it.
+    #[allow(clippy::needless_range_loop)]
     fn decode_frame(&mut self, data: &[u8]) -> Result<Option<Arc<Frame>>, Error> {
         let mut r = BitReader::new(data);
         let mut hdr = self.uncompressed_header(&mut r)?;
@@ -423,6 +425,7 @@ impl Decoder {
     }
 
     /// The uncompressed header (section 6.2).
+    #[allow(clippy::needless_range_loop)]
     fn uncompressed_header(&mut self, r: &mut BitReader) -> Result<FrameHeader, Error> {
         let mut h = FrameHeader {
             lf: self.lf.clone(),
@@ -666,6 +669,7 @@ pub fn split_superframe(chunk: &[u8]) -> Vec<&[u8]> {
 
 /// The compressed header (section 6.3): the transform mode, the reference mode and the forward
 /// updates of the probabilities.
+#[allow(clippy::needless_range_loop)]
 fn compressed_header(
     bd: &mut BoolDecoder,
     h: &mut FrameHeader,

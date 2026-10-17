@@ -701,12 +701,8 @@ pub fn reconstruct(
         } else {
             tr.adst(n);
         }
-        for i in 0..n0 {
-            let v = if lossless {
-                tr.t[i]
-            } else {
-                round2(tr.t[i], shift)
-            };
+        for (i, &tv) in tr.t.iter().enumerate().take(n0) {
+            let v = if lossless { tv } else { round2(tv, shift) };
             let at = (y + i) * stride + x + j;
             p.data[at] = clip1(i32::from(p.data[at]) + v);
         }
