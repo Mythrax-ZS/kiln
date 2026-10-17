@@ -153,8 +153,9 @@ impl Nvdrv {
             }
             // u32 command buffers, relocations, syncpoint increments, fences; then the command
             // buffers (12 bytes each), the relocations (16 each) and their shifts (4 each), the
-            // increments ({u32 syncpoint, u32 increments, and more} of a size the argument's size
-            // gives) and the fences ({u32 syncpoint, u32 value (out)}).
+            // increments ({u32 syncpoint, u32 increments, three words of the program's own}: 20
+            // bytes, or whatever size the argument's size gives) and the fences: a u32 threshold
+            // for each (out), the value the increment of the same index reaches (A-119).
             (CHANNEL, SUBMIT) if size >= 16 => {
                 let (buffers, relocs, incrs, fences) = (
                     args.u32(0) as usize,
@@ -166,14 +167,14 @@ impl Nvdrv {
                 let fixed = 16 + 12 * buffers + 20 * relocs;
                 let tail = args
                     .len()
-                    .checked_sub(fixed + 8 * fences)
+                    .checked_sub(fixed + 4 * fences)
                     .ok_or(NvError::INVALID_SIZE)?;
                 let incr_size = tail.checked_div(incrs).unwrap_or(0);
                 if incrs != 0 && (incr_size < 8 || incr_size % 4 != 0 || tail % incrs != 0) {
                     return Err(NvError::INVALID_SIZE.into());
                 }
                 let at_incr = |i: usize| fixed + i * incr_size;
-                let at_fence = |i: usize| fixed + incrs * incr_size + 8 * i;
+                let at_fence = |i: usize| fixed + incrs * incr_size + 4 * i;
                 for i in 0..incrs {
                     if !self.gpu.syncpoints.is_valid(args.u32(at_incr(i))) {
                         return Err(NvError::BAD_VALUE.into());
@@ -191,15 +192,14 @@ impl Nvdrv {
                     increments.push((id, by));
                 }
                 for i in 0..fences {
-                    let id = args.u32(at_fence(i));
+                    // The threshold of the increment of the same index; a fence past the
+                    // increments gets the value of the last one.
                     let value = promised
-                        .iter()
-                        .rev()
-                        .find(|(p, _)| *p == id)
+                        .get(i)
+                        .or(promised.last())
                         .and_then(|(_, v)| *v)
-                        .or_else(|| self.gpu.syncpoints.max(id))
                         .unwrap_or(0);
-                    args.set_u32(at_fence(i) + 4, value);
+                    args.set_u32(at_fence(i), value);
                 }
                 if let Some(queue) = &self.media.queue {
                     queue.push(Batch { jobs, increments });
@@ -365,19 +365,27 @@ mod tests {
         let h = nv.gpu.nvmap.create(0x1000).unwrap();
         mem.map(0x10_0000, 0x1000);
         nv.gpu.nvmap.alloc(h, 0, 0, 0, 0, 0x10_0000).unwrap();
-        // One command buffer, no relocations, one increment of 2 (20 bytes), one fence.
-        let size = 16 + 12 + 20 + 8;
+        // One command buffer, no relocations, one increment of 2 (20 bytes), one fence (a u32).
+        let size = 16 + 12 + 20 + 4;
         let input = u32s(&[
-            1, 0, 1, 1, // counts
-            h, 0, 4, // the command buffer
-            id, 2, 0, 0, 0, // the increment
-            id, 0, // the fence
+            1,
+            0,
+            1,
+            1, // counts
+            h,
+            0,
+            4, // the command buffer
+            id,
+            2,
+            1,
+            0xFFFF_FFFF,
+            0, // the increment, with the words of the program's own
+            0, // the fence
         ]);
         let (e, a) = call(&mut nv, fd, iowr(0, 1, size), &input);
         assert_eq!(e, NvError::SUCCESS);
-        assert_eq!(a.u32(16 + 12 + 20), id);
         assert_eq!(
-            a.u32(16 + 12 + 20 + 4),
+            a.u32(16 + 12 + 20),
             2,
             "the fence is the value after the increments"
         );
@@ -385,7 +393,7 @@ mod tests {
         assert!(nv.gpu.syncpoints.is_reached(id, 2));
         // A second one counts on.
         let (_, a) = call(&mut nv, fd, iowr(0, 1, size), &input);
-        assert_eq!(a.u32(16 + 12 + 20 + 4), 4);
+        assert_eq!(a.u32(16 + 12 + 20), 4);
         // An increment of a syncpoint that does not exist is refused.
         let bad = u32s(&[0, 0, 1, 0, 9999, 1, 0, 0, 0]);
         let (e, _) = call(&mut nv, fd, iowr(0, 1, 16 + 20), &bad[..36]);
