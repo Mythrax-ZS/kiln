@@ -333,16 +333,19 @@ impl Core {
             at += MEMPOOL_OUT;
         }
 
-        // The mixes and the sinks follow the voices and the effects in the input (and whatever
-        // the splitters take); a layout that does not add up plays nothing. From revision 7 on
-        // the mix section holds only the mixes that changed (A-179).
+        // The splitters, the mixes and the sinks follow the voices and the effects in the input;
+        // a layout that does not add up plays nothing. From revision 7 on the mix section holds
+        // only the mixes that changed (A-179), and the splitter section only the splitters and
+        // destinations that changed (A-180).
         let splitters = u32_at(input, 0x24) as usize;
-        let mixes_at = voices_at + voices + effects + splitters;
+        let splitters_at = voices_at + voices + effects;
+        let mixes_at = splitters_at + splitters;
         let sinks_at = mixes_at + mixes;
         let frame = self.params.sample_count as usize;
         let graph = sinks.is_multiple_of(SINK_SIZE)
             && sinks > 0
             && sinks_at + sinks <= total
+            && self.mixer.read_splitters(&input[splitters_at..mixes_at])
             && self.mixer.read_mixes(
                 &input[mixes_at..sinks_at],
                 revision_number(revision) >= DIRTY_MIXES_REVISION,
@@ -364,8 +367,8 @@ impl Core {
                 .collect();
             let shape = format!(
                 "{} mixes ({} used, final mix {} buffers, destinations {:?}), sinks [{}], \
-                 effects {effects:#x} bytes, splitters {splitters:#x} bytes, mixes {mixes:#x}, \
-                 sinks {sinks:#x}, layout read {graph}",
+                 {} splitters ({} destinations used), effects {effects:#x} bytes, splitters \
+                 {splitters:#x} bytes, mixes {mixes:#x}, sinks {sinks:#x}, layout read {graph}",
                 m.mixes.len(),
                 m.mixes.iter().filter(|x| x.used).count(),
                 m.mixes.first().map_or(0, |x| x.buffers),
@@ -375,6 +378,8 @@ impl Core {
                     .map(|x| x.dest as i32)
                     .collect::<Vec<_>>(),
                 sink_text.join("; "),
+                m.splitters.iter().filter(|s| !s.is_empty()).count(),
+                m.destinations.iter().filter(|d| d.used).count(),
             );
             if self.graph_said.as_deref() != Some(shape.as_str()) {
                 eprintln!("[audio] graph: {shape}");
@@ -416,8 +421,22 @@ impl Core {
                 }
             }
             if made && self.mixer.has_graph() {
+                // A voice that plays into no mix but into a splitter is sent on by its
+                // destinations, with their gains instead of those of the channel resources.
+                let through_splitter = (v.dest_mix as usize) >= self.mixer.mixes.len()
+                    && (v.dest_splitter as usize) < self.mixer.splitters.len();
                 for c in 0..v.channels {
                     if voice.out[c].is_empty() {
+                        continue;
+                    }
+                    if through_splitter {
+                        self.mixer.add_voice_through_splitter(
+                            v.dest_splitter,
+                            c,
+                            v.channels,
+                            &voice.out[c],
+                            v.volume,
+                        );
                         continue;
                     }
                     let mut target = [0.0f32; voice::MAX_MIX_BUFFERS];
