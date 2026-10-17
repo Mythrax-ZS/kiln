@@ -215,7 +215,9 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   needs the press 15 times later). Never `NX_DUMP_FRAMES` without `NX_DUMP_EVERY` for a long run.
 - Window and input: `NX_WINDOW=1` (with `NX_RENDERER=vulkan`) shows the frames in a window
   (`NX_WINDOW_SIZE=<w>x<h>`, `NX_WINDOW_TITLE`, `NX_PRESENT_MODE=fifo|mailbox|immediate`); no test
-  opens one. The window opens when the program starts (not when it first draws, seconds later),
+  opens one. A program shows at most 60 frames a second (60 divided by the swap interval it asks
+  for, as the console's display does, A-181), in a window or not; `NX_UNPACED=1` lets it go as fast
+  as it can, for headless runs with scripted input. The window opens when the program starts (not when it first draws, seconds later),
   comes to the front and is painted black until the first frame is presented. The keyboard and an XInput gamepad are the handheld controls of `hid`: `NX_KEYMAP=<file>`
   rebinds keys, `NX_TRACE_KEYS=1` prints the keys and button changes, `NX_GAMEPAD=0` and
   `NX_GAMEPAD_LABELS=1` (docs/ASSUMPTIONS.md A-104). To drive a window from a script, post key messages

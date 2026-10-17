@@ -14,12 +14,13 @@ use nx_gpu::event::EventToken;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// `vi` module 114, description 5: the command is not available on this session (Switchbrew).
 const NOT_AVAILABLE: ResultCode = ResultCode::new(114, 5);
 
-/// How often the vsync event is set: 60 Hz. Nothing measures time against it (docs/ASSUMPTIONS.md).
+/// The console's display refreshes at 60 Hz: the vsync event is set that often (A-059), and a frame
+/// queued with swap interval `n` is on screen for `n` such periods (A-181).
 const VSYNC_PERIOD: Duration = Duration::from_micros(16_667);
 
 /// The display state of the process and the events behind its tokens.
@@ -31,6 +32,9 @@ pub struct Shared {
     frame_limit: Option<u64>,
     /// The driver, which tells the renderer which buffer is on screen.
     gpu: Mutex<Option<Arc<super::nvdrv::Shared>>>,
+    /// When the call that queued the last frame returned, if frames are paced as the display
+    /// shows them (A-181; `NX_UNPACED=1` lets them go as fast as the program makes them).
+    pacing: Option<Mutex<Option<Instant>>>,
 }
 
 impl Shared {
@@ -43,6 +47,32 @@ impl Shared {
                 .ok()
                 .and_then(|v| v.parse().ok()),
             gpu: Mutex::new(None),
+            pacing: std::env::var_os("NX_UNPACED")
+                .is_none_or(|v| v == "0")
+                .then(|| Mutex::new(None)),
+        }
+    }
+
+    /// Hold the call that queued a frame of swap interval `interval` until the frame before has
+    /// had its time on screen: the call returns no sooner than `interval` vsync periods after the
+    /// one before it, so a program shows at most 60 / `interval` frames a second, as on the
+    /// console, whatever the refresh rate of the machine's screen. A program that is late is not
+    /// held, and does not catch up. Interval 0 is not held.
+    fn pace(&self, interval: u32) {
+        let Some(last) = &self.pacing else {
+            return;
+        };
+        if interval == 0 {
+            return;
+        }
+        let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let due = last.map_or(now, |t| t + VSYNC_PERIOD * interval);
+        if due > now {
+            std::thread::sleep(due - now);
+            *last = Some(due);
+        } else {
+            *last = Some(now);
         }
     }
 
@@ -338,13 +368,16 @@ impl BinderDriver {
         }
         if code == nx_gpu::display::code::QUEUE_BUFFER {
             let frame = self.shared.comp().last_frame_of(binder);
-            if let (Some(frame), Some(gpu)) = (frame, self.shared.gpu()) {
-                gpu.present(&frame).map_err(|why| {
+            if let (Some(frame), Some(gpu)) = (&frame, self.shared.gpu()) {
+                gpu.present(frame).map_err(|why| {
                     Stop(format!(
                         "the renderer could not show frame {}: {why}",
                         frame.number
                     ))
                 })?;
+            }
+            if let Some(frame) = &frame {
+                self.shared.pace(frame.input.swap_interval);
             }
         }
         if code == nx_gpu::display::code::QUEUE_BUFFER {
@@ -392,5 +425,63 @@ impl Service for BinderDriver {
                 other,
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paced() -> Shared {
+        let mut s = Shared::new();
+        s.pacing = Some(Mutex::new(None));
+        s
+    }
+
+    fn last(s: &Shared) -> Instant {
+        let held = s.pacing.as_ref().unwrap().lock().unwrap();
+        held.expect("a frame was paced")
+    }
+
+    #[test]
+    fn queued_frames_are_held_to_the_rate_of_the_display() {
+        let s = paced();
+        let start = Instant::now();
+        // The first frame goes at once, each of the next three a period after the one before.
+        for _ in 0..4 {
+            s.pace(1);
+        }
+        assert!(start.elapsed() >= VSYNC_PERIOD * 3, "{:?}", start.elapsed());
+        // A swap interval of 2 holds the next frame for two periods.
+        let before = last(&s);
+        s.pace(2);
+        assert_eq!(last(&s), before + VSYNC_PERIOD * 2);
+        assert!(Instant::now() >= before + VSYNC_PERIOD * 2);
+    }
+
+    #[test]
+    fn a_late_frame_is_not_held_and_does_not_catch_up() {
+        let s = paced();
+        s.pace(1);
+        std::thread::sleep(VSYNC_PERIOD * 3);
+        let before = Instant::now();
+        s.pace(1);
+        // Its time is counted from when it came, not from where the one before left off.
+        assert!(last(&s) >= before);
+        // Interval 0 is never held.
+        let before = last(&s);
+        s.pace(0);
+        assert_eq!(last(&s), before);
+    }
+
+    #[test]
+    fn unpaced_frames_are_never_held() {
+        let mut s = Shared::new();
+        s.pacing = None;
+        let start = Instant::now();
+        for _ in 0..10 {
+            s.pace(1);
+        }
+        assert!(start.elapsed() < VSYNC_PERIOD * 9, "{:?}", start.elapsed());
     }
 }
