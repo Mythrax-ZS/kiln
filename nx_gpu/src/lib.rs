@@ -33,6 +33,7 @@ pub mod render;
 pub mod shaders;
 pub mod state;
 pub mod syncpt;
+pub mod time;
 pub mod twod;
 pub mod vm;
 
