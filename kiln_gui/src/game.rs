@@ -349,6 +349,10 @@ pub struct RunSettings {
     /// that does not refresh 60 (or 120) times a second, where vsync shows every other frame for
     /// one refresh more than the next.
     pub vsync: bool,
+    /// Open the game over the whole screen, without a border (`NX_WINDOW_FULLSCREEN=1`; F11
+    /// switches while it runs). A screen with adaptive sync then follows the game's frame rate
+    /// where the driver applies that to fullscreen windows only.
+    pub fullscreen: bool,
     /// Stop the game at a draw the renderer cannot make. Off, a game that is drawn skips such a
     /// draw (and says so once), as a person playing wants (`NX_GPU_LENIENT=1`); a developer
     /// looking for what the renderer lacks wants the stop.
@@ -390,6 +394,7 @@ impl Default for RunSettings {
             play: true,
             mute: false,
             vsync: true,
+            fullscreen: false,
             strict_gpu: false,
             keymap: String::new(),
             frames: 0,
@@ -472,6 +477,9 @@ impl RunSettings {
             }
             if !self.vsync {
                 put("NX_PRESENT_MODE", "immediate".into());
+            }
+            if self.fullscreen {
+                put("NX_WINDOW_FULLSCREEN", "1".into());
             }
         }
         if self.mute {

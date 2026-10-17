@@ -224,9 +224,14 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
+        // `NX_WINDOW_FULLSCREEN=1`: a borderless window over the whole screen (F11 switches), so
+        // that a screen with adaptive sync follows the game's frame rate where a driver applies it
+        // to fullscreen windows only.
+        let fullscreen = std::env::var("NX_WINDOW_FULLSCREEN").is_ok_and(|v| v != "0");
         let attributes = WinitWindow::default_attributes()
             .with_title(self.title.clone())
-            .with_inner_size(PhysicalSize::new(self.initial.0, self.initial.1));
+            .with_inner_size(PhysicalSize::new(self.initial.0, self.initial.1))
+            .with_fullscreen(fullscreen.then_some(winit::window::Fullscreen::Borderless(None)));
         let window = match event_loop.create_window(attributes) {
             Ok(w) => w,
             Err(e) => return self.tell(Err(format!("creating the window: {e}"))),
@@ -265,6 +270,18 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(s) => self.size.store(pack(s.width, s.height), Ordering::Relaxed),
             WindowEvent::KeyboardInput { event, .. } => {
+                // F11 switches between the whole screen and a window; the game does not see it.
+                if event.physical_key == PhysicalKey::Code(KeyCode::F11) {
+                    if event.state == ElementState::Pressed && !event.repeat {
+                        if let Some(window) = &self.window {
+                            let now = window.fullscreen().is_none();
+                            window.set_fullscreen(
+                                now.then_some(winit::window::Fullscreen::Borderless(None)),
+                            );
+                        }
+                    }
+                    return;
+                }
                 // A key that is held sends its press again and again; the first one says it all.
                 if let (Some(sink), PhysicalKey::Code(code), false) =
                     (&self.input, event.physical_key, event.repeat)

@@ -226,7 +226,9 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   (`NX_WINDOW_SIZE=<w>x<h>`, `NX_WINDOW_TITLE`, `NX_PRESENT_MODE=mailbox|fifo|immediate`: mailbox by
   default, each refresh of the screen showing the newest frame; `fifo` queues frames and plays them
   one per refresh, which stutters on a screen that is not 60 or 120 Hz; `immediate` shows a frame at
-  once and may tear); no test
+  once and may tear; `NX_WINDOW_FULLSCREEN=1` opens the window over the whole screen without a
+  border, and F11 switches that while it runs: a screen with adaptive sync then follows the game's
+  frame rate where the driver applies that to fullscreen windows only); no test
   opens one. A program shows at most 60 frames a second (60 divided by the swap interval it asks
   for, as the console's display does, A-181), in a window or not; `NX_UNPACED=1` lets it go as fast
   as it can, for headless runs with scripted input. The window opens when the program starts (not when it first draws, seconds later),
