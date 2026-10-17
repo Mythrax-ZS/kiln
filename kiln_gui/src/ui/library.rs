@@ -439,6 +439,12 @@ fn run_settings_form(
             ui.spacing_mut().item_spacing.y = 10.0;
             theme::toggle(ui, &mut run.play, "Show the game in a window");
             theme::toggle(ui, &mut run.mute, "Mute the sound");
+            theme::toggle(ui, &mut run.vsync, "Wait for the screen's refresh (vsync)");
+            if !run.vsync {
+                ui.label(theme::muted(
+                    "Frames are shown the moment they are ready: they may tear, but they come evenly on a screen that does not refresh 60 or 120 times a second.",
+                ));
+            }
             theme::toggle(
                 ui,
                 &mut run.strict_gpu,

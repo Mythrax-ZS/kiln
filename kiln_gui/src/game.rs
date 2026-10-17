@@ -344,6 +344,11 @@ pub struct RunSettings {
     pub play: bool,
     /// Leave the sound device out (`NX_AUDIO=0`).
     pub mute: bool,
+    /// Show each frame at the screen's next refresh (vsync). Off, a frame is shown the moment it
+    /// is ready (`NX_PRESENT_MODE=immediate`): it may tear, but the frames come evenly on a screen
+    /// that does not refresh 60 (or 120) times a second, where vsync shows every other frame for
+    /// one refresh more than the next.
+    pub vsync: bool,
     /// Stop the game at a draw the renderer cannot make. Off, a game that is drawn skips such a
     /// draw (and says so once), as a person playing wants (`NX_GPU_LENIENT=1`); a developer
     /// looking for what the renderer lacks wants the stop.
@@ -384,6 +389,7 @@ impl Default for RunSettings {
             // A game is run to be played unless it is asked not to be.
             play: true,
             mute: false,
+            vsync: true,
             strict_gpu: false,
             keymap: String::new(),
             frames: 0,
@@ -463,6 +469,9 @@ impl RunSettings {
             put("NX_WINDOW", "1".into());
             if !self.strict_gpu {
                 put("NX_GPU_LENIENT", "1".into());
+            }
+            if !self.vsync {
+                put("NX_PRESENT_MODE", "immediate".into());
             }
         }
         if self.mute {
