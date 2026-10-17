@@ -21,7 +21,7 @@ ExeFS / NRO ──loader──▶ Module ──discover──▶ per-function CF
 | Build | `src/build` | clang discovery, parallel compile, link against `nx_runtime`. |
 | Run | `nx_runtime/src/rt` | Guest memory, exclusive monitor, function table, slow path, process start-up. |
 | Horizon | `nx_runtime/src/horizon` | The kernel a produced NSO or NRO runs on: SVCs, threads, synchronization, IPC, `sm:`, and the services. |
-| GPU | `nx_gpu` | The driver service and its device nodes, the display and buffer queue, and a command processor with a macro engine. It decodes the 3D state (`state.rs`, `draw_state.rs`), keeps the constant buffer bindings, counts the shader programs draws use (`shaders.rs`), and hands each draw, clear, compute launch (`compute.rs` decodes its descriptor) and displayed buffer to a `Backend` (`render.rs`) when there is one; the inline-to-memory engine (`i2m.rs`) writes data sent in the command stream to memory. |
+| GPU | `nx_gpu` | The driver service and its device nodes, the display and buffer queue, and a command processor with a macro engine. It decodes the 3D state (`state.rs`, `draw_state.rs`), keeps the constant buffer bindings, counts the shader programs draws use (`shaders.rs`), and hands each draw, clear, compute launch (`compute.rs` decodes its descriptor) and displayed buffer to a `Backend` (`render.rs`) when there is one; the inline-to-memory engine (`i2m.rs`) writes data sent in the command stream to memory; `media/` runs the jobs of the video decoder (host1x command buffers, a VP9 decoder written from the bitstream specification) and of the video image compositor (the conversion to an RGB surface). |
 | Shaders | `nx_shader` | The Maxwell program header, the instruction decoder, the control-flow graph (with the `SSY`/`PBK` stacks), a SPIR-V module builder, and the translation of a program to SPIR-V (`translate/`): registers and predicates as function variables, the blocks in address order each under a flag of its own when every jump goes forward and a dispatch loop over the blocks when one goes back (A-114), for the vertex and pixel stages and for a compute program as the title launches it (the kernel stage); `alu`, `int`, `io`, `tex`, `global` and `flow` hold the instructions (149 of 296 table rows, `example coverage`). |
 | Vulkan | `nx_vulkan` | The Vulkan device (loaded at run time), buffers, images with staging upload, a compute harness with textures and device-address patching (the translator's tests run its shaders here against plain Rust arithmetic), and the renderer, a `Backend` that draws with dynamic rendering, cached pipelines, textures (detiled, ASTC decoded by `astc.rs`), render targets that can be sampled or written back to the memory a texture reads, compute launches that run to the end before the next command, and guest memory imported for global access. |
 | Front end | `kiln_gui` | The desktop window around the command line: pick a game, recompile, keep a library of games and the settings each runs with. It runs `kiln` and the games as processes. |
@@ -167,6 +167,12 @@ guest ──IHOSBinderDriver──▶ vi service ──▶ nx_gpu::display (parc
 - `methods.rs` is generated (`tools/gen_methods.sh`) from NVIDIA's open-gpu-doc headers and only
   gives names to offsets, for traces.
 - `parcel.rs` and `display.rs` are the Android `Parcel` codec and the buffer queue of a layer.
+- `media/` is the engines behind the nodes of `nvdrv/decoder.rs`: `host1x.rs` parses the command
+  buffers, `vp9/` decodes VP9 (headers, tiles, reconstruction, the loop filter, probability
+  adaptation; `nvdec.rs` takes the console's picture setup and probability table in place of the
+  stream's headers) and `vic.rs` converts a decoded frame into the program's output surface. The
+  jobs run in the call that submits them; a frame of 1280 by 720 takes about 13 ms on the
+  development machine.
 - Time: syncpoint fences complete at once; the vsync is a 60 Hz host thread that sets the display's
   event (`vi.rs`), and the audio renderer's frame event a 200 Hz one (`audren.rs`).
 

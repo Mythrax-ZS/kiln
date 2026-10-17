@@ -9,7 +9,9 @@ Crates:
   NPDM, the A64 decoder and interpreter, guest memory and the Horizon emulation layer. Built as
   `rlib` and `staticlib`; every produced binary links against it.
 - `nx_gpu` (`nx_gpu/`): the GPU front, with no knowledge of Horizon: the driver service's device nodes,
-  the display buffer queue and a Maxwell command processor with a macro engine. `nx_runtime`
+  the display buffer queue, a Maxwell command processor with a macro engine, and the media engines
+  (`media/`: host1x command buffers, a VP9 decoder written from the bitstream specification, the
+  video image compositor's conversion to RGB). `nx_runtime`
   depends on it. It draws nothing itself: draws, clears and displayed buffers go to a `Backend`.
 - `nx_shader` (`nx_shader/`): Maxwell shader programs: header, decoder, control flow, a SPIR-V builder
   and the translation to SPIR-V. No dependencies and no knowledge of the GPU model that feeds it.
@@ -138,7 +140,10 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   frames are shown); `NX_TRACE_REGISTER=<hex byte offset>[,...]` prints every write to those 3D registers
   (with the draw count and the macro it came from) and `NX_TRACE_MACRO=<id>` every call of that macro
   with the writes it makes and its code, once; `NX_TRACE_2D=1` prints every copy of the 2D engine
-  with its surfaces and rectangles (A-165); `NX_MAX_FRAMES=<n>` ends the run after `n` presented
+  with its surfaces and rectangles (A-165); `NX_TRACE_MEDIA=1` prints every frame the video decoder
+  decodes and every conversion the video image compositor makes, with its output surface, format and
+  how many of its pixels are not black (A-182, A-183; `NX_TRACE_MEDIA=2` adds every method write and
+  every mapping of the engines); `NX_MAX_FRAMES=<n>` ends the run after `n` presented
   frames; `NX_SAVE_DIR=<dir>` is where save data goes (default `./nx_save`). `kiln symbols --exefs <dir> [--match <text>]
   [<address>...]` names the function around an address, for reading the return addresses a stop
   report ends with. `NX_TRACE_AS=1` says every mapping the program makes in the GPU's address space
