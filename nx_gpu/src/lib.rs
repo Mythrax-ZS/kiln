@@ -20,6 +20,7 @@ pub mod error;
 pub mod event;
 pub mod gpu;
 pub mod i2m;
+pub mod media;
 pub mod mem;
 pub mod methods;
 pub mod mme;
