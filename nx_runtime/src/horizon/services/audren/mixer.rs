@@ -465,8 +465,8 @@ impl Mixer {
                         continue;
                     };
                     let (dst_off, dst_n) = (target.offset, target.buffers);
-                    for b in 0..dst_n {
-                        self.add_buffer(src_off + k % src_n, dst_off + b, volume * send.gains[b]);
+                    for (b, &gain) in send.gains.iter().enumerate().take(dst_n) {
+                        self.add_buffer(src_off + k % src_n, dst_off + b, volume * gain);
                     }
                 }
             }
