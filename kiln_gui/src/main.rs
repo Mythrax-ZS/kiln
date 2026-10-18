@@ -38,6 +38,7 @@ fn main() -> eframe::Result {
         "kiln",
         options,
         Box::new(move |cc| {
+            theme::select(&settings.theme);
             theme::install(&cc.egui_ctx, settings.ui_scale);
             Ok(Box::new(app::App::new(cc.egui_ctx.clone(), settings)))
         }),

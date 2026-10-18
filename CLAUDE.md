@@ -20,7 +20,11 @@ Crates:
 - `kiln_gui` (`kiln_gui/`): the desktop front end (`egui`); it runs `kiln` and the games as
   processes. Run `cargo run -p kiln_gui`; `KILN_GUI_SCREENSHOT=<png>` saves its window. A game's
   tile shows `icon.png`/`icon.jpg` from its folder (the Library's Icon button, or an `icon*` picture
-  beside the input, copied when it is recompiled), else its initial. Its look (the
+  beside the input, copied when it is recompiled), else its initial. A recompile shows a progress bar
+  from the compiler's `KILN_PROGRESS` lines. The colors come from a theme (`theme::colors()`, never
+  a constant): five built in (`kiln_gui/src/theme.rs`), and any JSON file in `themes/` beside the
+  settings (`name`, `dark`, `base`, the colors of `Palette` as `#rrggbb`); the Settings screen
+  chooses. Its look (the
   icon, the mascot Cinder, the lettering) is pixel art in `kiln_gui/src/brand.rs`; `cargo run -p
   kiln_gui --example brand` writes `assets/brand/` and `dist/linux/kiln.png` from it, and
   `kiln_gui/build.rs` puts `assets/brand/kiln.ico` into `kiln-gui.exe`.
@@ -246,6 +250,9 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
 - A real title through the whole pipeline (opt-in, by hand; nothing from it is stored): build with
   `kiln build --exefs <exefs> --romfs <romfs> --out <dir>`, run `<dir>/<name>` with
   `NX_TRACE_SVC=1`, and use `kiln relink` / `--reuse-objects` to iterate on the runtime.
+  `KILN_PROGRESS=1` makes `kiln build` and `kiln relink` print `kiln: progress <stage> <done>/<total>`
+  on the standard error at each stage and each unit compiled (`0/0` for a stage of unknown
+  length), which the GUI's progress bar follows.
   `KILN_LINK_MAP=<file>` makes the link write a map of the executable, and on Windows
   `pwsh -File tools/sample_threads.ps1 -Map <file>` samples where every thread of the running
   program is (a generated function `f_<guest address>`, a Rust function of the runtime, a module

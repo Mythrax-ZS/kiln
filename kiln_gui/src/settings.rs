@@ -20,6 +20,8 @@ pub struct Settings {
     pub default_opt: u8,
     /// Interface scale.
     pub ui_scale: f32,
+    /// The theme, by name (a built-in one, or a file in `themes/` beside this file).
+    pub theme: String,
     /// The last game picked, to come back to.
     pub last_game: String,
 }
@@ -33,6 +35,7 @@ impl Default for Settings {
             runtime_lib: String::new(),
             default_opt: 1,
             ui_scale: 1.0,
+            theme: "Kiln".to_string(),
             last_game: String::new(),
         }
     }

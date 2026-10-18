@@ -16,16 +16,16 @@ pub struct Console {
 fn color_of(line: &Line) -> egui::Color32 {
     let lower = line.text.trim_start().to_lowercase();
     match line.stream {
-        Stream::Info => theme::ACCENT,
+        Stream::Info => theme::colors().accent,
         _ if lower.starts_with("error")
             || lower.contains("panicked")
             || lower.starts_with("fatal") =>
         {
-            theme::BAD
+            theme::colors().bad
         }
-        _ if lower.starts_with("warning") => theme::WARN,
+        _ if lower.starts_with("warning") => theme::colors().warn,
         Stream::Err => egui::Color32::from_rgb(0xc4, 0xca, 0xd6),
-        Stream::Out => theme::TEXT,
+        Stream::Out => theme::colors().text,
     }
 }
 
@@ -84,7 +84,7 @@ impl Console {
                 ui.label(
                     RichText::new(empty_hint)
                         .font(FontId::new(13.5, FontFamily::Monospace))
-                        .color(theme::FAINT),
+                        .color(theme::colors().faint),
                 );
                 return;
             }
@@ -118,11 +118,19 @@ impl Console {
                 ui.label(theme::muted(note));
             }
             theme::right(ui, |ui| {
-                if theme::button_ex(ui, None, "Clear", !self.is_empty(), theme::TEXT).clicked() {
+                if theme::button_ex(ui, None, "Clear", !self.is_empty(), theme::colors().text)
+                    .clicked()
+                {
                     self.clear();
                 }
-                if theme::button_ex(ui, Some(Icon::Copy), "Copy", !self.is_empty(), theme::TEXT)
-                    .clicked()
+                if theme::button_ex(
+                    ui,
+                    Some(Icon::Copy),
+                    "Copy",
+                    !self.is_empty(),
+                    theme::colors().text,
+                )
+                .clicked()
                 {
                     ui.ctx().copy_text(self.text());
                 }
@@ -157,10 +165,19 @@ mod tests {
             stream,
             text: text.to_string(),
         };
-        assert_eq!(color_of(&line(Stream::Err, "error: nope")), theme::BAD);
-        assert_eq!(color_of(&line(Stream::Out, "  Warning: hm")), theme::WARN);
-        assert_eq!(color_of(&line(Stream::Info, "$ kiln")), theme::ACCENT);
-        assert_eq!(color_of(&line(Stream::Out, "fine")), theme::TEXT);
+        assert_eq!(
+            color_of(&line(Stream::Err, "error: nope")),
+            theme::colors().bad
+        );
+        assert_eq!(
+            color_of(&line(Stream::Out, "  Warning: hm")),
+            theme::colors().warn
+        );
+        assert_eq!(
+            color_of(&line(Stream::Info, "$ kiln")),
+            theme::colors().accent
+        );
+        assert_eq!(color_of(&line(Stream::Out, "fine")), theme::colors().text);
         let mut c = Console::default();
         c.error("boom");
         assert_eq!(c.text(), "error: boom\n");

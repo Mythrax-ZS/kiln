@@ -47,7 +47,7 @@ fn paint_tile(painter: &egui::Painter, rect: Rect, name: &str, icon: Option<&Tex
         painter.rect_stroke(
             rect,
             radius,
-            Stroke::new(1.0, theme::BORDER_STRONG),
+            Stroke::new(1.0, theme::colors().border_strong),
             StrokeKind::Inside,
         );
         return;
@@ -80,7 +80,7 @@ impl App {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(theme::PANEL)
+                    .fill(theme::colors().panel)
                     .inner_margin(Margin::symmetric(20, 18)),
             )
             .show(ui, |ui| self.game_list(ui));
@@ -184,7 +184,7 @@ impl App {
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if running_this {
-                        if theme::button_ex(ui, Some(Icon::Stop), "Stop", true, theme::BAD)
+                        if theme::button_ex(ui, Some(Icon::Stop), "Stop", true, theme::colors().bad)
                             .clicked()
                         {
                             action = Some(Action::Stop);
@@ -196,7 +196,7 @@ impl App {
                     if theme::button(ui, Some(Icon::Folder), "Folder").clicked() {
                         action = Some(Action::Folder);
                     }
-                    if theme::button_ex(ui, Some(Icon::Wrench), "Relink", !self.busy(), theme::TEXT)
+                    if theme::button_ex(ui, Some(Icon::Wrench), "Relink", !self.busy(), theme::colors().text)
                         .on_hover_text(
                             "Link the program again with the current runtime, without recompiling",
                         )
@@ -222,7 +222,7 @@ impl App {
                             Some(Icon::Trash),
                             "Delete",
                             !running_this,
-                            theme::BAD,
+                            theme::colors().bad,
                         )
                         .clicked()
                         {
@@ -324,8 +324,8 @@ fn game_card(ui: &mut Ui, g: &Game, selected: bool, running: bool) -> (bool, boo
         rect,
         CornerRadius::same(14),
         theme::mix(
-            theme::mix(theme::CARD, theme::CARD_HOVER, t),
-            theme::ACCENT_DIM,
+            theme::mix(theme::colors().card, theme::colors().card_hover, t),
+            theme::colors().accent_dim,
             s,
         ),
     );
@@ -335,8 +335,8 @@ fn game_card(ui: &mut Ui, g: &Game, selected: bool, running: bool) -> (bool, boo
         Stroke::new(
             1.0,
             theme::mix(
-                theme::mix(theme::BORDER, theme::BORDER_STRONG, t),
-                theme::ACCENT,
+                theme::mix(theme::colors().border, theme::colors().border_strong, t),
+                theme::colors().accent,
                 s,
             ),
         ),
@@ -355,9 +355,9 @@ fn game_card(ui: &mut Ui, g: &Game, selected: bool, running: bool) -> (bool, boo
     let title = painter.layout_no_wrap(
         g.meta.name.clone(),
         FontId::new(16.0, theme::bold_family()),
-        theme::TEXT,
+        theme::colors().text,
     );
-    painter.galley(pos2(x, rect.center().y - 22.0), title, theme::TEXT);
+    painter.galley(pos2(x, rect.center().y - 22.0), title, theme::colors().text);
     let meta_line = format!(
         "-O{} · {} · {}",
         g.meta.opt,
@@ -367,9 +367,9 @@ fn game_card(ui: &mut Ui, g: &Game, selected: bool, running: bool) -> (bool, boo
     let meta = painter.layout_no_wrap(
         meta_line,
         FontId::new(12.5, FontFamily::Proportional),
-        theme::MUTED,
+        theme::colors().muted,
     );
-    painter.galley(pos2(x, rect.center().y + 4.0), meta, theme::MUTED);
+    painter.galley(pos2(x, rect.center().y + 4.0), meta, theme::colors().muted);
     // The play button.
     let button =
         Rect::from_center_size(pos2(rect.right() - 34.0, rect.center().y), vec2(40.0, 40.0));
@@ -377,10 +377,14 @@ fn game_card(ui: &mut Ui, g: &Game, selected: bool, running: bool) -> (bool, boo
     let ph = ui.ctx().animate_bool_with_time(pr.id, pr.hovered(), 0.12);
     let painter = ui.painter();
     let (fill, glyph) = if running {
-        (theme::alpha(theme::GOOD, 40), Icon::Stop)
+        (theme::alpha(theme::colors().good, 40), Icon::Stop)
     } else {
         (
-            theme::mix(theme::alpha(theme::ACCENT, 28), theme::ACCENT, ph),
+            theme::mix(
+                theme::alpha(theme::colors().accent, 28),
+                theme::colors().accent,
+                ph,
+            ),
             Icon::Play,
         )
     };
@@ -398,20 +402,20 @@ fn game_card(ui: &mut Ui, g: &Game, selected: bool, running: bool) -> (bool, boo
         ),
         glyph,
         if running {
-            theme::GOOD
+            theme::colors().good
         } else {
-            theme::mix(theme::ACCENT, Color32::WHITE, ph)
+            theme::mix(theme::colors().accent, Color32::WHITE, ph)
         },
     );
     if running {
         let dot = pos2(rect.right() - 78.0, rect.center().y);
-        painter.circle_filled(dot, 4.0, theme::GOOD);
+        painter.circle_filled(dot, 4.0, theme::colors().good);
         painter.text(
             dot - vec2(10.0, 0.0),
             Align2::RIGHT_CENTER,
             "Running",
             FontId::new(12.5, FontFamily::Proportional),
-            theme::GOOD,
+            theme::colors().good,
         );
     }
     if pr.hovered() || response.hovered() {
@@ -544,14 +548,22 @@ fn run_settings_form(
         } else {
             Icon::ChevronRight
         },
-        if hot { theme::TEXT } else { theme::MUTED },
+        if hot {
+            theme::colors().text
+        } else {
+            theme::colors().muted
+        },
     );
     ui.painter().text(
         pos2(rect.left() + 26.0, rect.center().y),
         Align2::LEFT_CENTER,
         "More",
         FontId::new(14.5, FontFamily::Proportional),
-        if hot { theme::TEXT } else { theme::MUTED },
+        if hot {
+            theme::colors().text
+        } else {
+            theme::colors().muted
+        },
     );
     if hot {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -595,8 +607,8 @@ fn run_settings_form(
     );
     setting_row(ui, "More variables", "One NAME=value per line.", |ui| {
         Frame::new()
-            .fill(theme::INPUT)
-            .stroke(Stroke::new(1.0, theme::BORDER))
+            .fill(theme::colors().input)
+            .stroke(Stroke::new(1.0, theme::colors().border))
             .corner_radius(CornerRadius::same(8))
             .inner_margin(Margin::symmetric(10, 8))
             .show(ui, |ui| {
@@ -606,7 +618,7 @@ fn run_settings_form(
                         .desired_rows(3)
                         .desired_width(380.0)
                         .font(FontId::new(13.0, FontFamily::Monospace))
-                        .hint_text(RichText::new("NX_TRACE_SVC=1").color(theme::FAINT)),
+                        .hint_text(RichText::new("NX_TRACE_SVC=1").color(theme::colors().faint)),
                 );
             });
     });

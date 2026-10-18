@@ -137,7 +137,9 @@ Library, which keeps one folder per game and the settings each is run with (wind
 and RomFS locations, the logging and GPU trace switches, extra environment variables), shows each game with a picture
 (`icon.png` or `icon.jpg` in its folder: chosen with the Icon button, or copied from an `icon*` PNG or JPEG beside the
 input when it is recompiled; otherwise its initial), and starts
-the game (drawn in a window with the sound on, unless the settings say otherwise) with the output shown beside them. The Settings screen names the `kiln` program, the C
+the game (drawn in a window with the sound on, unless the settings say otherwise) with the output shown beside them. A progress bar
+follows a recompile stage by stage. The window's colors come from a theme: five are built in, and your own go in a `themes` folder
+beside the settings as JSON files (a `name`, `dark` true or false, optionally a `base` theme, and any of the colors as `#rrggbb`). The Settings screen names the `kiln` program, the C
 compiler and the runtime library to use; the header shows whether each was found. The GUI finds
 `kiln` beside itself or on the `PATH`. It reads no keys and opens no NSP, XCI or NCA files, as
 the command line does not. `KILN_GUI_CONFIG_DIR` moves its settings folder, and

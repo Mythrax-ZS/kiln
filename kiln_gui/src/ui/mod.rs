@@ -27,8 +27,11 @@ pub(crate) fn setting_row(ui: &mut Ui, label: &str, help: &str, add: impl FnOnce
 pub(crate) fn hairline(ui: &Ui, top: bool) {
     let r = ui.max_rect();
     let y = if top { r.top() } else { r.bottom() };
-    ui.painter()
-        .hline(r.x_range(), y, egui::Stroke::new(1.0, theme::BORDER));
+    ui.painter().hline(
+        r.x_range(),
+        y,
+        egui::Stroke::new(1.0, theme::colors().border),
+    );
 }
 
 impl eframe::App for App {
@@ -66,7 +69,7 @@ impl App {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(theme::BG)
+                    .fill(theme::colors().bg)
                     .inner_margin(Margin::symmetric(24, 0)),
             )
             .show(ui, |ui| {
@@ -142,7 +145,7 @@ impl App {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(theme::BG)
+                    .fill(theme::colors().bg)
                     .inner_margin(Margin::symmetric(24, 0)),
             )
             .show(ui, |ui| {
@@ -151,7 +154,7 @@ impl App {
                     ui.label(theme::muted("Games folder:"));
                     let path = self.settings.games_dir.clone();
                     let r = ui.add(
-                        Label::new(RichText::new(&path).size(13.0).color(theme::TEXT))
+                        Label::new(RichText::new(&path).size(13.0).color(theme::colors().text))
                             .sense(Sense::click())
                             .truncate(),
                     );
@@ -194,8 +197,14 @@ impl App {
                 ));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if theme::button_ex(ui, Some(theme::Icon::Trash), "Delete", true, theme::BAD)
-                        .clicked()
+                    if theme::button_ex(
+                        ui,
+                        Some(theme::Icon::Trash),
+                        "Delete",
+                        true,
+                        theme::colors().bad,
+                    )
+                    .clicked()
                     {
                         delete = true;
                     }
@@ -226,6 +235,10 @@ pub(crate) fn empty_state(ui: &mut Ui, title: &str, text: &str) {
 
 pub(crate) fn central(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     CentralPanel::default()
-        .frame(Frame::new().fill(theme::BG).inner_margin(Margin::same(22)))
+        .frame(
+            Frame::new()
+                .fill(theme::colors().bg)
+                .inner_margin(Margin::same(22)),
+        )
         .show(ui, add);
 }

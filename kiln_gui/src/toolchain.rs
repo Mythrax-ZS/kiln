@@ -54,6 +54,8 @@ pub fn apply_env(cmd: &mut Command, settings: &Settings) {
     if !settings.runtime_lib.trim().is_empty() {
         cmd.env("KILN_RUNTIME_LIB", settings.runtime_lib.trim());
     }
+    // The progress lines the bar above the output follows.
+    cmd.env("KILN_PROGRESS", "1");
 }
 
 /// Run `kiln doctor` and read its answer.

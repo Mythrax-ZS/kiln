@@ -135,6 +135,8 @@ impl App {
         let mut save = false;
         let mut browse = false;
         let mut scale_done = None;
+        let mut theme_pick: Option<String> = None;
+        let mut themes_again = false;
         theme::wide_card(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 16.0;
             setting_row(
@@ -169,6 +171,38 @@ impl App {
             );
             setting_row(
                 ui,
+                "Theme",
+                "The colors of this window. Your own go in the themes folder beside the settings, one JSON file each (name, dark, and the colors as #rrggbb).",
+                |ui| {
+                    let names: Vec<String> = self.themes.iter().map(|t| t.name.clone()).collect();
+                    let labels: Vec<&str> = names.iter().map(String::as_str).collect();
+                    let mut chosen = names
+                        .iter()
+                        .position(|n| n.eq_ignore_ascii_case(&self.settings.theme))
+                        .unwrap_or(0);
+                    ui.vertical(|ui| {
+                        if theme::segmented(ui, &mut chosen, &labels) {
+                            theme_pick = names.get(chosen).cloned();
+                        }
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if theme::button(ui, Some(Icon::Refresh), "Look again")
+                                .on_hover_text("Read the themes folder again")
+                                .clicked()
+                            {
+                                themes_again = true;
+                            }
+                            if theme::button(ui, Some(Icon::Folder), "Themes folder").clicked() {
+                                let dir = crate::settings::config_dir().join("themes");
+                                let _ = std::fs::create_dir_all(&dir);
+                                self.reveal(&dir);
+                            }
+                        });
+                    });
+                },
+            );
+            setting_row(
+                ui,
                 "Interface size",
                 "Scale of everything in this window.",
                 |ui| {
@@ -195,6 +229,15 @@ impl App {
         if browse {
             self.pick_folder(Target::GamesDir);
         }
+        if themes_again {
+            self.themes = theme::themes();
+        }
+        if let Some(name) = theme_pick {
+            self.settings.theme = name;
+            theme::select(&self.settings.theme);
+            theme::install(&self.ctx, self.settings.ui_scale);
+            save = true;
+        }
         if let Some(scale) = scale_done {
             self.ctx.set_pixels_per_point(scale);
             save = true;
@@ -213,6 +256,6 @@ fn status_line(ui: &mut Ui, what: Option<(Status, String)>) {
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(vec2(10.0, 16.0), eframe::egui::Sense::hover());
         ui.painter().circle_filled(r.center(), 4.0, status.color());
-        ui.add(Label::new(RichText::new(text).size(12.5).color(theme::MUTED)).wrap());
+        ui.add(Label::new(RichText::new(text).size(12.5).color(theme::colors().muted)).wrap());
     });
 }

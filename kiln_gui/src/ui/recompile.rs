@@ -19,18 +19,22 @@ impl App {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(theme::PANEL)
+                    .fill(theme::colors().panel)
                     .inner_margin(Margin::symmetric(24, 18)),
             )
             .show(ui, |ui| {
                 Panel::bottom("recompile_go")
                     .show_separator_line(false)
-                    .frame(Frame::new().fill(theme::PANEL).inner_margin(Margin {
-                        top: 12,
-                        bottom: 4,
-                        left: 0,
-                        right: 0,
-                    }))
+                    .frame(
+                        Frame::new()
+                            .fill(theme::colors().panel)
+                            .inner_margin(Margin {
+                                top: 12,
+                                bottom: 4,
+                                left: 0,
+                                right: 0,
+                            }),
+                    )
                     .show(ui, |ui| self.go_bar(ui));
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -154,8 +158,8 @@ impl App {
                 Icon::ChevronRight
             },
             theme::mix(
-                theme::MUTED,
-                theme::TEXT,
+                theme::colors().muted,
+                theme::colors().text,
                 t.max(if response.hovered() { 1.0 } else { 0.0 }),
             ),
         );
@@ -165,8 +169,8 @@ impl App {
             "Advanced",
             egui::FontId::new(14.5, egui::FontFamily::Proportional),
             theme::mix(
-                theme::MUTED,
-                theme::TEXT,
+                theme::colors().muted,
+                theme::colors().text,
                 if response.hovered() { 1.0 } else { t },
             ),
         );
@@ -250,7 +254,7 @@ impl App {
             _ => None,
         };
         if let Some(r) = &reason {
-            ui.add(Label::new(RichText::new(r).size(13.0).color(theme::WARN)).truncate());
+            ui.add(Label::new(RichText::new(r).size(13.0).color(theme::colors().warn)).truncate());
         }
         if theme::primary_button(ui, Icon::Play, "Recompile", reason.is_none(), false, false)
             .clicked()
@@ -272,9 +276,13 @@ impl App {
             let mut open_library = false;
             let mut show_folder = false;
             let mut dismiss = false;
-            let accent = if ok { theme::GOOD } else { theme::BAD };
+            let accent = if ok {
+                theme::colors().good
+            } else {
+                theme::colors().bad
+            };
             Frame::new()
-                .fill(theme::mix(theme::CARD, accent, 0.10))
+                .fill(theme::mix(theme::colors().card, accent, 0.10))
                 .stroke(Stroke::new(1.0, theme::alpha(accent, 120)))
                 .corner_radius(CornerRadius::same(12))
                 .inner_margin(Margin::symmetric(16, 12))
@@ -356,13 +364,13 @@ impl App {
             ];
             for (n, text) in steps {
                 ui.horizontal_top(|ui| {
-                    ui.label(RichText::new(n).size(14.5).color(theme::ACCENT));
+                    ui.label(RichText::new(n).size(14.5).color(theme::colors().accent));
                     ui.add(Label::new(RichText::new(text).size(14.5)).wrap());
                 });
             }
             ui.add_space(6.0);
             Frame::new()
-                .fill(theme::INPUT)
+                .fill(theme::colors().input)
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(Margin::symmetric(14, 10))
                 .show(ui, |ui| {
@@ -382,6 +390,21 @@ impl App {
             ),
             None => String::new(),
         };
+        // How far the recompile has come, while it runs.
+        if let (Some(p), true) = (&self.progress, self.build.is_some()) {
+            let colors = theme::colors();
+            let bar = eframe::egui::ProgressBar::new(p.fraction().unwrap_or(0.0))
+                .desired_height(18.0)
+                .fill(colors.accent)
+                .text(
+                    eframe::egui::RichText::new(p.label())
+                        .size(12.5)
+                        .color(colors.text),
+                )
+                .animate(p.fraction().is_none());
+            ui.add(bar);
+            ui.add_space(6.0);
+        }
         self.build_console.header(ui, "Output", &note);
         ui.add_space(4.0);
         let h = ui.available_height();
@@ -408,13 +431,13 @@ fn detection_card(
     let mut action = CardAction::None;
     ui.add_space(4.0);
     Frame::new()
-        .fill(theme::CARD)
+        .fill(theme::colors().card)
         .stroke(Stroke::new(
             1.0,
             if problems.is_empty() {
-                theme::BORDER
+                theme::colors().border
             } else {
-                theme::alpha(theme::BAD, 120)
+                theme::alpha(theme::colors().bad, 120)
             },
         ))
         .corner_radius(CornerRadius::same(12))
@@ -430,13 +453,17 @@ fn detection_card(
                         ui.painter(),
                         r,
                         if warn { Icon::Info } else { Icon::Check },
-                        if warn { theme::WARN } else { theme::GOOD },
+                        if warn {
+                            theme::colors().warn
+                        } else {
+                            theme::colors().good
+                        },
                     );
                     ui.add(
                         Label::new(RichText::new(n).size(13.5).color(if warn {
-                            theme::WARN
+                            theme::colors().warn
                         } else {
-                            theme::TEXT
+                            theme::colors().text
                         }))
                         .wrap(),
                     );
@@ -445,8 +472,10 @@ fn detection_card(
             for p in problems {
                 ui.horizontal_top(|ui| {
                     let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                    theme::paint_icon(ui.painter(), r, Icon::Cross, theme::BAD);
-                    ui.add(Label::new(RichText::new(p).size(13.5).color(theme::BAD)).wrap());
+                    theme::paint_icon(ui.painter(), r, Icon::Cross, theme::colors().bad);
+                    ui.add(
+                        Label::new(RichText::new(p).size(13.5).color(theme::colors().bad)).wrap(),
+                    );
                 });
             }
             if inspect || offer_romfs {

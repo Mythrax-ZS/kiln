@@ -77,5 +77,5 @@ impl App {
 }
 
 fn paragraph(ui: &mut Ui, text: &str) {
-    ui.add(Label::new(RichText::new(text).size(14.5).color(theme::TEXT)).wrap());
+    ui.add(Label::new(RichText::new(text).size(14.5).color(theme::colors().text)).wrap());
 }

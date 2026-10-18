@@ -50,6 +50,45 @@ pub struct GameRun {
     pub name: String,
 }
 
+/// How far the recompile has come, from the compiler's progress lines (`KILN_PROGRESS`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Progress {
+    pub stage: String,
+    pub done: usize,
+    /// 0 for a stage whose length is not known.
+    pub total: usize,
+}
+
+impl Progress {
+    /// The share done, when the stage has a length.
+    pub fn fraction(&self) -> Option<f32> {
+        (self.total > 0).then(|| self.done as f32 / self.total as f32)
+    }
+
+    /// What the bar says.
+    pub fn label(&self) -> String {
+        match self.stage.as_str() {
+            "discovering" => "Finding the functions...".to_string(),
+            "compiling" => format!("Compiling unit {} of {}", self.done, self.total),
+            "linking" => "Linking...".to_string(),
+            "done" => "Done".to_string(),
+            other => other.to_string(),
+        }
+    }
+}
+
+/// A progress line of the compiler: `kiln: progress <stage> <done>/<total>`.
+pub fn parse_progress(line: &str) -> Option<Progress> {
+    let rest = line.strip_prefix("kiln: progress ")?;
+    let (stage, counts) = rest.rsplit_once(' ')?;
+    let (done, total) = counts.split_once('/')?;
+    Some(Progress {
+        stage: stage.to_string(),
+        done: done.parse().ok()?,
+        total: total.parse().ok()?,
+    })
+}
+
 /// How the last recompile ended, for the banner above the output.
 pub struct BuildOutcome {
     pub ok: bool,
@@ -86,6 +125,10 @@ pub struct App {
     pub build: Option<BuildRun>,
     pub build_console: Console,
     pub outcome: Option<BuildOutcome>,
+    /// How far the running recompile has come.
+    pub progress: Option<Progress>,
+    /// The themes there are to choose from (the Settings screen's "Look again" reads them anew).
+    pub themes: Vec<theme::Theme>,
 
     // The Library screen.
     pub games: Vec<Game>,
@@ -127,6 +170,8 @@ impl App {
             build: None,
             build_console: Console::default(),
             outcome: None,
+            progress: None,
+            themes: theme::themes(),
             games: Vec::new(),
             selected: None,
             game_console: Console::default(),
@@ -431,7 +476,10 @@ impl App {
             |cmd| toolchain::apply_env(cmd, &settings),
             &self.ctx,
         ) {
-            Ok(run) => self.build = Some(BuildRun { run, plan }),
+            Ok(run) => {
+                self.progress = None;
+                self.build = Some(BuildRun { run, plan });
+            }
             Err(e) => {
                 self.build_console
                     .error(format!("could not start kiln: {e}"));
@@ -493,6 +541,7 @@ impl App {
 
     fn finish_build(&mut self, ok: bool, code: Option<i32>) {
         let Some(b) = self.build.take() else { return };
+        self.progress = None;
         let seconds = b.run.started.elapsed().as_secs();
         let plan = b.plan;
         let dir = plan.out_dir();
@@ -700,6 +749,7 @@ impl App {
                     reuse_objects: false,
                     hints: None,
                 };
+                self.progress = None;
                 self.build = Some(BuildRun { run, plan });
                 self.tab = Tab::Recompile;
             }
@@ -817,7 +867,11 @@ impl App {
         if let Some(b) = &mut self.build {
             let (lines, status) = b.run.poll();
             for l in lines {
-                self.build_console.push(l);
+                // The compiler's progress lines feed the bar, not the output.
+                match parse_progress(&l.text) {
+                    Some(p) => self.progress = Some(p),
+                    None => self.build_console.push(l),
+                }
             }
             if let Some(s) = status {
                 ended = Some((s.success(), s.code()));
@@ -898,8 +952,8 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_opacity(fade);
                 Frame::new()
-                    .fill(theme::CARD_HOVER)
-                    .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
+                    .fill(theme::colors().card_hover)
+                    .stroke(Stroke::new(1.0, theme::colors().border_strong))
                     .corner_radius(CornerRadius::same(12))
                     .inner_margin(Margin::symmetric(16, 12))
                     .shadow(egui::Shadow {
@@ -936,7 +990,7 @@ impl App {
                 ui.painter().rect_stroke(
                     inner,
                     CornerRadius::same(18),
-                    Stroke::new(2.0, theme::ACCENT),
+                    Stroke::new(2.0, theme::colors().accent),
                     egui::StrokeKind::Inside,
                 );
                 ui.painter().text(
@@ -944,9 +998,34 @@ impl App {
                     Align2::CENTER_CENTER,
                     "Drop the game folder to recompile it",
                     egui::FontId::new(24.0, theme::bold_family()),
-                    theme::TEXT,
+                    theme::colors().text,
                 );
             });
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::{parse_progress, Progress};
+
+    #[test]
+    fn the_compilers_progress_lines_are_read_and_others_are_not() {
+        let p = parse_progress("kiln: progress compiling 37/1110").unwrap();
+        assert_eq!(
+            p,
+            Progress {
+                stage: "compiling".into(),
+                done: 37,
+                total: 1110
+            }
+        );
+        assert_eq!(p.fraction(), Some(37.0 / 1110.0));
+        assert_eq!(p.label(), "Compiling unit 37 of 1110");
+        let d = parse_progress("kiln: progress discovering 0/0").unwrap();
+        assert_eq!(d.fraction(), None, "a stage without a length");
+        assert_eq!(d.label(), "Finding the functions...");
+        assert_eq!(parse_progress("main: 156355 functions"), None);
+        assert_eq!(parse_progress("kiln: progress compiling x/y"), None);
     }
 }
 
