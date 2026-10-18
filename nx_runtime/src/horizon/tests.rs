@@ -2211,8 +2211,9 @@ fn a_syncpoint_event_comes_through_a_kernel_event_handle() {
     assert_eq!((r.result, r.data.clone()), (0, vec![0; 4]));
     let event = r.copied[0];
     e.write(SCRATCH + 0x400, &event.to_le_bytes());
-    // SYNCPT_WAIT_EVENT_EX(syncpoint 5, threshold 1, timeout, slot 3): not reached yet.
-    let wait = [5u32, 1, 0, 3]
+    // SYNCPT_WAIT_EVENT_EX(syncpoint 5, threshold 1, timeout 1 s, slot 3): not reached yet (a
+    // timeout of 0 would only ask, A-055).
+    let wait = [5u32, 1, 1000, 3]
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect::<Vec<_>>();

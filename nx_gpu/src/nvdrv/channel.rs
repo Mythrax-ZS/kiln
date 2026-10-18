@@ -481,8 +481,8 @@ mod tests {
         let ctrl = nv.open("/dev/nvhost-ctrl").unwrap();
         call(&mut nv, ctrl, 0xC004_001F, &u32s(&[2]));
         let token = nv.query_event(ctrl, 0x1000_0002).unwrap();
-        // Wait for the second increment.
-        let wait = u32s(&[syncpt, 2, 0, 2]);
+        // Wait for the second increment (with a timeout: a wait of 0 only asks, A-055).
+        let wait = u32s(&[syncpt, 2, 1000, 2]);
         let (e, _) = call(&mut nv, ctrl, 0xC010_001E, &wait);
         assert_eq!(e, NvError::TIMEOUT);
         // Two increments promised (flag 0x100: fence.value is the count): no commands at all.

@@ -173,21 +173,29 @@ impl Nvdrv {
             }
             // u32 id, u32 threshold, s32 timeout, u32 slot (in) / syncpoint value (out)
             SYNCPT_WAIT_EVENT_EX => {
-                let (id, threshold, slot) = (args.u32(0), args.u32(4), args.u32(12));
+                let (id, threshold, timeout, slot) =
+                    (args.u32(0), args.u32(4), args.i32(8), args.u32(12));
                 if !self.gpu.syncpoints.is_valid(id) {
                     return Err(NvError::BAD_PARAMETER.into());
                 }
-                let token = self.slot_token(fd, slot)?;
                 let value = self.gpu.syncpoints.value(id).unwrap_or(0);
-                if !self.gpu.syncpoints.wait(Waiter {
-                    token,
-                    id,
-                    threshold,
-                }) {
+                if self.gpu.syncpoints.is_reached(id, threshold) {
                     // Already reached: the event is not used.
                     args.set_u32(12, value);
                     return Ok(());
                 }
+                if timeout == 0 {
+                    // A timeout of 0 only asks: the slot is not armed and its event not touched
+                    // (another wait on the slot may be using it), and the answer is "not yet"
+                    // (A-055).
+                    return Err(NvError::TIMEOUT.into());
+                }
+                let token = self.slot_token(fd, slot)?;
+                self.gpu.syncpoints.wait(Waiter {
+                    token,
+                    id,
+                    threshold,
+                });
                 // Not yet: the event is signalled when it is, and the call says so with a timeout
                 // whose value names the slot and the syncpoint (Switchbrew).
                 args.set_u32(12, slot | (id << 4));
@@ -297,6 +305,22 @@ mod tests {
         // A fence that has passed answers at once with the syncpoint's value.
         let (e, out) = call(&mut nv, fd, SYNCPT_WAIT_EVENT_EX, &u32s(&[id, 2, 1000, 5]));
         assert_eq!((e, out.u32(12)), (NvError::SUCCESS, 2));
+    }
+
+    #[test]
+    fn a_wait_with_no_timeout_only_asks() {
+        let (mut nv, fd) = ctrl();
+        let id = nv.gpu.syncpoints.allocate().unwrap();
+        call(&mut nv, fd, SYNCPT_ALLOC_EVENT, &u32s(&[5]));
+        // Not reached: "not yet", the value as it was, the slot left alone.
+        let (e, out) = call(&mut nv, fd, SYNCPT_WAIT_EVENT_EX, &u32s(&[id, 1, 0, 5]));
+        assert_eq!((e, out.u32(12)), (NvError::TIMEOUT, 5));
+        assert!(nv.gpu.syncpoints.waiting().is_empty());
+        call(&mut nv, fd, SYNCPT_INCR, &u32s(&[id]));
+        assert!(nv.take_signals().is_empty(), "nothing was armed");
+        // Reached: answered with the value, slot or no slot.
+        let (e, out) = call(&mut nv, fd, SYNCPT_WAIT_EVENT_EX, &u32s(&[id, 1, 0, 63]));
+        assert_eq!((e, out.u32(12)), (NvError::SUCCESS, 1));
     }
 
     #[test]
