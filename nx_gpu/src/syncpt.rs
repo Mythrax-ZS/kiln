@@ -54,11 +54,12 @@ impl Syncpoints {
     }
 
     /// Reserve a syncpoint for a channel or a client.
+    /// A syncpoint keeps its count across being released and reserved again: it is a counter of
+    /// the hardware, which never restarts, and a program that opens its engine again may still
+    /// wait for a value it was promised before (A-182).
     pub fn allocate(&mut self) -> Option<u32> {
         let id = self.reserved.iter().position(|r| !r)?;
         self.reserved[id] = true;
-        self.value[id] = 0;
-        self.max[id] = 0;
         Some(id as u32)
     }
 
