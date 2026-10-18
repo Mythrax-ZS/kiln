@@ -3467,8 +3467,16 @@ fn an_audio_output_gives_each_buffer_back_when_its_time_has_been_played() {
         began.elapsed() >= Duration::from_millis(8),
         "a buffer takes its time"
     );
-    std::thread::sleep(Duration::from_millis(60));
-    let back = e.call(out, &released);
+    // Both buffers come back once their time has been played (about 15 ms); a loaded machine
+    // may be slow to play them, so ask again for up to half a second.
+    let mut back = e.call(out, &released);
+    for _ in 0..50 {
+        if back.data == 2u32.to_le_bytes() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        back = e.call(out, &released);
+    }
     assert_eq!(back.data, 2u32.to_le_bytes());
     assert_eq!(
         e.read(taken, 16),

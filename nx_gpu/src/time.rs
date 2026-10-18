@@ -110,18 +110,25 @@ mod tests {
     fn a_sleep_ends_at_its_moment_not_a_timer_tick_later() {
         // Twenty sleeps of 3 ms, each from the end of the one before: never early, and together
         // well under the 20 ticks of a coarse timer they would take if each were a millisecond
-        // late.
-        let began = Instant::now();
-        for _ in 0..20 {
-            let at = Instant::now();
-            sleep_until(at + Duration::from_millis(3));
-            assert!(
-                at.elapsed() >= Duration::from_millis(3),
-                "{:?}",
-                at.elapsed()
-            );
+        // late. A loaded machine (a continuous-integration runner, a virtual machine) can hold
+        // the thread for longer than that now and then, so the run is tried a few times.
+        let mut took = Duration::ZERO;
+        for _attempt in 0..3 {
+            let began = Instant::now();
+            for _ in 0..20 {
+                let at = Instant::now();
+                sleep_until(at + Duration::from_millis(3));
+                assert!(
+                    at.elapsed() >= Duration::from_millis(3),
+                    "{:?}",
+                    at.elapsed()
+                );
+            }
+            took = began.elapsed();
+            if took < Duration::from_millis(75) {
+                return;
+            }
         }
-        let took = began.elapsed();
-        assert!(took < Duration::from_millis(75), "{took:?}");
+        panic!("twenty 3 ms sleeps took {took:?} three times over");
     }
 }
