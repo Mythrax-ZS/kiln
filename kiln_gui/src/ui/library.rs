@@ -456,6 +456,16 @@ fn run_settings_form(
             }
             theme::toggle(
                 ui,
+                &mut run.full_rate,
+                "Keep 60 frames a second where the game asks for 30",
+            );
+            if run.full_rate {
+                ui.label(theme::muted(
+                    "Not what the console does: a game that lowers its frame rate because a scene is slow here is paced at 60 wherever it can keep up; a scene made for 30 may run too fast.",
+                ));
+            }
+            theme::toggle(
+                ui,
                 &mut run.strict_gpu,
                 "Stop at a draw that cannot be rendered",
             );

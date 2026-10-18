@@ -353,6 +353,11 @@ pub struct RunSettings {
     /// switches while it runs). A screen with adaptive sync then follows the game's frame rate
     /// where the driver applies that to fullscreen windows only.
     pub fullscreen: bool,
+    /// Pace the game at 60 frames a second even where it asks the display for 30
+    /// (`NX_MAX_SWAP_INTERVAL=1`). Not the console's behavior: a game that lowers its frame rate
+    /// where a scene is slow under Kiln, and keeps it low where it could hold 60, is shown at 60
+    /// there; a scene made for 30 may run too fast.
+    pub full_rate: bool,
     /// Stop the game at a draw the renderer cannot make. Off, a game that is drawn skips such a
     /// draw (and says so once), as a person playing wants (`NX_GPU_LENIENT=1`); a developer
     /// looking for what the renderer lacks wants the stop.
@@ -395,6 +400,7 @@ impl Default for RunSettings {
             mute: false,
             vsync: true,
             fullscreen: false,
+            full_rate: false,
             strict_gpu: false,
             keymap: String::new(),
             frames: 0,
@@ -480,6 +486,9 @@ impl RunSettings {
             }
             if self.fullscreen {
                 put("NX_WINDOW_FULLSCREEN", "1".into());
+            }
+            if self.full_rate {
+                put("NX_MAX_SWAP_INTERVAL", "1".into());
             }
         }
         if self.mute {
