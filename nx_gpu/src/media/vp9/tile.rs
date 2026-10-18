@@ -193,6 +193,7 @@ impl<'a> FrameState<'a> {
             let others: Vec<_> = (1..tile_cols)
                 .map(|col| {
                     scope.spawn(move || {
+                        crate::time::raise_priority();
                         let mut state = FrameState::new(hdr, probs, inputs);
                         state.decode_tile_column(col, tiles, tile_cols, tile_rows)?;
                         Ok::<FrameState<'a>, Error>(state)

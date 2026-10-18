@@ -750,6 +750,7 @@ impl Renderer {
         // The frames are kept on a grid, so that no lateness adds up (A-186).
         let mut next = std::time::Instant::now();
         std::thread::spawn(move || loop {
+            nx_gpu::time::raise_priority();
             next += FRAME_PERIOD;
             crate::horizon::kernel::sleep_until(next);
             let Some(kernel) = weak.upgrade() else {

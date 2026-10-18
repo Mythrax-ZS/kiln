@@ -183,6 +183,7 @@ impl Config {
                 for (k, rows) in rows.chunks_mut(band * w * 4).enumerate() {
                     let convert_row = &convert_row;
                     scope.spawn(move || {
+                        crate::time::raise_priority();
                         for (i, row) in rows.chunks_exact_mut(w * 4).enumerate() {
                             convert_row(top + k * band + i, row);
                         }

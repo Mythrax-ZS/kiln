@@ -69,6 +69,7 @@ pub fn loop_filter(s: &mut FrameState) {
         for (plane, p) in s.cur.planes.iter_mut().enumerate() {
             let lvl = &lvl;
             scope.spawn(move || {
+                crate::time::raise_priority();
                 for row in (0..modes.mi_rows).step_by(8) {
                     for col in (0..modes.mi_cols).step_by(8) {
                         for pass in 0..2 {

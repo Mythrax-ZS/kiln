@@ -31,6 +31,77 @@ pub fn sleep_until(deadline: Instant) {
     }
 }
 
+/// Give the calling thread a priority above the normal one, once, so that the load of other
+/// programs does not make it late: for the threads that keep time (the display's vsync, the
+/// audio renderer's frame), draw and present, and decode video. On Windows this is
+/// `THREAD_PRIORITY_ABOVE_NORMAL`; elsewhere nothing is done.
+pub fn raise_priority() {
+    thread_local! {
+        static RAISED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if RAISED.with(|r| r.replace(true)) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn SetThreadPriority(thread: isize, priority: i32) -> i32;
+        }
+        const ABOVE_NORMAL: i32 = 1;
+        // SAFETY: plain calls on the pseudo-handle of the calling thread.
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), ABOVE_NORMAL);
+        }
+    }
+}
+
+/// How busy the whole machine is: the share of all processors' time that was not idle since the
+/// last question, from the system's own counters (Windows; `None` elsewhere). For the reports of
+/// `NX_TRACE_PERF`, to tell a run slowed by other programs from one slowed by this one.
+#[derive(Default)]
+pub struct MachineLoad {
+    last: Option<(u64, u64)>,
+}
+
+impl MachineLoad {
+    pub fn new() -> MachineLoad {
+        let mut load = MachineLoad::default();
+        let _ = load.busy_percent();
+        load
+    }
+
+    /// The percentage of the machine's processor time that was busy since the last call.
+    pub fn busy_percent(&mut self) -> Option<f64> {
+        let (idle, total) = system_times()?;
+        let out = self
+            .last
+            .map(|(i0, t0)| 100.0 * (1.0 - (idle - i0) as f64 / (total - t0).max(1) as f64));
+        self.last = Some((idle, total));
+        out
+    }
+}
+
+/// (idle, idle + kernel + user) of all processors, in 100 ns units.
+#[cfg(windows)]
+fn system_times() -> Option<(u64, u64)> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemTimes(idle: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+    }
+    let (mut idle, mut kernel, mut user) = (0u64, 0u64, 0u64);
+    // SAFETY: three out-parameters of the sizes the call writes (FILETIME is 64 bits).
+    let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+    // The kernel time counts the idle time too.
+    (ok != 0).then_some((idle, kernel + user))
+}
+
+#[cfg(not(windows))]
+fn system_times() -> Option<(u64, u64)> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
