@@ -430,8 +430,13 @@ fn symbols_command(args: &Args) -> Result<String> {
             .strip_prefix("0x")
             .map_or_else(|| text.parse::<u64>(), |h| u64::from_str_radix(h, 16))
             .map_err(|_| Error::format("command line", format!("`{text}` is not an address")))?;
+        // The module whose image holds the address (`main` comes first and is below the SDK's
+        // modules, so the first module the address is above is not the one).
         let found = program.modules.iter().find_map(|m| {
             let offset = addr.checked_sub(m.base)?;
+            if offset >= m.image.len() as u64 {
+                return None;
+            }
             m.exports
                 .iter()
                 .filter(|e| e.offset <= offset)
