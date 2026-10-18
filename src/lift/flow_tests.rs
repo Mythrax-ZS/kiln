@@ -209,6 +209,40 @@ pub fn jump_table_bytes(base: u64) -> Vec<u32> {
     words
 }
 
+/// A `switch` on a bit field, with no bounds check: the index is `and w9, w0, #3` (the SDK's
+/// `memcpy` for device memory dispatches on the alignment this way), bytes from a label scaled
+/// by 4.
+pub fn jump_table_masked_index(base: u64) -> Vec<u32> {
+    bit_field_table(base, asm::logical_imm(false, 0, false, 0, 1, 0, 9)) // and w9, w0, #3
+}
+
+/// The same with the index two bits from the middle of a word: `ubfx w9, w0, #4, #2` (zlib's
+/// `inflate` switches on two bits of its bit buffer this way).
+pub fn jump_table_bitfield_index(base: u64) -> Vec<u32> {
+    bit_field_table(base, asm::bitfield(false, 2, false, 4, 5, 0, 9)) // ubfx w9, w0, #4, #2
+}
+
+fn bit_field_table(base: u64, extract: u32) -> Vec<u32> {
+    let mut p = Prog::new(base);
+    p.emit(extract);
+    p.adr(10, "table");
+    p.emit(asm::ldst_reg(0, 1, 9, 2, false, 10, 12)); // ldrb w12, [x10, w9, uxtw]
+    p.adr(11, "base");
+    p.emit(asm::add_sub_ext(true, false, false, 12, 3, 2, 11, 11)); // add x11, x11, x12, uxtx #2
+    p.emit(asm::br(11));
+    p.label("base");
+    for i in 0..4u32 {
+        p.label(&format!("c{i}"))
+            .emit(asm::movz(true, 0, 20 + i, 0));
+        p.emit(asm::ret(30));
+    }
+    p.label("table");
+    let mut words = p.finish();
+    // Entries are (case - base) / 4: two words a case.
+    words.push(0x0604_0200);
+    words
+}
+
 /// The compare is on one register and the table is indexed through a copy of it.
 pub fn jump_table_copied_index(base: u64) -> Vec<u32> {
     let mut p = Prog::new(base);
@@ -446,6 +480,11 @@ pub fn catalogue(base: u64) -> Vec<Entry> {
         entry("flags across a join", flags_across_a_join(base)),
         entry("jump table of words", jump_table_words(base, 8)),
         entry("jump table of bytes", jump_table_bytes(base)),
+        entry("jump table, index masked", jump_table_masked_index(base)),
+        entry(
+            "jump table, index a bit field",
+            jump_table_bitfield_index(base),
+        ),
         entry("jump table, index copied", jump_table_copied_index(base)),
         entry("jump table, index adjusted", jump_table_offset_index(base)),
         entry(
@@ -559,6 +598,16 @@ fn discovery_finds_the_functions_and_tables() {
     let d = discovery(&jump_table_copied_index(CODE));
     assert_eq!(d.report.jump_tables.len(), 1, "{:?}", d.report);
     assert_eq!(d.report.jump_tables[0].targets.len(), 6);
+
+    for words in [
+        jump_table_masked_index(CODE),
+        jump_table_bitfield_index(CODE),
+    ] {
+        let d = discovery(&words);
+        assert_eq!(d.report.jump_tables.len(), 1, "{:?}", d.report);
+        assert_eq!(d.report.jump_tables[0].targets.len(), 4);
+        assert!(d.report.unresolved_branches.is_empty());
+    }
     let d = discovery(&jump_table_offset_index(CODE));
     assert_eq!(d.report.jump_tables.len(), 1, "{:?}", d.report);
     assert_eq!(d.report.jump_tables[0].targets.len(), 4);

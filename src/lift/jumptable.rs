@@ -18,13 +18,20 @@
 //! repeated with two different fillers for the registers the code does not set, and a result
 //! that changes means the target depends on something unknown, so nothing is reported.
 //!
+//! A `switch` on a bit field needs no bounds check: `and x9, x8, #3` or `ubfx w9, w23, #1, #2`
+//! picks a few bits and the table has an entry for each value. The SDK's `memcpy` for device
+//! memory dispatches on the alignment of the destination this way and zlib's `inflate` on two
+//! bits of its bit buffer; left to the function table at run time, their loops were interpreted
+//! (2.8 million instructions a second in the third title's opening cutscene). For these the code
+//! after the extraction is run with the extracted register holding each value in turn.
+//!
 //! The answer is only a *candidate set*: the lifter switches on the computed address and sends
 //! anything outside the set through the function table. A wrong guess therefore costs speed, never
 //! correctness.
 
 use super::discover::CodeSource;
 use nx_runtime::a64::bus::{Bus, Fault, FaultKind};
-use nx_runtime::a64::inst::{BranchReg, Inst, MemKind, MovOp};
+use nx_runtime::a64::inst::{BitfieldOp, BranchReg, Inst, LogicOp, MemKind, MovOp};
 use nx_runtime::a64::interp::execute;
 use nx_runtime::a64::state::CpuState;
 use std::collections::BTreeMap;
@@ -108,7 +115,40 @@ pub fn resolve(
         at = prev;
     }
     window.reverse();
+    let mut out =
+        compared(code, &window, rn, known).or_else(|| extracted(code, &window, rn, known))?;
+    if !out
+        .iter()
+        .all(|&t| t % 4 == 0 && inside(t) && code.word(t).is_some())
+    {
+        return None;
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
 
+/// A state with every register holding `fill`, except those the code gives a constant.
+fn fresh(fill: u64, known: &[(usize, u64)]) -> CpuState {
+    let mut cpu = CpuState {
+        sp: fill,
+        ..CpuState::default()
+    };
+    cpu.x = [fill; 31];
+    for &(r, value) in known {
+        cpu.x[r] = value;
+    }
+    cpu
+}
+
+/// A `switch` with a bounds check: `cmp idx, #N` and `b.hi`/`b.hs` to the default case before
+/// the table. The targets for each index the check admits.
+fn compared(
+    code: &dyn CodeSource,
+    window: &[(u64, Inst)],
+    rn: u8,
+    known: &[(usize, u64)],
+) -> Option<Vec<u64>> {
     // `b.hi`/`b.hs` to the default case, preceded by `cmp idx, #imm`.
     let jb = window
         .iter()
@@ -163,17 +203,6 @@ pub fn resolve(
     let prefix = &window[..jc];
     let post = &window[jb + 1..];
     let wmask = if sf { u64::MAX } else { 0xFFFF_FFFF };
-    let fresh = |fill: u64| {
-        let mut cpu = CpuState {
-            sp: fill,
-            ..CpuState::default()
-        };
-        cpu.x = [fill; 31];
-        for &(r, value) in known {
-            cpu.x[r] = value;
-        }
-        cpu
-    };
     let observed = usize::from(idx);
 
     // Where does the compared register get its value? It may be a copy or adjustment of a
@@ -187,7 +216,7 @@ pub fn resolve(
         let mut results = Vec::new();
         for fill in [0u64, 0x5A5A_5A5A_5A5A_5A5A] {
             let start = |v0: u64| -> Option<CpuState> {
-                let mut c = fresh(fill);
+                let mut c = fresh(fill, known);
                 run(code, &mut c, &prefix[..pos], true)?;
                 c.x[var] = v0;
                 run(code, &mut c, &prefix[pos..], true)?;
@@ -254,16 +283,65 @@ pub fn resolve(
     let mut results = (0..=prefix.len())
         .rev()
         .find_map(|pos| changed[pos].iter().find_map(|&var| attempt(pos, var)))?;
-    let mut out = results.swap_remove(0);
-    if !out
-        .iter()
-        .all(|&t| t % 4 == 0 && inside(t) && code.word(t).is_some())
-    {
-        return None;
+    Some(results.swap_remove(0))
+}
+
+/// A `switch` whose index is a bit field, so needs no bounds check (see the module's notes). The
+/// extraction is the last instruction of the window that writes a register as `and rd, rn,
+/// #mask` (a mask of low bits) or `ubfx rd, rn, #lsb, #width` (`UBFM` with `imms` not below
+/// `immr`); the code after it is run with the register holding each value in turn, and the
+/// branch has to depend on it.
+fn extracted(
+    code: &dyn CodeSource,
+    window: &[(u64, Inst)],
+    rn: u8,
+    known: &[(usize, u64)],
+) -> Option<Vec<u64>> {
+    let bits = MAX_ENTRIES.trailing_zeros() as u8;
+    for (k, &(_, inst)) in window.iter().enumerate().rev() {
+        let (idx, last) = match inst {
+            Inst::LogicalImm {
+                op: LogicOp::And,
+                rd,
+                imm,
+                ..
+            } if rd != 31 && imm != 0 && imm & (imm + 1) == 0 && imm < MAX_ENTRIES => {
+                (usize::from(rd), imm)
+            }
+            Inst::Bitfield {
+                op: BitfieldOp::Ubfm,
+                rd,
+                immr,
+                imms,
+                ..
+            } if rd != 31 && imms >= immr && imms - immr < bits => {
+                (usize::from(rd), (1u64 << (imms - immr + 1)) - 1)
+            }
+            _ => continue,
+        };
+        let (prefix, post) = (&window[..k], &window[k + 1..]);
+        let targets_for = |fill: u64| -> Option<Vec<u64>> {
+            let mut targets = Vec::with_capacity(last as usize + 1);
+            for i in 0..=last {
+                let mut c = fresh(fill, known);
+                run(code, &mut c, prefix, true)?;
+                c.x[idx] = i;
+                run(code, &mut c, post, false)?;
+                targets.push(c.x_zr(rn));
+            }
+            Some(targets)
+        };
+        let Some(targets) = targets_for(0) else {
+            continue;
+        };
+        if targets_for(0x5A5A_5A5A_5A5A_5A5A).as_ref() != Some(&targets) {
+            continue;
+        }
+        if targets.iter().any(|&t| t != targets[0]) {
+            return Some(targets);
+        }
     }
-    out.sort_unstable();
-    out.dedup();
-    Some(out)
+    None
 }
 
 /// The callee-saved registers (x19 to x28) that the code decoded so far gives one constant value
