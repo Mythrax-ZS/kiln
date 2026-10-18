@@ -121,11 +121,15 @@ pub fn parse_picture(pic: &[u8], seg_tree: [u8; 7], seg_pred: [u8; 3]) -> Result
     })
 }
 
+/// The frames decoded, by the (guest) address of the luma surface they were decoded into:
+/// shared between the decoder, which puts them there, and the compositor, which takes them, on
+/// threads of their own (A-184).
+pub type FrameStore = Arc<std::sync::Mutex<HashMap<u64, Arc<Frame>>>>;
+
 /// The decoder as the console's video engine runs it.
 #[derive(Default)]
 pub struct Engine {
-    /// The frames decoded, by the (guest) address of the luma surface they were decoded into.
-    frames: HashMap<u64, Arc<Frame>>,
+    frames: FrameStore,
     prev: Option<PrevFrame>,
     prev_segment_ids: Vec<u8>,
     last_size: Option<(usize, usize)>,
@@ -134,6 +138,19 @@ pub struct Engine {
 impl Engine {
     pub fn new() -> Engine {
         Engine::default()
+    }
+
+    /// A decoder whose frames go into (and come from) `frames`.
+    pub fn with_store(frames: FrameStore) -> Engine {
+        Engine {
+            frames,
+            ..Engine::default()
+        }
+    }
+
+    /// The store of its frames, to share with a compositor.
+    pub fn store(&self) -> FrameStore {
+        self.frames.clone()
     }
 
     /// Decode a frame from its picture setup, probability table and tile data, from the frames
@@ -151,8 +168,10 @@ impl Engine {
         let picture = parse_picture(pic, tree, pred)?;
         let hdr = &picture.header;
         let intra = hdr.frame_is_intra();
-        let refs: Vec<Option<Arc<Frame>>> =
-            refs.iter().map(|a| self.frames.get(a).cloned()).collect();
+        let refs: Vec<Option<Arc<Frame>>> = {
+            let frames = self.frames.lock().unwrap_or_else(|e| e.into_inner());
+            refs.iter().map(|a| frames.get(a).cloned()).collect()
+        };
         if !intra && refs.iter().any(Option::is_none) {
             return Err(Error::Stream(
                 "an inter frame whose reference surfaces hold no decoded frame",
@@ -186,17 +205,27 @@ impl Engine {
         self.prev = Some(decoded.prev);
         self.last_size = Some(size);
         let frame = Arc::new(decoded.frame);
-        self.frames.insert(out, frame.clone());
+        self.frames
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(out, frame.clone());
         Ok(frame)
     }
 
     /// The frame decoded into the surface whose luma is at `luma`.
     pub fn frame(&self, luma: u64) -> Option<Arc<Frame>> {
-        self.frames.get(&luma).cloned()
+        self.frames
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&luma)
+            .cloned()
     }
 
     /// Forget the frames of surfaces in `range` (memory that was freed).
     pub fn forget(&mut self, range: std::ops::Range<u64>) {
-        self.frames.retain(|a, _| !range.contains(a));
+        self.frames
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|a, _| !range.contains(a));
     }
 }

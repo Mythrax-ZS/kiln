@@ -87,7 +87,7 @@ impl Iova {
 
 /// A job of the engines, with everything it reads copied out of the program's memory when it
 /// was submitted: it can run later, on another thread, while the program goes on (A-184).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Job {
     /// Decode a VP9 frame (A-182) from the frames in the surfaces at `refs` (guest addresses of
     /// the last, golden and alternate references) into the surface at `out`.
@@ -107,11 +107,25 @@ pub enum Job {
     },
     /// Memory was freed: the frames decoded into it go with it.
     Forget(Range<u64>),
+    /// A wait the command stream put before the jobs after it (the host class's `WAIT_SYNCPT`,
+    /// or `LOAD_SYNCPT_PAYLOAD_32` with `WAIT_SYNCPT_32`): they run once the syncpoint has
+    /// reached the threshold. Whoever runs the jobs does the waiting, with the syncpoints.
+    Wait { id: u32, threshold: u32 },
+}
+
+/// The engine a batch belongs to: each runs its batches in order, on a thread of its own, the
+/// waits in the streams ordering one against the other (A-184).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EngineKind {
+    #[default]
+    Decoder,
+    Compositor,
 }
 
 /// The jobs of one submission, and the syncpoint increments (id, by) that follow them.
 #[derive(Debug, Default)]
 pub struct Batch {
+    pub channel: EngineKind,
     pub jobs: Vec<Job>,
     pub increments: Vec<(u32, u32)>,
 }
@@ -145,12 +159,23 @@ fn ms(since: Instant) -> f64 {
 
 impl Engines {
     pub fn new() -> Engines {
+        Engines::with_store(vp9::nvdec::FrameStore::default())
+    }
+
+    /// Engines whose decoder puts its frames into `store` and whose compositor takes them from
+    /// it: the decoder's and the compositor's threads each have engines over one store.
+    pub fn with_store(store: vp9::nvdec::FrameStore) -> Engines {
         Engines {
-            vp9: vp9::nvdec::Engine::new(),
+            vp9: vp9::nvdec::Engine::with_store(store),
             trace: std::env::var_os("NX_TRACE_MEDIA").is_some(),
             last_decode: None,
             origin: Instant::now(),
         }
+    }
+
+    /// The store of decoded frames, to share.
+    pub fn store(&self) -> vp9::nvdec::FrameStore {
+        self.vp9.store()
     }
 
     /// Run one job. A frame that cannot be decoded, or converted from a surface that holds no
@@ -217,6 +242,8 @@ impl Engines {
                 }
             }
             Job::Forget(range) => self.vp9.forget(range.clone()),
+            // The caller, who has the syncpoints, has waited already.
+            Job::Wait { .. } => {}
         }
         Ok(())
     }
@@ -365,6 +392,7 @@ impl Media {
     pub fn forget(&mut self, range: Range<u64>) {
         match &self.queue {
             Some(q) => q.push(Batch {
+                channel: EngineKind::Decoder,
                 jobs: vec![Job::Forget(range)],
                 increments: Vec::new(),
             }),

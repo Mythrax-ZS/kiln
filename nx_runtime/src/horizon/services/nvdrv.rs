@@ -169,13 +169,29 @@ struct MediaWorker {
     changed: Condvar,
 }
 
-impl MediaQueue for MediaWorker {
+impl MediaWorker {
     fn push(&self, batch: Batch) {
         self.backlog
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push_back(batch);
         self.changed.notify_all();
+    }
+}
+
+/// The decoder's and the compositor's queues: each engine runs its batches in order on a
+/// thread of its own, as the console's engines run beside one another (A-184).
+struct MediaQueues {
+    decoder: Arc<MediaWorker>,
+    compositor: Arc<MediaWorker>,
+}
+
+impl MediaQueue for MediaQueues {
+    fn push(&self, batch: Batch) {
+        match batch.channel {
+            nx_gpu::media::EngineKind::Decoder => self.decoder.push(batch),
+            nx_gpu::media::EngineKind::Compositor => self.compositor.push(batch),
+        }
     }
 }
 
@@ -233,10 +249,16 @@ impl Shared {
             core.gpu.queue = Some(w.clone());
         }
         // The media engines' jobs run on a thread of their own by the same rule (A-184).
-        let media = queued.then(|| {
+        let new_worker = || {
             Arc::new(MediaWorker {
                 backlog: Mutex::new(VecDeque::new()),
                 changed: Condvar::new(),
+            })
+        };
+        let media = queued.then(|| {
+            Arc::new(MediaQueues {
+                decoder: new_worker(),
+                compositor: new_worker(),
             })
         });
         if let Some(m) = &media {
@@ -251,11 +273,16 @@ impl Shared {
                     .expect("the thread that runs the renderer's commands");
             }
             if let Some(m) = &media {
-                let (weak, m) = (weak.clone(), m.clone());
-                std::thread::Builder::new()
-                    .name("media".to_string())
-                    .spawn(move || run_media(weak, m))
-                    .expect("the thread that runs the media engines' jobs");
+                // One thread each, over one store of decoded frames.
+                let store = nx_gpu::media::vp9::nvdec::FrameStore::default();
+                for (name, worker) in [("nvdec", &m.decoder), ("vic", &m.compositor)] {
+                    let (weak, worker) = (weak.clone(), worker.clone());
+                    let engines = Engines::with_store(store.clone());
+                    std::thread::Builder::new()
+                        .name(name.to_string())
+                        .spawn(move || run_media(weak, worker, engines))
+                        .expect("the thread that runs a media engine's jobs");
+                }
             }
             Shared {
                 core: Mutex::new(core),
@@ -389,6 +416,7 @@ impl Shared {
 /// The thread that runs what the queue was given, in order: a step of a submission at a time,
 /// with the driver let go of between two steps so that the calls of the program get in.
 fn run_worker(shared: Weak<Shared>, worker: Arc<Worker>) {
+    nx_gpu::time::raise_priority();
     // Where the thread's time goes, reported every few seconds with `NX_TRACE_PERF`.
     let trace = std::env::var_os("NX_TRACE_PERF").is_some();
     let mut spent = [Duration::ZERO; 4];
@@ -397,6 +425,7 @@ fn run_worker(shared: Weak<Shared>, worker: Arc<Worker>) {
     #[cfg(feature = "alloc_stats")]
     let mut allocs_before = (0u64, 0u64);
     let mut reported = std::time::Instant::now();
+    let mut machine = nx_gpu::time::MachineLoad::new();
     loop {
         let waiting = std::time::Instant::now();
         let mut task = {
@@ -471,7 +500,7 @@ fn run_worker(shared: Weak<Shared>, worker: Arc<Worker>) {
         tasks_run += 1;
         if trace && reported.elapsed() >= Duration::from_secs(2) {
             eprintln!(
-                "[gpu thread] in the last {:.1} s: {} tasks, {} steps; no task to run {:.0} ms, made way {:.0} ms ({yields} times), waited for the driver {:.0} ms, ran {:.0} ms; the program called the driver {} times",
+                "[gpu thread] in the last {:.1} s: {} tasks, {} steps; no task to run {:.0} ms, made way {:.0} ms ({yields} times), waited for the driver {:.0} ms, ran {:.0} ms; the program called the driver {} times; the machine was busy {:.0} %",
                 reported.elapsed().as_secs_f64(),
                 tasks_run,
                 steps,
@@ -479,7 +508,8 @@ fn run_worker(shared: Weak<Shared>, worker: Arc<Worker>) {
                 spent[1].as_secs_f64() * 1000.0,
                 spent[2].as_secs_f64() * 1000.0,
                 spent[3].as_secs_f64() * 1000.0,
-                shared.calls.load(Ordering::Relaxed) - calls_before
+                shared.calls.load(Ordering::Relaxed) - calls_before,
+                machine.busy_percent().unwrap_or(0.0)
             );
             #[cfg(feature = "alloc_stats")]
             {
@@ -601,9 +631,11 @@ fn finish(shared: &Shared, outcome: Result<(), SubmitError>) {
 /// The thread that runs the media engines' jobs, batch after batch, in order: the jobs without
 /// the driver (a frame takes milliseconds to decode), then, with it, the syncpoint increments the
 /// submission asked for, so that the program's fences complete when the frames are there (A-184).
-fn run_media(shared: Weak<Shared>, worker: Arc<MediaWorker>) {
-    let mut engines = Engines::new();
+fn run_media(shared: Weak<Shared>, worker: Arc<MediaWorker>, mut engines: Engines) {
+    nx_gpu::time::raise_priority();
     let mem = ProcessMemory;
+    let trace_media = std::env::var_os("NX_TRACE_MEDIA").is_some();
+    let media_began = std::time::Instant::now();
     loop {
         let batch = {
             let mut b = worker.backlog.lock().unwrap_or_else(|e| e.into_inner());
@@ -618,6 +650,39 @@ fn run_media(shared: Weak<Shared>, worker: Arc<MediaWorker>) {
             return;
         };
         for job in &batch.jobs {
+            if let nx_gpu::media::Job::Wait { id, threshold } = job {
+                // A wait the stream put before the job: for the GPU, or another engine, to get
+                // there. One nothing reaches ends after two seconds, said, as the GPU's own
+                // stream waits end (A-182).
+                let began = std::time::Instant::now();
+                loop {
+                    let (reached, now) = {
+                        let core = shared.core.lock().unwrap_or_else(|e| e.into_inner());
+                        (
+                            core.gpu.syncpoints.is_reached(*id, *threshold),
+                            core.gpu.syncpoints.value(*id).unwrap_or(0),
+                        )
+                    };
+                    if reached {
+                        if trace_media {
+                            eprintln!(
+                                "[media] a job waited {:.1} ms for syncpoint {id} to reach {threshold} (at {now}), at {:.1} ms",
+                                began.elapsed().as_secs_f64() * 1000.0,
+                                media_began.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        break;
+                    }
+                    if began.elapsed() >= Duration::from_secs(2) {
+                        eprintln!(
+                            "[media] a job waited 2 s for syncpoint {id} to reach {threshold} (it is at {now}) and goes on"
+                        );
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_micros(500));
+                }
+                continue;
+            }
             if let Err(e) = engines.run(job, &mem) {
                 shared.fail(e);
                 return;

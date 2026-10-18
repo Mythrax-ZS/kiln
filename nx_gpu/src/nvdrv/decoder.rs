@@ -14,7 +14,7 @@ use super::args::{unimplemented, Args, Fail, IoResult, Ioctl};
 use super::{Node, Nvdrv};
 use crate::error::NvError;
 use crate::media::host1x::{Channel, Write};
-use crate::media::{Batch, Job, EXECUTE};
+use crate::media::{Batch, EngineKind, Job, EXECUTE};
 use std::collections::HashMap;
 
 /// The type byte of the channel commands (0) and of `SET_NVMAP_FD` (`'H'`).
@@ -40,6 +40,8 @@ pub struct Decoder {
     channel: Channel,
     /// The engine methods written so far, by byte offset.
     regs: HashMap<u32, u32>,
+    /// The host class's `LOAD_SYNCPT_PAYLOAD_32`: the threshold of its next `WAIT_SYNCPT_32`.
+    payload: u32,
 }
 
 impl Decoder {
@@ -51,6 +53,7 @@ impl Decoder {
             timeout: 0,
             channel: Channel::default(),
             regs: HashMap::new(),
+            payload: 0,
         }
     }
 
@@ -163,7 +166,11 @@ impl Nvdrv {
                     args.u32(8) as usize,
                     args.u32(12) as usize,
                 );
-                self.decoder(fd)?;
+                let channel = if self.decoder(fd)?.path.contains("vic") {
+                    EngineKind::Compositor
+                } else {
+                    EngineKind::Decoder
+                };
                 let fixed = 16 + 12 * buffers + 20 * relocs;
                 let tail = args
                     .len()
@@ -202,10 +209,24 @@ impl Nvdrv {
                     args.set_u32(at_fence(i), value);
                 }
                 if let Some(queue) = &self.media.queue {
-                    queue.push(Batch { jobs, increments });
+                    queue.push(Batch {
+                        channel,
+                        jobs,
+                        increments,
+                    });
                     return Ok(());
                 }
                 for job in &jobs {
+                    if let Job::Wait { id, threshold } = job {
+                        // In the call, everything submitted before has run: a fence not reached
+                        // now never will be, so the job goes on and says so.
+                        if !self.gpu.syncpoints.is_reached(*id, *threshold) {
+                            eprintln!(
+                                "[media] a job waited for syncpoint {id} to reach {threshold}, which nothing left to run would reach; it goes on"
+                            );
+                        }
+                        continue;
+                    }
                     if let Err(e) = self.media.engines.run(job, self.gpu.mem.as_ref()) {
                         return unimplemented(e);
                     }
@@ -291,13 +312,36 @@ impl Nvdrv {
                 if self.media.trace_writes {
                     eprintln!("[media] {}: {write:x?}", node.path);
                 }
-                let Write::Method {
-                    class,
-                    offset,
-                    value,
-                } = write
-                else {
-                    continue;
+                let (class, offset, value) = match write {
+                    Write::Method {
+                        class,
+                        offset,
+                        value,
+                    } => (class, offset, value),
+                    // The host class's waits hold the jobs after them (A-182): `WAIT_SYNCPT`
+                    // names the syncpoint in its top byte and the threshold below, and
+                    // `WAIT_SYNCPT_32` names the syncpoint, its threshold loaded before by
+                    // `LOAD_SYNCPT_PAYLOAD_32`.
+                    Write::Register {
+                        class: crate::media::host1x::HOST1X,
+                        reg,
+                        value,
+                    } => {
+                        match reg {
+                            0x08 => jobs.push(Job::Wait {
+                                id: value >> 24,
+                                threshold: value & 0xFF_FFFF,
+                            }),
+                            0x4E => node.payload = value,
+                            0x50 => jobs.push(Job::Wait {
+                                id: value,
+                                threshold: node.payload,
+                            }),
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    Write::Register { .. } => continue,
                 };
                 node.regs.insert(offset, value);
                 if offset == EXECUTE {
@@ -452,6 +496,58 @@ mod tests {
             panic!()
         };
         assert_eq!(d.regs.get(&0x404), Some(&(((address + 0x100) >> 8) as u32)));
+    }
+
+    /// A queue that keeps the batches it is given.
+    #[derive(Default)]
+    struct Kept(std::sync::Mutex<Vec<Batch>>);
+
+    impl crate::media::MediaQueue for Kept {
+        fn push(&self, batch: Batch) {
+            self.0.lock().unwrap().push(batch);
+        }
+    }
+
+    #[test]
+    fn the_host_classs_waits_in_a_stream_become_jobs_that_hold_the_rest() {
+        let (mut nv, mem) = nvdrv();
+        let kept = std::sync::Arc::new(Kept::default());
+        nv.media.queue = Some(kept.clone());
+        let fd = nv.open("/dev/nvhost-vic").unwrap();
+        let cmds = nv.gpu.nvmap.create(0x1000).unwrap();
+        mem.map(0x30_0000, 0x1000);
+        nv.gpu.nvmap.alloc(cmds, 0, 0, 0, 0, 0x30_0000).unwrap();
+        // SETCLASS host1x (1); LOAD_SYNCPT_PAYLOAD_32 (0x4E) = 7, WAIT_SYNCPT_32 (0x50) = syncpoint
+        // 3; WAIT_SYNCPT (0x08) = syncpoint 2, threshold 0x123456.
+        let words = [
+            0x0000_0040u32,
+            0x104E_0001,
+            7,
+            0x1050_0001,
+            3,
+            0x1008_0001,
+            0x0212_3456,
+        ];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        mem.write(0x30_0000, &bytes);
+        let input = u32s(&[1, 0, 0, 0, cmds, 0, 7]);
+        let (e, _) = call(&mut nv, fd, iowr(0, 1, 16 + 12), &input);
+        assert_eq!(e, NvError::SUCCESS);
+        let batches = kept.0.lock().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].jobs,
+            vec![
+                Job::Wait {
+                    id: 3,
+                    threshold: 7
+                },
+                Job::Wait {
+                    id: 2,
+                    threshold: 0x12_3456
+                }
+            ]
+        );
     }
 
     #[test]
