@@ -39,11 +39,9 @@ pub fn raise_priority() {
     thread_local! {
         static RAISED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
-    if RAISED.with(|r| r.replace(true)) {
-        return;
-    }
+    let first = !RAISED.with(|r| r.replace(true));
     #[cfg(windows)]
-    {
+    if first {
         #[link(name = "kernel32")]
         extern "system" {
             fn GetCurrentThread() -> isize;
@@ -55,6 +53,8 @@ pub fn raise_priority() {
             SetThreadPriority(GetCurrentThread(), ABOVE_NORMAL);
         }
     }
+    #[cfg(not(windows))]
+    let _ = first;
 }
 
 /// How busy the whole machine is: the share of all processors' time that was not idle since the
