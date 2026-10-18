@@ -236,7 +236,9 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   frame rate where the driver applies that to fullscreen windows only); no test
   opens one. A program shows at most 60 frames a second (60 divided by the swap interval it asks
   for, as the console's display does, A-181), in a window or not; `NX_UNPACED=1` lets it go as fast
-  as it can, for headless runs with scripted input. The window opens when the program starts (not when it first draws, seconds later),
+  as it can, for headless runs with scripted input, and `NX_MAX_SWAP_INTERVAL=<n>` caps the swap
+  interval honored (1: a game that asks for 30 frames a second is paced at 60; the GUI's "Keep 60
+  frames a second where the game asks for 30"). The window opens when the program starts (not when it first draws, seconds later),
   comes to the front and is painted black until the first frame is presented. The keyboard and an XInput gamepad are the handheld controls of `hid`: `NX_KEYMAP=<file>`
   rebinds keys, `NX_TRACE_KEYS=1` prints the keys and button changes, `NX_GAMEPAD=0` and
   `NX_GAMEPAD_LABELS=1` (docs/ASSUMPTIONS.md A-104). To drive a window from a script, post key messages

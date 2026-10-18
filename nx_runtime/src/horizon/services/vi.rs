@@ -39,6 +39,11 @@ pub struct Shared {
     interval: Mutex<Option<u32>>,
     /// `NX_TRACE_PERF`: say what the program asks of the display.
     trace: bool,
+    /// The largest swap interval honored (`NX_MAX_SWAP_INTERVAL`): a program asking for more is
+    /// paced as if it asked for this. Not the console's behavior (A-181); for a program that
+    /// drops to 30 frames a second where it cannot hold 60 under this runtime, and keeps that
+    /// where it could.
+    max_interval: u32,
 }
 
 impl Shared {
@@ -56,7 +61,17 @@ impl Shared {
                 .then(|| Mutex::new(None)),
             interval: Mutex::new(None),
             trace: std::env::var_os("NX_TRACE_PERF").is_some_and(|v| v != "0"),
+            max_interval: std::env::var("NX_MAX_SWAP_INTERVAL")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(u32::MAX),
         }
+    }
+
+    /// The swap interval a frame is paced with: the one the program asked for, up to the cap.
+    fn capped(&self, interval: u32) -> u32 {
+        interval.min(self.max_interval)
     }
 
     /// Hold the call that queued a frame of swap interval `interval` until the frame before has
@@ -399,8 +414,14 @@ impl BinderDriver {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 if *seen != Some(f.input.swap_interval) {
+                    let capped = self.shared.capped(f.input.swap_interval);
+                    let note = if capped != f.input.swap_interval {
+                        format!(" (paced as {capped}, NX_MAX_SWAP_INTERVAL)")
+                    } else {
+                        String::new()
+                    };
                     eprintln!(
-                        "[vi] frame {}: the program queues its frames with swap interval {}",
+                        "[vi] frame {}: the program queues its frames with swap interval {}{note}",
                         f.number, f.input.swap_interval
                     );
                     *seen = Some(f.input.swap_interval);
@@ -410,7 +431,7 @@ impl BinderDriver {
             // its tick, whatever it takes to draw (A-181).
             let tick = frame
                 .as_ref()
-                .and_then(|f| self.shared.pace(f.input.swap_interval));
+                .and_then(|f| self.shared.pace(self.shared.capped(f.input.swap_interval)));
             if let (Some(frame), Some(gpu)) = (&frame, self.shared.gpu()) {
                 gpu.present(frame, tick.map(|t| t + VSYNC_PERIOD))
                     .map_err(|why| {
@@ -555,6 +576,19 @@ mod tests {
             short <= 3,
             "{short} of 8 frames one period after the one before"
         );
+    }
+
+    #[test]
+    fn the_swap_interval_honored_can_be_capped() {
+        let mut s = paced();
+        assert_eq!(s.capped(2), 2, "no cap by default");
+        s.max_interval = 1;
+        assert_eq!((s.capped(0), s.capped(1), s.capped(2)), (0, 1, 1));
+        // Paced with the cap: a frame of interval 2 is held one period, not two.
+        s.pace(1);
+        let before = last(&s);
+        s.pace(s.capped(2));
+        assert_eq!(last(&s), before + VSYNC_PERIOD);
     }
 
     #[test]
