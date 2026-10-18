@@ -9,7 +9,6 @@
 use super::abi::{perm, stop, trap, FuncEntry, NativeCpu, STOP_PC};
 use super::census::{self, Kind};
 use super::mem::{fast_ptr, MapError, FAST_READ, FAST_WRITE};
-use super::monitor::nx_mem_armed;
 use super::runtime::{
     handle_trap, interpret, interpret_one, record_fault, record_stop, record_trap, rt, run,
     service_svc, slow_path, NativeBus, SvcHandler,
@@ -72,13 +71,10 @@ macro_rules! plain_access {
 
         #[no_mangle]
         pub extern "C" fn $st(p: *mut NativeCpu, addr: u64, value: $ty, pc: u64) {
-            // With a reservation outstanding a store must tell the monitor (`Runtime::store`).
-            if nx_mem_armed.load(Relaxed) == 0 {
-                if let Some(host) = fast_ptr(addr, $size, FAST_WRITE) {
-                    // SAFETY: `fast_ptr` found `$size` writable bytes, aligned for the access.
-                    unsafe { <$atomic>::from_ptr(host.cast()).store(value, Relaxed) };
-                    return;
-                }
+            if let Some(host) = fast_ptr(addr, $size, FAST_WRITE) {
+                // SAFETY: `fast_ptr` found `$size` writable bytes, aligned for the access.
+                unsafe { <$atomic>::from_ptr(host.cast()).store(value, Relaxed) };
+                return;
             }
             do_store(p, addr, pc, $size, u64::from(value), Relaxed)
         }
@@ -97,12 +93,10 @@ macro_rules! plain_access {
 
         #[no_mangle]
         pub extern "C" fn $stlr(p: *mut NativeCpu, addr: u64, value: $ty, pc: u64) {
-            if nx_mem_armed.load(Relaxed) == 0 {
-                if let Some(host) = fast_ptr(addr, $size, FAST_WRITE) {
-                    // SAFETY: as above.
-                    unsafe { <$atomic>::from_ptr(host.cast()).store(value, Release) };
-                    return;
-                }
+            if let Some(host) = fast_ptr(addr, $size, FAST_WRITE) {
+                // SAFETY: as above.
+                unsafe { <$atomic>::from_ptr(host.cast()).store(value, Release) };
+                return;
             }
             if misaligned(p, addr, pc, $size, true) {
                 return;

@@ -246,7 +246,7 @@ fn the_fast_lookup_takes_only_what_it_can_do_in_one_access() {
 }
 
 #[test]
-fn plain_stores_of_every_size_end_other_threads_reservations() {
+fn another_threads_store_of_every_size_fails_a_store_exclusive() {
     map(0x1800_0000, 0x1000);
     let a = Cpu::new();
     let b = Cpu::new();
@@ -263,6 +263,7 @@ fn plain_stores_of_every_size_end_other_threads_reservations() {
         ("stlr64", |c, a| nx_stlr64(c, a, 1, 0)),
     ];
     for (name, store) in stores {
+        nx_st64(a.0, addr, 0x55, 0);
         nx_ldx(a.0, addr, 0x10, 8, 0);
         store(b.0, addr);
         assert_eq!(
@@ -274,6 +275,12 @@ fn plain_stores_of_every_size_end_other_threads_reservations() {
     // Without a reservation anywhere the same stores work as plain stores.
     nx_stlr64(b.0, addr, 77, 0);
     assert_eq!(nx_ld64(a.0, addr, 0), 77);
+    // A store by another thread that leaves the bytes as the load saw them is not noticed: the
+    // store-exclusive is a compare-and-exchange against those bytes (A-021).
+    nx_ldx(a.0, addr, 0x10, 8, 0);
+    nx_st64(b.0, addr, 77, 0);
+    assert_eq!(nx_stx(a.0, addr, 78, 0, 0x14, 8, 0), 0);
+    assert_eq!(nx_ld64(a.0, addr, 0), 78);
 }
 
 #[test]
@@ -289,16 +296,17 @@ fn store_exclusive_needs_its_own_reservation() {
     assert_eq!(nx_ld64(a.0, addr, 0), 11);
     assert_eq!(nx_stx(a.0, addr, 12, 0, 0x18, 8, 0), 1);
     assert_eq!(nx_ld64(a.0, addr, 0), 11);
-    // Own plain stores do not end the reservation.
+    // A thread's own plain store into the range ends it too: the bytes are no longer those the
+    // load saw (the architecture leaves this one implementation defined, A-021).
     nx_ldx(a.0, addr, 0x10, 8, 1);
     nx_st64(a.0, addr, 20, 0x14);
-    assert_eq!(nx_stx(a.0, addr, 21, 0, 0x18, 8, 1), 0);
-    assert_eq!(nx_ld64(a.0, addr, 0), 21);
-    // Another thread's store does, even when it writes the value that was there.
+    assert_eq!(nx_stx(a.0, addr, 21, 0, 0x18, 8, 1), 1);
+    assert_eq!(nx_ld64(a.0, addr, 0), 20);
+    // Another thread's store does: the bytes are no longer those the load saw.
     nx_ldx(a.0, addr, 0x10, 8, 0);
-    nx_st64(b.0, addr, 21, 0x20);
+    nx_st64(b.0, addr, 22, 0x20);
     assert_eq!(nx_stx(a.0, addr, 99, 0, 0x14, 8, 0), 1);
-    assert_eq!(nx_ld64(a.0, addr, 0), 21);
+    assert_eq!(nx_ld64(a.0, addr, 0), 22);
     // CLREX, a different address and a different size all fail the store.
     nx_ldx(a.0, addr, 0x10, 8, 0);
     nx_clrex(a.0);
@@ -307,7 +315,7 @@ fn store_exclusive_needs_its_own_reservation() {
     assert_eq!(nx_stx(a.0, addr + 8, 5, 0, 0x14, 8, 0), 1);
     nx_ldx(a.0, addr, 0x10, 8, 0);
     assert_eq!(nx_stx(a.0, addr, 5, 0, 0x14, 4, 0), 1);
-    assert_eq!(nx_ld64(a.0, addr, 0), 21);
+    assert_eq!(nx_ld64(a.0, addr, 0), 22);
     // A failed store-exclusive to unmapped memory does not fault: it never touches memory.
     assert_eq!(nx_stx(a.0, 0x7000_0000, 5, 0, 0x14, 8, 0), 1);
     assert_eq!(a.c().ctl.stop, stop::NONE);
@@ -343,6 +351,25 @@ fn exclusive_pairs_move_both_halves() {
     assert_eq!(nx_stx(cpu.0, addr, 0xAAAA, 0xBBBB, 0x14, 16, 0), 0);
     assert_eq!(nx_ld64(cpu.0, addr, 0), 0xAAAA);
     assert_eq!(nx_ld64(cpu.0, addr + 8, 0), 0xBBBB);
+    // A store by another thread into either half fails the pair's store: the exchange is of
+    // all 16 bytes.
+    let other = Cpu::new();
+    nx_ldx(cpu.0, addr, 0x10, 16, 0);
+    nx_st64(other.0, addr + 8, 0xCCCC, 0);
+    assert_eq!(nx_stx(cpu.0, addr, 1, 2, 0x14, 16, 0), 1);
+    nx_ldx(cpu.0, addr, 0x10, 16, 0);
+    nx_st64(other.0, addr, 0xDDDD, 0);
+    assert_eq!(nx_stx(cpu.0, addr, 1, 2, 0x14, 16, 0), 1);
+    assert_eq!(
+        (nx_ld64(cpu.0, addr, 0), nx_ld64(cpu.0, addr + 8, 0)),
+        (0xDDDD, 0xCCCC)
+    );
+    nx_ldx(cpu.0, addr, 0x10, 16, 0);
+    assert_eq!(nx_stx(cpu.0, addr, 1, 2, 0x14, 16, 0), 0);
+    assert_eq!(
+        (nx_ld64(cpu.0, addr, 0), nx_ld64(cpu.0, addr + 8, 0)),
+        (1, 2)
+    );
     // A misaligned pair faults.
     nx_ldx(cpu.0, addr + 8, 0x18, 16, 0);
     assert_eq!(cpu.c().ctl.stop, stop::FAULT);

@@ -3,7 +3,6 @@
 use super::abi::{self, stop, trap, FuncEntry, NativeCpu, EXIT_PC, STOP_PC};
 use super::census::{self, Kind};
 use super::mem::GuestMemory;
-use super::monitor::{Monitors, Reservation};
 use crate::a64::bus::{Bus, Fault, FaultKind, COUNTER_FREQUENCY};
 use crate::a64::inst::SysReg;
 use crate::a64::interp::{step, Trap};
@@ -77,9 +76,13 @@ impl FuncTable {
     }
 }
 
+thread_local! {
+    /// The bytes the calling thread's last load-exclusive saw (A-021).
+    static SEEN: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
+}
+
 pub struct Runtime {
     pub mem: GuestMemory,
-    pub monitors: Monitors,
     funcs: RwLock<Vec<FuncEntry>>,
     /// What lookups read: built from `funcs` when a lookup finds `funcs_dirty`, and never freed (a
     /// registration after the first lookup leaves the older table behind; they are small).
@@ -113,7 +116,6 @@ impl Runtime {
     fn new() -> Runtime {
         Runtime {
             mem: GuestMemory::new(),
-            monitors: Monitors::global(),
             funcs: RwLock::new(Vec::new()),
             func_table: AtomicPtr::new(std::ptr::null_mut()),
             funcs_dirty: AtomicBool::new(true),
@@ -230,54 +232,41 @@ impl Runtime {
     }
 
     // ---- memory with the exclusive monitor ----
+    //
+    // A thread's load-exclusive records the range it covers (in its `CpuState`) and the bytes it
+    // saw (here, per host thread, which is the guest thread's own); its store-exclusive commits
+    // with one compare-and-exchange against those bytes. Plain stores never consult the monitor
+    // (docs/ASSUMPTIONS.md A-021).
 
-    /// A plain store. When some thread holds a reservation the store runs under the monitor lock,
-    /// so it cannot slip between a store-exclusive's check and its write.
+    /// A plain store by `thread`.
     pub fn store(
         &self,
-        thread: u64,
+        _thread: u64,
         addr: u64,
         size: u8,
         value: u128,
         order: Ordering,
     ) -> Result<(), FaultKind> {
-        if self.monitors.any_armed() {
-            let mut g = self.monitors.lock();
-            self.mem.write(addr, size, value, order)?;
-            g.note_store(thread, addr, size, value);
-            return Ok(());
-        }
         self.mem.write(addr, size, value, order)
     }
 
-    /// A compare-and-exchange by `thread` (the kernel's atomic updates of guest words): like a
-    /// plain store, a successful exchange ends other threads' reservations on the location.
+    /// A compare-and-exchange by `thread` (the kernel's atomic updates of guest words).
     pub fn compare_exchange(
         &self,
-        thread: u64,
+        _thread: u64,
         addr: u64,
         size: u8,
         expected: u64,
         new: u64,
         order: Ordering,
     ) -> Result<bool, FaultKind> {
-        if self.monitors.any_armed() {
-            let mut g = self.monitors.lock();
-            let done = self
-                .mem
-                .compare_exchange(addr, size, expected, new, order)?;
-            if done {
-                g.note_store(thread, addr, size, u128::from(new));
-            }
-            return Ok(done);
-        }
         self.mem.compare_exchange(addr, size, expected, new, order)
     }
 
-    /// `LDXR`: read, then record the reservation.
+    /// `LDXR`: read, then record the reservation and what it saw.
     pub fn load_exclusive(
         &self,
-        thread: u64,
+        _thread: u64,
         st: &mut CpuState,
         addr: u64,
         bytes: u8,
@@ -288,23 +277,16 @@ impl Runtime {
         } else {
             Ordering::Relaxed
         };
-        let mut g = self.monitors.lock();
         let v = self.mem.read(addr, bytes, order)?;
-        g.arm(
-            thread,
-            Reservation {
-                addr,
-                bytes,
-                observed: [v as u64, (v >> 64) as u64],
-            },
-        );
         st.excl_addr = addr;
         st.excl_size = u64::from(bytes);
+        SEEN.with(|s| s.set(v));
         Ok(v)
     }
 
-    /// `STXR`: store if the reservation for exactly this range is intact. The reservation ends
-    /// either way. A failed check does not touch memory, so it cannot fault.
+    /// `STXR`: store if the reservation is for exactly this range and the bytes are still those
+    /// the load-exclusive saw. The reservation ends either way. A failed check does not touch
+    /// memory, so it cannot fault.
     pub fn store_exclusive(
         &self,
         thread: u64,
@@ -319,40 +301,22 @@ impl Runtime {
         } else {
             Ordering::Relaxed
         };
-        let mut g = self.monitors.lock();
-        let mine = g.get(thread);
         let armed = st.excl_size == u64::from(bytes) && st.excl_addr == addr;
-        g.disarm(thread);
         st.excl_size = 0;
-        let Some(res) = mine.filter(|r| armed && r.addr == addr && r.bytes == bytes) else {
-            return Ok(false);
-        };
-        if self.take_spurious(thread) {
+        if !armed || self.take_spurious(thread) {
             return Ok(false);
         }
-        let done = if bytes <= 8 {
+        let seen = SEEN.with(|s| s.get());
+        if bytes <= 8 {
             self.mem
-                .compare_exchange(addr, bytes, res.observed[0], value as u64, order)?
+                .compare_exchange(addr, bytes, seen as u64, value as u64, order)
         } else {
-            let seen = u128::from(res.observed[0]) | (u128::from(res.observed[1]) << 64);
-            if self.mem.read(addr, bytes, Ordering::Relaxed)? != seen {
-                false
-            } else {
-                self.mem.write(addr, bytes, value, order)?;
-                true
-            }
-        };
-        if done {
-            g.note_store(thread, addr, bytes, value);
+            self.mem.compare_exchange_128(addr, seen, value, order)
         }
-        Ok(done)
     }
 
-    pub fn clear_exclusive(&self, thread: u64, st: &mut CpuState) {
+    pub fn clear_exclusive(&self, _thread: u64, st: &mut CpuState) {
         st.excl_size = 0;
-        if self.monitors.any_armed() {
-            self.monitors.lock().disarm(thread);
-        }
     }
 }
 

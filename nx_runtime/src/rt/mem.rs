@@ -698,10 +698,74 @@ impl GuestMemory {
         Ok(ok)
     }
 
+    /// Atomically replace the 16 bytes at `addr`, which must be 16-byte aligned, if they still
+    /// hold `expected`: one exchange, the host's 16-byte compare-and-exchange. Where the host
+    /// has none, a read, a compare and a write under a lock stand in, which a plain store by
+    /// another thread can slip between.
+    pub fn compare_exchange_128(
+        &self,
+        addr: u64,
+        expected: u128,
+        new: u128,
+        order: Ordering,
+    ) -> Result<bool, FaultKind> {
+        if !addr.is_multiple_of(16) {
+            return Err(FaultKind::Alignment);
+        }
+        let p = self.page_ptr(addr, 16, true, Some(new))?;
+        // SAFETY: 16 writable bytes inside one page, aligned to 16.
+        Ok(unsafe { cas128(p.cast(), expected, new, order) })
+    }
+
     /// Does the page at `addr` allow execution?
     pub fn is_executable(&self, addr: u64) -> bool {
         self.entry(addr) & (PRESENT | EXEC) == PRESENT | EXEC
     }
+}
+
+/// # Safety
+/// `p` must point at 16 writable bytes, aligned to 16.
+#[cfg(target_arch = "x86_64")]
+unsafe fn cas128(p: *mut u128, expected: u128, new: u128, order: Ordering) -> bool {
+    #[target_feature(enable = "cmpxchg16b")]
+    unsafe fn exchange(p: *mut u128, expected: u128, new: u128, order: Ordering) -> u128 {
+        // The failure ordering may be neither a release nor stronger than the success one.
+        let failure = match order {
+            Ordering::Relaxed | Ordering::Release => Ordering::Relaxed,
+            _ => Ordering::Acquire,
+        };
+        core::arch::x86_64::cmpxchg16b(p, expected, new, order, failure)
+    }
+    if std::is_x86_feature_detected!("cmpxchg16b") {
+        return exchange(p, expected, new, order) == expected;
+    }
+    cas128_locked(p, expected, new)
+}
+
+/// # Safety
+/// `p` must point at 16 writable bytes, aligned to 16.
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn cas128(p: *mut u128, expected: u128, new: u128, _order: Ordering) -> bool {
+    cas128_locked(p, expected, new)
+}
+
+/// The 16-byte exchange where the host cannot do it in one instruction: under a lock, so it is
+/// atomic against the other exchanges, not against plain stores.
+///
+/// # Safety
+/// `p` must point at 16 writable bytes, aligned to 8.
+unsafe fn cas128_locked(p: *mut u128, expected: u128, new: u128) -> bool {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let words = p.cast::<u64>();
+    let lo = AtomicU64::from_ptr(words).load(Ordering::Relaxed);
+    let hi = AtomicU64::from_ptr(words.add(1)).load(Ordering::Relaxed);
+    if u128::from(lo) | (u128::from(hi) << 64) != expected {
+        return false;
+    }
+    AtomicU64::from_ptr(words).store(new as u64, Ordering::Relaxed);
+    AtomicU64::from_ptr(words.add(1)).store((new >> 64) as u64, Ordering::Release);
+    true
 }
 
 /// # Safety
