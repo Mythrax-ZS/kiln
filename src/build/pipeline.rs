@@ -303,6 +303,7 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
 
     // Discovery.
     let t0 = Instant::now();
+    progress("discovering", 0, 0);
     let (roots, aopts) = analysis_inputs(&program.modules, &opts.hints)?;
     let d = discover(&ProcessCode(&program.modules), &roots, &aopts);
     let discover_s = t0.elapsed().as_secs_f32();
@@ -317,6 +318,8 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
     let t1 = Instant::now();
     let groups = batches(&d.funcs, opts.unit_size);
     let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    progress("compiling", 0, groups.len());
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let blocks = AtomicUsize::new(0);
     let is_function = |a: u64| d.funcs.contains_key(&a);
@@ -332,6 +335,11 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
                     let Some(group) = groups.get(i) else { break };
                     let obj = work.join(format!("unit{i}.{obj_ext}"));
                     if opts.reuse_objects && obj.is_file() {
+                        progress(
+                            "compiling",
+                            done.fetch_add(1, Ordering::Relaxed) + 1,
+                            groups.len(),
+                        );
                         continue;
                     }
                     let funcs: Vec<_> = group
@@ -353,6 +361,11 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
                     if let Err(e) = result {
                         errors.lock().unwrap().push(e.to_string());
                     }
+                    progress(
+                        "compiling",
+                        done.fetch_add(1, Ordering::Relaxed) + 1,
+                        groups.len(),
+                    );
                 })
                 .expect("spawn a lifting worker");
         }
@@ -402,6 +415,7 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
 
     // Link.
     let t2 = Instant::now();
+    progress("linking", 0, 0);
     let runtime = runtime_lib()?;
     let mut objs: Vec<PathBuf> = (0..groups.len())
         .map(|i| work.join(format!("unit{i}.{obj_ext}")))
@@ -471,13 +485,25 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
         },
     };
     write_report(&report, program, &report_file)?;
+    progress("done", 1, 1);
     Ok(report)
+}
+
+/// Say how far a build has come (`KILN_PROGRESS=1`): a line `kiln: progress <stage> <done>/<total>`
+/// on the standard error for each unit compiled and each stage begun, which a front end turns
+/// into a progress bar. A stage without a count (`0/0`) is one whose length is not known.
+pub fn progress(stage: &str, done: usize, total: usize) {
+    static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *WANTED.get_or_init(|| std::env::var("KILN_PROGRESS").is_ok_and(|v| v != "0")) {
+        eprintln!("kiln: progress {stage} {done}/{total}");
+    }
 }
 
 /// Link the object files of an earlier `build` again, against the runtime library as it is now.
 /// The services and the kernel layer change much more often than the generated code, and linking
 /// takes seconds where compiling a whole title takes much longer. Returns the executable.
 pub fn relink(tc: &Toolchain, out_dir: &Path, name: &str) -> Result<PathBuf> {
+    progress("linking", 0, 0);
     let work = out_dir.join("work");
     let obj_ext = if cfg!(windows) { "obj" } else { "o" };
     let mut objs: Vec<PathBuf> = Vec::new();
