@@ -4,12 +4,13 @@
 # runtime's functions have their Rust names) or a module of the process (a driver, ntdll).
 #
 # usage: pwsh -File tools/sample_threads.ps1 -Map <map file> [-Process title] [-Samples 40]
-#            [-IntervalMs 50] [-Top 25] [-OnlyRunning] [-Callers]
+#            [-IntervalMs 50] [-Top 25] [-OnlyRunning] [-Callers] [-Depth 1]
 #
 # -OnlyRunning leaves out the threads the system says are waiting. The first column is how many
 # samples found a thread at the place, then the thread's id, then the place. -Callers adds, to a
 # sample that is outside the program (a system library), the first place of the program that a word
-# near the top of the thread's stack points into: usually who called it.
+# near the top of the thread's stack points into: usually who called it; -Depth 3 adds the next
+# two such places, a rough backtrace (return addresses and spilled pointers alike).
 param(
     [Parameter(Mandatory = $true)][string]$Map,
     [string]$Process = "title",
@@ -17,7 +18,8 @@ param(
     [int]$IntervalMs = 50,
     [int]$Top = 25,
     [switch]$OnlyRunning,
-    [switch]$Callers
+    [switch]$Callers,
+    [int]$Depth = 1
 )
 Add-Type -TypeDefinition @"
 using System;
@@ -129,8 +131,13 @@ for ($n = 0; $n -lt $Samples; $n++) {
         $rip = [ThreadIp]::Rip([uint32]$t.Id, [uint32]$p.Id, $(if ($Callers) { 1536 } else { 0 }))
         $where = Where-Is $rip
         if ($Callers -and $rip -ne 0 -and ($rip -lt $base -or $rip -ge $base + 0x20000000) -and [ThreadIp]::Stack) {
+            $found = 0
             foreach ($w in [ThreadIp]::Stack) {
-                if ($w -ge $base -and $w -lt $base + 0x20000000) { $where += "  <- " + (Where-Is $w); break }
+                if ($w -ge $base -and $w -lt $base + 0x20000000) {
+                    $where += "  <- " + (Where-Is $w)
+                    $found++
+                    if ($found -ge $Depth) { break }
+                }
             }
         }
         $key = "{0}  {1}" -f $t.Id, $where
