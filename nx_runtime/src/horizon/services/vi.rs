@@ -35,6 +35,10 @@ pub struct Shared {
     /// When the call that queued the last frame returned, if frames are paced as the display
     /// shows them (A-181; `NX_UNPACED=1` lets them go as fast as the program makes them).
     pacing: Option<Mutex<Option<Instant>>>,
+    /// The swap interval of the last frame queued, to say when it changes (`NX_TRACE_PERF`).
+    interval: Mutex<Option<u32>>,
+    /// `NX_TRACE_PERF`: say what the program asks of the display.
+    trace: bool,
 }
 
 impl Shared {
@@ -50,6 +54,8 @@ impl Shared {
             pacing: std::env::var_os("NX_UNPACED")
                 .is_none_or(|v| v == "0")
                 .then(|| Mutex::new(None)),
+            interval: Mutex::new(None),
+            trace: std::env::var_os("NX_TRACE_PERF").is_some_and(|v| v != "0"),
         }
     }
 
@@ -57,8 +63,10 @@ impl Shared {
     /// had its time on screen: the call returns no sooner than `interval` vsync periods after the
     /// one before it, so a program shows at most 60 / `interval` frames a second, as on the
     /// console, whatever the refresh rate of the machine's screen. A program that is late is not
-    /// held, and does not catch up. Interval 0 is not held. Returns the tick of the grid the
-    /// frame was held to (`None` when it was not held), for the moment it is to reach the screen.
+    /// held, and does not catch up: its frame takes the last tick of the grid before now, and so
+    /// reaches the screen at the next, as the console's display shows a frame at the first vsync
+    /// after it was queued. Interval 0 is not held. Returns the tick of the grid the frame was
+    /// held to (`None` when it was not held), for the moment it is to reach the screen.
     fn pace(&self, interval: u32) -> Option<Instant> {
         let last = self.pacing.as_ref()?;
         if interval == 0 {
@@ -66,18 +74,26 @@ impl Shared {
         }
         let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        let due = last.map_or(now, |t| t + VSYNC_PERIOD * interval);
-        if due > now {
-            super::super::kernel::sleep_until(due);
-            *last = Some(due);
-        } else if now - due < VSYNC_PERIOD {
-            // Late by less than a period: the next frame is due on the same grid, so the lateness
-            // does not add up from one frame to the next.
-            *last = Some(due);
-        } else {
-            *last = Some(now);
-        }
-        *last
+        let tick = match *last {
+            None => now,
+            Some(t) => {
+                let due = t + VSYNC_PERIOD * interval;
+                if due > now {
+                    super::super::kernel::sleep_until(due);
+                    due
+                } else {
+                    // The grid keeps its phase: a program whose frames take 31 ms shows them
+                    // 33.3 ms apart, with one 16.7 ms apart now and then, as on the console.
+                    // (Snapping a frame late by less than a period back to the tick it missed,
+                    // and the next, late by more, to now, showed them 17 and 47 ms apart in
+                    // turn: frame pairs, seen as stutter.)
+                    let periods = (now - due).as_nanos() / VSYNC_PERIOD.as_nanos();
+                    due + VSYNC_PERIOD * periods as u32
+                }
+            }
+        };
+        *last = Some(tick);
+        Some(tick)
     }
 
     /// Connect the display to the driver, so displayed buffers reach the renderer.
@@ -119,6 +135,7 @@ impl Shared {
         // The periods are kept on a grid, so that no lateness adds up (A-186).
         let mut next = Instant::now();
         std::thread::spawn(move || loop {
+            nx_gpu::time::raise_priority();
             next += VSYNC_PERIOD;
             super::super::kernel::sleep_until(next);
             let Some(kernel) = kernel.upgrade() else {
@@ -375,6 +392,20 @@ impl BinderDriver {
         }
         if code == nx_gpu::display::code::QUEUE_BUFFER {
             let frame = self.shared.comp().last_frame_of(binder);
+            if let Some(f) = frame.as_ref().filter(|_| self.shared.trace) {
+                let mut seen = self
+                    .shared
+                    .interval
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if *seen != Some(f.input.swap_interval) {
+                    eprintln!(
+                        "[vi] frame {}: the program queues its frames with swap interval {}",
+                        f.number, f.input.swap_interval
+                    );
+                    *seen = Some(f.input.swap_interval);
+                }
+            }
             // The frame is held to the grid first; it is to reach the screen one period after
             // its tick, whatever it takes to draw (A-181).
             let tick = frame
@@ -470,18 +501,60 @@ mod tests {
     }
 
     #[test]
-    fn a_late_frame_is_not_held_and_does_not_catch_up() {
+    fn a_late_frame_takes_the_last_tick_before_it_and_keeps_the_grid() {
         let s = paced();
         s.pace(1);
+        let first = last(&s);
         std::thread::sleep(VSYNC_PERIOD * 3);
         let before = Instant::now();
         s.pace(1);
-        // Its time is counted from when it came, not from where the one before left off.
-        assert!(last(&s) >= before);
+        let after = Instant::now();
+        // Not held, and not caught up: the call returned at once.
+        assert!(after - before < VSYNC_PERIOD, "{:?}", after - before);
+        // Its tick is the last one of the grid before it came (so it is shown at the next), and
+        // the grid keeps the phase of the first frame.
+        let tick = last(&s);
+        assert!(tick <= after);
+        assert!(
+            after - tick < VSYNC_PERIOD + Duration::from_millis(10),
+            "{:?}",
+            after - tick
+        );
+        assert_eq!((tick - first).as_nanos() % VSYNC_PERIOD.as_nanos(), 0);
         // Interval 0 is never held.
         let before = last(&s);
         s.pace(0);
         assert_eq!(last(&s), before);
+    }
+
+    #[test]
+    fn the_frames_of_a_slow_program_come_evenly_on_the_grid() {
+        // Frames every 31 ms: on the console each is shown at the next vsync, 33.3 ms after the
+        // one before, with one 16.7 ms after it now and then; never two close together and then
+        // a gap.
+        let s = paced();
+        s.pace(1);
+        let mut ticks = vec![last(&s)];
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(31));
+            s.pace(1);
+            ticks.push(last(&s));
+        }
+        let period = VSYNC_PERIOD.as_nanos();
+        for pair in ticks.windows(2) {
+            let gap = (pair[1] - pair[0]).as_nanos();
+            assert_eq!(gap % period, 0, "off the grid by {} ns", gap % period);
+            // (A loaded machine may oversleep; the grid still holds.)
+            assert!((1..=6).contains(&(gap / period)), "{gap} ns");
+        }
+        let short = ticks
+            .windows(2)
+            .filter(|p| (p[1] - p[0]).as_nanos() == period)
+            .count();
+        assert!(
+            short <= 3,
+            "{short} of 8 frames one period after the one before"
+        );
     }
 
     #[test]
