@@ -366,9 +366,24 @@ impl Shared {
             return core.gpu.present(frame, due);
         };
         // The buffer is shown after the commands queued before it have run.
+        let began = std::time::Instant::now();
         worker.wait_for_room(true);
+        let roomed = std::time::Instant::now();
         let request = {
             let mut core = self.lock();
+            if super::vi::trace_pace() {
+                let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+                let (tasks, presents) = {
+                    let b = worker.lock();
+                    (b.tasks.len(), b.presents)
+                };
+                eprintln!(
+                    "[pace] frame {}: room in the renderer's queue after {:.2} ms, its lock after {:.2} ms more ({tasks} tasks, {presents} presents pending)",
+                    frame.number,
+                    ms(roomed.duration_since(began)),
+                    ms(roomed.elapsed())
+                );
+            }
             core.gpu.note_frame(frame.number);
             core.gpu.present_request(frame, due)?
         };

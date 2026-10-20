@@ -23,6 +23,13 @@ const NOT_AVAILABLE: ResultCode = ResultCode::new(114, 5);
 /// queued with swap interval `n` is on screen for `n` such periods (A-181).
 const VSYNC_PERIOD: Duration = Duration::from_micros(16_667);
 
+/// `NX_TRACE_PACE=1`: say, for every frame queued, how the hold went and how long handing the
+/// frame to the renderer took (the room in its queue, the driver's lock).
+pub fn trace_pace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NX_TRACE_PACE").is_some_and(|v| v != "0"))
+}
+
 /// The display state of the process and the events behind its tokens.
 pub struct Shared {
     comp: Mutex<Compositor>,
@@ -82,7 +89,7 @@ impl Shared {
     /// reaches the screen at the next, as the console's display shows a frame at the first vsync
     /// after it was queued. Interval 0 is not held. Returns the tick of the grid the frame was
     /// held to (`None` when it was not held), for the moment it is to reach the screen.
-    fn pace(&self, interval: u32) -> Option<Instant> {
+    fn pace(&self, interval: u32, frame: u64) -> Option<Instant> {
         let last = self.pacing.as_ref()?;
         if interval == 0 {
             return None;
@@ -93,6 +100,20 @@ impl Shared {
             None => now,
             Some(t) => {
                 let due = t + VSYNC_PERIOD * interval;
+                if trace_pace() {
+                    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+                    if due > now {
+                        eprintln!(
+                            "[pace] frame {frame}: interval {interval}, early by {:.2} ms, held",
+                            ms(due - now)
+                        );
+                    } else {
+                        eprintln!(
+                            "[pace] frame {frame}: interval {interval}, late by {:.2} ms, not held",
+                            ms(now - due)
+                        );
+                    }
+                }
                 if due > now {
                     super::super::kernel::sleep_until(due);
                     due
@@ -429,9 +450,12 @@ impl BinderDriver {
             }
             // The frame is held to the grid first; it is to reach the screen one period after
             // its tick, whatever it takes to draw (A-181).
-            let tick = frame
-                .as_ref()
-                .and_then(|f| self.shared.pace(self.shared.capped(f.input.swap_interval)));
+            let paced = Instant::now();
+            let tick = frame.as_ref().and_then(|f| {
+                self.shared
+                    .pace(self.shared.capped(f.input.swap_interval), f.number)
+            });
+            let presented = Instant::now();
             if let (Some(frame), Some(gpu)) = (&frame, self.shared.gpu()) {
                 gpu.present(frame, tick.map(|t| t + VSYNC_PERIOD))
                     .map_err(|why| {
@@ -440,6 +464,16 @@ impl BinderDriver {
                             frame.number
                         ))
                     })?;
+            }
+            if trace_pace() {
+                if let Some(f) = &frame {
+                    eprintln!(
+                        "[pace] frame {}: queued; the hold took {:.2} ms, handing it to the renderer {:.2} ms",
+                        f.number,
+                        presented.duration_since(paced).as_secs_f64() * 1000.0,
+                        presented.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
             }
         }
         if code == nx_gpu::display::code::QUEUE_BUFFER {
@@ -511,12 +545,12 @@ mod tests {
         let start = Instant::now();
         // The first frame goes at once, each of the next three a period after the one before.
         for _ in 0..4 {
-            s.pace(1);
+            s.pace(1, 0);
         }
         assert!(start.elapsed() >= VSYNC_PERIOD * 3, "{:?}", start.elapsed());
         // A swap interval of 2 holds the next frame for two periods.
         let before = last(&s);
-        s.pace(2);
+        s.pace(2, 0);
         assert_eq!(last(&s), before + VSYNC_PERIOD * 2);
         assert!(Instant::now() >= before + VSYNC_PERIOD * 2);
     }
@@ -524,11 +558,11 @@ mod tests {
     #[test]
     fn a_late_frame_takes_the_last_tick_before_it_and_keeps_the_grid() {
         let s = paced();
-        s.pace(1);
+        s.pace(1, 0);
         let first = last(&s);
         std::thread::sleep(VSYNC_PERIOD * 3);
         let before = Instant::now();
-        s.pace(1);
+        s.pace(1, 0);
         let after = Instant::now();
         // Not held, and not caught up: the call returned at once.
         assert!(after - before < VSYNC_PERIOD, "{:?}", after - before);
@@ -544,7 +578,7 @@ mod tests {
         assert_eq!((tick - first).as_nanos() % VSYNC_PERIOD.as_nanos(), 0);
         // Interval 0 is never held.
         let before = last(&s);
-        s.pace(0);
+        s.pace(0, 0);
         assert_eq!(last(&s), before);
     }
 
@@ -554,11 +588,11 @@ mod tests {
         // one before, with one 16.7 ms after it now and then; never two close together and then
         // a gap.
         let s = paced();
-        s.pace(1);
+        s.pace(1, 0);
         let mut ticks = vec![last(&s)];
         for _ in 0..8 {
             std::thread::sleep(Duration::from_millis(31));
-            s.pace(1);
+            s.pace(1, 0);
             ticks.push(last(&s));
         }
         let period = VSYNC_PERIOD.as_nanos();
@@ -585,9 +619,9 @@ mod tests {
         s.max_interval = 1;
         assert_eq!((s.capped(0), s.capped(1), s.capped(2)), (0, 1, 1));
         // Paced with the cap: a frame of interval 2 is held one period, not two.
-        s.pace(1);
+        s.pace(1, 0);
         let before = last(&s);
-        s.pace(s.capped(2));
+        s.pace(s.capped(2), 0);
         assert_eq!(last(&s), before + VSYNC_PERIOD);
     }
 
@@ -597,7 +631,7 @@ mod tests {
         s.pacing = None;
         let start = Instant::now();
         for _ in 0..10 {
-            s.pace(1);
+            s.pace(1, 0);
         }
         assert!(start.elapsed() < VSYNC_PERIOD * 9, "{:?}", start.elapsed());
     }
