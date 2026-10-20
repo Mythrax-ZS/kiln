@@ -86,6 +86,7 @@ public static class ThreadIp {
 
 $p = Get-Process $Process -ErrorAction Stop | Select-Object -First 1
 $base = [uint64]$p.MainModule.BaseAddress.ToInt64()
+$size = [uint64]$p.MainModule.ModuleMemorySize   # the program's image, however big
 $preferred = [uint64]0x140000000   # the image base the map is written for
 
 # The map's symbols, by address.
@@ -108,7 +109,7 @@ $modules = $p.Modules | ForEach-Object {
 
 function Where-Is([uint64]$rip) {
     if ($rip -eq 0) { return "(no context)" }
-    if ($rip -lt $base -or $rip -ge $base + 0x20000000) {
+    if ($rip -lt $base -or $rip -ge $base + $size) {
         foreach ($m in $modules) {
             if ($rip -ge $m.Lo -and $rip -lt $m.Hi) { return "{0}+{1:x}" -f $m.Name, ($rip - $m.Lo) }
         }
@@ -124,16 +125,19 @@ function Where-Is([uint64]$rip) {
 }
 
 $counts = @{}
+$cpu0 = @{}
+foreach ($t in $p.Threads) { $cpu0[$t.Id] = $t.TotalProcessorTime.TotalMilliseconds }
+$wall0 = Get-Date
 for ($n = 0; $n -lt $Samples; $n++) {
     $p.Refresh()
     foreach ($t in $p.Threads) {
         if ($OnlyRunning -and $t.ThreadState -ne "Running") { continue }
         $rip = [ThreadIp]::Rip([uint32]$t.Id, [uint32]$p.Id, $(if ($Callers) { 1536 } else { 0 }))
         $where = Where-Is $rip
-        if ($Callers -and $rip -ne 0 -and ($rip -lt $base -or $rip -ge $base + 0x20000000) -and [ThreadIp]::Stack) {
+        if ($Callers -and $rip -ne 0 -and ($rip -lt $base -or $rip -ge $base + $size) -and [ThreadIp]::Stack) {
             $found = 0
             foreach ($w in [ThreadIp]::Stack) {
-                if ($w -ge $base -and $w -lt $base + 0x20000000) {
+                if ($w -ge $base -and $w -lt $base + $size) {
                     $where += "  <- " + (Where-Is $w)
                     $found++
                     if ($found -ge $Depth) { break }
@@ -147,3 +151,15 @@ for ($n = 0; $n -lt $Samples; $n++) {
 }
 $counts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First $Top |
     ForEach-Object { "{0,5}  {1}" -f $_.Value, $_.Key }
+# The processor time each thread used while the samples were taken: how busy it really was, whether
+# the samples caught it running or not.
+$wall = ((Get-Date) - $wall0).TotalMilliseconds
+$p.Refresh()
+$busy = foreach ($t in $p.Threads) {
+    if ($cpu0.ContainsKey($t.Id)) {
+        $used = $t.TotalProcessorTime.TotalMilliseconds - $cpu0[$t.Id]
+        if ($used -ge 1) { [pscustomobject]@{ Id = $t.Id; Used = $used } }
+    }
+}
+"cpu time over {0:f0} ms of sampling:" -f $wall
+$busy | Sort-Object Used -Descending | Select-Object -First 8 | ForEach-Object { "  thread {0}: {1:f0} ms ({2:f0} %)" -f $_.Id, $_.Used, (100 * $_.Used / $wall) }
