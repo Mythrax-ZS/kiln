@@ -29,6 +29,11 @@ Crates:
   kiln_gui --example brand` writes `assets/brand/` and `dist/linux/kiln.png` from it, and
   `kiln_gui/build.rs` puts `assets/brand/kiln.ico` into `kiln-gui.exe`.
 
+A few SDK routines run natively in place of their recompiled code, by the names a module
+exports (`nx_runtime/src/rt/hle.rs`, `src/codegen/native.rs`, A-187): `nn::util`'s gzip, zlib
+and deflate decompressors. Add one only with its signature pinned by a test and a row in
+`docs/ASSUMPTIONS.md`; the build report lists them.
+
 ## Inputs (owner instruction, 2026-10-12)
 
 The tool takes the **already extracted ExeFS and RomFS** of a game (a directory or an image for
@@ -104,7 +109,10 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   words).
 - Kernel layer: `nx_runtime/src/horizon/tests.rs` drives the SVC interface with real host threads
   and needs no external tool. The homebrew tests in `src/build/e2e_tests.rs` build small NROs
-  from assembled words and run them (clang needed). `NX_TRACE_SVC=1` logs every SVC and IPC
+  from assembled words and run them (clang needed). `NX_TRACE_PACE=1` prints, for every frame a
+  program queues, how the hold to the display's grid went (early or late by how much) and how
+  long handing the frame to the renderer took (the room in its queue, the driver's lock).
+  `NX_TRACE_SVC=1` logs every SVC and IPC
   request of a produced program (with the thread that made it and, for a reply, each handle it
   hands over and what the handle names; `NX_TRACE_IPC_DATA=1` adds the data bytes of each request
   to its line); `NX_TRACE_ROMFS=1` names the RomFS file and offset of every read of the data storage;
@@ -278,8 +286,9 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   picture of the program's own window (never of the screen) and posts keys to its message queue;
   run the program with an `NX_KEYMAP` that binds F13 and up so that nobody's typing disturbs it.
   `NX_CENSUS=<file>` counts the floating-point and SIMD instruction words that reach the runtime
-  (`nx_vec`, `nx_vecmem`), the words the lifter left to the interpreter and the addresses the slow
-  path interprets, and rewrites the file every ten seconds, most frequent first, with the decoded
+  (`nx_vec`, `nx_vecmem`), the words the lifter left to the interpreter, the addresses the slow
+  path interprets and the loads and stores that took the runtime's slow path (an access across two
+  pages, an unmapped page, a missing permission; `slow`), and rewrites the file every ten seconds, most frequent first, with the decoded
   instruction: what to lower to native code next.
 - Unicorn (AArch64 oracle): `UNICORN_DLL`, else `.venv` (`py -m venv .venv`, then
   `.venv\Scripts\pip install unicorn`). The shared library is loaded with `libloading`.
