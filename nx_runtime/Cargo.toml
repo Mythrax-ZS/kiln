@@ -24,6 +24,8 @@ window = ["vulkan", "nx_vulkan/window"]
 
 [dependencies]
 nx_gpu = { path = "../nx_gpu" }
+# Inflate, for the SDK's decompressors run natively (docs/ASSUMPTIONS.md A-187).
+miniz_oxide = "0.8"
 nx_vulkan = { path = "../nx_vulkan", optional = true }
 
 [dev-dependencies]

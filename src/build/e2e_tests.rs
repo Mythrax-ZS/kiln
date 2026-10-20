@@ -194,6 +194,83 @@ fn exports_unwind_ranges_and_jump_tables_feed_the_analysis() {
     }
 }
 
+/// A gzip member holding `payload` in one stored deflate block (RFC 1951 and 1952).
+fn gzip_stored(payload: &[u8]) -> Vec<u8> {
+    let mut g = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    g.push(1); // BFINAL, stored
+    g.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    g.extend_from_slice(&(!(payload.len() as u16)).to_le_bytes());
+    g.extend_from_slice(payload);
+    g.extend_from_slice(&[0, 0, 0, 0]); // the CRC, which the native routine does not check
+    g.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    g
+}
+
+#[test]
+fn the_sdks_decompressors_run_natively() {
+    let Some(tc) = toolchain_or_skip() else {
+        return;
+    };
+    use nx_runtime::testing::prog::Prog;
+    let payload: Vec<u8> = (0..300u32).map(|i| (42 + i % 7) as u8).collect();
+    let blob = gzip_stored(&payload);
+    let dst = GUEST_BASE + crate::loader::testing::DATA_OFF as u64;
+    // nnMain: x20 = dst; DecompressGzip(dst, 512, blob, len, dst + 0x100, 0x100); the exit code
+    // is the result bit in bit 7 and the first byte written below it.
+    let mut p = Prog::new(CODE_OFF as u64);
+    p.emit(asm::ldst_pair(2, 3, false, -2, 30, 31, 20)); // stp x20, x30, [sp, #-16]!
+    p.emit(asm::mov_wide(true, 2, 0, (dst & 0xFFFF) as u32, 20));
+    p.emit(asm::mov_wide(true, 3, 1, ((dst >> 16) & 0xFFFF) as u32, 20));
+    p.emit(asm::add_imm(true, 0, 20, 0));
+    p.emit(asm::movz(true, 1, 512, 0));
+    p.adr(2, "blob");
+    p.emit(asm::movz(true, 3, blob.len() as u32, 0));
+    p.emit(asm::add_imm(true, 4, 20, 0x100));
+    p.emit(asm::movz(true, 5, 0x100, 0));
+    p.bl("decompress");
+    p.emit(asm::logical_imm(false, 0, false, 0, 0, 0, 0)); // and w0, w0, #1
+    p.emit(asm::bitfield(false, 2, false, 25, 24, 0, 0)); // lsl w0, w0, #7
+    p.emit(asm::ldst_unsigned(0, 1, 0, 20, 1)); // ldrb w1, [x20]
+    p.emit(asm::add_sub_shifted(false, false, false, 0, 1, 0, 0, 0)); // add w0, w0, w1
+    p.emit(asm::ldst_pair(2, 1, true, 2, 30, 31, 20)); // ldp x20, x30, [sp], #16
+    p.emit(asm::ret(30));
+    // What the module exports under the SDK's name: a guest routine that fails. Run natively, it
+    // is never translated.
+    p.label("decompress").emit(asm::movz(false, 0, 0, 0));
+    p.emit(asm::ret(30));
+    let decompress = p.addr_of("decompress");
+    p.label("blob");
+    for chunk in blob.chunks(4) {
+        let mut w = [0u8; 4];
+        w[..chunk.len()].copy_from_slice(chunk);
+        p.emit(u32::from_le_bytes(w));
+    }
+    let program = program_from(&Spec {
+        code: p.finish(),
+        with_mod0: true,
+        exports: vec![
+            ("nnMain", CODE_OFF as u64),
+            ("_ZN2nn4util14DecompressGzipEPvmPKvmS1_m", decompress),
+        ],
+        ..Spec::default()
+    });
+    let dir = TempDir::new("e2e-native");
+    let opts = BuildOptions::new(dir.path(), "nativemain");
+    let report = build(&program, &tc, &opts).unwrap();
+    let text = std::fs::read_to_string(&report.report_file).unwrap();
+    assert!(
+        text.contains("routines run natively (A-187): 1") && text.contains("DecompressGzip"),
+        "{text}"
+    );
+    let out = run(&report.exe);
+    assert_eq!(
+        out.status.code(),
+        Some(128 + 42),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn a_program_that_stops_says_why_and_exits_nonzero() {
     let Some(tc) = toolchain_or_skip() else {

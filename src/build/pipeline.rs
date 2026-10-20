@@ -236,6 +236,11 @@ fn write_report(r: &BuildReport, program: &Program, path: &Path) -> Result<()> {
             m.image.len()
         );
     }
+    let native = codegen::native::routines(&program.modules);
+    let _ = writeln!(s, "routines run natively (A-187): {}", native.len());
+    for (addr, id) in &native {
+        let _ = writeln!(s, "  {addr:#x} {}", nx_runtime::rt::hle::name(*id));
+    }
     let _ = writeln!(s, "entry {:#x}", program.entry_module().entry());
     let _ = writeln!(
         s,
@@ -326,6 +331,7 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
     let workers = std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .min(groups.len().max(1));
+    let native = codegen::native::routines(&program.modules);
     std::thread::scope(|scope| {
         for _ in 0..workers {
             std::thread::Builder::new()
@@ -352,9 +358,10 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
                     );
                     let refs: Vec<_> = funcs.iter().collect();
                     let ll = work.join(format!("unit{i}.ll"));
-                    let result = std::fs::write(&ll, codegen::function_unit(triple, &refs))
-                        .map_err(Error::from)
-                        .and_then(|()| tc.compile(&ll, &obj, opts.opt_level));
+                    let result =
+                        std::fs::write(&ll, codegen::function_unit(triple, &refs, &native))
+                            .map_err(Error::from)
+                            .and_then(|()| tc.compile(&ll, &obj, opts.opt_level));
                     if !opts.keep_ir {
                         let _ = std::fs::remove_file(&ll);
                     }
@@ -562,6 +569,7 @@ pub fn analyze(program: &Program, hints: &[u64], unit_size: usize) -> Result<Ana
     let workers = std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .min(groups.len().max(1));
+    let native = codegen::native::routines(&program.modules);
     std::thread::scope(|scope| {
         for _ in 0..workers {
             std::thread::Builder::new()
@@ -583,7 +591,7 @@ pub fn analyze(program: &Program, hints: &[u64], unit_size: usize) -> Result<Ana
                     );
                     let refs: Vec<_> = funcs.iter().collect();
                     bytes.fetch_add(
-                        codegen::function_unit(triple, &refs).len(),
+                        codegen::function_unit(triple, &refs, &native).len(),
                         Ordering::Relaxed,
                     );
                 })

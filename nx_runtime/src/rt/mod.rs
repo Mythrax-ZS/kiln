@@ -9,6 +9,7 @@
 pub mod abi;
 pub mod census;
 pub mod exports;
+pub mod hle;
 pub mod host;
 pub mod mem;
 pub mod runtime;

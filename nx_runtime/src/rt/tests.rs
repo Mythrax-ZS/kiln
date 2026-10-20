@@ -4,6 +4,7 @@
 
 use super::abi::{perm, stop, trap, FuncEntry, NativeCpu, EXIT_PC, STOP_PC};
 use super::exports::*;
+use super::runtime::rt;
 use crate::testing::asm;
 use std::ffi::c_void;
 
@@ -373,6 +374,91 @@ fn exclusive_pairs_move_both_halves() {
     // A misaligned pair faults.
     nx_ldx(cpu.0, addr + 8, 0x18, 16, 0);
     assert_eq!(cpu.c().ctl.stop, stop::FAULT);
+}
+
+#[test]
+fn the_decompressors_run_on_guest_memory_and_fault_on_bad_pointers() {
+    use super::hle::{DECOMPRESS_DEFLATE, DECOMPRESS_GZIP, DECOMPRESS_ZLIB};
+    map(0x1A00_0000, 0x4000);
+    let cpu = Cpu::new();
+    let payload: Vec<u8> = (0..3000u32).map(|i| (i % 253) as u8).collect();
+    let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    gz.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(&payload, 6));
+    gz.extend_from_slice(&[0; 4]);
+    gz.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    let streams = [
+        (DECOMPRESS_GZIP, gz),
+        (
+            DECOMPRESS_ZLIB,
+            miniz_oxide::deflate::compress_to_vec_zlib(&payload, 6),
+        ),
+        (
+            DECOMPRESS_DEFLATE,
+            miniz_oxide::deflate::compress_to_vec(&payload, 6),
+        ),
+    ];
+    let (dst, src) = (0x1A00_0000u64, 0x1A00_2000u64);
+    for (id, stream) in &streams {
+        rt().mem.write_bytes(src, stream, false).unwrap();
+        for (i, v) in [dst, 4096, src, stream.len() as u64, 0x1A00_3000, 0x1000]
+            .into_iter()
+            .enumerate()
+        {
+            cpu.c().state.x[i] = v;
+        }
+        nx_hle(cpu.0, *id, 0x100);
+        assert_eq!(cpu.c().state.x[0], 1, "routine {id} succeeds");
+        let mut back = vec![0u8; payload.len()];
+        rt().mem.read_bytes(dst, &mut back, false).unwrap();
+        assert_eq!(back, payload, "routine {id} wrote the payload");
+        // A destination too small is a failure, not a fault.
+        cpu.c().state.x[0] = dst;
+        cpu.c().state.x[1] = 100;
+        nx_hle(cpu.0, *id, 0x100);
+        assert_eq!(cpu.c().state.x[0], 0);
+        assert_eq!(cpu.c().ctl.stop, stop::NONE);
+    }
+    // An unreadable source faults, as the guest routine's own load would.
+    cpu.c().state.x[0] = dst;
+    cpu.c().state.x[1] = 4096;
+    cpu.c().state.x[2] = 0x7100_0000;
+    cpu.c().state.x[3] = 64;
+    nx_hle(cpu.0, DECOMPRESS_GZIP, 0x100);
+    assert_eq!(cpu.c().ctl.stop, stop::FAULT);
+}
+
+#[test]
+fn unaligned_plain_accesses_within_a_page_take_the_fast_path_and_match_the_slow_one() {
+    use super::mem::{fast_ptr_any, FAST_READ};
+    map(0x1B00_0000, 0x2000);
+    let cpu = Cpu::new();
+    // An unaligned word inside a page: found by the fast path, not aligned.
+    let (_, aligned) = fast_ptr_any(0x1B00_0003, 8, FAST_READ).expect("inside one page");
+    assert!(!aligned);
+    assert!(
+        fast_ptr_any(0x1B00_0FFC, 8, FAST_READ).is_none(),
+        "straddles two pages"
+    );
+    assert!(
+        fast_ptr_any(0x1B00_0FF8, 8, FAST_READ).unwrap().1,
+        "the last aligned word"
+    );
+    // The helpers agree with the byte-wise view of memory, inside a page and across two.
+    for addr in [0x1B00_0003u64, 0x1B00_0FFD, 0x1B00_1001] {
+        nx_st64(cpu.0, addr, 0x1122_3344_5566_7788, 0x10);
+        assert_eq!(nx_ld64(cpu.0, addr, 0x14), 0x1122_3344_5566_7788);
+        let mut bytes = [0u8; 8];
+        rt().mem.read_bytes(addr, &mut bytes, false).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(bytes),
+            0x1122_3344_5566_7788,
+            "{addr:#x}"
+        );
+        nx_st16(cpu.0, addr + 1, 0xBEEF, 0x18);
+        assert_eq!(nx_ld16(cpu.0, addr + 1, 0x1c), 0xBEEF);
+        assert_eq!(nx_ld32(cpu.0, addr + 1, 0x20) & 0xFFFF, 0xBEEF);
+    }
+    assert_eq!(cpu.c().ctl.stop, stop::NONE);
 }
 
 #[test]

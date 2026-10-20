@@ -7,12 +7,13 @@
 
 mod descriptor;
 pub mod llvm;
+pub mod native;
 
 pub use descriptor::{descriptor_unit, Descriptor, SegmentInfo};
 
 use crate::lift::ir::Func;
 use llvm::{declarations, dispatcher, emit_function, func_symbol, METADATA};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 /// The target triple the generated code is compiled for: the host.
@@ -26,13 +27,18 @@ pub fn host_triple() -> &'static str {
     }
 }
 
-/// One translation unit with these functions.
-pub fn function_unit(triple: &str, funcs: &[&Func]) -> String {
+/// One translation unit with these functions; those in `native` (by guest address, with the
+/// routine's number) are stubs that call the runtime (A-187).
+pub fn function_unit(triple: &str, funcs: &[&Func], native: &BTreeMap<u64, u32>) -> String {
     let mut body = String::new();
     let mut intrinsics = BTreeSet::new();
     let mut callees = BTreeSet::new();
     for f in funcs {
-        emit_function(f, &mut body, &mut intrinsics, &mut callees);
+        if let Some(&id) = native.get(&f.addr) {
+            native::emit_stub(f.addr, id, &mut body);
+        } else {
+            emit_function(f, &mut body, &mut intrinsics, &mut callees);
+        }
     }
     let defined: BTreeSet<u64> = funcs.iter().map(|f| f.addr).collect();
     let mut s = String::new();
@@ -101,7 +107,31 @@ mod tests {
         let d = discover(&Image::new(words), &[CODE], &Options::default());
         let funcs = lift_all(&d);
         let refs: Vec<&crate::lift::ir::Func> = funcs.values().collect();
-        function_unit(host_triple(), &refs)
+        function_unit(host_triple(), &refs, &BTreeMap::new())
+    }
+
+    #[test]
+    fn a_routine_run_natively_is_a_stub_that_calls_the_runtime_and_returns() {
+        let d = discover(
+            &Image::new(vec![asm::movz(true, 0, 7, 0), asm::ret(30)]),
+            &[CODE],
+            &Options::default(),
+        );
+        let funcs = lift_all(&d);
+        let refs: Vec<&crate::lift::ir::Func> = funcs.values().collect();
+        let native = BTreeMap::from([(CODE, nx_runtime::rt::hle::DECOMPRESS_GZIP)]);
+        let ll = function_unit(host_triple(), &refs, &native);
+        assert!(
+            ll.contains(&format!(
+                "call void @nx_hle(ptr %cpu, i32 1, i64 {})",
+                CODE as i64
+            )),
+            "{ll}"
+        );
+        // The guest code is not translated: no `mov x0, #7`; the stub returns to x30.
+        assert!(!ll.contains("i64 7"), "{ll}");
+        assert!(ll.contains("store i64 %lr, ptr %pcp"), "{ll}");
+        assert!(native::routines(&[]).is_empty());
     }
 
     #[test]

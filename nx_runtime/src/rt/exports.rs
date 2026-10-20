@@ -8,7 +8,7 @@
 
 use super::abi::{perm, stop, trap, FuncEntry, NativeCpu, STOP_PC};
 use super::census::{self, Kind};
-use super::mem::{fast_ptr, MapError, FAST_READ, FAST_WRITE};
+use super::mem::{fast_ptr, fast_ptr_any, MapError, FAST_READ, FAST_WRITE};
 use super::runtime::{
     handle_trap, interpret, interpret_one, record_fault, record_stop, record_trap, rt, run,
     service_svc, slow_path, NativeBus, SvcHandler,
@@ -30,6 +30,9 @@ fn cpu<'a>(p: *mut NativeCpu) -> &'a mut NativeCpu {
 #[inline(never)]
 fn do_load(p: *mut NativeCpu, addr: u64, pc: u64, size: u8, order: Ordering) -> u64 {
     let c = cpu(p);
+    if super::census::enabled() {
+        super::census::note(super::census::Kind::Slow, pc);
+    }
     match rt().mem.read(addr, size, order) {
         Ok(v) => v as u64,
         Err(k) => {
@@ -42,6 +45,9 @@ fn do_load(p: *mut NativeCpu, addr: u64, pc: u64, size: u8, order: Ordering) -> 
 #[inline(never)]
 fn do_store(p: *mut NativeCpu, addr: u64, pc: u64, size: u8, value: u64, order: Ordering) {
     let c = cpu(p);
+    if super::census::enabled() {
+        super::census::note(super::census::Kind::Slow, pc);
+    }
     super::trap::note_pc(pc);
     if let Err(k) = rt().store(c.ctl.thread_id, addr, size, u128::from(value), order) {
         record_fault(c, addr, pc, true, k);
@@ -62,21 +68,26 @@ macro_rules! plain_access {
     ($ld:ident, $st:ident, $ldar:ident, $stlr:ident, $ty:ty, $atomic:ty, $size:expr) => {
         #[no_mangle]
         pub extern "C" fn $ld(p: *mut NativeCpu, addr: u64, pc: u64) -> $ty {
-            if let Some(host) = fast_ptr(addr, $size, FAST_READ) {
-                // SAFETY: `fast_ptr` found `$size` readable bytes, aligned for the access.
-                return unsafe { <$atomic>::from_ptr(host.cast()).load(Relaxed) };
+            match fast_ptr_any(addr, $size, FAST_READ) {
+                // SAFETY: `fast_ptr_any` found `$size` readable bytes, aligned for the access.
+                Some((host, true)) => unsafe { <$atomic>::from_ptr(host.cast()).load(Relaxed) },
+                // SAFETY: `$size` readable bytes within one page; an unaligned access may tear.
+                Some((host, false)) => unsafe { host.cast::<$ty>().read_unaligned() },
+                None => do_load(p, addr, pc, $size, Relaxed) as $ty,
             }
-            do_load(p, addr, pc, $size, Relaxed) as $ty
         }
 
         #[no_mangle]
         pub extern "C" fn $st(p: *mut NativeCpu, addr: u64, value: $ty, pc: u64) {
-            if let Some(host) = fast_ptr(addr, $size, FAST_WRITE) {
-                // SAFETY: `fast_ptr` found `$size` writable bytes, aligned for the access.
-                unsafe { <$atomic>::from_ptr(host.cast()).store(value, Relaxed) };
-                return;
+            match fast_ptr_any(addr, $size, FAST_WRITE) {
+                // SAFETY: `fast_ptr_any` found `$size` writable bytes, aligned for the access.
+                Some((host, true)) => unsafe {
+                    <$atomic>::from_ptr(host.cast()).store(value, Relaxed)
+                },
+                // SAFETY: `$size` writable bytes within one page.
+                Some((host, false)) => unsafe { host.cast::<$ty>().write_unaligned(value) },
+                None => do_store(p, addr, pc, $size, u64::from(value), Relaxed),
             }
-            do_store(p, addr, pc, $size, u64::from(value), Relaxed)
         }
 
         #[no_mangle]
@@ -164,6 +175,13 @@ pub extern "C" fn nx_stx(
             1
         }
     }
+}
+
+/// A routine run natively in place of its recompiled code (`hle`, A-187): `id` names it, `pc` is
+/// the function's address.
+#[no_mangle]
+pub extern "C" fn nx_hle(p: *mut NativeCpu, id: u32, pc: u64) {
+    super::hle::run(cpu(p), id, pc);
 }
 
 #[no_mangle]
@@ -444,6 +462,7 @@ pub const GENERATED_CODE_SYMBOLS: &[&str] = &[
     "nx_stlr32",
     "nx_stlr64",
     "nx_ldx",
+    "nx_hle",
     "nx_stx",
     "nx_clrex",
     "nx_dczva",

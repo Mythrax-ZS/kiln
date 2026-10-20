@@ -2011,6 +2011,7 @@ name = "nx_runtime"
 version = "0.1.0"
 dependencies = [
  "libloading",
+ "miniz_oxide 0.8.9",
  "nx_gpu",
  "nx_runtime",
  "nx_vulkan",

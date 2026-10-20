@@ -312,7 +312,11 @@ pub fn write_units(
     let mut jobs = Vec::new();
     for (i, chunk) in funcs.chunks(per_unit.max(1)).enumerate() {
         let ll = dir.join(format!("unit{i}.ll"));
-        std::fs::write(&ll, codegen::function_unit(triple, chunk))?;
+        // Synthetic programs export no SDK routine to run natively.
+        std::fs::write(
+            &ll,
+            codegen::function_unit(triple, chunk, &std::collections::BTreeMap::new()),
+        )?;
         jobs.push((ll, dir.join(format!("unit{i}.{obj_ext}"))));
     }
     let entries: Vec<u64> = funcs.iter().map(|f| f.addr).collect();

@@ -59,6 +59,7 @@ pub fn declarations(defines_dispatcher: bool) -> String {
         "declare void @nx_vecmem(ptr, i32, i64, i64)",
         "declare void @nx_trap(ptr, i32, i64, i64, i64)",
         "declare void @nx_svc(ptr, i32)",
+        "declare void @nx_hle(ptr, i32, i64)",
         "declare void @nx_interp1(ptr)",
         "declare ptr @nx_lookup(i64)",
         "declare void @nx_slow_path(ptr)",

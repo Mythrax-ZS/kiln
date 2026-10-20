@@ -25,7 +25,10 @@ use std::sync::Mutex;
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const ADDRESS_BITS: u32 = 39;
-const L1_ENTRIES: usize = 1 << (ADDRESS_BITS - 21);
+/// The first level is indexed by the address bits from this one up, the second by the page bits
+/// below it: `L2_ENTRIES` pages of `PAGE_SIZE`.
+const L1_SHIFT: u32 = 21;
+const L1_ENTRIES: usize = 1 << (ADDRESS_BITS - L1_SHIFT);
 const L2_ENTRIES: usize = 512;
 
 const PRESENT: u64 = 1 << 3;
@@ -79,6 +82,43 @@ pub fn fast_ptr(addr: u64, size: u64, need: u64) -> Option<*mut u8> {
         return None;
     }
     Some(((entry & !FLAGS) | (addr & (PAGE_SIZE - 1))) as *mut u8)
+}
+
+/// Like [`fast_ptr`] for an access that may be unaligned but lies within one page: the host
+/// address of its bytes and whether it is aligned (an aligned access is made atomically, an
+/// unaligned one as the host does it, which may tear, as the architecture allows an unaligned
+/// access to). `None` for what the slow path handles: one that straddles two pages, an
+/// address beyond the space, an unmapped page or a missing permission. The copies a program
+/// makes are often unaligned by a few bytes; sent through the slow path (a second walk of the
+/// table and a byte-wise assembly), they held the third title's opening cutscene at 31 ms a
+/// frame.
+pub fn fast_ptr_any(addr: u64, size: u64, need: u64) -> Option<(*mut u8, bool)> {
+    let offset = addr & (PAGE_SIZE - 1);
+    if offset + size > PAGE_SIZE || addr >> ADDRESS_BITS != 0 {
+        return None;
+    }
+    let l1 = nx_mem_l1.load(Ordering::Acquire);
+    if l1.is_null() {
+        return None;
+    }
+    // SAFETY: as in `fast_ptr`.
+    let l2 = unsafe { (*l1.add((addr >> L1_SHIFT) as usize)).load(Ordering::Acquire) };
+    if l2.is_null() {
+        return None;
+    }
+    // SAFETY: as in `fast_ptr`.
+    let entry = unsafe {
+        (*l2.cast::<AtomicU64>()
+            .add(((addr >> 12) & (L2_ENTRIES as u64 - 1)) as usize))
+        .load(Ordering::Relaxed)
+    };
+    if entry & need == 0 {
+        return None;
+    }
+    Some((
+        ((entry & !FLAGS) | offset) as *mut u8,
+        addr & (size - 1) == 0,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

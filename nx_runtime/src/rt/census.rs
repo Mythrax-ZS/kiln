@@ -31,6 +31,9 @@ pub enum Kind {
     Fallback = 3,
     /// The address of an instruction the slow path interpreted.
     Interpreted = 4,
+    /// The address of a load or store that took the runtime's slow path (an access straddling
+    /// two pages, an unmapped page, a missing permission), with the instruction.
+    Slow = 5,
 }
 
 struct Table {
@@ -141,6 +144,7 @@ fn kind_name(kind: u8) -> &'static str {
         k if k == Kind::Vec as u8 => "vec",
         k if k == Kind::VecMem as u8 => "vecmem",
         k if k == Kind::Fallback as u8 => "fallback",
+        k if k == Kind::Slow as u8 => "slow",
         _ => "interpreted",
     }
 }
@@ -148,7 +152,13 @@ fn kind_name(kind: u8) -> &'static str {
 /// The text of a report: totals per kind, then one line per word or address, most frequent first.
 fn report(entries: &[(u8, u64, u64)]) -> String {
     let mut s = String::new();
-    for kind in [Kind::Vec, Kind::VecMem, Kind::Fallback, Kind::Interpreted] {
+    for kind in [
+        Kind::Vec,
+        Kind::VecMem,
+        Kind::Fallback,
+        Kind::Interpreted,
+        Kind::Slow,
+    ] {
         let (distinct, total) = entries
             .iter()
             .filter(|e| e.0 == kind as u8)
