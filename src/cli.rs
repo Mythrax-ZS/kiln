@@ -496,6 +496,22 @@ fn describe_analysis(out: &mut String, a: &discover::Report) {
 /// The instructions that run in the interpreter and the ones that stop the run, with addresses.
 fn describe_stops(out: &mut String, a: &discover::Report) {
     const LIMIT: usize = 100;
+    let mut by_reason: BTreeMap<String, usize> = BTreeMap::new();
+    for why in a.fallbacks.values() {
+        *by_reason
+            .entry(format!("interpreter fallback: {why}"))
+            .or_default() += 1;
+    }
+    for (_, kind) in &a.traps {
+        *by_reason
+            .entry(format!("stops the run: {kind:?}"))
+            .or_default() += 1;
+    }
+    let mut counted: Vec<_> = by_reason.into_iter().collect();
+    counted.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+    for (what, n) in counted {
+        let _ = writeln!(out, "  {n:>9} {what}");
+    }
     for (lo, hi, why) in pipeline::ranges_of(&a.fallbacks).iter().take(LIMIT) {
         let _ = writeln!(out, "  interpreter fallback {lo:#x}..{hi:#x}: {why}");
     }
