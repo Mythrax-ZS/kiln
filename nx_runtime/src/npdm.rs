@@ -47,8 +47,30 @@ pub struct Meta {
     pub name: String,
 }
 
+/// The console a program was built for, told by the size of the signature area in front of its
+/// ACID header (docs/ASSUMPTIONS.md A-188). Every difference between the two is gated on this.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Platform {
+    /// The Switch (NX): two signatures and a key, 0x200 bytes.
+    #[default]
+    Nx,
+    /// The Switch 2 (NX2): 0x300 bytes.
+    Nx2,
+}
+
+impl Platform {
+    /// Bytes of signatures and key before the `ACID` magic.
+    pub fn signature_area(self) -> usize {
+        match self {
+            Platform::Nx => 0x200,
+            Platform::Nx2 => 0x300,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Acid {
+    pub platform: Platform,
     pub flags: u32,
     pub program_id_min: u64,
     pub program_id_max: u64,
@@ -307,13 +329,19 @@ impl Npdm {
         let acid_size = u32_at(data, 0x7C) as usize;
 
         let acid_raw = slice(data, acid_off, acid_size, "NPDM ACID")?;
-        if acid_raw.len() < 0x240 || &acid_raw[0x200..0x204] != b"ACID" {
-            return Err(Error::format("NPDM ACID", "bad magic or too short"));
-        }
+        let platform = [Platform::Nx, Platform::Nx2]
+            .into_iter()
+            .find(|p| {
+                let h = p.signature_area();
+                acid_raw.len() >= h + 0x40 && &acid_raw[h..h + 4] == b"ACID"
+            })
+            .ok_or_else(|| Error::format("NPDM ACID", "bad magic or too short"))?;
+        let h = platform.signature_area();
         let acid = Acid {
-            flags: u32_at(acid_raw, 0x20C),
-            program_id_min: u64_at(acid_raw, 0x210),
-            program_id_max: u64_at(acid_raw, 0x218),
+            platform,
+            flags: u32_at(acid_raw, h + 0xC),
+            program_id_min: u64_at(acid_raw, h + 0x10),
+            program_id_max: u64_at(acid_raw, h + 0x18),
         };
 
         let aci = slice(data, aci_off, aci_size, "NPDM ACI0")?;
@@ -334,6 +362,11 @@ impl Npdm {
             services,
             kernel,
         })
+    }
+
+    /// The console the program was built for.
+    pub fn platform(&self) -> Platform {
+        self.acid.platform
     }
 
     /// May the program connect to `service`? Entries with the server bit only allow registering.
@@ -379,6 +412,7 @@ pub mod builder {
         pub program_id: u64,
         pub services: Vec<(&'static str, bool)>,
         pub kc: Vec<u32>,
+        pub platform: super::Platform,
     }
 
     impl Default for NpdmSpec {
@@ -392,6 +426,7 @@ pub mod builder {
                 program_id: 0x0100_0000_0000_1234,
                 services: vec![("fsp-srv", false), ("sm:", false), ("nvdrv*", false)],
                 kc: Vec::new(),
+                platform: super::Platform::Nx,
             }
         }
     }
@@ -441,20 +476,26 @@ pub mod builder {
         }
         let kc: Vec<u8> = spec.kc.iter().flat_map(|w| w.to_le_bytes()).collect();
 
-        let acid_header = 0x240usize;
-        let acid_sac_off = acid_header;
+        // A signature and the key it is checked with, both 2048-bit on the Switch and 3072-bit on
+        // the Switch 2, come before the header; the size field counts from the key.
+        let h = match spec.platform {
+            super::Platform::Nx => 0x200usize,
+            super::Platform::Nx2 => 0x300,
+        };
+        let acid_sac_off = h + 0x40;
         let acid_kc_off = acid_sac_off + sac.len();
         let mut acid = vec![0u8; acid_kc_off + kc.len()];
-        acid[0x200..0x204].copy_from_slice(b"ACID");
-        let acid_len = acid.len() as u32;
-        acid[0x204..0x208].copy_from_slice(&(acid_len - 0x100).to_le_bytes());
-        acid[0x20C..0x210].copy_from_slice(&1u32.to_le_bytes());
-        acid[0x210..0x218].copy_from_slice(&0u64.to_le_bytes());
-        acid[0x218..0x220].copy_from_slice(&u64::MAX.to_le_bytes());
-        acid[0x228..0x22C].copy_from_slice(&(acid_sac_off as u32).to_le_bytes());
-        acid[0x22C..0x230].copy_from_slice(&(sac.len() as u32).to_le_bytes());
-        acid[0x230..0x234].copy_from_slice(&(acid_kc_off as u32).to_le_bytes());
-        acid[0x234..0x238].copy_from_slice(&(kc.len() as u32).to_le_bytes());
+        let mut put =
+            |at: usize, bytes: &[u8]| acid[h + at..h + at + bytes.len()].copy_from_slice(bytes);
+        put(0, b"ACID");
+        put(4, &((acid_kc_off + kc.len() - h / 2) as u32).to_le_bytes());
+        put(0xC, &1u32.to_le_bytes());
+        put(0x10, &0u64.to_le_bytes());
+        put(0x18, &u64::MAX.to_le_bytes());
+        put(0x28, &(acid_sac_off as u32).to_le_bytes());
+        put(0x2C, &(sac.len() as u32).to_le_bytes());
+        put(0x30, &(acid_kc_off as u32).to_le_bytes());
+        put(0x34, &(kc.len() as u32).to_le_bytes());
         acid[acid_sac_off..acid_sac_off + sac.len()].copy_from_slice(&sac);
         acid[acid_kc_off..].copy_from_slice(&kc);
 
@@ -510,6 +551,31 @@ mod tests {
         let names: Vec<&str> = n.services.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["fsp-srv", "sm:", "nvdrv*"]);
         n.require_aarch64().unwrap();
+        assert_eq!(n.platform(), Platform::Nx);
+    }
+
+    #[test]
+    fn a_switch_2_acid_is_told_by_its_larger_signature_area() {
+        let spec = NpdmSpec {
+            platform: Platform::Nx2,
+            program_id: 0x0400_0000_0000_1234,
+            kc: vec![enable_svcs(0, &[1, 2])],
+            ..NpdmSpec::default()
+        };
+        let bytes = build(&spec);
+        let n = Npdm::parse(&bytes).unwrap();
+        assert_eq!(n.platform(), Platform::Nx2);
+        assert_eq!(n.acid.flags, 1);
+        assert_eq!(n.acid.program_id_max, u64::MAX);
+        assert_eq!(n.program_id, 0x0400_0000_0000_1234);
+        assert!(n.allows_service("nvdrv:a"));
+        assert!(n.allows_svc(2) && !n.allows_svc(3));
+        // A magic at neither place is not an ACID.
+        let acid = u32_at(&bytes, 0x78) as usize;
+        let mut moved = bytes.clone();
+        moved.copy_within(acid + 0x300..acid + 0x304, acid + 0x280);
+        moved[acid + 0x300..acid + 0x304].fill(0);
+        assert!(Npdm::parse(&moved).is_err());
     }
 
     #[test]

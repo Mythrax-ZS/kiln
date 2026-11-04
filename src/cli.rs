@@ -242,8 +242,10 @@ fn describe_npdm(out: &mut String, bytes: &[u8]) -> Result<()> {
     let n = Npdm::parse(bytes)?;
     let _ = writeln!(
         out,
-        "main.npdm: name `{}`, program id {:#018x}",
-        n.meta.name, n.program_id
+        "main.npdm: name `{}`, program id {:#018x}, platform {:?}",
+        n.meta.name,
+        n.program_id,
+        n.platform()
     );
     let _ = writeln!(
         out,
