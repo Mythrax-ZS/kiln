@@ -12,7 +12,7 @@ ExeFS / NRO ──loader──▶ Module ──discover──▶ per-function CF
 |------|------|--------------|
 | Input | `src/container`, `nx_runtime/src/{storage,romfs,npdm}.rs` | ExeFS directory or PFS0, RomFS directory or image, NPDM. No keys. |
 | Load | `src/loader`, `src/program.rs` | NSO0 / NRO0: LZ4, SHA-256, MOD0 relocations, exports, `.eh_frame_hdr` function extents. Fixed guest base `0x0800_0000`. All NSOs of an ExeFS are mapped back to back (`rtld`, `main`, `subsdk0-9`, `sdk`) and the program starts in the first; the embedded image is the unrelocated one, as the kernel's loader leaves it (A-041). |
-| Decode | `nx_runtime/src/a64/decode.rs` | 32-bit word to `Inst`; strict (unallocated is distinct from unsupported). |
+| Decode | `nx_runtime/src/a64/decode.rs` | 32-bit word to `Inst`; strict (unallocated is distinct from unsupported). The Cortex-A57's Armv8.0 plus the Armv8.1 to 8.3 forms a Switch 2 program uses: LSE atomics (`Inst::Atomic`, `Inst::Cas`; one host atomic each, `nx_atomic`/`nx_cas`/`nx_cas128`), `LDAPR`, and pointer authentication with the keys off (A-189; `PACGA`'s QARMA5 in `a64/pac.rs`). |
 | Floating point and SIMD | `nx_runtime/src/a64/{fp.rs,vec/}` | Exact soft-float (`fp.rs`), the decoder for the scalar FP and Advanced SIMD space and the executor (`vec/`). One implementation, used by the interpreter and by generated code. |
 | Interpret | `nx_runtime/src/a64/interp.rs` | The oracle, and the fallback for anything not translated. |
 | Discover | `src/lift/discover.rs`, `jumptable.rs` | Recursive descent from roots; functions, blocks, jump tables. |
@@ -98,6 +98,9 @@ on its own host thread (`Kernel::run_process`). Generated code reaches the kerne
 `cpu.ctl.user` and calls `Kernel::svc`, which takes its arguments from `X0..X7` and leaves its
 results there as the Switchbrew SVC pages lay them out, and the generated code reloads the state.
 
+- **Platform**: `platform.rs` holds what a Switch 2 process sees differently (the counter's rate,
+  the heap region and the memory, six cores, `GetInfo` 29 to 33, SVC 0x80), chosen once from
+  `Npdm::platform` (A-188, A-190); everything else is the same kernel.
 - **State**: one `Mutex` and one `Condvar` guard everything the kernel knows (handles, memory
   blocks, threads, events, waiter lists). A blocking call sleeps in `wait_until`, which re-checks
   its predicate whenever anything changed.

@@ -18,7 +18,7 @@ keys or title data are stored in this repository.
 
 ## Status
 
-Work proceeds in milestones M1 to M10. Each milestone has a report under `docs/reports/` that states
+Work proceeds in milestones (M1 to M10 for the Switch, M11 on for the Switch 2). Each milestone has a report under `docs/reports/` that states
 what was implemented, what was tested and how, and what was not verified. `docs/ARCHITECTURE.md`
 explains how the pieces fit together.
 
@@ -33,7 +33,10 @@ that traces what a title sends; the same title now runs its main loop and submit
 (shader translation, `nx_shader`: the Maxwell programs the title binds translate to SPIR-V and are
 compared with Rust arithmetic by tests on a GPU) and M10 (the Vulkan backend: `nx_vulkan` draws
 what the command processor decodes, with ASTC textures decoded on the host, shows the frames in a
-window, and takes keyboard and gamepad input).
+window, and takes keyboard and gamepad input), and M11 (a Switch 2 title, recognised by its NPDM,
+is recompiled whole with the Armv8.1 to 8.3 instructions it uses, LSE atomics and pointer
+authentication among them, and boots on the kernel layer until it asks for its graphics
+supervisor; `docs/reports/M11-switch2-boot.md`). Nothing of a Switch 2 title's graphics runs yet.
 
 **First frames.** Over its first 1,500 presented frames the title's 380,376 draws and
 1,499 clears run on a Vulkan device and none fails; the frames, dumped as PNG files and looked at,

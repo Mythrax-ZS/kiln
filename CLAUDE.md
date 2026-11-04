@@ -68,8 +68,12 @@ Small chunks. Title at most 50 characters. No body. No attribution lines of any 
   return a made-up success.
 - Where Unicorn disagrees with the Arm pseudocode, the pseudocode wins and the disagreement is
   recorded in `docs/UNICORN_DISAGREEMENTS.md`.
-- Milestones M1..M10 (see `docs/reports/`): stop after each one, run the tests, write the report,
-  then move on. M8 passed (2026-10-12): the owner approved the GPU front, the `nx_gpu` crate
+- Milestones M1..M10, and M11 on for the Switch 2 (see `docs/reports/`): stop after each one, run
+  the tests, write the report, then move on. The owner asked for Switch 2 (NX2) work on
+  2026-11-04; M11 passed the same day (an NX2 title boots until it asks for its graphics
+  supervisor, `docs/reports/M11-switch2-boot.md`). The owner's request covers what follows, the
+  NX2 GPU front, sm_86 shaders and the renderer's NX2 path (M12 to M14, laid out in that report).
+  Every NX2 difference is gated on `Npdm::platform` (A-188), never on a title. M8 passed (2026-10-12): the owner approved the GPU front, the `nx_gpu` crate
   (`nvdrv` and its device nodes, the display and buffer-queue path, a tracing command processor
   with a macro engine). The owner approved shader translation (Maxwell SASS to SPIR-V, crate
   `nx_shader`, M9) and the Vulkan backend (`ash`, crate `nx_vulkan`, M10) on 2026-10-13; M9
