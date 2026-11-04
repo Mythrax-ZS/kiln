@@ -47,6 +47,9 @@ pub struct AppletState {
     started: bool,
     /// The display the program's layers are made on (`CreateManagedDisplayLayer`).
     pub display: Option<Arc<super::vi::Shared>>,
+    /// The GPU driver's state, for the graphics sessions a Switch 2 program opens through the
+    /// applet (A-194).
+    pub gpu: Option<Arc<super::nvdrv::Shared>>,
     /// Has the pre-selected user been popped? A launch parameter can be popped once.
     preselected_popped: bool,
     /// What `SetIdleTimeDetectionExtension` was given: how much longer the console waits before
@@ -309,6 +312,16 @@ impl Service for SelfController {
             // A Switch 2 program's: nn::applet::SetRtcScreenSharingAudioEnabled(bool) (A-192).
             // Nothing is shared here, so there is nothing to change.
             2400 => Ok(Response::ok()),
+            // A Switch 2 program's: the graphics supervisor, a TIPC session of its own handed
+            // over as a copied handle (`nn::gsv::BootWithRemoteMemory`, A-194).
+            2000 => {
+                let gpu = lock(&self.shared).gpu.clone().ok_or_else(|| {
+                    Stop("the graphics supervisor was asked for with no GPU driver".into())
+                })?;
+                Ok(Response::ok().with_copy_handle(KObject::session(Box::new(
+                    super::gsv::Supervisor::new(self.kernel.clone(), gpu),
+                ))))
+            }
             other => Err(Stop::unknown_command("ISelfController", other)),
         }
     }

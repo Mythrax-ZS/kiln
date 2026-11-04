@@ -14,6 +14,7 @@ mod bsd;
 mod ectx;
 mod friend;
 mod fsp;
+mod gsv;
 mod hid;
 mod lm;
 mod mm;
@@ -59,7 +60,11 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     let gpu = nvdrv::Shared::new();
     let display = Arc::new(vi::Shared::new());
     display.set_gpu(gpu.clone());
-    applet.lock().unwrap_or_else(|e| e.into_inner()).display = Some(display.clone());
+    {
+        let mut a = applet.lock().unwrap_or_else(|e| e.into_inner());
+        a.display = Some(display.clone());
+        a.gpu = Some(gpu.clone());
+    }
     register(kernel, "vi:u", move |k| {
         vi::RootService::new(k, display.clone())
     });

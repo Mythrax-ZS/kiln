@@ -688,6 +688,13 @@ impl Kernel {
         rt().mem.write_bytes(addr, data, true).is_ok()
     }
 
+    /// Copy bytes into memory the program lent a service, which the program may have made
+    /// read-only for itself: the service writes it as the process it was lent to would, through
+    /// a mapping of its own (the permission is not checked).
+    pub fn write_lent_memory(&self, addr: u64, data: &[u8]) -> bool {
+        rt().mem.write_bytes(addr, data, false).is_ok()
+    }
+
     /// The contents of an IPC buffer, at most `limit` bytes of it; `None` when it is not readable.
     pub fn read_buffer(&self, buf: super::service::Buffer, limit: u64) -> Option<Vec<u8>> {
         let mut out = vec![0u8; buf.size.min(limit) as usize];

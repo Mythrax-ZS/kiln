@@ -345,6 +345,38 @@ impl Shared {
         }
     }
 
+    /// The readable end of the event of slot `slot` of the Switch 2's syncpoint service.
+    pub fn nx2_slot_event(&self, kernel: &Kernel, slot: u32) -> KObject {
+        let token = self.lock().nx2_slot_token(slot);
+        self.event(kernel, token).1
+    }
+
+    /// Arm `slot` for syncpoint `id` reaching `threshold`; `false` when `id` is no syncpoint.
+    pub fn nx2_slot_wait(&self, kernel: &Kernel, slot: u32, id: u32, threshold: u32) -> bool {
+        let armed = self.lock().nx2_slot_wait(slot, id, threshold);
+        self.deliver_signals(kernel);
+        armed
+    }
+
+    /// End the wait on `slot` and set its event.
+    pub fn nx2_slot_cancel(&self, kernel: &Kernel, slot: u32) {
+        self.lock().nx2_slot_cancel(slot);
+        self.deliver_signals(kernel);
+    }
+
+    /// The values of syncpoints `0..out.len()`, read under one lock (0 past the table).
+    pub fn syncpoint_values(&self, out: &mut [u32]) {
+        let core = self.lock();
+        for (id, v) in out.iter_mut().enumerate() {
+            *v = core.gpu.syncpoints.value(id as u32).unwrap_or(0);
+        }
+    }
+
+    /// The value of syncpoint `id`, if there is one.
+    pub fn syncpoint_value(&self, id: u32) -> Option<u32> {
+        self.lock().gpu.syncpoints.value(id)
+    }
+
     /// The (writable, readable) ends of the event behind `token`, made on first use.
     fn event(&self, kernel: &Kernel, token: EventToken) -> (KObject, KObject) {
         let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());

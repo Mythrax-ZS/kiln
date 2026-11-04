@@ -82,6 +82,9 @@ pub struct SyncptWait {
     pub writes_value: bool,
 }
 
+/// The descriptor number the Switch 2 syncpoint service's slots are kept under (A-195).
+const NX2_SLOTS: u32 = u32::MAX;
+
 pub struct Nvdrv {
     pub gpu: Gpu,
     nodes: BTreeMap<u32, Node>,
@@ -273,6 +276,43 @@ impl Nvdrv {
         self.next_token += 1;
         self.tokens.insert((fd, id), t);
         t
+    }
+
+    /// The event of slot `slot` of the Switch 2's syncpoint service, made on first use. The
+    /// slots' events are kept under a descriptor number no node has.
+    pub fn nx2_slot_token(&mut self, slot: u32) -> EventToken {
+        self.token(NX2_SLOTS, slot)
+    }
+
+    /// The Switch 2's syncpoint service arms `slot`: its event is cleared, and set when syncpoint
+    /// `id` reaches `threshold` (at once when it already has). `false` when `id` is no syncpoint.
+    pub fn nx2_slot_wait(&mut self, slot: u32, id: u32, threshold: u32) -> bool {
+        if !self.gpu.syncpoints.is_valid(id) {
+            return false;
+        }
+        let token = self.nx2_slot_token(slot);
+        self.gpu.syncpoints.cancel(token);
+        self.signals.push(Signal {
+            token,
+            signaled: false,
+        });
+        if self.gpu.syncpoints.is_reached(id, threshold) {
+            self.signal([token]);
+        } else {
+            self.gpu.syncpoints.wait(crate::syncpt::Waiter {
+                token,
+                id,
+                threshold,
+            });
+        }
+        true
+    }
+
+    /// The wait on `slot` ends and its event is set.
+    pub fn nx2_slot_cancel(&mut self, slot: u32) {
+        let token = self.nx2_slot_token(slot);
+        self.gpu.syncpoints.cancel(token);
+        self.signal([token]);
     }
 
     /// The events a submission that ran elsewhere has set (the renderer's thread, A-124).
