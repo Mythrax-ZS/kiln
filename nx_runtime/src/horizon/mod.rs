@@ -19,6 +19,7 @@ pub mod layout;
 pub mod memobj;
 pub mod memory;
 pub mod object;
+pub mod platform;
 pub mod process;
 pub mod result;
 pub mod service;

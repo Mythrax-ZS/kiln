@@ -253,6 +253,9 @@ pub unsafe fn run_module(m: &crate::rt::host::ModuleDesc) -> i32 {
     info.romfs = std::env::var_os("NX_ROMFS")
         .map(std::path::PathBuf::from)
         .or(built_with);
+    // The counter runs at the rate of the console the program was built for (A-190).
+    crate::rt::runtime::rt()
+        .set_counter_frequency(super::platform::counter_frequency(info.platform()));
     let kernel = Kernel::new(info);
     super::services::register_defaults(&kernel);
     let segments = c_slice(m.segs, m.nsegs as usize)

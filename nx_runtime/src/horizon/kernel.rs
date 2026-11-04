@@ -55,6 +55,14 @@ pub struct ProcessInfo {
 }
 
 impl ProcessInfo {
+    /// The console the program was built for (docs/ASSUMPTIONS.md A-188); a program without an
+    /// NPDM is a Switch program.
+    pub fn platform(&self) -> crate::npdm::Platform {
+        self.npdm
+            .as_ref()
+            .map_or_else(Default::default, |n| n.platform())
+    }
+
     pub fn new(name: &str, kind: ProcessKind, npdm: Option<Npdm>) -> ProcessInfo {
         ProcessInfo {
             name: name.to_string(),
@@ -97,9 +105,10 @@ impl Thread {
     /// The core the thread is on, as `GetCurrentProcessorNumber` tells it: its ideal core when the
     /// core mask allows that core, otherwise the lowest core the mask names (docs/ASSUMPTIONS.md
     /// A-149).
-    pub fn running_core(&self) -> i32 {
-        let mask = self.core_mask & 0xF;
-        if (0..4).contains(&self.ideal_core) && mask & (1 << self.ideal_core) != 0 {
+    /// `cores` is how many the program has ([`super::platform::cores`]).
+    pub fn running_core(&self, cores: i32) -> i32 {
+        let mask = self.core_mask & ((1 << cores) - 1);
+        if (0..cores).contains(&self.ideal_core) && mask & (1 << self.ideal_core) != 0 {
             self.ideal_core
         } else if mask != 0 {
             mask.trailing_zeros() as i32
@@ -569,7 +578,7 @@ impl Kernel {
         self.lock()
             .threads
             .get(&thread)
-            .map(|t| (t.entry, t.arg, t.priority, t.running_core()))
+            .map(|t| (t.entry, t.arg, t.priority, t.running_core(self.cores())))
     }
 
     pub fn trace_log(&self) -> bool {
@@ -805,10 +814,11 @@ impl Kernel {
             if !(0..=0x3F).contains(&priority) || priority < lo.min(hi) || priority > lo.max(hi) {
                 return Err(err::INVALID_PRIORITY);
             }
-            if !(core == -2 || (0..=3).contains(&core)) {
+            if !(core == -2 || (0..self.cores()).contains(&core)) {
                 return Err(err::INVALID_CORE_ID);
             }
         }
+        let all_cores = (1u64 << self.cores()) - 1;
         let mut st = self.lock();
         let tls = st.alloc_tls()?;
         let id = rt().new_thread_id();
@@ -824,7 +834,7 @@ impl Kernel {
             Thread {
                 priority,
                 ideal_core: if core == -2 { 0 } else { core },
-                core_mask: if core < 0 { 0xF } else { 1 << core },
+                core_mask: if core < 0 { all_cores } else { 1 << core },
                 tls,
                 entry,
                 arg,
@@ -967,7 +977,7 @@ impl Kernel {
                 .lock()
                 .threads
                 .get(&thread)
-                .map_or(0, Thread::running_core);
+                .map_or(0, |t| t.running_core(self.cores()));
             let core = cores.core_of(ideal);
             cores.acquire(core);
             held.store(core, Ordering::Relaxed);
@@ -1546,14 +1556,20 @@ impl Kernel {
 
     // ---- process memory ----
 
+    /// How many cores the program's threads may use.
+    pub fn cores(&self) -> i32 {
+        super::platform::cores(self.process.platform())
+    }
+
     /// `SetHeapSize`: the heap is `size` bytes (a multiple of 2 MiB) at the start of the heap
     /// region. Returns its address.
     pub fn set_heap_size(&self, size: u64) -> KResult<u64> {
-        use super::layout::{HEAP_BASE, HEAP_REGION_SIZE};
-        if !size.is_multiple_of(0x20_0000) || size > 1 << 32 {
+        use super::layout::HEAP_BASE;
+        let platform = self.process.platform();
+        if !size.is_multiple_of(0x20_0000) || size > super::platform::max_heap_size(platform) {
             return Err(err::INVALID_SIZE);
         }
-        if size > HEAP_REGION_SIZE {
+        if size > super::platform::heap_region_size(platform) {
             return Err(err::OUT_OF_MEMORY);
         }
         let mut st = self.lock();
@@ -1643,7 +1659,7 @@ impl Kernel {
                     | mem_type::THREAD_LOCAL
             )
         });
-        if used + new > super::svc::TOTAL_MEMORY_SIZE {
+        if used + new > super::platform::total_memory_size(self.process.platform()) {
             return err::LIMIT_REACHED;
         }
         let mut done = Vec::new();

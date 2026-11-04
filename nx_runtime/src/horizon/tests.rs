@@ -428,6 +428,61 @@ fn query_memory_describes_modules_gaps_and_the_ends() {
 }
 
 #[test]
+fn a_switch_2_process_gets_the_switch_2_answers() {
+    let nx2 = |platform| {
+        let spec = builder::NpdmSpec {
+            platform,
+            // Each descriptor enables 24 SVCs: SetHeapSize (1), GetInfo (0x29), 0x80.
+            kc: vec![
+                builder::enable_svcs(0, &[1, 8]), // and CreateThread
+                builder::enable_svcs(1, &[0x29 - 24]),
+                builder::enable_svcs(5, &[0x80 - 120]),
+            ],
+            ..builder::NpdmSpec::default()
+        };
+        Env::with(
+            ProcessKind::Nso,
+            Some(Npdm::parse(&builder::build(&spec)).unwrap()),
+            Vec::new(),
+        )
+    };
+    let proc = u64::from(CURRENT_PROCESS);
+    let info = |e: &mut Env, id: u64| {
+        e.svc(0x29, &[0, id, proc, 0]);
+        (e.r(), e.x(1))
+    };
+    let mut e = nx2(crate::npdm::Platform::Nx2);
+    assert_eq!(info(&mut e, 5).1, 0x2_8000_0000, "a 10 GiB heap region");
+    assert_eq!(info(&mut e, 6).1, 9809 << 20);
+    assert_eq!(info(&mut e, 29), (0, ALIAS_BASE + ALIAS_SIZE / 2));
+    assert_eq!(info(&mut e, 30), (0, ALIAS_SIZE / 2));
+    assert_eq!(info(&mut e, 31), (0, 0));
+    assert_eq!(info(&mut e, 33), (0, 0x1000));
+    // A heap of more than 4 GiB.
+    e.svc(0x01, &[0, 0x1_4000_0000]);
+    assert_eq!((e.r(), e.x(1)), (0, HEAP_BASE));
+    e.svc(0x80, &[HEAP_BASE, 0x2000, 0x20, 0x20]);
+    assert_eq!(e.r(), 0);
+    e.svc(0x80, &[HEAP_BASE + 1, 0x2000, 0x20, 0x20]);
+    assert_eq!(e.r(), err::INVALID_ADDRESS.0);
+    // Six cores: a thread may start on core 5, not on 6.
+    e.svc(0x08, &[0, 0x0900_0000, 0, SCRATCH, 0x2C, 5]);
+    assert_eq!(e.r(), 0);
+    e.svc(0x08, &[0, 0x0900_0000, 0, SCRATCH, 0x2C, 6]);
+    assert_eq!(e.r(), err::INVALID_CORE_ID.0);
+    drop(e); // one process at a time: `Env` holds the runtime
+
+    let mut e = nx2(crate::npdm::Platform::Nx);
+    assert_eq!(info(&mut e, 5).1, HEAP_REGION_SIZE);
+    assert_eq!(info(&mut e, 29).0, err::INVALID_ENUM_VALUE.0);
+    e.svc(0x01, &[0, 0x1_4000_0000]);
+    assert_eq!(e.r(), err::INVALID_SIZE.0);
+    e.svc(0x08, &[0, 0x0900_0000, 0, SCRATCH, 0x2C, 4]);
+    assert_eq!(e.r(), err::INVALID_CORE_ID.0);
+    assert_eq!(e.svc(0x80, &[HEAP_BASE, 0x2000, 0x20, 0x20]), Flow::Stop);
+}
+
+#[test]
 fn get_info_reports_the_regions_and_refuses_what_it_does_not_know() {
     let mut e = Env::new();
     let info = |e: &mut Env, id: u64, handle: u64, sub: u64| {

@@ -8,8 +8,8 @@
 use super::handle::Handle;
 use super::kernel::{Kernel, ThreadCtx};
 use super::layout::{
-    mem_type, ALIAS_BASE, ALIAS_SIZE, ASLR_BASE, ASLR_SIZE, HEAP_BASE, HEAP_REGION_SIZE,
-    STACK_BASE, STACK_REGION_SIZE, TLS_BASE,
+    mem_type, ALIAS_BASE, ALIAS_SIZE, ASLR_BASE, ASLR_SIZE, HEAP_BASE, STACK_BASE,
+    STACK_REGION_SIZE, TLS_BASE,
 };
 use super::object::KObject;
 use super::result::{kernel as err, ResultCode};
@@ -536,7 +536,7 @@ impl Kernel {
                     .lock()
                     .threads
                     .get(&thread)
-                    .map_or(0, |t| t.running_core());
+                    .map_or(0, |t| t.running_core(self.cores()));
                 cpu.state.x[0] = core as u64;
             }
             0x11 => {
@@ -744,6 +744,10 @@ impl Kernel {
                 result(cpu, r);
             }
             0x36 => {}
+            0x80 if self.process.platform() == crate::npdm::Platform::Nx2 => {
+                let r = super::platform::set_gpu_memory_attribute(x[0], x[1], w(x[2]), w(x[3]));
+                result(cpu, r);
+            }
             0x45 => match self.create_event() {
                 Ok((writable, readable)) => {
                     result(cpu, ResultCode::SUCCESS);
@@ -780,9 +784,11 @@ impl Kernel {
         thread: u64,
     ) -> Result<Result<u64, ResultCode>, String> {
         let process_handle = matches!(self.object(handle, thread), Some(KObject::Process));
-        let needs_process = matches!(id, 0..=7 | 12..=18 | 20..=24 | 26..=28);
+        let platform = self.process.platform();
+        let switch_2 = super::platform::info(platform, id);
+        let needs_process = matches!(id, 0..=7 | 12..=18 | 20..=24 | 26..=28) || switch_2.is_some();
         let needs_zero = matches!(id, 8..=11 | 19);
-        if id > 28 {
+        if id > 28 && switch_2.is_none() {
             return Ok(Err(err::INVALID_ENUM_VALUE));
         }
         if needs_process && !process_handle {
@@ -817,8 +823,8 @@ impl Kernel {
             2 => ALIAS_BASE,
             3 => ALIAS_SIZE,
             4 => HEAP_BASE,
-            5 => HEAP_REGION_SIZE,
-            6 => TOTAL_MEMORY_SIZE,
+            5 => super::platform::heap_region_size(platform),
+            6 => super::platform::total_memory_size(platform),
             7 => self.used_memory(),
             8 => 0,
             10 => {
@@ -850,9 +856,10 @@ impl Kernel {
             // no thread takes, which is where the kernel would write the context of an exception
             // (docs/ASSUMPTIONS.md A-143)
             20 => TLS_BASE,
-            21 => TOTAL_MEMORY_SIZE,
+            21 => super::platform::total_memory_size(platform),
             22 => self.used_memory(),
             23 => u64::from(self.process.kind == super::kernel::ProcessKind::Nso),
+            29..=33 => switch_2.unwrap_or_default(),
             9 | 24 | 26..=28 => {
                 return Err(format!(
                     "GetInfo with information type {id} is not implemented"

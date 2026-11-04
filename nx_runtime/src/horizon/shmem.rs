@@ -10,9 +10,8 @@
 use super::handle::Handle;
 use super::kernel::Kernel;
 use super::layout::{
-    mem_type, ADDRESS_SPACE_END, ALIAS_BASE, ALIAS_SIZE, ASLR_BASE, HEAP_BASE, HEAP_REGION_SIZE,
-    KERNEL_SCRATCH_BASE, KERNEL_SCRATCH_SIZE, PAGE, STACK_BASE, STACK_REGION_SIZE, TLS_BASE,
-    TLS_REGION_SIZE,
+    mem_type, ADDRESS_SPACE_END, ALIAS_BASE, ALIAS_SIZE, ASLR_BASE, HEAP_BASE, KERNEL_SCRATCH_BASE,
+    KERNEL_SCRATCH_SIZE, PAGE, STACK_BASE, STACK_REGION_SIZE, TLS_BASE, TLS_REGION_SIZE,
 };
 use super::memory::Info;
 use super::object::KObject;
@@ -106,7 +105,10 @@ impl Kernel {
         // (docs/ASSUMPTIONS.md A-164).
         let reserved = [
             (ALIAS_BASE, ALIAS_SIZE),
-            (HEAP_BASE, HEAP_REGION_SIZE),
+            (
+                HEAP_BASE,
+                super::platform::heap_region_size(self.process.platform()),
+            ),
             (STACK_BASE, STACK_REGION_SIZE),
             (TLS_BASE, TLS_REGION_SIZE),
             (KERNEL_SCRATCH_BASE, KERNEL_SCRATCH_SIZE),
