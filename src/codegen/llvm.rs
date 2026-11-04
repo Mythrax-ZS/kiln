@@ -57,6 +57,7 @@ pub fn declarations(defines_dispatcher: bool) -> String {
         "declare i64 @nx_cas128(ptr, i64, i64, i64, i64, i64, i64, i32)",
         "declare void @nx_dczva(ptr, i64, i64)",
         "declare i64 @nx_counter()",
+        "declare i64 @nx_counter_frequency() memory(none) nounwind",
         "declare i32 @nx_crc32(i32, i64, i32, i32) memory(none) nounwind",
         "declare i64 @nx_vec(ptr, i32, i64, i64)",
         "declare void @nx_vecmem(ptr, i32, i64, i64)",
@@ -560,6 +561,7 @@ impl<'a> Emitter<'a> {
                 self.fault_check(b, split);
             }
             Op::Counter => self.line(&format!("{r} = call i64 @nx_counter()")),
+            Op::CounterFrequency => self.line(&format!("{r} = call i64 @nx_counter_frequency()")),
             Op::LoadField(fld) => {
                 let p = self.ptr(fld.offset());
                 self.line(&format!("{r} = load {t}, ptr {p}"));

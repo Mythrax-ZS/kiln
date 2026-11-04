@@ -19,8 +19,10 @@ pub struct Fault {
     pub kind: FaultKind,
 }
 
-/// Counter frequency reported by `CNTFRQ_EL0` (docs/ASSUMPTIONS.md A-001).
+/// Counter frequency reported by `CNTFRQ_EL0` on the Switch (docs/ASSUMPTIONS.md A-001).
 pub const COUNTER_FREQUENCY: u64 = 19_200_000;
+/// The same on the Switch 2 (A-190).
+pub const COUNTER_FREQUENCY_NX2: u64 = 31_250_000;
 /// Cortex-A57 value of `CTR_EL0`.
 pub const CTR_EL0: u64 = 0x8444_C004;
 /// `DCZID_EL0`: `DC ZVA` block size is 4 words squared, 64 bytes, and the instruction is allowed.
@@ -103,11 +105,16 @@ pub trait Bus {
         0
     }
 
+    /// What `CNTFRQ_EL0` reads: the counter's rate.
+    fn counter_frequency(&mut self) -> u64 {
+        COUNTER_FREQUENCY
+    }
+
     /// Read a system register that is not part of [`CpuState`]. `None` means the register is not
     /// implemented, which stops the run instead of returning an invented value.
     fn system_register(&mut self, reg: SysReg) -> Option<u64> {
         match reg {
-            SysReg::CntfrqEl0 => Some(COUNTER_FREQUENCY),
+            SysReg::CntfrqEl0 => Some(self.counter_frequency()),
             SysReg::CntpctEl0 | SysReg::CntvctEl0 => Some(self.counter()),
             SysReg::CtrEl0 => Some(CTR_EL0),
             SysReg::DczidEl0 => Some(DCZID_EL0),

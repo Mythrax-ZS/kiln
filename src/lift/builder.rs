@@ -501,6 +501,11 @@ impl Builder {
         self.effect(b, Ty::Void, Op::DcZva { pc, addr });
     }
 
+    /// `CNTFRQ_EL0`, from the runtime.
+    pub fn counter_frequency(&mut self, b: BlockId) -> ValueId {
+        self.effect(b, Ty::I64, Op::CounterFrequency)
+    }
+
     pub fn counter(&mut self, b: BlockId) -> ValueId {
         self.effect(b, Ty::I64, Op::Counter)
     }

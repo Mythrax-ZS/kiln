@@ -318,6 +318,12 @@ pub extern "C" fn nx_counter() -> u64 {
     rt().counter()
 }
 
+/// What `CNTFRQ_EL0` reads (A-190).
+#[no_mangle]
+pub extern "C" fn nx_counter_frequency() -> u64 {
+    rt().counter_frequency()
+}
+
 /// The diagnostic build counts the reads and the cycles they take.
 #[cfg(feature = "alloc_stats")]
 #[no_mangle]
@@ -580,6 +586,7 @@ pub const GENERATED_CODE_SYMBOLS: &[&str] = &[
     "nx_cas128",
     "nx_dczva",
     "nx_counter",
+    "nx_counter_frequency",
     "nx_crc32",
     "nx_vec",
     "nx_vecmem",

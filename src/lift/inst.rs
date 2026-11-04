@@ -9,7 +9,7 @@
 use super::builder::Builder;
 use super::ir::*;
 use nx_runtime::a64::bits::decode_bit_masks;
-use nx_runtime::a64::bus::{COUNTER_FREQUENCY, CTR_EL0, DCZID_EL0};
+use nx_runtime::a64::bus::{CTR_EL0, DCZID_EL0};
 use nx_runtime::a64::inst::*;
 use nx_runtime::a64::interp::{FPCR_MASK, FPSR_MASK};
 
@@ -513,7 +513,7 @@ impl<'a> Lifter<'a> {
                     }
                     SysReg::TpidrEl0 => self.b.load_field(blk, Field::TpidrEl0),
                     SysReg::TpidrroEl0 => self.b.load_field(blk, Field::TpidrroEl0),
-                    SysReg::CntfrqEl0 => self.k64(COUNTER_FREQUENCY),
+                    SysReg::CntfrqEl0 => self.b.counter_frequency(blk),
                     SysReg::CntpctEl0 | SysReg::CntvctEl0 => self.b.counter(blk),
                     SysReg::CtrEl0 => self.k64(CTR_EL0),
                     SysReg::DczidEl0 => self.k64(DCZID_EL0),

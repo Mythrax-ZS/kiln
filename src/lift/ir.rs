@@ -404,6 +404,8 @@ pub enum Op {
     },
     /// `CNTPCT_EL0` and `CNTVCT_EL0`.
     Counter,
+    /// `CNTFRQ_EL0`: the runtime's counter rate, which does not change while a program runs.
+    CounterFrequency,
     LoadField(Field),
     StoreField(Field, ValueId),
     /// A floating-point or SIMD computation on the vector registers, which stay in the CPU
@@ -427,7 +429,12 @@ impl Op {
     /// Calls `f` on every operand.
     pub fn for_each_operand(&self, mut f: impl FnMut(ValueId)) {
         match self {
-            Op::Const(_) | Op::LoadVar(_) | Op::ClearExcl | Op::Fence(_) | Op::Counter => {}
+            Op::Const(_)
+            | Op::LoadVar(_)
+            | Op::ClearExcl
+            | Op::Fence(_)
+            | Op::Counter
+            | Op::CounterFrequency => {}
             Op::LoadField(_) => {}
             Op::Vec { src, nzcv, .. } => {
                 src.iter().chain(nzcv.iter()).for_each(|&v| f(v));
@@ -478,7 +485,12 @@ impl Op {
     /// Rewrites every operand in place.
     pub fn map_operands(&mut self, mut f: impl FnMut(ValueId) -> ValueId) {
         match self {
-            Op::Const(_) | Op::LoadVar(_) | Op::ClearExcl | Op::Fence(_) | Op::Counter => {}
+            Op::Const(_)
+            | Op::LoadVar(_)
+            | Op::ClearExcl
+            | Op::Fence(_)
+            | Op::Counter
+            | Op::CounterFrequency => {}
             Op::LoadField(_) => {}
             Op::Vec { src, nzcv, .. } => {
                 src.iter_mut()
@@ -545,6 +557,7 @@ impl Op {
                 | Op::Fshr(..)
                 | Op::MulHi { .. }
                 | Op::Crc32 { .. }
+                | Op::CounterFrequency
         )
     }
 }
@@ -1157,7 +1170,7 @@ impl Func {
                     return bad("dc zva address");
                 }
             }
-            Op::Counter => {
+            Op::Counter | Op::CounterFrequency => {
                 if inst.ty != Ty::I64 {
                     return bad("counter is i64");
                 }
@@ -1353,6 +1366,7 @@ fn fmt_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
         Op::Fence(k) => write!(f, "fence {k:?}"),
         Op::DcZva { pc, addr } => write!(f, "dczva %{addr} @{pc:#x}"),
         Op::Counter => write!(f, "counter"),
+        Op::CounterFrequency => write!(f, "counter_frequency"),
         Op::LoadField(fl) => write!(f, "loadfield {}", fl.name()),
         Op::StoreField(fl, v) => write!(f, "storefield {} %{v}", fl.name()),
         Op::Vec { word, src, nzcv } => {

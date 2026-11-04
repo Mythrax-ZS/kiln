@@ -7,7 +7,6 @@
 use super::super::kernel::Kernel;
 use super::super::object::KObject;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
-use crate::a64::bus::COUNTER_FREQUENCY;
 use crate::rt::runtime::rt;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -178,7 +177,7 @@ impl Service for StaticService {
                                 ))
                             })?;
                         let counter_ns = (u128::from(rt().counter()) * 1_000_000_000
-                            / u128::from(COUNTER_FREQUENCY))
+                            / u128::from(rt().counter_frequency()))
                             as u64;
                         if !kernel.write_memory(addr, &shared_memory_image(counter_ns)) {
                             return Err(Stop("the time shared memory is not writable".into()));

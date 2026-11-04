@@ -96,6 +96,8 @@ pub struct Runtime {
     /// When non-zero, the system counter returns this value and adds one per read, so a test can
     /// replay a run and get the same readings.
     counter_fixed: AtomicU64,
+    /// The counter's rate, 0 for the Switch's.
+    counter_hz: AtomicU64,
     unknown: Mutex<BTreeSet<u64>>,
     next_thread: AtomicU64,
     start: Instant,
@@ -123,6 +125,7 @@ impl Runtime {
             spurious: Mutex::new(BTreeMap::new()),
             spurious_any: AtomicBool::new(false),
             counter_fixed: AtomicU64::new(0),
+            counter_hz: AtomicU64::new(0),
             unknown: Mutex::new(BTreeSet::new()),
             next_thread: AtomicU64::new(1),
             start: Instant::now(),
@@ -222,13 +225,27 @@ impl Runtime {
         self.counter_fixed.store(start, Ordering::Relaxed);
     }
 
-    /// The free-running system counter at `COUNTER_FREQUENCY`.
+    /// The free-running system counter at [`Runtime::counter_frequency`].
     pub fn counter(&self) -> u64 {
         if self.counter_fixed.load(Ordering::Relaxed) != 0 {
             return self.counter_fixed.fetch_add(1, Ordering::Relaxed);
         }
         let ns = self.start.elapsed().as_nanos();
-        (ns * u128::from(COUNTER_FREQUENCY) / 1_000_000_000) as u64
+        (ns * u128::from(self.counter_frequency()) / 1_000_000_000) as u64
+    }
+
+    /// The counter's rate, `CNTFRQ_EL0`: the Switch's unless the process says otherwise.
+    pub fn counter_frequency(&self) -> u64 {
+        match self.counter_hz.load(Ordering::Relaxed) {
+            0 => COUNTER_FREQUENCY,
+            hz => hz,
+        }
+    }
+
+    /// Set the counter's rate before the program starts (the platform's, A-190). The counter
+    /// keeps counting from the time the runtime started, at the new rate.
+    pub fn set_counter_frequency(&self, hz: u64) {
+        self.counter_hz.store(hz, Ordering::Relaxed);
     }
 
     // ---- memory with the exclusive monitor ----
@@ -509,6 +526,10 @@ impl Bus for NativeBus {
 
     fn counter(&mut self) -> u64 {
         rt().counter()
+    }
+
+    fn counter_frequency(&mut self) -> u64 {
+        rt().counter_frequency()
     }
 }
 

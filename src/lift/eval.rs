@@ -339,6 +339,7 @@ impl<'f> Evaluator<'f> {
                 0
             }
             Op::Counter => u128::from(bus.counter()),
+            Op::CounterFrequency => u128::from(bus.counter_frequency()),
             Op::LoadField(f) => match f {
                 Field::TpidrEl0 => u128::from(cpu.tpidr_el0),
                 Field::TpidrroEl0 => u128::from(cpu.tpidrro_el0),
