@@ -107,8 +107,9 @@ impl Service for AppletOe {
 
     fn request(&mut self, req: &Request) -> ServiceResult {
         match req.command {
-            // OpenApplicationProxy(u64 reserved, pid, process handle) -> IApplicationProxy
-            0 => {
+            // OpenApplicationProxy(u64 reserved, pid, process handle) -> IApplicationProxy; a
+            // Switch 2 program opens it with command 10 and 16 bytes of data (A-192).
+            0 | 10 => {
                 let kernel = self.kernel.upgrade().ok_or_else(gone)?;
                 // An application starts in the foreground, which the applet manager announces
                 // with a focus message (docs/ASSUMPTIONS.md A-043).
@@ -152,6 +153,9 @@ impl Service for ApplicationProxy {
             1000 => Box::new(Bare("nn::am::service::IDebugFunctions")),
             11 => Box::new(LibraryAppletCreator { kernel }),
             20 => Box::new(ApplicationFunctions { kernel, shared }),
+            // A Switch 2 program's interfaces (A-192), none of whose commands is known yet.
+            40 => Box::new(Bare("nn::am::service::IPerformanceFunctions")),
+            60 => Box::new(Bare("nn::am::service::IGraphicsScalingParametersFunctions")),
             other => return Err(Stop::unknown_command("IApplicationProxy", other)),
         };
         Ok(Response::ok().with_object(object))
@@ -302,6 +306,9 @@ impl Service for SelfController {
                 ))),
             },
             63 => Ok(Response::ok().with_u32(lock(&self.shared).idle_extension)),
+            // A Switch 2 program's: nn::applet::SetRtcScreenSharingAudioEnabled(bool) (A-192).
+            // Nothing is shared here, so there is nothing to change.
+            2400 => Ok(Response::ok()),
             other => Err(Stop::unknown_command("ISelfController", other)),
         }
     }
@@ -465,6 +472,13 @@ impl Service for ApplicationFunctions {
                 let kernel = self.kernel.upgrade().ok_or_else(gone)?;
                 Ok(Response::ok().with_copy_handle(idle_event(&kernel, &self.shared, 2)))
             }
+            // A Switch 2 program's (A-192): whether screenshots and continuous recording start
+            // enabled, two bools for nn::oe::detail::SetScreenShotAndContinuousRecordingInitially
+            // Enabled. This runtime records nothing: both off.
+            320 => Ok(Response::ok().with_bytes(&[0, 0])),
+            // A Switch 2 program's: one bool for nn::applet::SetRtcScreenSharingAudioEnabled (and
+            // the display's buffer permission 4). There is no screen sharing here: off.
+            321 => Ok(Response::ok().with_bytes(&[0])),
             // GetHealthWarningDisappearedSystemEvent() -> event [9.0.0+]
             160 => {
                 let kernel = self.kernel.upgrade().ok_or_else(gone)?;
