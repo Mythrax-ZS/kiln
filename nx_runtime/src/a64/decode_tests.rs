@@ -931,7 +931,7 @@ fn reserved_and_unallocated_encodings() {
 fn valid_but_unimplemented_encodings_are_unsupported_not_ignored() {
     // Valid in the architecture, outside this project's scope: must stop the run, never vanish.
     for w in [
-        0xC8A0_7C41u32, // cas x0, x1, [x2]
+        0xD503_30FFu32, // sb
         0xD4A0_0001,    // dcps1
         0xD400_0002,    // hvc #0
         0xD440_0000,    // hlt #0
@@ -945,6 +945,101 @@ fn valid_but_unimplemented_encodings_are_unsupported_not_ignored() {
     }
     // PAC hints are HINT instructions and execute as no-ops on a core without PAuth.
     assert_eq!(decode(0xD503_233F), Inst::Hint { imm: 25 }); // paciasp
+}
+
+#[test]
+fn armv8_1_to_8_3_forms_of_a_switch_2_program() {
+    use AtomicOp::*;
+    let atomic = |op, size, acquire, release, rs, rt, rn| Inst::Atomic {
+        op,
+        size,
+        acquire,
+        release,
+        rs,
+        rt,
+        rn,
+    };
+    let cas = |pair, size, acquire, release, rs, rt, rn| Inst::Cas {
+        pair,
+        size,
+        acquire,
+        release,
+        rs,
+        rt,
+        rn,
+    };
+    let br = |kind, rn| Inst::BranchReg { kind, rn };
+    let nop = Inst::Hint { imm: 0 };
+    let ld64 = |rt, rn, mode| Inst::LdSt {
+        kind: MemKind::Load,
+        size: 3,
+        rt,
+        rn,
+        mode,
+    };
+    for (word, want) in [
+        // FEAT_LSE
+        (0xF8E9_0108u32, atomic(Add, 3, true, true, 9, 8, 8)), // ldaddal x9, x8, [x8]
+        (0xB8FF_3108, atomic(Set, 2, true, true, 31, 8, 8)),   // ldsetal wzr, w8, [x8]
+        (0xF8E0_8100, atomic(Swp, 3, true, true, 0, 0, 8)),    // swpal x0, x0, [x8]
+        (0xB821_005F, atomic(Add, 2, false, false, 1, 31, 2)), // stadd w1, [x2]
+        (0x3862_1020, atomic(Clr, 0, false, true, 2, 0, 1)),   // ldclrlb w2, w0, [x1]
+        (0x78A3_4020, atomic(Smax, 1, true, false, 3, 0, 1)),  // ldsmaxah w3, w0, [x1]
+        (0xF824_7020, atomic(Umin, 3, false, false, 4, 0, 1)), // ldumin x4, x0, [x1]
+        (0xC8A0_7C41, cas(false, 3, false, false, 0, 1, 2)),   // cas x0, x1, [x2]
+        (0x88E0_FC41, cas(false, 2, true, true, 0, 1, 2)),     // casal w0, w1, [x2]
+        (0x48A0_7C41, cas(false, 1, false, false, 0, 1, 2)),   // cash w0, w1, [x2]
+        (0x4822_7C22, cas(true, 3, false, false, 2, 2, 1)),    // casp x2, x3, x2, x3, [x1]
+        (0x0860_FC44, cas(true, 2, true, true, 0, 4, 2)),      // caspal w0, w1, w4, w5, [x2]
+        (0x4823_7C22, Inst::Unallocated(0x4823_7C22)),         // casp with an odd Rs
+        // FEAT_LRCPC
+        (
+            0xF8BF_C020,
+            Inst::AcqRel {
+                load: true,
+                size: 3,
+                rt: 0,
+                rn: 1,
+            },
+        ), // ldapr x0, [x1]
+        (
+            0x38BF_C020,
+            Inst::AcqRel {
+                load: true,
+                size: 0,
+                rt: 0,
+                rn: 1,
+            },
+        ), // ldaprb w0, [x1]
+        // FEAT_PAuth, keys off
+        (0xD65F_0BFF, br(BranchReg::Ret, 30)),          // retaa
+        (0xD65F_0FFF, br(BranchReg::Ret, 30)),          // retab
+        (0xD71F_0822, br(BranchReg::Br, 1)),            // braa x1, x2
+        (0xD73F_0C43, br(BranchReg::Blr, 2)),           // blrab x2, x3
+        (0xD63F_087F, br(BranchReg::Blr, 3)),           // blraaz x3
+        (0xD61F_0860, Inst::Unallocated(0xD61F_0860)),  // braaz whose modifier field is not 31
+        (0xDAC1_0020, nop),                             // pacia x0, x1
+        (0xDAC1_17E3, nop),                             // autib x3, sp
+        (0xDAC1_23E0, nop),                             // paciza x0
+        (0xDAC1_43E5, Inst::Xpac { rd: 5 }),            // xpaci x5
+        (0xDAC1_47E5, Inst::Xpac { rd: 5 }),            // xpacd x5
+        (0xDAC1_4025, Inst::Unallocated(0xDAC1_4025)),  // xpaci with Rn not 31
+        (0x5AC1_0020, Inst::Unallocated(0x5AC1_0020)),  // pacia of a W register
+        (0xF820_1420, ld64(0, 1, AddrMode::Offset(8))), // ldraa x0, [x1, #8]
+        (0xF8FF_FC20, ld64(0, 1, AddrMode::PreIndex(-8))), // ldrab x0, [x1, #-8]!
+        (0xB820_1420, Inst::Unallocated(0xB820_1420)),  // the same with a 32-bit size
+        (
+            0x9AC1_3000,
+            Inst::Pacga {
+                rd: 0,
+                rn: 0,
+                rm: 1,
+            },
+        ), // pacga x0, x0, x1
+        (0x1AC1_3000, Inst::Unallocated(0x1AC1_3000)),  // pacga of W registers
+    ] {
+        assert_eq!(decode(word), want, "{word:#010x}");
+    }
 }
 
 #[test]

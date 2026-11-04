@@ -225,6 +225,8 @@ pub(super) fn splits_of(op: &Op) -> usize {
         | Op::Store { .. }
         | Op::LoadExcl { .. }
         | Op::StoreExcl { .. }
+        | Op::Atomic { .. }
+        | Op::Cas { .. }
         | Op::DcZva { .. } => 1,
         Op::VecMem { word, .. } => accesses(*word).map_or(1, |(_, a)| a.len()),
         Op::Vec { word, .. } => match decode(*word) {

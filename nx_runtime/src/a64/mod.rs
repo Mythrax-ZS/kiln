@@ -12,6 +12,7 @@ pub mod inst;
 pub mod interp;
 #[cfg(test)]
 mod interp_tests;
+pub mod pac;
 pub mod state;
 pub mod vec;
 

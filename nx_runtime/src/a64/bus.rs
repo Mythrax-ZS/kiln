@@ -1,7 +1,7 @@
 //! What the interpreter needs from its surroundings: memory, the exclusive monitor, and the few
 //! system registers that live outside the CPU state.
 
-use super::inst::SysReg;
+use super::inst::{AtomicOp, SysReg};
 use super::state::CpuState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +66,36 @@ pub trait Bus {
     /// `CLREX`.
     fn clear_exclusive(&mut self, cpu: &mut CpuState) {
         cpu.excl_size = 0;
+    }
+
+    /// An LSE read-modify-write of `size` bytes (1 to 8) at an aligned `addr`, which memory
+    /// observes as one access: returns what memory held. The access counts as a write for its
+    /// faults. This default is for buses that one thread uses; a shared one overrides it.
+    fn atomic(&mut self, addr: u64, size: u8, op: AtomicOp, operand: u64) -> Result<u64, Fault> {
+        let as_write = |f: Fault| Fault { write: true, ..f };
+        let old = self.read(addr, size).map_err(as_write)? as u64;
+        self.write(
+            addr,
+            size,
+            u128::from(op.apply(old, operand, 8 * u32::from(size))),
+        )?;
+        Ok(old)
+    }
+
+    /// `CAS`/`CASP` of `size` bytes (1 to 16) at an aligned `addr`: `new` replaces `expected` if
+    /// memory holds it; returns what memory held. A compare that fails still counts as a write
+    /// for faults (the Arm pseudocode's atomic access); this default writes the old bytes back.
+    fn compare_swap(
+        &mut self,
+        addr: u64,
+        size: u8,
+        expected: u128,
+        new: u128,
+    ) -> Result<u128, Fault> {
+        let as_write = |f: Fault| Fault { write: true, ..f };
+        let old = self.read(addr, size).map_err(as_write)?;
+        self.write(addr, size, if old == expected { new } else { old })?;
+        Ok(old)
     }
 
     /// The system counter behind `CNTPCT_EL0` and `CNTVCT_EL0`.

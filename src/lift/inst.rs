@@ -717,6 +717,87 @@ impl<'a> Lifter<'a> {
                     self.b.store(blk, bytes, Order::Release, pc, addr, v);
                 }
             }
+            Inst::Atomic {
+                op,
+                size,
+                acquire,
+                release,
+                rs,
+                rt,
+                rn,
+            } => {
+                let bytes = 1u8 << size;
+                let addr = self.x(rn, true);
+                let operand = self.x(rs, false);
+                let operand = self.low_bytes(operand, bytes);
+                let ordering = (acquire, release);
+                let old = self.b.atomic(blk, op, bytes, ordering, pc, addr, operand);
+                self.set_x(rt, old, false);
+            }
+            Inst::Cas {
+                pair,
+                size,
+                acquire,
+                release,
+                rs,
+                rt,
+                rn,
+            } => {
+                let esize = 1u8 << size;
+                let addr = self.x(rn, true);
+                let ordering = (acquire, release);
+                if !pair {
+                    let expected = self.x(rs, false);
+                    let expected = self.low_bytes(expected, esize);
+                    let new = self.x(rt, false);
+                    let new = self.low_bytes(new, esize);
+                    let old = self.b.cas(blk, esize, ordering, pc, addr, expected, new);
+                    self.set_x(rs, old, false);
+                } else if esize == 8 {
+                    let join = |s: &mut Self, r: u8| {
+                        let lo = s.x(r, false);
+                        let lo = s.zext(lo, Ty::I128);
+                        let hi = s.x(r + 1, false);
+                        let hi = s.zext(hi, Ty::I128);
+                        let hi = s.shl_c(hi, 64);
+                        s.or(lo, hi)
+                    };
+                    let expected = join(self, rs);
+                    let new = join(self, rt);
+                    let old = self.b.cas(blk, 16, ordering, pc, addr, expected, new);
+                    let lo = self.trunc(old, Ty::I64);
+                    let hi = self.lshr_c(old, 64);
+                    let hi = self.trunc(hi, Ty::I64);
+                    self.set_x(rs, lo, false);
+                    self.set_x(rs + 1, hi, false);
+                } else {
+                    let join = |s: &mut Self, r: u8| {
+                        let lo = s.x(r, false);
+                        let lo = s.and_const(lo, 0xFFFF_FFFF);
+                        let hi = s.x(r + 1, false);
+                        let hi = s.shl_c(hi, 32);
+                        s.or(lo, hi)
+                    };
+                    let expected = join(self, rs);
+                    let new = join(self, rt);
+                    let old = self.b.cas(blk, 8, ordering, pc, addr, expected, new);
+                    let lo = self.and_const(old, 0xFFFF_FFFF);
+                    let hi = self.lshr_c(old, 32);
+                    self.set_x(rs, lo, false);
+                    self.set_x(rs + 1, hi, false);
+                }
+            }
+            Inst::Xpac { rd } => {
+                // strip_pac: the bits from PAC_BOTTOM_BIT up become copies of bit 55.
+                let low = (1u64 << PAC_BOTTOM_BIT) - 1;
+                let v = self.x(rd, false);
+                let kept = self.and_const(v, low);
+                let top = self.shl_c(v, 8);
+                let ext = self.ashr_c(top, 63);
+                let ext = self.and_const(ext, !low);
+                let r = self.or(kept, ext);
+                self.set_x(rd, r, false);
+            }
 
             Inst::LogicalShifted {
                 sf,
@@ -1022,9 +1103,19 @@ impl<'a> Lifter<'a> {
             | Inst::Svc { .. }
             | Inst::Brk { .. }
             | Inst::Unallocated(_)
-            | Inst::Unsupported { .. } => {
+            | Inst::Unsupported { .. }
+            | Inst::Pacga { .. } => {
                 unreachable!("{inst:?} is a terminator, handled by the block driver")
             }
+        }
+    }
+
+    /// The low `bytes` of an `i64`, still an `i64`.
+    fn low_bytes(&mut self, v: ValueId, bytes: u8) -> ValueId {
+        if bytes >= 8 {
+            v
+        } else {
+            self.and_const(v, (1u64 << (8 * u32::from(bytes))) - 1)
         }
     }
 

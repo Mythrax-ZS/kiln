@@ -13,6 +13,7 @@
 
 use super::ir::*;
 use super::sem;
+use nx_runtime::a64::inst::AtomicOp;
 use std::collections::HashMap;
 
 const NONE: ValueId = u32::MAX;
@@ -401,6 +402,65 @@ impl Builder {
                 acquire,
                 pc,
                 addr,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn atomic(
+        &mut self,
+        b: BlockId,
+        op: AtomicOp,
+        bytes: u8,
+        (acquire, release): (bool, bool),
+        pc: u64,
+        addr: ValueId,
+        value: ValueId,
+    ) -> ValueId {
+        let (addr, value) = (self.resolve(addr), self.resolve(value));
+        self.effect(
+            b,
+            Ty::I64,
+            Op::Atomic {
+                op,
+                bytes,
+                acquire,
+                release,
+                pc,
+                addr,
+                value,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn cas(
+        &mut self,
+        b: BlockId,
+        bytes: u8,
+        (acquire, release): (bool, bool),
+        pc: u64,
+        addr: ValueId,
+        expected: ValueId,
+        new: ValueId,
+    ) -> ValueId {
+        let (addr, expected, new) = (
+            self.resolve(addr),
+            self.resolve(expected),
+            self.resolve(new),
+        );
+        let ty = if bytes == 16 { Ty::I128 } else { Ty::I64 };
+        self.effect(
+            b,
+            ty,
+            Op::Cas {
+                bytes,
+                acquire,
+                release,
+                pc,
+                addr,
+                expected,
+                new,
             },
         )
     }

@@ -17,10 +17,14 @@
 
 use super::abi::perm;
 use crate::a64::bus::FaultKind;
+use crate::a64::inst::AtomicOp;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::collections::HashMap;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{
+    AtomicI16, AtomicI32, AtomicI64, AtomicI8, AtomicPtr, AtomicU16, AtomicU32, AtomicU64,
+    AtomicU8, Ordering,
+};
 use std::sync::Mutex;
 
 pub const PAGE_SIZE: u64 = 4096;
@@ -754,6 +758,95 @@ impl GuestMemory {
         }
         let p = self.page_ptr(addr, 16, true, Some(new))?;
         // SAFETY: 16 writable bytes inside one page, aligned to 16.
+        Ok(unsafe { cas128(p.cast(), expected, new, order) } == expected)
+    }
+
+    /// An LSE atomic (`LD<op>`, `SWP`) on `size` bytes (1, 2, 4 or 8) at `addr`, which must be
+    /// aligned: one host atomic operation. Returns what memory held.
+    pub fn atomic(
+        &self,
+        addr: u64,
+        size: u8,
+        op: AtomicOp,
+        operand: u64,
+        order: Ordering,
+    ) -> Result<u64, FaultKind> {
+        if !addr.is_multiple_of(u64::from(size)) {
+            return Err(FaultKind::Alignment);
+        }
+        let p = self.page_ptr(addr, usize::from(size), true, Some(u128::from(operand)))?;
+        macro_rules! rmw {
+            ($au:ident, $ai:ident, $u:ty, $i:ty) => {{
+                // SAFETY: aligned, inside one writable page.
+                let (a, s) = unsafe { ($au::from_ptr(p.cast()), $ai::from_ptr(p.cast())) };
+                let v = operand as $u;
+                u64::from(match op {
+                    AtomicOp::Add => a.fetch_add(v, order),
+                    AtomicOp::Clr => a.fetch_and(!v, order),
+                    AtomicOp::Eor => a.fetch_xor(v, order),
+                    AtomicOp::Set => a.fetch_or(v, order),
+                    AtomicOp::Smax => s.fetch_max(v as $i, order) as $u,
+                    AtomicOp::Smin => s.fetch_min(v as $i, order) as $u,
+                    AtomicOp::Umax => a.fetch_max(v, order),
+                    AtomicOp::Umin => a.fetch_min(v, order),
+                    AtomicOp::Swp => a.swap(v, order),
+                })
+            }};
+        }
+        Ok(match size {
+            1 => rmw!(AtomicU8, AtomicI8, u8, i8),
+            2 => rmw!(AtomicU16, AtomicI16, u16, i16),
+            4 => rmw!(AtomicU32, AtomicI32, u32, i32),
+            _ => rmw!(AtomicU64, AtomicI64, u64, i64),
+        })
+    }
+
+    /// `CAS` of `size` bytes (1, 2, 4 or 8) at an aligned `addr`: `new` replaces `expected` if
+    /// memory holds it, in one host compare-and-exchange. Returns what memory held. A compare
+    /// that fails still needs a writable page, as the Arm pseudocode's atomic access does.
+    pub fn compare_swap(
+        &self,
+        addr: u64,
+        size: u8,
+        expected: u64,
+        new: u64,
+        order: Ordering,
+    ) -> Result<u64, FaultKind> {
+        if !addr.is_multiple_of(u64::from(size)) {
+            return Err(FaultKind::Alignment);
+        }
+        let p = self.page_ptr(addr, usize::from(size), true, Some(u128::from(new)))?;
+        let failure = failure_order(order);
+        macro_rules! cas {
+            ($au:ident, $u:ty) => {{
+                // SAFETY: aligned, inside one writable page.
+                let a = unsafe { $au::from_ptr(p.cast()) };
+                let r = a.compare_exchange(expected as $u, new as $u, order, failure);
+                u64::from(r.unwrap_or_else(|v| v))
+            }};
+        }
+        Ok(match size {
+            1 => cas!(AtomicU8, u8),
+            2 => cas!(AtomicU16, u16),
+            4 => cas!(AtomicU32, u32),
+            _ => cas!(AtomicU64, u64),
+        })
+    }
+
+    /// `CASP` of X registers: [`GuestMemory::compare_swap`] of the 16 bytes at `addr`, which must be
+    /// 16-byte aligned. Returns what memory held.
+    pub fn compare_swap_128(
+        &self,
+        addr: u64,
+        expected: u128,
+        new: u128,
+        order: Ordering,
+    ) -> Result<u128, FaultKind> {
+        if !addr.is_multiple_of(16) {
+            return Err(FaultKind::Alignment);
+        }
+        let p = self.page_ptr(addr, 16, true, Some(new))?;
+        // SAFETY: 16 writable bytes inside one page, aligned to 16.
         Ok(unsafe { cas128(p.cast(), expected, new, order) })
     }
 
@@ -763,10 +856,21 @@ impl GuestMemory {
     }
 }
 
+/// The ordering of a compare-and-exchange that fails: never a release, never stronger.
+fn failure_order(order: Ordering) -> Ordering {
+    match order {
+        Ordering::Relaxed | Ordering::Release => Ordering::Relaxed,
+        Ordering::SeqCst => Ordering::SeqCst,
+        _ => Ordering::Acquire,
+    }
+}
+
+/// A 16-byte compare-and-exchange; returns what the bytes held.
+///
 /// # Safety
 /// `p` must point at 16 writable bytes, aligned to 16.
 #[cfg(target_arch = "x86_64")]
-unsafe fn cas128(p: *mut u128, expected: u128, new: u128, order: Ordering) -> bool {
+unsafe fn cas128(p: *mut u128, expected: u128, new: u128, order: Ordering) -> u128 {
     #[target_feature(enable = "cmpxchg16b")]
     unsafe fn exchange(p: *mut u128, expected: u128, new: u128, order: Ordering) -> u128 {
         // The failure ordering may be neither a release nor stronger than the success one.
@@ -777,7 +881,7 @@ unsafe fn cas128(p: *mut u128, expected: u128, new: u128, order: Ordering) -> bo
         core::arch::x86_64::cmpxchg16b(p, expected, new, order, failure)
     }
     if std::is_x86_feature_detected!("cmpxchg16b") {
-        return exchange(p, expected, new, order) == expected;
+        return exchange(p, expected, new, order);
     }
     cas128_locked(p, expected, new)
 }
@@ -785,7 +889,7 @@ unsafe fn cas128(p: *mut u128, expected: u128, new: u128, order: Ordering) -> bo
 /// # Safety
 /// `p` must point at 16 writable bytes, aligned to 16.
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn cas128(p: *mut u128, expected: u128, new: u128, _order: Ordering) -> bool {
+unsafe fn cas128(p: *mut u128, expected: u128, new: u128, _order: Ordering) -> u128 {
     cas128_locked(p, expected, new)
 }
 
@@ -794,18 +898,18 @@ unsafe fn cas128(p: *mut u128, expected: u128, new: u128, _order: Ordering) -> b
 ///
 /// # Safety
 /// `p` must point at 16 writable bytes, aligned to 8.
-unsafe fn cas128_locked(p: *mut u128, expected: u128, new: u128) -> bool {
+unsafe fn cas128_locked(p: *mut u128, expected: u128, new: u128) -> u128 {
     static LOCK: Mutex<()> = Mutex::new(());
     let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let words = p.cast::<u64>();
     let lo = AtomicU64::from_ptr(words).load(Ordering::Relaxed);
     let hi = AtomicU64::from_ptr(words.add(1)).load(Ordering::Relaxed);
-    if u128::from(lo) | (u128::from(hi) << 64) != expected {
-        return false;
+    let old = u128::from(lo) | (u128::from(hi) << 64);
+    if old == expected {
+        AtomicU64::from_ptr(words).store(new as u64, Ordering::Relaxed);
+        AtomicU64::from_ptr(words.add(1)).store((new >> 64) as u64, Ordering::Release);
     }
-    AtomicU64::from_ptr(words).store(new as u64, Ordering::Relaxed);
-    AtomicU64::from_ptr(words.add(1)).store((new >> 64) as u64, Ordering::Release);
-    true
+    old
 }
 
 /// # Safety

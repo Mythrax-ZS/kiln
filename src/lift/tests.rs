@@ -363,6 +363,11 @@ pub const TEMPLATES: &[(&str, u32, u32)] = &[
     ("load literal", 0x3F00_0000, 0x1800_0000),
     ("load/store pair", 0x3E00_0000, 0x2800_0000),
     ("exclusive and ordered", 0x3F00_0000, 0x0800_0000),
+    ("atomic memory operations", 0x3F20_0C00, 0x3820_0000),
+    ("compare and swap", 0x3FA0_7C00, 0x08A0_7C00),
+    ("compare and swap pair", 0xBFA0_7C00, 0x0820_7C00),
+    ("load with pointer authentication", 0xFF20_0400, 0xF820_0400),
+    ("pointer authentication", 0xFFFF_0000, 0xDAC1_0000),
     ("system register", 0xFFD0_0000, 0xD510_0000),
     ("system instruction", 0xFFD8_0000, 0xD508_0000),
     ("hint", 0xFFFF_F01F, 0xD503_201F),
@@ -497,9 +502,11 @@ fn encodings_that_trap_stop_the_same_way() {
         asm::sysreg(false, 3, 3, 13, 0, 3, 3), // msr tpidrro_el0, x3 (read only)
         asm::sys(false, 3, 7, 5, 0, 3),        // ic iallu is EL1
         asm::sys(true, 0, 1, 2, 3, 3),         // sysl
-        0xC8A0_7C41, // cas x0, x1, [x2]: Armv8.1 atomics are not implemented
-        0x4E28_4820, // aese v0.16b, v1.16b (implemented)
-        0x4EA0_8400, // add v0.4s, v0.4s, v0.4s (implemented)
+        0xC8A0_7C41,                           // cas x0, x1, [x2]
+        0x9AC1_3000,                           // pacga x0, x0, x1: left to the interpreter
+        0xD503_30FF,                           // sb: not implemented
+        0x4E28_4820,                           // aese v0.16b, v1.16b (implemented)
+        0x4EA0_8400,                           // add v0.4s, v0.4s, v0.4s (implemented)
     ];
     for w in words {
         for _ in 0..20 {

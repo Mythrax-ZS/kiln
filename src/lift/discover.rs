@@ -183,7 +183,7 @@ impl Build<'_> {
                         }
                         break;
                     }
-                    Inst::Svc { .. } | Inst::Unsupported { .. } => {
+                    Inst::Svc { .. } | Inst::Unsupported { .. } | Inst::Pacga { .. } => {
                         self.add_block(a + 4);
                         break;
                     }
@@ -264,7 +264,9 @@ impl Build<'_> {
                     targets: self.tables.get(&a).cloned().unwrap_or_default(),
                 },
             }),
-            Inst::Svc { .. } | Inst::Unsupported { .. } => Some(End::Call { ret: a + 4 }),
+            Inst::Svc { .. } | Inst::Unsupported { .. } | Inst::Pacga { .. } => {
+                Some(End::Call { ret: a + 4 })
+            }
             _ => traps(inst).map(|_| End::Trap),
         }
     }
@@ -419,8 +421,16 @@ pub fn discover(code: &dyn CodeSource, roots: &[u64], opts: &Options) -> Discove
         report.out_of_code.extend(out.bad.iter().copied());
         for block in cfg.blocks.values() {
             for &(pc, ref inst) in &block.insts {
-                if let Inst::Unsupported { what, .. } = inst {
-                    report.fallbacks.insert(pc, what);
+                match inst {
+                    Inst::Unsupported { what, .. } => {
+                        report.fallbacks.insert(pc, what);
+                    }
+                    Inst::Pacga { .. } => {
+                        report
+                            .fallbacks
+                            .insert(pc, "PACGA (FEAT_PAuth), interpreted");
+                    }
+                    _ => {}
                 }
                 if let Some(t) = traps(inst) {
                     report.traps.push((pc, t));

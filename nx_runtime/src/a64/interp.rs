@@ -464,6 +464,55 @@ pub fn execute<B: Bus + ?Sized>(cpu: &mut CpuState, bus: &mut B, inst: Inst) -> 
                 bus.write(addr, bytes, v)?;
             }
         }
+        Inst::Atomic {
+            op,
+            size,
+            rs,
+            rt,
+            rn,
+            ..
+        } => {
+            let bytes = 1u8 << size;
+            let addr = cpu.x_sp(rn);
+            check_align(addr, u64::from(bytes), true)?;
+            let operand = cpu.x_zr(rs) & mask(8 * u32::from(bytes));
+            let old = bus.atomic(addr, bytes, op, operand)?;
+            cpu.set_x_zr(rt, old);
+        }
+        Inst::Cas {
+            pair,
+            size,
+            rs,
+            rt,
+            rn,
+            ..
+        } => {
+            let esize = 1u8 << size;
+            let ebits = 8 * u32::from(esize);
+            let bytes = if pair { esize * 2 } else { esize };
+            let addr = cpu.x_sp(rn);
+            check_align(addr, u64::from(bytes), true)?;
+            let m = mask(ebits);
+            let join = |lo: u64, hi: u64| u128::from(lo & m) | (u128::from(hi & m) << ebits);
+            let (expected, new) = if pair {
+                (
+                    join(cpu.x_zr(rs), cpu.x_zr(rs + 1)),
+                    join(cpu.x_zr(rt), cpu.x_zr(rt + 1)),
+                )
+            } else {
+                (u128::from(cpu.x_zr(rs) & m), u128::from(cpu.x_zr(rt) & m))
+            };
+            let old = bus.compare_swap(addr, bytes, expected, new)?;
+            cpu.set_x_zr(rs, old as u64 & m);
+            if pair {
+                cpu.set_x_zr(rs + 1, (old >> ebits) as u64 & m);
+            }
+        }
+        Inst::Xpac { rd } => cpu.set_x_zr(rd, strip_pac(cpu.x_zr(rd))),
+        Inst::Pacga { rd, rn, rm } => {
+            let code = super::pac::pacga(cpu.x_zr(rn), cpu.x_sp(rm));
+            cpu.set_x_zr(rd, code);
+        }
 
         Inst::LogicalShifted {
             sf,

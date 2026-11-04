@@ -4,7 +4,7 @@ use super::abi::{self, stop, trap, FuncEntry, NativeCpu, EXIT_PC, STOP_PC};
 use super::census::{self, Kind};
 use super::mem::GuestMemory;
 use crate::a64::bus::{Bus, Fault, FaultKind, COUNTER_FREQUENCY};
-use crate::a64::inst::SysReg;
+use crate::a64::inst::{AtomicOp, SysReg};
 use crate::a64::interp::{step, Trap};
 use crate::a64::state::CpuState;
 use crate::slow::{self, SlowHost};
@@ -318,6 +318,38 @@ impl Runtime {
     pub fn clear_exclusive(&self, _thread: u64, st: &mut CpuState) {
         st.excl_size = 0;
     }
+
+    /// An LSE atomic by `thread` (see [`GuestMemory::atomic`]).
+    pub fn atomic(
+        &self,
+        _thread: u64,
+        addr: u64,
+        size: u8,
+        op: AtomicOp,
+        operand: u64,
+        order: Ordering,
+    ) -> Result<u64, FaultKind> {
+        self.mem.atomic(addr, size, op, operand, order)
+    }
+
+    /// `CAS` (1 to 8 bytes) or `CASP` (8 or 16) by `thread`: returns what memory held.
+    pub fn compare_swap(
+        &self,
+        _thread: u64,
+        addr: u64,
+        size: u8,
+        expected: u128,
+        new: u128,
+        order: Ordering,
+    ) -> Result<u128, FaultKind> {
+        if size == 16 {
+            self.mem.compare_swap_128(addr, expected, new, order)
+        } else {
+            self.mem
+                .compare_swap(addr, size, expected as u64, new as u64, order)
+                .map(u128::from)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -457,6 +489,22 @@ impl Bus for NativeBus {
 
     fn clear_exclusive(&mut self, cpu: &mut CpuState) {
         rt().clear_exclusive(self.thread, cpu);
+    }
+
+    fn atomic(&mut self, addr: u64, size: u8, op: AtomicOp, operand: u64) -> Result<u64, Fault> {
+        rt().atomic(self.thread, addr, size, op, operand, Ordering::SeqCst)
+            .map_err(|k| to_fault(addr, true, k))
+    }
+
+    fn compare_swap(
+        &mut self,
+        addr: u64,
+        size: u8,
+        expected: u128,
+        new: u128,
+    ) -> Result<u128, Fault> {
+        rt().compare_swap(self.thread, addr, size, expected, new, Ordering::SeqCst)
+            .map_err(|k| to_fault(addr, true, k))
     }
 
     fn counter(&mut self) -> u64 {

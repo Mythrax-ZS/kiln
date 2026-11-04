@@ -956,6 +956,231 @@ fn exclusive_pairs_of_instructions() {
     );
 }
 
+/// `LD<op>`/`SWP` (FEAT_LSE): `opc` with `o3` clear is the operation, `SWP` has `o3` set.
+#[allow(clippy::too_many_arguments)]
+fn lse(size: u32, a: bool, r: bool, rs: u8, o3: bool, opc: u32, rn: u8, rt: u8) -> u32 {
+    size << 30
+        | 0b111000 << 24
+        | u32::from(a) << 23
+        | u32::from(r) << 22
+        | 1 << 21
+        | u32::from(rs) << 16
+        | u32::from(o3) << 15
+        | opc << 12
+        | u32::from(rn) << 5
+        | u32::from(rt)
+}
+
+/// `CAS` of `1 << size` bytes, or `CASP` of W (`size` 2) or X (3) registers.
+fn cas_word(pair: bool, size: u32, l: bool, o0: bool, rs: u8, rn: u8, rt: u8) -> u32 {
+    let size_field = if pair { size - 2 } else { size };
+    size_field << 30
+        | 0b001000 << 24
+        | u32::from(!pair) << 23
+        | u32::from(l) << 22
+        | 1 << 21
+        | u32::from(rs) << 16
+        | u32::from(o0) << 15
+        | 0b11111 << 10
+        | u32::from(rn) << 5
+        | u32::from(rt)
+}
+
+#[test]
+fn lse_atomics_return_the_old_value_and_store_the_update() {
+    // (size, o3, opc, memory before, Rs, memory after)
+    let cases: [(u32, bool, u32, u64, u64, u64); 12] = [
+        (3, false, 0, u64::MAX, 2, 1),                        // ldadd: wraps
+        (0, false, 0, 0xFF, 1, 0),                            // ldaddb: wraps at 8 bits
+        (2, false, 0, 0xFFFF_FFFF, 0xFFFF_FFFF_0000_0001, 0), // ldadd w: Rs's top ignored
+        (2, false, 1, 0xFF00_FF00, 0x0F0F_0F0F, 0xF000_F000), // ldclr
+        (1, false, 2, 0x1234, 0xFFFF, 0xEDCB),                // ldeorh
+        (3, false, 3, 1, 1 << 63, (1 << 63) | 1),             // ldset
+        (0, false, 4, 0x80, 0x7F, 0x7F),                      // ldsmaxb: -128 < 127
+        (0, false, 4, 0x01, 0xFF, 0x01),                      // ldsmaxb: 1 > -1
+        (2, false, 5, 1, 0xFFFF_FFFF, 0xFFFF_FFFF),           // ldsmin: -1 < 1
+        (1, false, 6, 0x8000, 0x7FFF, 0x8000),                // ldumaxh
+        (3, false, 7, 5, 3, 3),                               // ldumin
+        (2, true, 0, 0xAAAA_AAAA, 0x5555_5555, 0x5555_5555),  // swp
+    ];
+    for (size, o3, opc, before, rs, after) in cases {
+        let bytes = 1u8 << size;
+        let mut m = Machine::new(&[lse(size, true, false, 2, o3, opc, 1, 3)]);
+        m.cpu.x[1] = DATA;
+        m.cpu.x[2] = rs;
+        m.cpu.x[3] = 0xDEAD_DEAD_DEAD_DEAD;
+        m.bus
+            .poke(DATA, 16, 0x5A5A_5A5A_5A5A_5A5A_5A5A_5A5A_5A5A_5A5A);
+        m.bus.poke(DATA, bytes, u128::from(before));
+        m.run(1).unwrap();
+        let what = format!("size {size} o3 {o3} opc {opc}");
+        assert_eq!(m.x(3), before, "{what}: the old value, zero-extended");
+        assert_eq!(m.bus.peek(DATA, bytes), u128::from(after), "{what}");
+        if bytes < 8 {
+            assert_eq!(
+                m.bus.peek(DATA + u64::from(bytes), 1),
+                0x5A,
+                "{what}: next byte kept"
+            );
+        }
+        assert_eq!(m.x(2), rs, "{what}: Rs is not written");
+    }
+
+    // st<op>: the old value goes to the zero register
+    let mut m = Machine::new(&[lse(3, false, false, 2, false, 0, 1, 31)]);
+    m.cpu.x[1] = DATA;
+    m.cpu.x[2] = 5;
+    m.bus.poke(DATA, 8, 10);
+    m.run(1).unwrap();
+    assert_eq!(m.bus.peek(DATA, 8), 15);
+
+    // the access is aligned and counts as a write
+    let mut m = Machine::new(&[lse(2, false, false, 2, false, 0, 1, 3)]);
+    m.cpu.x[1] = DATA + 2;
+    assert!(matches!(
+        m.run(1),
+        Err(Trap::Fault(f)) if f.kind == FaultKind::Alignment && f.write
+    ));
+    let mut m = Machine::new(&[lse(2, false, false, 2, false, 0, 1, 3)]);
+    m.cpu.x[1] = DATA;
+    m.bus.protect(DATA, DATA + 4);
+    assert!(matches!(
+        m.run(1),
+        Err(Trap::Fault(f)) if f.kind == FaultKind::Permission && f.write
+    ));
+    assert_eq!(m.x(3), 0, "no register changed");
+}
+
+#[test]
+fn compare_and_swap_singles_and_pairs() {
+    // cas x2, x3, [x1]: equal, so stored
+    let mut m = Machine::new(&[cas_word(false, 3, false, false, 2, 1, 3)]);
+    m.cpu.x[1] = DATA;
+    m.cpu.x[2] = 0x1111;
+    m.cpu.x[3] = 0x2222;
+    m.bus.poke(DATA, 8, 0x1111);
+    m.run(1).unwrap();
+    assert_eq!((m.x(2), m.bus.peek(DATA, 8)), (0x1111, 0x2222));
+
+    // casalb: compares the low byte only, and fails here
+    let mut m = Machine::new(&[cas_word(false, 0, true, true, 2, 1, 3)]);
+    m.cpu.x[1] = DATA;
+    m.cpu.x[2] = 0xFFFF_FF42;
+    m.cpu.x[3] = 0x77;
+    m.bus.poke(DATA, 2, 0x9941);
+    m.run(1).unwrap();
+    assert_eq!(m.x(2), 0x41, "Rs gets the old byte, zero-extended");
+    assert_eq!(m.bus.peek(DATA, 2), 0x9941, "nothing stored");
+
+    // ... and succeeds when the low byte matches, leaving the next byte alone
+    let mut m = Machine::new(&[cas_word(false, 0, true, true, 2, 1, 3)]);
+    m.cpu.x[1] = DATA;
+    m.cpu.x[2] = 0xFFFF_FF41;
+    m.cpu.x[3] = 0x177;
+    m.bus.poke(DATA, 2, 0x9941);
+    m.run(1).unwrap();
+    assert_eq!((m.x(2), m.bus.peek(DATA, 2)), (0x41, 0x9977));
+
+    // casp x4, x5, x6, x7, [x1]: both halves, low register at the low address
+    let casp = cas_word(true, 3, false, false, 4, 1, 6);
+    let mut m = Machine::new(&[casp, casp]);
+    m.cpu.x[1] = DATA;
+    m.cpu.x[4] = 0xA;
+    m.cpu.x[5] = 0xB;
+    m.cpu.x[6] = 0xC;
+    m.cpu.x[7] = 0xD;
+    m.bus.poke(DATA, 8, 0xA);
+    m.bus.poke(DATA + 8, 8, 0xB);
+    m.run(1).unwrap();
+    assert_eq!((m.x(4), m.x(5)), (0xA, 0xB));
+    assert_eq!((m.bus.peek(DATA, 8), m.bus.peek(DATA + 8, 8)), (0xC, 0xD));
+    // the second one fails (memory now holds C:D) and returns it
+    m.run(1).unwrap();
+    assert_eq!((m.x(4), m.x(5)), (0xC, 0xD));
+
+    // casp w: 8 bytes in all
+    let mut m = Machine::new(&[cas_word(true, 2, false, true, 4, 1, 6)]);
+    m.cpu.x[1] = DATA;
+    m.cpu.x[4] = 0x1_0000_0001; // only the low word counts
+    m.cpu.x[5] = 2;
+    m.cpu.x[6] = 3;
+    m.cpu.x[7] = 4;
+    m.bus.poke(DATA, 8, 0x0000_0002_0000_0001);
+    m.run(1).unwrap();
+    assert_eq!((m.x(4), m.x(5)), (1, 2));
+    assert_eq!(m.bus.peek(DATA, 8), 0x0000_0004_0000_0003);
+
+    // a pair aligned to 8 but not 16 is misaligned
+    let mut m = Machine::new(&[casp]);
+    m.cpu.x[1] = DATA + 8;
+    assert!(matches!(
+        m.run(1),
+        Err(Trap::Fault(f)) if f.kind == FaultKind::Alignment
+    ));
+
+    // a failing compare on read-only memory still faults as a write
+    let mut m = Machine::new(&[cas_word(false, 3, false, false, 2, 1, 3)]);
+    m.cpu.x[1] = DATA;
+    m.cpu.x[2] = 1;
+    m.bus.protect(DATA, DATA + 8);
+    assert!(matches!(
+        m.run(1),
+        Err(Trap::Fault(f)) if f.kind == FaultKind::Permission && f.write
+    ));
+}
+
+#[test]
+fn pointer_authentication_with_the_keys_off() {
+    use super::inst::strip_pac;
+    // pacia x0, x1; autdzb x0; paciasp; autiasp: nothing changes
+    let mut m = Machine::new(&[0xDAC1_0020, 0xDAC1_3FE0, asm::hint(25), asm::hint(29)]);
+    m.cpu.x[0] = 0x1234_5678;
+    m.cpu.x[30] = 0x8000_0000_0000_0010;
+    m.run(4).unwrap();
+    assert_eq!((m.x(0), m.x(30)), (0x1234_5678, 0x8000_0000_0000_0010));
+
+    // xpaci x5: the bits from 39 up copy bit 55
+    for (v, want) in [
+        (0x0000_7FFF_1234_5678u64, 0x0000_007F_1234_5678u64),
+        (0x0080_0000_0000_1000, 0xFFFF_FF80_0000_1000),
+        (0x0000_0080_0000_0000, 0x0000_0000_0000_0000),
+        (0x0000_0040_0000_0000, 0x0000_0040_0000_0000),
+        (0x0000_0012_3456_789A, 0x0000_0012_3456_789A),
+    ] {
+        assert_eq!(strip_pac(v), want, "{v:#x}");
+        let m = one(0xDAC1_43E5, |c| c.x[5] = v);
+        assert_eq!(m.x(5), want);
+    }
+
+    // retaa returns to x30; braa x1, x2 goes to x1; blraa x1, x2 also links
+    let m = one(0xD65F_0BFF, |c| c.x[30] = CODE + 0x40);
+    assert_eq!(m.cpu.pc, CODE + 0x40);
+    let m = one(0xD71F_0822, |c| c.x[1] = CODE + 0x80);
+    assert_eq!(m.cpu.pc, CODE + 0x80);
+    let m = one(0xD73F_0822, |c| c.x[1] = CODE + 0x80);
+    assert_eq!((m.cpu.pc, m.x(30)), (CODE + 0x80, CODE + 4));
+
+    // pacga x0, x1, x2 (the generic key is zero), and pacga x0, x1, sp
+    let m = one(0x9AC2_3020, |c| {
+        c.x[1] = 1;
+        c.x[2] = 2;
+    });
+    assert_eq!(m.x(0), 0x8d6a_3922_0000_0000);
+    let m = one(0x9ADF_3020, |c| {
+        c.x[1] = 1;
+        c.sp = 2;
+    });
+    assert_eq!(m.x(0), 0x8d6a_3922_0000_0000, "Rm = 31 is SP");
+
+    // ldraa x0, [x1, #8] and ldrab x0, [x1, #-8]!
+    let mut m = Machine::new(&[0xF820_1420, 0xF8FF_FC23]);
+    m.cpu.x[1] = DATA;
+    m.bus.poke(DATA + 8, 8, 0xAB);
+    m.bus.poke(DATA - 8, 8, 0xCD);
+    m.run(2).unwrap();
+    assert_eq!((m.x(0), m.x(3), m.x(1)), (0xAB, 0xCD, DATA - 8));
+}
+
 #[test]
 fn exclusive_register_pairs() {
     let ldxp = asm::exclusive(3, false, true, true, 31, false, 4, 1, 3); // ldxp x3, x4, [x1]
@@ -1166,10 +1391,10 @@ fn undefined_and_unsupported_instructions_stop_the_run() {
     let mut m = Machine::new(&[0x0000_0000]);
     assert_eq!(m.run(1), Err(Trap::Undefined(0)));
     assert_eq!(m.cpu.pc, CODE);
-    // cas x0, x1, [x2]: an Armv8.1 atomic, valid but not on the modelled core and not implemented.
-    let cas = 0xC8A0_7C41;
-    let mut m = Machine::new(&[cas]);
-    assert!(matches!(m.run(1), Err(Trap::Unsupported { word, .. }) if word == cas));
+    // sb: valid, and not implemented.
+    let sb = 0xD503_30FF;
+    let mut m = Machine::new(&[sb]);
+    assert!(matches!(m.run(1), Err(Trap::Unsupported { word, .. }) if word == sb));
     assert_eq!(m.cpu.pc, CODE);
 }
 

@@ -108,7 +108,8 @@ pub fn resolve(
             | Inst::Svc { .. }
             | Inst::Brk { .. }
             | Inst::Unallocated(_)
-            | Inst::Unsupported { .. } => break,
+            | Inst::Unsupported { .. }
+            | Inst::Pacga { .. } => break,
             _ => {}
         }
         window.push((prev, inst));

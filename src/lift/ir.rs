@@ -17,7 +17,7 @@
 //!   `MIN`); the code generator adds the guards LLVM needs;
 //! - a value is used only where its definition dominates the use.
 
-use nx_runtime::a64::inst::SysReg;
+use nx_runtime::a64::inst::{AtomicOp, SysReg};
 use std::fmt;
 
 pub type ValueId = u32;
@@ -373,6 +373,29 @@ pub enum Op {
         value: ValueId,
     },
     ClearExcl,
+    /// An LSE atomic (FEAT_LSE) of `bytes` (1, 2, 4 or 8) at an aligned address: memory becomes
+    /// `op(old, value)`. The result is the old value, an `i64` with the bits above `bytes` clear.
+    Atomic {
+        op: AtomicOp,
+        bytes: u8,
+        acquire: bool,
+        release: bool,
+        pc: u64,
+        addr: ValueId,
+        value: ValueId,
+    },
+    /// `CAS`/`CASP` of `bytes` (1 to 16) at an aligned address: `new` replaces `expected` if
+    /// memory holds it. The result is what memory held; the values are `i64` (the bits above
+    /// `bytes` clear), or `i128` for 16 bytes.
+    Cas {
+        bytes: u8,
+        acquire: bool,
+        release: bool,
+        pc: u64,
+        addr: ValueId,
+        expected: ValueId,
+        new: ValueId,
+    },
     Fence(Fence),
     /// `DC ZVA`.
     DcZva {
@@ -434,6 +457,20 @@ impl Op {
                 f(*addr);
                 f(*value);
             }
+            Op::Atomic { addr, value, .. } => {
+                f(*addr);
+                f(*value);
+            }
+            Op::Cas {
+                addr,
+                expected,
+                new,
+                ..
+            } => {
+                f(*addr);
+                f(*expected);
+                f(*new);
+            }
             Op::StoreField(_, v) => f(*v),
         }
     }
@@ -474,6 +511,20 @@ impl Op {
             Op::Store { addr, value, .. } | Op::StoreExcl { addr, value, .. } => {
                 *addr = f(*addr);
                 *value = f(*value);
+            }
+            Op::Atomic { addr, value, .. } => {
+                *addr = f(*addr);
+                *value = f(*value);
+            }
+            Op::Cas {
+                addr,
+                expected,
+                new,
+                ..
+            } => {
+                *addr = f(*addr);
+                *expected = f(*expected);
+                *new = f(*new);
             }
             Op::StoreField(_, v) => *v = f(*v),
         }
@@ -1083,6 +1134,24 @@ impl Func {
                     return bad("store-exclusive types");
                 }
             }
+            Op::Atomic { addr, value, .. } => {
+                if t(*addr) != Ty::I64 || t(*value) != Ty::I64 || inst.ty != Ty::I64 {
+                    return bad("atomic types");
+                }
+            }
+            Op::Cas {
+                bytes,
+                addr,
+                expected,
+                new,
+                ..
+            } => {
+                let want = if *bytes == 16 { Ty::I128 } else { Ty::I64 };
+                if t(*addr) != Ty::I64 || t(*expected) != want || t(*new) != want || inst.ty != want
+                {
+                    return bad("compare-and-swap types");
+                }
+            }
             Op::DcZva { addr, .. } => {
                 if t(*addr) != Ty::I64 {
                     return bad("dc zva address");
@@ -1257,6 +1326,30 @@ fn fmt_op(f: &mut fmt::Formatter<'_>, op: &Op) -> fmt::Result {
             value,
         } => write!(f, "stx{bytes} rel={release} %{addr}, %{value} @{pc:#x}"),
         Op::ClearExcl => write!(f, "clrex"),
+        Op::Atomic {
+            op,
+            bytes,
+            acquire,
+            release,
+            pc,
+            addr,
+            value,
+        } => write!(
+            f,
+            "atomic{bytes} {op:?} acq={acquire} rel={release} %{addr}, %{value} @{pc:#x}"
+        ),
+        Op::Cas {
+            bytes,
+            acquire,
+            release,
+            pc,
+            addr,
+            expected,
+            new,
+        } => write!(
+            f,
+            "cas{bytes} acq={acquire} rel={release} %{addr}, %{expected}, %{new} @{pc:#x}"
+        ),
         Op::Fence(k) => write!(f, "fence {k:?}"),
         Op::DcZva { pc, addr } => write!(f, "dczva %{addr} @{pc:#x}"),
         Op::Counter => write!(f, "counter"),

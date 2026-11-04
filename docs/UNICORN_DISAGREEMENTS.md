@@ -2,7 +2,11 @@
 
 Differential tests (`nx_runtime/tests/unicorn_diff.rs`) run the same instruction from the same
 random state on Unicorn 2.1 (QEMU 5 TCG, Cortex-A57 model) and on the project's interpreter and
-compare every register, the flags and memory. **Where Unicorn disagrees with the Arm pseudocode,
+compare every register, the flags and memory. The Armv8.1 to 8.3 forms a Switch 2 program uses
+(LSE atomics, `LDAPR`, pointer authentication), which are undefined on the Cortex-A57, are
+compared on Unicorn's `max` core instead, set up as docs/ASSUMPTIONS.md A-189 models the Switch
+2's core (pointer authentication not trapped, the keys off, the generic key zero, 39-bit halves
+of the address space). **Where Unicorn disagrees with the Arm pseudocode,
 the pseudocode wins** and the disagreement is recorded here. Entries tagged H are artifacts of how
 the harness drives Unicorn, not differences in the CPU model.
 
@@ -32,6 +36,8 @@ returning a value.
 | U-9 | Executes `FCMP`/`FCMPE` against `#0.0` when the `Rm` field, which the zero form fixes at zero, is not zero. | No encoding matches: the decoder reports it as unallocated. | 8 of 8,000,000 random words |
 | U-10 | A misaligned `LDAR`/`STLR`/`LDXR`/`STXR` to an unmapped or read-only address reports the translation or permission fault. | `AArch64.CheckAlignment` runs before the address is translated, so the access is an alignment fault. Both stop the run; only the reported cause differs. | 1 of 8,000,000 random words |
 | U-11 | Executes system registers and `SYS` operations that are not EL0 operations on the Switch's core or that the model does not provide (debug and PMU registers, the physical timer, `TLBI` and `DC` operations), because it runs the guest at EL1. | The interpreter stops with a report naming the encoding and never invents a value; a title that needs the register shows up as a stop with its address. | 16 of 8,000,000 random words |
+| U-12 | On the `max` core: a `LDSMAX`/`LDSMIN` of a byte, halfword or word zero-extends both values before comparing them as signed 64-bit numbers, which is the unsigned comparison: `LDSMAXB` of `0xFF` against memory `0x2D` stores `0xFF`. | Both are signed values of the access size: it keeps `0x2D`. Accepted only when Unicorn's store is exactly the unsigned comparison's and nothing else differs. | 375 of 60,000 cases of `switch_2_forms_match_unicorns_max_core` |
+| U-13 | On the `max` core: `XPACI`/`XPACD` do nothing while no pointer authentication key is enabled. | `Strip` replaces the code field whatever the keys (docs/ASSUMPTIONS.md A-189). Accepted only when Unicorn left the register unchanged and the interpreter's value is the strip. | 3 of 60,000 cases |
 
 ## Not compared (CONSTRAINED UNPREDICTABLE)
 

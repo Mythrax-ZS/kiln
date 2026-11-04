@@ -7,7 +7,7 @@ mod common;
 use common::gen::Gen;
 use common::harness::{Case, Class, Harness, Outcome, CODE_BASE, CODE_SIZE, DATA_BASE, DATA_SIZE};
 use common::{case_count, run_batch, unicorn_or_skip, Accepted};
-use nx_runtime::a64::inst::SysReg;
+use nx_runtime::a64::inst::{strip_pac, AtomicOp, SysReg};
 use nx_runtime::a64::{decode, Inst};
 use nx_runtime::testing::asm;
 
@@ -746,6 +746,158 @@ fn load_acquire_store_release() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The Armv8.1 to 8.3 forms of a Switch 2 program, on the max core
+// ---------------------------------------------------------------------------------------------
+
+/// Encoding groups of the forms a Switch 2 program uses that the Cortex-A57 does not have:
+/// `(name, mask, value)` as in the lifter's tests. The decoder is the same for both consoles; a
+/// Switch program never holds these words (they are undefined on its core).
+const SWITCH2_FORMS: &[(&str, u32, u32)] = &[
+    (
+        "atomic memory operations and LDAPR",
+        0x3F20_0C00,
+        0x3820_0000,
+    ),
+    ("compare and swap", 0x3FA0_7C00, 0x08A0_7C00),
+    ("compare and swap pair", 0xBFA0_7C00, 0x0820_7C00),
+    ("load with pointer authentication", 0xFF20_0400, 0xF820_0400),
+    ("pointer authentication", 0xFFFF_0000, 0xDAC1_0000),
+    ("PACGA", 0xFFE0_FC00, 0x9AC0_3000),
+    (
+        "branches with pointer authentication",
+        0xFE1F_F800,
+        0xD61F_0800,
+    ),
+];
+
+fn switch2_form(word: u32) -> Option<&'static str> {
+    SWITCH2_FORMS
+        .iter()
+        .find(|&&(_, mask, value)| word & mask == value)
+        .map(|&(name, _, _)| name)
+}
+
+/// What the max core does differently from the model, for the Switch 2 forms.
+fn known_switch2_differences(case: &Case, uc: &Outcome, mine: &Outcome) -> Option<Accepted> {
+    let last = decode(*case.words.last()?);
+    if mine.class == Class::Alignment
+        && matches!(
+            last,
+            Inst::Atomic { .. } | Inst::Cas { .. } | Inst::AcqRel { .. }
+        )
+    {
+        // H-2: a misaligned access is reported as a generic exception.
+        return (uc.class == Class::Exception).then_some(Accepted { id: "H-2" });
+    }
+    let same_registers = uc.state.x == mine.state.x
+        && uc.state.sp == mine.state.sp
+        && uc.state.pc == mine.state.pc
+        && uc.state.nzcv == mine.state.nzcv;
+    let both_ok = uc.class == Class::Ok && mine.class == Class::Ok;
+    match last {
+        // U-12: QEMU 5 zero-extends both values of a narrow LDSMAX/LDSMIN before its signed
+        // comparison, which makes it the unsigned one. The pseudocode compares both as signed
+        // values of the access size. Accepted only when Unicorn's store is exactly that
+        // comparison's and nothing else differs.
+        Inst::Atomic {
+            op: op @ (AtomicOp::Smax | AtomicOp::Smin),
+            size,
+            rs,
+            rn,
+            ..
+        } if size < 3 && both_ok && same_registers => {
+            let bytes = 1usize << size;
+            let off = reg_value(&case.state, rn, true).wrapping_sub(DATA_BASE) as usize;
+            let mut old = [0u8; 8];
+            old[..bytes].copy_from_slice(&case.data[off..off + bytes]);
+            let mask = (1u64 << (8 * bytes)) - 1;
+            let (a, b) = (
+                u64::from_le_bytes(old) as i64,
+                (reg_value(&case.state, rs, false) & mask) as i64,
+            );
+            let qemu = if op == AtomicOp::Smax {
+                a.max(b)
+            } else {
+                a.min(b)
+            } as u64;
+            let rest_same = uc.data[..off] == mine.data[..off]
+                && uc.data[off + bytes..] == mine.data[off + bytes..];
+            (uc.data[off..off + bytes] == qemu.to_le_bytes()[..bytes] && rest_same)
+                .then_some(Accepted { id: "U-12" })
+        }
+        // U-13: QEMU leaves out XPACI/XPACD while no key is enabled; the pseudocode strips the
+        // code field whatever the keys.
+        Inst::Xpac { rd } if both_ok => {
+            let before = reg_value(&case.state, rd, false);
+            let mut uc_x = uc.state.x;
+            uc_x[usize::from(rd)] = strip_pac(before);
+            (uc.state.x[usize::from(rd)] == before
+                && mine.state.x[usize::from(rd)] == strip_pac(before)
+                && uc_x == mine.state.x)
+                .then_some(Accepted { id: "U-13" })
+        }
+        _ => wild_branch_target(case, uc, mine),
+    }
+}
+
+fn gen_switch2(g: &mut Gen) -> Case {
+    loop {
+        let (_, mask, value) = SWITCH2_FORMS[g.below(SWITCH2_FORMS.len() as u64) as usize];
+        let word = (g.rng.next_u32() & !mask) | value;
+        // ERETAA and ERETAB are EL1 instructions, which Unicorn runs the guest at.
+        if matches!(decode(word), Inst::Unsupported { .. }) {
+            continue;
+        }
+        let mut case = g.case(vec![word]);
+        let rn = ((word >> 5) & 31) as u8;
+        let size = word >> 30;
+        let mut addr = g.data_pointer(0x1000, 0x1000);
+        if g.below(4) != 0 {
+            addr &= !((2u64 << size) - 1); // aligned for a pair too
+        }
+        set_base(&mut case, rn, addr);
+        // A branch goes into the code region, which holds NOPs (H-1).
+        if let Inst::BranchReg { rn: target, .. } = decode(word) {
+            if target != 31 {
+                case.state.x[usize::from(target)] = CODE_BASE + 4 * g.below(CODE_SIZE as u64 / 4);
+            }
+        }
+        // The registers a compare-and-swap compares often hold what memory holds (never the
+        // base register, which must keep pointing at the data).
+        if matches!(decode(word), Inst::Cas { .. }) && g.flag() {
+            let rs = ((word >> 16) & 31) as usize;
+            let off = (addr.wrapping_sub(DATA_BASE)) as usize;
+            let base = usize::from(rn);
+            if rs < 31 && rs != base && rs + 1 != base && off + 16 <= case.data.len() {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&case.data[off..off + 8]);
+                case.state.x[rs] = u64::from_le_bytes(b);
+                if rs + 1 < 31 {
+                    b.copy_from_slice(&case.data[off + 8..off + 16]);
+                    case.state.x[rs + 1] = u64::from_le_bytes(b);
+                }
+            }
+        }
+        return case;
+    }
+}
+
+#[test]
+fn switch_2_forms_match_unicorns_max_core() {
+    let Some(api) = unicorn_or_skip() else { return };
+    let mut h = Harness::with_engine(api.engine_max());
+    let mut g = Gen::new(0x5A2);
+    run_batch(
+        "Switch 2 forms on the max core",
+        &mut h,
+        case_count(60_000),
+        false,
+        |_, _| gen_switch2(&mut g),
+        known_switch2_differences,
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Random words: decoder coverage and execution parity
 // ---------------------------------------------------------------------------------------------
 
@@ -760,6 +912,7 @@ fn random_words_decode_and_execute_like_unicorn() {
     let mut skipped_unsupported = 0usize;
     let mut unsupported_what: std::collections::BTreeMap<&'static str, usize> = Default::default();
     let mut skipped_unpredictable = 0usize;
+    let mut switch2_only = 0usize;
     let mut extra_sysregs = 0usize;
     // Encodings the decoder rejects but Unicorn executes, by family.
     let mut gaps: std::collections::BTreeMap<&'static str, Vec<u32>> = Default::default();
@@ -774,6 +927,11 @@ fn random_words_decode_and_execute_like_unicorn() {
         }
         if constrained_unpredictable(&inst) {
             skipped_unpredictable += 1;
+            continue;
+        }
+        // Undefined on the Cortex-A57; `switch_2_forms_match_unicorns_max_core` compares them.
+        if !matches!(inst, Inst::Unallocated(_)) && switch2_form(word).is_some() {
+            switch2_only += 1;
             continue;
         }
         // Registers: a mix of data pointers and boundary values so that memory forms hit mapped memory.
@@ -837,6 +995,7 @@ fn random_words_decode_and_execute_like_unicorn() {
     eprintln!(
         "random words: {n} drawn; {supported} executed on both, {unallocated_both} unallocated on both, \
          {skipped_unsupported} in unsupported groups, {skipped_unpredictable} CONSTRAINED UNPREDICTABLE (not compared), \
+         {switch2_only} Switch 2 forms (compared on the max core), \
          {extra_sysregs} system registers only Unicorn implements, \
          {total_gaps} strict-decoder rejections Unicorn executes"
     );

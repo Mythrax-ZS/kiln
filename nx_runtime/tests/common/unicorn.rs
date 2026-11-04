@@ -11,6 +11,8 @@ use std::path::PathBuf;
 pub const ARCH_ARM64: c_uint = 2;
 pub const MODE_ARM: c_uint = 0;
 pub const CPU_ARM64_A57: c_int = 0;
+/// QEMU's `max` core: FEAT_LSE, FEAT_LRCPC, FEAT_PAuth (QARMA5), FP16 and more.
+pub const CPU_ARM64_MAX: c_int = 3;
 pub const CTL_CPU_MODEL: c_int = 7;
 pub const CTL_TB_FLUSH: c_int = 10;
 pub const CTL_TB_REMOVE_CACHE: c_int = 9;
@@ -44,6 +46,19 @@ pub mod reg {
     pub const FPCR: c_int = 291;
     pub const FPSR: c_int = 292;
     pub const Q0: c_int = 104; // Q0..Q31 are consecutive
+    /// Any system register, through a `uc_arm64_cp_reg`.
+    pub const CP_REG: c_int = 290;
+}
+
+/// `uc_arm64_cp_reg`.
+#[repr(C)]
+struct CpReg {
+    crn: u32,
+    crm: u32,
+    op0: u32,
+    op1: u32,
+    op2: u32,
+    val: u64,
 }
 
 type Open = unsafe extern "C" fn(c_uint, c_uint, *mut *mut c_void) -> c_int;
@@ -144,6 +159,25 @@ impl Api {
         assert_eq!(err, ERR_OK, "selecting the Cortex-A57 model failed: {err}");
         Engine { api: self, uc }
     }
+
+    /// A fresh engine on the `max` core, set up as this project models the Switch 2's core
+    /// (docs/ASSUMPTIONS.md A-189): pointer authentication not trapped to EL2 or EL3
+    /// (`HCR_EL2`/`SCR_EL3` API and APK), the instruction and data keys off (`SCTLR_EL1` as it
+    /// resets), the generic key zero, and 39-bit halves of the address space with the top byte
+    /// not ignored (`TCR_EL1.T0SZ` and `T1SZ` = 25), which decide the bits `XPAC` strips.
+    pub fn engine_max(&self) -> Engine<'_> {
+        let mut uc: *mut c_void = std::ptr::null_mut();
+        let err = unsafe { (self.open)(ARCH_ARM64, MODE_ARM, &mut uc) };
+        assert_eq!(err, ERR_OK, "uc_open failed: {err}");
+        let ctl = CTL_CPU_MODEL | (1 << 26) | (CTL_IO_WRITE << 30);
+        let err = unsafe { (self.ctl)(uc, ctl, CPU_ARM64_MAX) };
+        assert_eq!(err, ERR_OK, "selecting the max model failed: {err}");
+        let mut e = Engine { api: self, uc };
+        e.write_sysreg([3, 4, 1, 1, 0], 1 << 41 | 1 << 40 | 1 << 31); // HCR_EL2: API, APK, RW
+        e.write_sysreg([3, 6, 1, 1, 0], 1 << 17 | 1 << 16 | 1 << 10 | 1); // SCR_EL3: API, APK, RW, NS
+        e.write_sysreg([3, 0, 2, 0, 2], 25 | 25 << 16); // TCR_EL1: T0SZ, T1SZ
+        e
+    }
 }
 
 pub struct Engine<'a> {
@@ -187,6 +221,24 @@ impl Engine<'_> {
         let mut v = value;
         let err = unsafe { (self.api.reg_write)(self.uc, id, (&mut v as *mut u64).cast()) };
         assert_eq!(err, ERR_OK, "uc_reg_write({id}) failed: {err}");
+    }
+
+    /// Write the system register `op0:op1:CRn:CRm:op2`.
+    pub fn write_sysreg(&mut self, [op0, op1, crn, crm, op2]: [u32; 5], val: u64) {
+        let mut r = CpReg {
+            crn,
+            crm,
+            op0,
+            op1,
+            op2,
+            val,
+        };
+        let err =
+            unsafe { (self.api.reg_write)(self.uc, reg::CP_REG, (&mut r as *mut CpReg).cast()) };
+        assert_eq!(
+            err, ERR_OK,
+            "writing system register {op0}:{op1}:{crn}:{crm}:{op2} failed: {err}"
+        );
     }
 
     pub fn reg_read(&mut self, id: c_int) -> u64 {

@@ -358,9 +358,36 @@ pub fn supervisor_calls(base: u64) -> Vec<u32> {
 pub fn unsupported_instruction(base: u64) -> Vec<u32> {
     let mut p = Prog::new(base);
     p.emit(asm::add_imm(true, 0, 0, 1));
-    p.emit(0xC8A0_7C41); // cas x0, x1, [x2]: Armv8.1 atomics are not implemented
+    p.emit(0xD503_30FF); // sb: FEAT_SB is not implemented
     p.emit(asm::add_imm(true, 0, 0, 2));
     p.emit(asm::ret(30));
+    p.finish()
+}
+
+/// LSE atomics and compare-and-swap at the stack pointer, which the tests keep 16-byte aligned,
+/// so that the compares succeed as well as fail; the return is `RETAA`.
+pub fn atomics(base: u64) -> Vec<u32> {
+    let mut p = Prog::new(base);
+    for w in [
+        0xF940_03E2, // ldr x2, [sp]
+        0xC8A2_7FE3, // cas x2, x3, [sp]: succeeds
+        0xC8A2_7FE3, // cas x2, x3, [sp]: fails unless x2 was x3
+        0xF8E4_03E5, // ldaddal x4, x5, [sp]
+        0x4826_7FE8, // casp x6, x7, x8, x9, [sp]: fails unless the pair matches
+        0xA940_1FE6, // ldp x6, x7, [sp]
+        0x4826_7FE8, // casp x6, x7, x8, x9, [sp]: succeeds
+        0xB8EA_83EB, // swpal w10, w11, [sp]
+        0x3821_53EF, // ldsminb w1, w15, [sp]
+        0xF82C_63FF, // stumax x12, [sp]
+        0xF940_03ED, // ldr x13, [sp]
+        0xDAC1_43EE, // xpaci x14
+        0xDAC1_0020, // pacia x0, x1
+        0x9ACD_3010, // pacga x16, x0, x13: left to the interpreter
+        0x9ADF_3071, // pacga x17, x3, sp
+        0xD65F_0BFF, // retaa
+    ] {
+        p.emit(w);
+    }
     p.finish()
 }
 
@@ -493,6 +520,7 @@ pub fn catalogue(base: u64) -> Vec<Entry> {
         ),
         entry("supervisor calls", supervisor_calls(base)),
         entry("unsupported instruction", unsupported_instruction(base)),
+        entry("atomics and pointer authentication", atomics(base)),
     ];
     let (words, hints) = indirect_calls(base);
     v.push(Entry {

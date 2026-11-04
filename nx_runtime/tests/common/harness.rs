@@ -161,7 +161,11 @@ fn state_of(v: &[u64]) -> CpuState {
 
 impl<'a> Harness<'a> {
     pub fn new(api: &'a Api) -> Harness<'a> {
-        let mut engine = api.engine();
+        Harness::with_engine(api.engine())
+    }
+
+    /// A harness around an engine set up by the caller (for example [`Api::engine_max`]).
+    pub fn with_engine(mut engine: Engine<'a>) -> Harness<'a> {
         // Guest stores must not rewrite the code under test, in either backend; the harness itself
         // writes instructions with host-side writes, which Unicorn allows on a read-only region.
         engine.map_with(

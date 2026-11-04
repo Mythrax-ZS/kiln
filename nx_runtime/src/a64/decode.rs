@@ -226,29 +226,26 @@ fn decode_branch_reg(w: u32) -> Inst {
     if op2 != 0b11111 {
         return Inst::Unallocated(w);
     }
-    if op3 != 0 || op4 != 0 {
-        return if op3 >> 1 == 1 {
-            unsupported(w, "pointer authentication (FEAT_PAuth)")
-        } else {
-            Inst::Unallocated(w)
-        };
-    }
-    match opc {
-        0b0000 => Inst::BranchReg {
-            kind: BranchReg::Br,
-            rn,
-        },
-        0b0001 => Inst::BranchReg {
-            kind: BranchReg::Blr,
-            rn,
-        },
-        0b0010 => Inst::BranchReg {
-            kind: BranchReg::Ret,
-            rn,
-        },
-        0b0100 | 0b0101 => unsupported(w, "ERET/DRPS (not available to EL0)"),
-        _ => Inst::Unallocated(w),
-    }
+    // FEAT_PAuth forms have op3 = 00001x (bit 10 picks key A or B). With the keys off (A-189)
+    // authenticating the target returns it unchanged: BRAA and the rest are BR, BLR and RET.
+    let pauth = op3 >> 1 == 1;
+    let plain = op3 == 0 && op4 == 0;
+    let (kind, rn) = match (opc, pauth) {
+        (0b0000, false) if plain => (BranchReg::Br, rn),
+        (0b0001, false) if plain => (BranchReg::Blr, rn),
+        (0b0010, false) if plain => (BranchReg::Ret, rn),
+        (0b0000, true) if op4 == 31 => (BranchReg::Br, rn), // BRAAZ, BRABZ
+        (0b0001, true) if op4 == 31 => (BranchReg::Blr, rn), // BLRAAZ, BLRABZ
+        (0b0010, true) if rn == 31 && op4 == 31 => (BranchReg::Ret, 30), // RETAA, RETAB
+        (0b1000, true) => (BranchReg::Br, rn),              // BRAA, BRAB (op4: the modifier)
+        (0b1001, true) => (BranchReg::Blr, rn),             // BLRAA, BLRAB
+        (0b0100 | 0b0101, false) if plain => {
+            return unsupported(w, "ERET/DRPS (not available to EL0)")
+        }
+        (0b0100, true) => return unsupported(w, "ERETAA/ERETAB (not available to EL0)"),
+        _ => return Inst::Unallocated(w),
+    };
+    Inst::BranchReg { kind, rn }
 }
 
 fn sysreg_of(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> SysReg {
@@ -387,7 +384,19 @@ fn decode_exclusive(w: u32) -> Inst {
         },
         (false, true) => {
             if size < 2 {
-                return Inst::Unallocated(w);
+                // CASP (FEAT_LSE): bit 30 picks W or X pairs, both registers even.
+                if rt2 != 31 || rs & 1 != 0 || rt & 1 != 0 {
+                    return Inst::Unallocated(w);
+                }
+                return Inst::Cas {
+                    pair: true,
+                    size: 2 + size,
+                    acquire: load,
+                    release: o0,
+                    rs,
+                    rt,
+                    rn,
+                };
             }
             Inst::Exclusive {
                 load,
@@ -410,7 +419,74 @@ fn decode_exclusive(w: u32) -> Inst {
             }
             Inst::AcqRel { load, size, rt, rn }
         }
-        (true, true) => unsupported(w, "compare and swap (FEAT_LSE)"),
+        (true, true) => {
+            if rt2 != 31 {
+                return Inst::Unallocated(w);
+            }
+            Inst::Cas {
+                pair: false,
+                size,
+                acquire: load,
+                release: o0,
+                rs,
+                rt,
+                rn,
+            }
+        }
+    }
+}
+
+/// Atomic memory operations (FEAT_LSE): `LD<op>`, `ST<op>`, `SWP`, and `LDAPR` (FEAT_LRCPC).
+fn decode_atomic(w: u32) -> Inst {
+    let size = bits(w, 31, 30) as u8;
+    let acquire = bit(w, 23);
+    let release = bit(w, 22);
+    let rs = bits(w, 20, 16) as u8;
+    let rn = bits(w, 9, 5) as u8;
+    let rt = bits(w, 4, 0) as u8;
+    let op = match (bit(w, 15), bits(w, 14, 12)) {
+        (false, opc) => AtomicOp::LD[opc as usize],
+        (true, 0b000) => AtomicOp::Swp,
+        (true, 0b100) if acquire && !release && rs == 31 => {
+            return Inst::AcqRel {
+                load: true,
+                size,
+                rt,
+                rn,
+            }
+        }
+        _ => return Inst::Unallocated(w),
+    };
+    Inst::Atomic {
+        op,
+        size,
+        acquire,
+        release,
+        rs,
+        rt,
+        rn,
+    }
+}
+
+/// `LDRAA`/`LDRAB` (FEAT_PAuth): a 64-bit load at the base plus a signed, scaled 10-bit offset,
+/// with writeback when bit 11 is set. With the keys off (A-189) the base is not changed by its
+/// authentication: an ordinary `LDR`.
+fn decode_load_authenticated(w: u32) -> Inst {
+    if bits(w, 31, 30) != 0b11 {
+        return Inst::Unallocated(w);
+    }
+    let imm10 = (bits(w, 22, 22) << 9) | bits(w, 20, 12);
+    let offset = ((i64::from(imm10) << 54) >> 54) << 3;
+    Inst::LdSt {
+        kind: MemKind::Load,
+        size: 3,
+        rt: bits(w, 4, 0) as u8,
+        rn: bits(w, 9, 5) as u8,
+        mode: if bit(w, 11) {
+            AddrMode::PreIndex(offset)
+        } else {
+            AddrMode::Offset(offset)
+        },
     }
 }
 
@@ -447,6 +523,13 @@ fn decode_pair(w: u32) -> Inst {
 }
 
 fn decode_single(w: u32) -> Inst {
+    if !bit(w, 24) && bit(w, 21) {
+        match bits(w, 11, 10) {
+            0b00 => return decode_atomic(w),
+            0b01 | 0b11 => return decode_load_authenticated(w),
+            _ => {} // register offset, below
+        }
+    }
     let size = bits(w, 31, 30) as u8;
     let opc = bits(w, 23, 22);
     let rn = bits(w, 9, 5) as u8;
@@ -495,8 +578,7 @@ fn decode_single(w: u32) -> Inst {
                     amount: if bit(w, 12) { size } else { 0 },
                 }
             }
-            0b00 => return unsupported(w, "atomic memory operations (FEAT_LSE)"),
-            _ => return unsupported(w, "load/store with pointer authentication"),
+            _ => unreachable!("decoded above"),
         }
     };
     // Prefetch with a pre/post-indexed form is unallocated.
@@ -667,8 +749,10 @@ fn decode_dp_reg(w: u32) -> Inst {
 }
 
 fn decode_dp1(w: u32, sf: bool, rd: u8, rn: u8) -> Inst {
-    if bits(w, 20, 16) != 0 {
-        return unsupported(w, "pointer authentication (FEAT_PAuth)");
+    match bits(w, 20, 16) {
+        0b00000 => {}
+        0b00001 => return decode_pauth(w, sf, rd, rn),
+        _ => return Inst::Unallocated(w),
     }
     let op = match (bits(w, 15, 10), sf) {
         (0b000000, _) => Dp1Op::Rbit,
@@ -681,6 +765,21 @@ fn decode_dp1(w: u32, sf: bool, rd: u8, rn: u8) -> Inst {
         _ => return Inst::Unallocated(w),
     };
     Inst::DataProc1 { sf, op, rd, rn }
+}
+
+/// The pointer authentication instructions of data processing (1 source), FEAT_PAuth. With the
+/// keys off (A-189) adding or checking a code returns the register unchanged, which makes every
+/// `PAC*` and `AUT*` form a no-op.
+fn decode_pauth(w: u32, sf: bool, rd: u8, rn: u8) -> Inst {
+    if !sf {
+        return Inst::Unallocated(w);
+    }
+    match bits(w, 15, 10) {
+        0b000000..=0b000111 => Inst::Hint { imm: 0 }, // PACIA, PACIB, PACDA, PACDB, AUTIA, ...
+        0b001000..=0b001111 if rn == 31 => Inst::Hint { imm: 0 }, // PACIZA, ..., AUTDZB
+        0b010000 | 0b010001 if rn == 31 => Inst::Xpac { rd }, // XPACI, XPACD
+        _ => Inst::Unallocated(w),
+    }
 }
 
 fn decode_dp2(w: u32, sf: bool, rd: u8, rn: u8, rm: u8) -> Inst {
@@ -701,9 +800,8 @@ fn decode_dp2(w: u32, sf: bool, rd: u8, rn: u8, rm: u8) -> Inst {
                 c: v & 4 != 0,
             }
         }
-        0b000000 | 0b000100 | 0b000101 | 0b001100 => {
-            return unsupported(w, "memory tagging or pointer authentication")
-        }
+        0b000000 | 0b000100 | 0b000101 if sf => return unsupported(w, "memory tagging (FEAT_MTE)"),
+        0b001100 if sf => return Inst::Pacga { rd, rn, rm },
         _ => return Inst::Unallocated(w),
     };
     Inst::DataProc2 { sf, op, rd, rn, rm }

@@ -300,6 +300,36 @@ impl<'f> Evaluator<'f> {
                 bus.clear_exclusive(cpu);
                 0
             }
+            Op::Atomic {
+                op,
+                bytes,
+                pc,
+                addr,
+                value,
+                ..
+            } => {
+                let a = self.get(*addr) as u64;
+                if let Some(f) = align_fault(a, u64::from(*bytes), true) {
+                    return Err((f, *pc));
+                }
+                let v = self.get(*value) as u64;
+                u128::from(bus.atomic(a, *bytes, *op, v).map_err(|f| (f, *pc))?)
+            }
+            Op::Cas {
+                bytes,
+                pc,
+                addr,
+                expected,
+                new,
+                ..
+            } => {
+                let a = self.get(*addr) as u64;
+                if let Some(f) = align_fault(a, u64::from(*bytes), true) {
+                    return Err((f, *pc));
+                }
+                bus.compare_swap(a, *bytes, self.get(*expected), self.get(*new))
+                    .map_err(|f| (f, *pc))?
+            }
             Op::Fence(_) => 0,
             Op::DcZva { pc, addr } => {
                 let base = (self.get(*addr) as u64) & !(ZVA_BLOCK - 1);

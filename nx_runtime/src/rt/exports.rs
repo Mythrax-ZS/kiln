@@ -15,6 +15,7 @@ use super::runtime::{
 };
 use crate::a64::bits::crc32_update;
 use crate::a64::bus::{FaultKind, ZVA_BLOCK};
+use crate::a64::inst::AtomicOp;
 use crate::a64::vec;
 use std::ffi::c_void;
 use std::sync::atomic::Ordering::{self, Acquire, Relaxed, Release};
@@ -173,6 +174,115 @@ pub extern "C" fn nx_stx(
         Err(k) => {
             record_fault(c, addr, pc, true, k);
             1
+        }
+    }
+}
+
+/// The ordering an atomic's flags ask for: bit 0 acquire, bit 1 release.
+fn atomic_order(flags: u32) -> Ordering {
+    match flags & 3 {
+        0 => Relaxed,
+        1 => Acquire,
+        2 => Release,
+        _ => Ordering::AcqRel,
+    }
+}
+
+/// An LSE atomic (`LD<op>`, `ST<op>`, `SWP`) of `bytes` (1, 2, 4 or 8) at `addr`: `op` is
+/// [`AtomicOp::code`], `order` [`atomic_order`]'s flags. Returns what memory held.
+#[no_mangle]
+pub extern "C" fn nx_atomic(
+    p: *mut NativeCpu,
+    addr: u64,
+    operand: u64,
+    pc: u64,
+    bytes: u32,
+    op: u32,
+    order: u32,
+) -> u64 {
+    let c = cpu(p);
+    let Some(op) = AtomicOp::from_code(op) else {
+        record_trap(c, trap::UNDEFINED, pc, u64::from(op), 0);
+        return 0;
+    };
+    match rt().atomic(
+        c.ctl.thread_id,
+        addr,
+        bytes as u8,
+        op,
+        operand,
+        atomic_order(order),
+    ) {
+        Ok(old) => old,
+        Err(k) => {
+            record_fault(c, addr, pc, true, k);
+            0
+        }
+    }
+}
+
+/// `CAS` of `bytes` (1, 2, 4 or 8), or `CASP` of W registers (8), at `addr`. Returns what memory
+/// held.
+#[no_mangle]
+pub extern "C" fn nx_cas(
+    p: *mut NativeCpu,
+    addr: u64,
+    expected: u64,
+    new: u64,
+    pc: u64,
+    bytes: u32,
+    order: u32,
+) -> u64 {
+    let c = cpu(p);
+    let r = rt().compare_swap(
+        c.ctl.thread_id,
+        addr,
+        bytes as u8,
+        u128::from(expected),
+        u128::from(new),
+        atomic_order(order),
+    );
+    match r {
+        Ok(old) => old as u64,
+        Err(k) => {
+            record_fault(c, addr, pc, true, k);
+            0
+        }
+    }
+}
+
+/// `CASP` of X registers: 16 bytes at `addr`. Returns the low 64 bits of what memory held and
+/// leaves the high 64 in `ctl.aux`.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nx_cas128(
+    p: *mut NativeCpu,
+    addr: u64,
+    expected_lo: u64,
+    expected_hi: u64,
+    new_lo: u64,
+    new_hi: u64,
+    pc: u64,
+    order: u32,
+) -> u64 {
+    let c = cpu(p);
+    let join = |lo: u64, hi: u64| u128::from(lo) | (u128::from(hi) << 64);
+    let r = rt().compare_swap(
+        c.ctl.thread_id,
+        addr,
+        16,
+        join(expected_lo, expected_hi),
+        join(new_lo, new_hi),
+        atomic_order(order),
+    );
+    match r {
+        Ok(old) => {
+            c.ctl.aux = (old >> 64) as u64;
+            old as u64
+        }
+        Err(k) => {
+            record_fault(c, addr, pc, true, k);
+            0
         }
     }
 }
@@ -465,6 +575,9 @@ pub const GENERATED_CODE_SYMBOLS: &[&str] = &[
     "nx_hle",
     "nx_stx",
     "nx_clrex",
+    "nx_atomic",
+    "nx_cas",
+    "nx_cas128",
     "nx_dczva",
     "nx_counter",
     "nx_crc32",

@@ -52,6 +52,9 @@ pub fn declarations(defines_dispatcher: bool) -> String {
         "declare i64 @nx_ldx(ptr, i64, i64, i32, i32)",
         "declare i32 @nx_stx(ptr, i64, i64, i64, i64, i32, i32)",
         "declare void @nx_clrex(ptr)",
+        "declare i64 @nx_atomic(ptr, i64, i64, i64, i32, i32, i32)",
+        "declare i64 @nx_cas(ptr, i64, i64, i64, i64, i32, i32)",
+        "declare i64 @nx_cas128(ptr, i64, i64, i64, i64, i64, i64, i32)",
         "declare void @nx_dczva(ptr, i64, i64)",
         "declare i64 @nx_counter()",
         "declare i32 @nx_crc32(i32, i64, i32, i32) memory(none) nounwind",
@@ -470,6 +473,77 @@ impl<'a> Emitter<'a> {
                 self.fault_check(b, split);
             }
             Op::ClearExcl => self.line("call void @nx_clrex(ptr %cpu)"),
+            Op::Atomic {
+                op,
+                bytes,
+                acquire,
+                release,
+                pc,
+                addr,
+                value,
+            } => {
+                let line = format!(
+                    "{r} = call i64 @nx_atomic(ptr %cpu, i64 {}, i64 {}, i64 {}, i32 {bytes}, i32 {}, i32 {})",
+                    self.val(addr),
+                    self.val(value),
+                    pc as i64,
+                    op.code(),
+                    u8::from(acquire) | u8::from(release) << 1
+                );
+                self.line(&line);
+                self.fault_check(b, split);
+            }
+            Op::Cas {
+                bytes,
+                acquire,
+                release,
+                pc,
+                addr,
+                expected,
+                new,
+            } => {
+                let order = u8::from(acquire) | u8::from(release) << 1;
+                if bytes == 16 {
+                    let mut halves = |v: ValueId| {
+                        let lo = self.temp("cl");
+                        self.line(&format!("{lo} = trunc i128 {} to i64", self.val(v)));
+                        let sh = self.temp("cs");
+                        self.line(&format!("{sh} = lshr i128 {}, 64", self.val(v)));
+                        let hi = self.temp("ch");
+                        self.line(&format!("{hi} = trunc i128 {sh} to i64"));
+                        (lo, hi)
+                    };
+                    let (el, eh) = halves(expected);
+                    let (nl, nh) = halves(new);
+                    let lo = self.temp("co");
+                    let line = format!(
+                        "{lo} = call i64 @nx_cas128(ptr %cpu, i64 {}, i64 {el}, i64 {eh}, i64 {nl}, i64 {nh}, i64 {}, i32 {order})",
+                        self.val(addr),
+                        pc as i64
+                    );
+                    self.line(&line);
+                    let p = self.ptr(cpu_offsets::AUX);
+                    let hi = self.temp("cp");
+                    self.line(&format!("{hi} = load i64, ptr {p}"));
+                    let l128 = self.temp("cz");
+                    self.line(&format!("{l128} = zext i64 {lo} to i128"));
+                    let h128 = self.temp("cy");
+                    self.line(&format!("{h128} = zext i64 {hi} to i128"));
+                    let sh = self.temp("cx");
+                    self.line(&format!("{sh} = shl i128 {h128}, 64"));
+                    self.line(&format!("{r} = or i128 {l128}, {sh}"));
+                } else {
+                    let line = format!(
+                        "{r} = call i64 @nx_cas(ptr %cpu, i64 {}, i64 {}, i64 {}, i64 {}, i32 {bytes}, i32 {order})",
+                        self.val(addr),
+                        self.val(expected),
+                        self.val(new),
+                        pc as i64
+                    );
+                    self.line(&line);
+                }
+                self.fault_check(b, split);
+            }
             Op::Fence(kind) => match kind {
                 Fence::Acquire => self.line("fence acquire"),
                 Fence::Release => self.line("fence release"),

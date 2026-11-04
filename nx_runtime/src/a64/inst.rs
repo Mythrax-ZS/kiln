@@ -107,6 +107,90 @@ pub enum BranchReg {
     Ret,
 }
 
+/// The update of an LSE atomic (FEAT_LSE, Armv8.1): `LD<op>`, its `ST<op>` alias and `SWP`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AtomicOp {
+    Add,
+    /// `LDCLR`: memory AND NOT the operand.
+    Clr,
+    Eor,
+    /// `LDSET`: memory OR the operand.
+    Set,
+    Smax,
+    Smin,
+    Umax,
+    Umin,
+    Swp,
+}
+
+impl AtomicOp {
+    /// The operations in the order of the encoding's `opc` field (`SWP` has `o3` set instead).
+    pub const LD: [AtomicOp; 8] = [
+        AtomicOp::Add,
+        AtomicOp::Clr,
+        AtomicOp::Eor,
+        AtomicOp::Set,
+        AtomicOp::Smax,
+        AtomicOp::Smin,
+        AtomicOp::Umax,
+        AtomicOp::Umin,
+    ];
+
+    /// The number generated code passes for the operation (`nx_atomic`).
+    pub fn code(self) -> u32 {
+        match self {
+            AtomicOp::Swp => 8,
+            op => AtomicOp::LD.iter().position(|&o| o == op).unwrap_or(0) as u32,
+        }
+    }
+
+    /// The operation [`AtomicOp::code`] numbers.
+    pub fn from_code(code: u32) -> Option<AtomicOp> {
+        match code {
+            8 => Some(AtomicOp::Swp),
+            c => AtomicOp::LD.get(c as usize).copied(),
+        }
+    }
+
+    /// What memory holds afterwards, from what it held and the operand (both `bits` wide, the
+    /// bits above zero).
+    pub fn apply(self, old: u64, operand: u64, bits: u32) -> u64 {
+        let m = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let signed = |v: u64| ((v << (64 - bits)) as i64) >> (64 - bits);
+        let r = match self {
+            AtomicOp::Add => old.wrapping_add(operand),
+            AtomicOp::Clr => old & !operand,
+            AtomicOp::Eor => old ^ operand,
+            AtomicOp::Set => old | operand,
+            AtomicOp::Smax => signed(old).max(signed(operand)) as u64,
+            AtomicOp::Smin => signed(old).min(signed(operand)) as u64,
+            AtomicOp::Umax => old.max(operand),
+            AtomicOp::Umin => old.min(operand),
+            AtomicOp::Swp => operand,
+        };
+        r & m
+    }
+}
+
+/// The lowest bit of the pointer authentication code in a pointer: the address space is 39 bits
+/// (docs/ASSUMPTIONS.md A-189).
+pub const PAC_BOTTOM_BIT: u32 = 39;
+
+/// `Strip` of the Arm pseudocode (`XPACI`, `XPACD`) with the top byte not ignored: the bits from
+/// [`PAC_BOTTOM_BIT`] up become copies of bit 55.
+pub fn strip_pac(v: u64) -> u64 {
+    let low = (1u64 << PAC_BOTTOM_BIT) - 1;
+    if v >> 55 & 1 == 1 {
+        v | !low
+    } else {
+        v & low
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BarrierKind {
     Dsb,
@@ -328,12 +412,47 @@ pub enum Inst {
         rt2: Reg,
         rn: Reg,
     },
-    /// LDAR / STLR (load-acquire, store-release; alignment checked).
+    /// LDAR / STLR (load-acquire, store-release; alignment checked), and LDAPR (FEAT_LRCPC), whose
+    /// weaker ordering a load-acquire satisfies.
     AcqRel {
         load: bool,
         size: u8,
         rt: Reg,
         rn: Reg,
+    },
+    /// An LSE atomic (FEAT_LSE): `[Xn|SP]` becomes `op(old, Rs)`; Rt, unless it is ZR, receives
+    /// the old value zero-extended. Aligned to the access size, which is `1 << size` bytes.
+    Atomic {
+        op: AtomicOp,
+        size: u8,
+        acquire: bool,
+        release: bool,
+        rs: Reg,
+        rt: Reg,
+        rn: Reg,
+    },
+    /// `CAS` (FEAT_LSE): if `[Xn|SP]` holds Rs, it becomes Rt; Rs receives the old value. With
+    /// `pair` (`CASP`) the registers are Rs, Rs + 1 and Rt, Rt + 1 (even numbers; 31 is ZR), the
+    /// first of each at the lower address, and the access is twice `1 << size` bytes.
+    Cas {
+        pair: bool,
+        size: u8,
+        acquire: bool,
+        release: bool,
+        rs: Reg,
+        rt: Reg,
+        rn: Reg,
+    },
+    /// `XPACI` and `XPACD`: [`strip_pac`] of Rd. (`XPACLRI` is in the hint space and stays the
+    /// Cortex-A57's no-op, A-189.)
+    Xpac {
+        rd: Reg,
+    },
+    /// `PACGA Xd, Xn, Xm|SP` ([`super::pac::pacga`]). The lifter leaves it to the interpreter.
+    Pacga {
+        rd: Reg,
+        rn: Reg,
+        rm: Reg,
     },
 
     // ---- data processing, register ----

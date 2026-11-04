@@ -285,6 +285,60 @@ fn another_threads_store_of_every_size_fails_a_store_exclusive() {
 }
 
 #[test]
+fn lse_atomics_are_atomic_across_threads_and_fault_like_stores() {
+    use crate::a64::inst::AtomicOp;
+    map(0x1340_0000, 0x1000);
+    let addr = 0x1340_0040;
+    let setup = Cpu::new();
+    nx_st64(setup.0, addr, 0, 0);
+    let add = AtomicOp::Add.code();
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(move || {
+                let c = Cpu::new();
+                for _ in 0..20_000 {
+                    nx_atomic(c.0, addr, 1, 0x10, 8, add, 3);
+                }
+            });
+        }
+    });
+    assert_eq!(nx_ld64(setup.0, addr, 0), 80_000, "no increment lost");
+
+    // A narrow signed maximum compares at the access size; the bytes around it stay.
+    nx_st64(setup.0, addr, 0x1111_1111_1111_1180, 0);
+    let old = nx_atomic(setup.0, addr, 0x7F, 0x10, 1, AtomicOp::Smax.code(), 0);
+    assert_eq!(
+        (old, nx_ld64(setup.0, addr, 0)),
+        (0x80, 0x1111_1111_1111_117F)
+    );
+
+    // cas returns the old value either way; casp moves both halves
+    assert_eq!(
+        nx_cas(setup.0, addr, 1, 2, 0x14, 8, 0),
+        0x1111_1111_1111_117F
+    );
+    assert_eq!(
+        nx_cas(setup.0, addr, 0x1111_1111_1111_117F, 2, 0x14, 8, 0),
+        0x1111_1111_1111_117F
+    );
+    assert_eq!(nx_ld64(setup.0, addr, 0), 2);
+    nx_st64(setup.0, addr + 8, 3, 0);
+    assert_eq!(nx_cas128(setup.0, addr, 2, 3, 5, 6, 0x18, 3), 2);
+    assert_eq!(setup.c().ctl.aux, 3);
+    assert_eq!(
+        (nx_ld64(setup.0, addr, 0), nx_ld64(setup.0, addr + 8, 0)),
+        (5, 6)
+    );
+
+    // misaligned: an alignment fault that counts as a write
+    let c = Cpu::new();
+    nx_atomic(c.0, addr + 2, 1, 0x20, 4, add, 0);
+    let ctl = &c.c().ctl;
+    assert_eq!((ctl.fault_flag, ctl.fault_kind, ctl.fault_write), (1, 2, 1));
+    assert_eq!(ctl.stop_pc, 0x20);
+}
+
+#[test]
 fn store_exclusive_needs_its_own_reservation() {
     map(0x1300_0000, 0x1000);
     let a = Cpu::new();
@@ -577,11 +631,11 @@ fn stops_are_recorded_with_their_details() {
     );
     assert_eq!(c.state.pc, STOP_PC);
 
-    // brk, an undefined word, an unsupported word (an Armv8.1 atomic), an EL1-only register.
+    // brk, an undefined word, an unsupported word (sb), an EL1-only register.
     for (word, kind, aux) in [
         (asm::brk(0x123), trap::BRK, 0x123u64),
         (0x0000_0000, trap::UNDEFINED, 0),
-        (0xC8A0_7C41, trap::UNSUPPORTED, 0xC8A0_7C41),
+        (0xD503_30FF, trap::UNSUPPORTED, 0xD503_30FF),
         (asm::sysreg(true, 3, 0, 0, 0, 0, 3), trap::SYSREG, 3 << 14),
     ] {
         put_words(0x2300_0100, &[word]);
