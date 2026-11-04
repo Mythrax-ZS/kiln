@@ -625,6 +625,26 @@ fn discovery_finds_the_functions_and_tables() {
 }
 
 #[test]
+fn straight_line_code_that_leaves_its_function_or_the_code_ends_a_block() {
+    use super::cfg::{End, Target};
+    let words = vec![asm::nop(), asm::nop(), asm::nop(), asm::ret(30)];
+    // The extent says the function is two instructions long: the third begins another one.
+    let opts = Options {
+        ranges: vec![(CODE, CODE + 8)],
+    };
+    let d = discover(&Image::new(words), &[CODE], &opts);
+    let f = &d.funcs[&CODE];
+    assert_eq!(f.blocks[&CODE].end, End::Fall(CODE + 8));
+    assert_eq!(f.blocks[&(CODE + 8)].end, End::Jump(Target::Tail(CODE + 8)));
+    assert!(d.funcs.contains_key(&(CODE + 8)), "the rest is a function");
+
+    // No return before the end of the code.
+    let d = discovery(&[asm::nop(), asm::nop()]);
+    assert_eq!(d.report.out_of_code, [CODE + 8]);
+    assert_eq!(d.funcs[&CODE].blocks[&(CODE + 8)].end, End::OutOfCode);
+}
+
+#[test]
 fn division_edge_cases() {
     // sdiv/udiv in both widths over the awkward operand pairs.
     let pairs: [(u64, u64); 8] = [

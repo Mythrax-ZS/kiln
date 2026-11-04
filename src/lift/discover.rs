@@ -136,14 +136,18 @@ impl Build<'_> {
                 if self.insts.contains_key(&a) || self.bad.contains(&a) {
                     break;
                 }
+                // Both stops below begin a block of their own, also when straight-line code (not
+                // a branch) reached them.
                 if !self.in_bounds(a) {
                     // Straight-line code left the function: continue as a tail call.
                     self.fell_off.insert(a);
                     self.new_roots.insert(a);
+                    self.leaders.insert(a);
                     break;
                 }
                 let Some(word) = self.code.word(a) else {
                     self.bad.insert(a);
+                    self.leaders.insert(a);
                     break;
                 };
                 let inst = decode(word);
