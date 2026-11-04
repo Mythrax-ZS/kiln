@@ -62,6 +62,8 @@ pub mod attr {
     pub const IPC_LOCKED: u32 = 2;
     pub const DEVICE_SHARED: u32 = 4;
     pub const UNCACHED: u32 = 8;
+    /// The permission may not change any more [17.0.0+] (docs/ASSUMPTIONS.md A-193).
+    pub const PERMISSION_LOCKED: u32 = 0x10;
 }
 
 /// Pages the kernel layer keeps for objects the program cannot see (the backing of shared memory

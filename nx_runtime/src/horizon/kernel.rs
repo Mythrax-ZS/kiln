@@ -1726,9 +1726,9 @@ impl Kernel {
             )
         };
         if covered != size
-            || blocks
-                .iter()
-                .any(|(_, _, i)| !reprotectable(i.mem_type) || i.attr & attr::LOCKED != 0)
+            || blocks.iter().any(|(_, _, i)| {
+                !reprotectable(i.mem_type) || i.attr & (attr::LOCKED | attr::PERMISSION_LOCKED) != 0
+            })
         {
             return err::INVALID_CURRENT_MEMORY;
         }
@@ -1750,7 +1750,13 @@ impl Kernel {
         if size == 0 || !size.is_multiple_of(PAGE) {
             return err::INVALID_SIZE;
         }
-        if mask != attr::UNCACHED || value & !attr::UNCACHED != 0 {
+        // Uncached, and the permission lock, which can be set and never cleared (A-193).
+        let supported = attr::UNCACHED | attr::PERMISSION_LOCKED;
+        if mask == 0
+            || (mask | value) != mask
+            || (mask | supported) != supported
+            || (mask & attr::PERMISSION_LOCKED != 0 && value & attr::PERMISSION_LOCKED == 0)
+        {
             return err::INVALID_COMBINATION;
         }
         let mut st = self.lock();

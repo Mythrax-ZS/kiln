@@ -860,7 +860,23 @@ impl Kernel {
             22 => self.used_memory(),
             23 => u64::from(self.process.kind == super::kernel::ProcessKind::Nso),
             29..=33 => switch_2.unwrap_or_default(),
-            9 | 24 | 26..=28 => {
+            // AliasRegionExtraSize [18.0.0+]: none unless the NPDM asks for it with flag bit 6
+            // (docs/ASSUMPTIONS.md A-191).
+            28 => {
+                let asks = self
+                    .process
+                    .npdm
+                    .as_ref()
+                    .is_some_and(|n| n.meta.flags0 & 0x40 != 0);
+                if asks {
+                    return Err(
+                        "GetInfo 28 for a program whose NPDM enables the alias region's extra size is not implemented"
+                            .to_string(),
+                    );
+                }
+                0
+            }
+            9 | 24 | 26 | 27 => {
                 return Err(format!(
                     "GetInfo with information type {id} is not implemented"
                 ))
