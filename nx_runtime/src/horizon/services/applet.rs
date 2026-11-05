@@ -315,11 +315,18 @@ impl Service for SelfController {
             // A Switch 2 program's: the graphics supervisor, a TIPC session of its own handed
             // over as a copied handle (`nn::gsv::BootWithRemoteMemory`, A-194).
             2000 => {
-                let gpu = lock(&self.shared).gpu.clone().ok_or_else(|| {
-                    Stop("the graphics supervisor was asked for with no GPU driver".into())
-                })?;
+                let (gpu, display) = {
+                    let a = lock(&self.shared);
+                    (a.gpu.clone(), a.display.clone())
+                };
+                let (Some(gpu), Some(display)) = (gpu, display) else {
+                    return Err(Stop(
+                        "the graphics supervisor was asked for with no GPU driver or display"
+                            .into(),
+                    ));
+                };
                 Ok(Response::ok().with_copy_handle(KObject::session(Box::new(
-                    super::gsv::Supervisor::new(self.kernel.clone(), gpu),
+                    super::gsv::Supervisor::new(self.kernel.clone(), gpu, display),
                 ))))
             }
             other => Err(Stop::unknown_command("ISelfController", other)),

@@ -9,7 +9,7 @@
 use super::super::kernel::Kernel;
 use super::super::object::KObject;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
-use super::nvdrv;
+use super::{nvdrv, vi};
 use std::sync::{Arc, Weak};
 
 /// `nn::gsv`'s supervisor session.
@@ -17,15 +17,21 @@ use std::sync::{Arc, Weak};
 pub struct Supervisor {
     kernel: Weak<Kernel>,
     gpu: Arc<nvdrv::Shared>,
+    display: Arc<vi::Shared>,
     /// Command 11 was sent.
     client_registered: bool,
 }
 
 impl Supervisor {
-    pub fn new(kernel: Weak<Kernel>, gpu: Arc<nvdrv::Shared>) -> Supervisor {
+    pub fn new(
+        kernel: Weak<Kernel>,
+        gpu: Arc<nvdrv::Shared>,
+        display: Arc<vi::Shared>,
+    ) -> Supervisor {
         Supervisor {
             kernel,
             gpu,
+            display,
             client_registered: false,
         }
     }
@@ -223,6 +229,261 @@ impl Service for Syncpt {
     }
 }
 
+/// `nx2:vi2`: the display, as a Switch 2 program sees it (A-198).
+#[derive(Debug)]
+pub struct Vi2Session {
+    kernel: Weak<Kernel>,
+    display: Arc<vi::Shared>,
+    /// The layers made with 201, by the client's token.
+    layers: std::collections::BTreeSet<u64>,
+    /// This session's keys in the display's list of vsync listeners: this, with the slot in the
+    /// low byte.
+    key: u64,
+    /// The (writable, readable) ends of each native event slot's event, once acquired (31).
+    native: [Option<(KObject, KObject)>; VI2_NATIVE_EVENTS],
+}
+
+/// The buffer slots of a layer, as the bits `vi2` hands back.
+const VI2_ALL_SLOTS: u64 = 0x7FFF;
+/// The displays `vi2` has and the timestamp recorders it says it has.
+const VI2_DISPLAYS: u32 = 1;
+const VI2_TIMESTAMP_RECORDERS: u32 = 7;
+/// The native event slots of a session (31, 32 and the bindings of 261 to 272).
+const VI2_NATIVE_EVENTS: usize = 8;
+
+/// The eight-byte name (of a display or a layer stack) at `at` of a request, without its zeros.
+fn vi2_name(req: &Request, at: usize) -> Vec<u8> {
+    let raw = req.data.get(at..at + 8).unwrap_or_default();
+    raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())].to_vec()
+}
+
+/// Stop unless the request names the one display, `default`, at `at`.
+fn vi2_default_display(req: &Request, at: usize) -> Result<(), Stop> {
+    let name = vi2_name(req, at);
+    if name != b"default" {
+        return Err(Stop(format!(
+            "nx2:vi2 {} of the display `{}`; only `default` exists",
+            req.command,
+            String::from_utf8_lossy(&name)
+        )));
+    }
+    Ok(())
+}
+
+impl Vi2Session {
+    pub fn new(kernel: Weak<Kernel>, display: Arc<vi::Shared>) -> Vi2Session {
+        static SESSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Vi2Session {
+            kernel,
+            display,
+            layers: Default::default(),
+            key: SESSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 8,
+            native: Default::default(),
+        }
+    }
+
+    /// The native event slot named by the request's u32 at `at`.
+    fn slot(req: &Request, at: usize) -> Result<usize, Stop> {
+        let slot = req.u32_at(at) as usize;
+        if slot >= VI2_NATIVE_EVENTS {
+            return Err(Stop(format!(
+                "nx2:vi2 {} of the native event {slot}; a session has {VI2_NATIVE_EVENTS}",
+                req.command
+            )));
+        }
+        Ok(slot)
+    }
+
+    /// The (writable, readable) ends of an acquired slot's event.
+    fn acquired(&self, req: &Request, slot: usize) -> Result<(KObject, KObject), Stop> {
+        self.native[slot].clone().ok_or_else(|| {
+            Stop(format!(
+                "nx2:vi2 {} of the native event {slot}, which was not acquired",
+                req.command
+            ))
+        })
+    }
+
+    fn listener(&self, slot: usize) -> u64 {
+        self.key | slot as u64
+    }
+}
+
+impl Drop for Vi2Session {
+    fn drop(&mut self) {
+        for slot in 0..VI2_NATIVE_EVENTS {
+            self.display.unlisten_vsync(self.listener(slot));
+        }
+    }
+}
+
+impl Service for Vi2Session {
+    fn name(&self) -> &str {
+        "nx2:vi2"
+    }
+
+    fn request(&mut self, req: &Request) -> ServiceResult {
+        Err(Stop(format!(
+            "nx2:vi2 was sent a CMIF message (command {}); it speaks TIPC",
+            req.command
+        )))
+    }
+
+    fn request_tipc(&mut self, req: &Request) -> ServiceResult {
+        let kernel = self
+            .kernel
+            .upgrade()
+            .ok_or_else(|| Stop("the process is gone".into()))?;
+        match req.command {
+            // Handshake(u64) -> the same u64
+            0 => Ok(Response::ok().with_u64(req.u64_at(0))),
+            1 | 3 => Ok(Response::ok().with_u32(VI2_DISPLAYS)),
+            // GetTimestampRecorderCount -> u32 (the SDK's stub stops the program at 8 or more).
+            5 => Ok(Response::ok().with_u32(VI2_TIMESTAMP_RECORDERS)),
+            // An event the program waits on whose cause is not known: nothing sets it.
+            11 => Ok(Response::ok().with_copy_handle(kernel.new_event().1)),
+            // (u32 count) from nn::vi2::CreateTimestampRecorder, before its first recorder: how many
+            // of the recorders of 5 the program uses, the count of 5 or 7 if that is less; only
+            // the result is read.
+            51 => {
+                if req.u32_at(0) > VI2_TIMESTAMP_RECORDERS {
+                    return Err(Stop(format!(
+                        "nx2:vi2 51 asks for {} timestamp recorders of {VI2_TIMESTAMP_RECORDERS}",
+                        req.u32_at(0)
+                    )));
+                }
+                Ok(Response::ok())
+            }
+            // AcquireNativeEvent(u32 slot) -> event: the slot's event, made the first time. Nothing
+            // sets it until the slot is bound to a source of the display (261 to 271).
+            31 => {
+                let slot = Self::slot(req, 0)?;
+                let (_, readable) = self.native[slot]
+                    .get_or_insert_with(|| kernel.new_event())
+                    .clone();
+                Ok(Response::ok().with_copy_handle(readable))
+            }
+            // DuplicateNativeEvent(handle, u32 slot) -> event: the client hands back the handle of
+            // an acquired slot and gets the slot's event again.
+            32 => {
+                let slot = Self::slot(req, 0)?;
+                Ok(Response::ok().with_copy_handle(self.acquired(req, slot)?.1))
+            }
+            // OpenDisplay(char name[8], u32), from nn::vi::detail::DefaultDisplay::OnOpen: the one
+            // display is "default"; only the result is read.
+            101 => {
+                vi2_default_display(req, 0)?;
+                Ok(Response::ok())
+            }
+            // QueryDisplayRefreshRate(display name) -> u64: 1 is 60 Hz (2 is 120 Hz and bit 63
+            // none, the SDK's conversion to nn::vi::RefreshRate).
+            103 => {
+                vi2_default_display(req, 0)?;
+                Ok(Response::ok().with_u64(1))
+            }
+            // QueryDisplayHdrStatus(display name) -> u64 format, u16: format 1 is SDR output (2 is
+            // HDR); the SDK passes the u16 on, taken for the panel's peak luminance in nits.
+            104 => {
+                vi2_default_display(req, 0)?;
+                Ok(Response::ok()
+                    .with_u64(1)
+                    .with_bytes(&VI2_PEAK_NITS.to_le_bytes()))
+            }
+            // QueryDisplayHdrPaperWhite(display name) -> u16 nits
+            105 => {
+                vi2_default_display(req, 0)?;
+                Ok(Response::ok().with_bytes(&VI2_PAPER_WHITE_NITS.to_le_bytes()))
+            }
+            // QueryDisplayBufferMaxResolution(display name) -> u64: 2 is 1920x1080, the handheld
+            // screen's (1 is 1280x720, 4 2560x1440 and 8 3840x2160 in the SDK's table).
+            106 => {
+                vi2_default_display(req, 0)?;
+                Ok(Response::ok().with_u64(2))
+            }
+            // (char display[8], char stack[8], u64 layer): the layer joins a layer stack of the
+            // display (Layer::OnOpen); one layer is shown here, so there is nothing to order. Only
+            // the result is read.
+            111 => {
+                vi2_default_display(req, 0)?;
+                if !self.layers.contains(&req.u64_at(16)) {
+                    return Err(Stop(format!(
+                        "nx2:vi2 111 of the unknown layer {:#x}",
+                        req.u64_at(16)
+                    )));
+                }
+                Ok(Response::ok())
+            }
+            // CreateLayer(u64 client token, u32, u32), from nn::vi::CreateLayer through
+            // nn::vi::Layer::OnOpen: the token names the layer from then on; only the result is
+            // read.
+            201 => {
+                if !self.layers.insert(req.u64_at(0)) {
+                    return Err(Stop(format!(
+                        "nx2:vi2 201 made the layer {:#x} a second time",
+                        req.u64_at(0)
+                    )));
+                }
+                Ok(Response::ok())
+            }
+            // GetLayerBufferBits(u64 layer) -> u64: the slots the client may draw into, all of
+            // them while the display holds none.
+            212 => {
+                if !self.layers.contains(&req.u64_at(0)) {
+                    return Err(Stop(format!(
+                        "nx2:vi2 212 of the unknown layer {:#x}",
+                        req.u64_at(0)
+                    )));
+                }
+                Ok(Response::ok().with_u64(VI2_ALL_SLOTS))
+            }
+            // (u64 layer, char display[8]): the layer goes on the display (from Layer::OnOpen
+            // too); only the result is read.
+            251 => {
+                vi2_default_display(req, 8)?;
+                if !self.layers.contains(&req.u64_at(0)) {
+                    return Err(Stop(format!(
+                        "nx2:vi2 251 of the unknown layer {:#x}",
+                        req.u64_at(0)
+                    )));
+                }
+                Ok(Response::ok())
+            }
+            // Bind(display name, u32 slot): 261 to the vsync, which sets the slot at every vblank
+            // from then on; 263 the refresh rate, 265 the HDR status, 267 the HDR paper white, 269
+            // the largest buffer resolution and 271 the mode capability. None of those changes
+            // here, so their slot is set once, when it is bound: the SDK asks for a value only
+            // after its event was set, and keeps the one it has otherwise.
+            261 | 263 | 265 | 267 | 269 | 271 => {
+                vi2_default_display(req, 0)?;
+                let slot = Self::slot(req, 8)?;
+                let (writable, _) = self.acquired(req, slot)?;
+                self.display.unlisten_vsync(self.listener(slot));
+                if req.command == 261 {
+                    self.display
+                        .listen_vsync(&kernel, self.listener(slot), writable);
+                } else {
+                    kernel.set_event(&writable, true);
+                }
+                Ok(Response::ok())
+            }
+            // Unbind(display name, u32 slot), the even numbers after each: the slot is no longer
+            // set by its source.
+            262 | 264 | 266 | 268 | 270 | 272 => {
+                vi2_default_display(req, 0)?;
+                let slot = Self::slot(req, 8)?;
+                self.acquired(req, slot)?;
+                self.display.unlisten_vsync(self.listener(slot));
+                Ok(Response::ok())
+            }
+            other => Err(Stop::unknown_command(self.name(), other)),
+        }
+    }
+}
+
+/// What `vi2` says of the panel's luminance: its peak and its reference white, in nits (A-198).
+const VI2_PEAK_NITS: u16 = 400;
+const VI2_PAPER_WHITE_NITS: u16 = 203;
+
 /// `nx2:nvsrv`: the GPU driver's session, which, unlike the supervisor, speaks CMIF: `nvdrv`'s
 /// commands (Open, Ioctl, Close, Initialize, QueryEvent and the rest) with the same arguments
 /// (A-194).
@@ -285,6 +546,10 @@ impl Service for Supervisor {
                     gpu: self.gpu.clone(),
                 }))),
             ),
+            // OpenViSession(u64): presentation (A-198).
+            305 => Ok(Response::ok().with_copy_handle(KObject::session(Box::new(
+                Vi2Session::new(self.kernel.clone(), self.display.clone()),
+            )))),
             // nn::nvsrv::BootWithRemoteMemory: a session of the GPU driver (A-194).
             1402 => Ok(
                 Response::ok().with_copy_handle(KObject::session(Box::new(NvSrv(
@@ -310,7 +575,11 @@ mod tests {
 
     #[test]
     fn the_supervisor_answers_what_it_knows_over_tipc_and_stops_on_the_rest() {
-        let mut s = Supervisor::new(Weak::new(), nvdrv::Shared::new());
+        let mut s = Supervisor::new(
+            Weak::new(),
+            nvdrv::Shared::new(),
+            Arc::new(vi::Shared::new()),
+        );
         assert!(s.request_tipc(&req(4)).is_ok(), "BootWithRemoteMemory");
         assert!(s.request_tipc(&req(11)).is_ok() && s.request_tipc(&req(101)).is_ok());
         assert!(
@@ -331,5 +600,76 @@ mod tests {
             s.request(&req(4)).is_err(),
             "a CMIF message is not the supervisor's"
         );
+    }
+
+    /// A vi2 request naming a display and a slot (the shape of 261 to 272).
+    fn named(command: u32, display: &[u8; 8], slot: u32) -> Request {
+        Request {
+            command,
+            data: [display.as_slice(), &slot.to_le_bytes()].concat(),
+            ..Request::default()
+        }
+    }
+
+    #[test]
+    fn a_vi2_native_event_is_set_by_the_source_it_is_bound_to() {
+        use super::super::super::kernel::{ProcessInfo, ProcessKind};
+        let kernel = Kernel::new(ProcessInfo::new("vi2", ProcessKind::Nso, None));
+        let mut v = Vi2Session::new(Arc::downgrade(&kernel), Arc::new(vi::Shared::new()));
+        let display = b"default\0";
+        assert!(
+            v.request_tipc(&named(261, display, 0)).is_err(),
+            "a slot is acquired before it is bound"
+        );
+        let mut acquire = req(31);
+        acquire.data = 0u32.to_le_bytes().to_vec();
+        let event = v.request_tipc(&acquire).unwrap().copy_handles.remove(0);
+        assert!(
+            !kernel.event_signaled(&event),
+            "nothing sets an unbound slot"
+        );
+        // A change source (here the refresh rate) sets the slot once, when it is bound.
+        v.request_tipc(&named(263, display, 0)).unwrap();
+        assert!(kernel.event_signaled(&event));
+        kernel.set_event(&event, false);
+        // The vsync sets it at every vblank.
+        v.request_tipc(&named(261, display, 0)).unwrap();
+        let start = std::time::Instant::now();
+        while !kernel.event_signaled(&event) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "no vsync"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Unbound, it is set no more.
+        v.request_tipc(&named(262, display, 0)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        kernel.set_event(&event, false);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!kernel.event_signaled(&event), "an unbound slot is quiet");
+        // The duplicate of an acquired slot is the same event.
+        let mut duplicate = req(32);
+        duplicate.data = 0u32.to_le_bytes().to_vec();
+        let again = v.request_tipc(&duplicate).unwrap();
+        assert!(matches!(
+            (&again.copy_handles[0], &event),
+            (KObject::ReadableEvent(a), KObject::ReadableEvent(b)) if a == b
+        ));
+        // The queries answer in vi2's own values: 60 Hz, SDR, 1920x1080.
+        let query = |v: &mut Vi2Session, command| v.request_tipc(&named(command, display, 0));
+        assert_eq!(query(&mut v, 103).unwrap().data, 1u64.to_le_bytes());
+        assert_eq!(query(&mut v, 104).unwrap().data[..8], 1u64.to_le_bytes());
+        assert_eq!(query(&mut v, 106).unwrap().data, 2u64.to_le_bytes());
+        // Another display, or a slot past the eight, stops the run.
+        assert!(v.request_tipc(&named(103, b"other\0\0\0", 0)).is_err());
+        acquire.data = 8u32.to_le_bytes().to_vec();
+        assert!(v.request_tipc(&acquire).is_err());
+        // 51 takes up to the seven recorders 5 says there are.
+        let mut count = req(51);
+        count.data = 7u32.to_le_bytes().to_vec();
+        assert!(v.request_tipc(&count).is_ok());
+        count.data = 8u32.to_le_bytes().to_vec();
+        assert!(v.request_tipc(&count).is_err());
     }
 }

@@ -1101,6 +1101,15 @@ impl Kernel {
         }
     }
 
+    /// Whether the event one of whose ends is `end` is signaled.
+    #[cfg(test)]
+    pub fn event_signaled(&self, end: &KObject) -> bool {
+        let (KObject::WritableEvent(i) | KObject::ReadableEvent(i)) = end else {
+            return false;
+        };
+        self.lock().events.get(*i).is_some_and(|e| e.signaled)
+    }
+
     pub fn signal_event(&self, h: Handle) -> ResultCode {
         let mut st = self.lock();
         match st.handles.get(h) {

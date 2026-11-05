@@ -51,6 +51,9 @@ pub struct Shared {
     /// drops to 30 frames a second where it cannot hold 60 under this runtime, and keeps that
     /// where it could.
     max_interval: u32,
+    /// Events set at every vsync besides the displays' own: the native events of the Switch 2's
+    /// `vi2` that are bound to the vsync (A-198), under keys their sessions choose.
+    vsync_listeners: Mutex<HashMap<u64, KObject>>,
 }
 
 impl Shared {
@@ -73,6 +76,7 @@ impl Shared {
                 .and_then(|v| v.trim().parse().ok())
                 .filter(|&n| n > 0)
                 .unwrap_or(u32::MAX),
+            vsync_listeners: Mutex::new(HashMap::new()),
         }
     }
 
@@ -162,6 +166,24 @@ impl Shared {
         }
     }
 
+    fn listeners(&self) -> std::sync::MutexGuard<'_, HashMap<u64, KObject>> {
+        self.vsync_listeners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Set the event `writable` at every vsync from now on, until `unlisten_vsync` with the same
+    /// key: for the Switch 2's `vi2` (A-198), which opens no display through this service.
+    pub fn listen_vsync(self: &Arc<Shared>, kernel: &Arc<Kernel>, key: u64, writable: KObject) {
+        self.listeners().insert(key, writable);
+        self.start_vsync(kernel);
+    }
+
+    /// No longer set the event of `key` at a vsync (nothing happens when there is none).
+    pub fn unlisten_vsync(&self, key: u64) {
+        self.listeners().remove(&key);
+    }
+
     /// Start the thread that sets the vsync events, once.
     fn start_vsync(self: &Arc<Shared>, kernel: &Arc<Kernel>) {
         if self.vsync_running.swap(true, Ordering::AcqRel) {
@@ -182,6 +204,11 @@ impl Shared {
             }
             shared.comp().tick_vsync();
             shared.deliver_signals(&kernel);
+            // Taken out of the lock first: setting an event takes the kernel's.
+            let listeners: Vec<KObject> = shared.listeners().values().cloned().collect();
+            for writable in &listeners {
+                kernel.set_event(writable, true);
+            }
         });
     }
 }
