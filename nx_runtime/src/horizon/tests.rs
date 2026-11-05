@@ -468,6 +468,22 @@ fn a_switch_2_process_gets_the_switch_2_answers() {
     // Six cores: a thread may start on core 5, not on 6.
     e.svc(0x08, &[0, 0x0900_0000, 0, SCRATCH, 0x2C, 5]);
     assert_eq!(e.r(), 0);
+    // Each thread finds its own handle in its thread-local region (A-233), the main thread too.
+    let created = e.x(1) as u32;
+    let handle_in_tls = |e: &Env, h: u32| {
+        let st = e.kernel.lock();
+        let id = st.thread_of(h, e.tid).unwrap();
+        let tls = st.threads[&id].tls;
+        drop(st);
+        u32::from_le_bytes(e.read(tls + 0x110, 4).try_into().unwrap())
+    };
+    assert_eq!(handle_in_tls(&e, created), created);
+    let main_tls = e.kernel.lock().threads[&e.tid].tls;
+    let main_handle = u32::from_le_bytes(e.read(main_tls + 0x110, 4).try_into().unwrap());
+    assert_eq!(
+        e.kernel.lock().thread_of(main_handle, u64::MAX),
+        Some(e.tid)
+    );
     e.svc(0x08, &[0, 0x0900_0000, 0, SCRATCH, 0x2C, 6]);
     assert_eq!(e.r(), err::INVALID_CORE_ID.0);
     // The Switch 2's own services are there (A-219).
@@ -486,6 +502,9 @@ fn a_switch_2_process_gets_the_switch_2_answers() {
     assert_eq!(e.r(), err::INVALID_SIZE.0);
     e.svc(0x08, &[0, 0x0900_0000, 0, SCRATCH, 0x2C, 4]);
     assert_eq!(e.r(), err::INVALID_CORE_ID.0);
+    // A Switch program's thread-local region is left to it.
+    let tls = e.kernel.lock().threads[&e.tid].tls;
+    assert_eq!(e.read(tls + 0x110, 4), vec![0; 4]);
     assert_eq!(e.svc(0x80, &[HEAP_BASE, 0x2000, 0x20, 0x20]), Flow::Stop);
     super::services::register_defaults(&e.kernel);
     assert!(!e

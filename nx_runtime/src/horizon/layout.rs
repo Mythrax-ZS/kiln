@@ -33,6 +33,8 @@ pub const MAIN_STACK_TOP: u64 = STACK_BASE + STACK_REGION_SIZE - 0x10_0000;
 pub const TLS_BASE: u64 = 0x3C_0000_0000;
 pub const TLS_REGION_SIZE: u64 = 0x4000_0000;
 pub const TLS_SLOT_SIZE: u64 = 0x200;
+/// Where in its thread-local region a Switch 2 thread finds its own handle (A-233).
+pub const TLS_CURRENT_THREAD_HANDLE: u64 = 0x110;
 
 /// Memory types (the low byte of the memory state), as `QueryMemory` reports them.
 pub mod mem_type {

@@ -7,7 +7,7 @@
 
 use super::cores::Cores;
 use super::handle::{Handle, HandleTable, CURRENT_PROCESS, CURRENT_THREAD};
-use super::layout::{attr, mem_type, PAGE, TLS_BASE, TLS_SLOT_SIZE};
+use super::layout::{attr, mem_type, PAGE, TLS_BASE, TLS_CURRENT_THREAD_HANDLE, TLS_SLOT_SIZE};
 use super::memory::{Info, MemoryMap};
 use super::object::KObject;
 use super::result::{kernel as err, KResult, ResultCode};
@@ -836,6 +836,15 @@ impl Kernel {
                 return Err(e);
             }
         };
+        // The Switch 2's kernel keeps each thread's own handle in its thread-local region,
+        // where the SDK reads it as the current thread's (A-233).
+        if self.process.platform() == crate::npdm::Platform::Nx2 {
+            let _ = rt().mem.write_bytes(
+                tls + TLS_CURRENT_THREAD_HANDLE,
+                &handle.to_le_bytes(),
+                false,
+            );
+        }
         st.threads.insert(
             id,
             Thread {
