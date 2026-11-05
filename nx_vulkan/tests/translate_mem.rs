@@ -204,6 +204,22 @@ fn global_loads_and_stores_follow_the_table() {
 }
 
 #[test]
+fn a_store_says_the_program_writes_global_memory_and_a_load_does_not() {
+    use nx_shader::cfg::Code;
+    use nx_shader::translate::{translate, Config, Stage};
+    let info = |program: &[u64]| {
+        let bytes = nx_shader::asm::assemble(program);
+        translate(Code(&bytes), None, &Config::new(Stage::Compute))
+            .expect("translates")
+            .info
+    };
+    let loads = info(&[ldg(3, 1, 0, 4).build(), exit(Guard::ALWAYS)]);
+    assert!(loads.global_memory && !loads.global_writes);
+    let stores = info(&[stg(4, 1, 0, 4).build(), exit(Guard::ALWAYS)]);
+    assert!(stores.global_memory && stores.global_writes);
+}
+
+#[test]
 fn addresses_outside_the_ranges_read_the_zeroed_scratch_page() {
     let Some(vk) = vulkan() else { return };
     let program = [ldg(3, 1, 0, 4).build(), exit(Guard::ALWAYS)];

@@ -257,6 +257,9 @@ pub struct Info {
     /// covers, then from word 4 six words per entry: the first GPU address (low, high), one past
     /// the last (low, high) and the device address of the first byte (low, high).
     pub global_memory: bool,
+    /// The program stores into global memory or changes it with atomic operations (otherwise it
+    /// only reads it): what it does there is waited for before the host reads that memory.
+    pub global_writes: bool,
     /// sm_86 programs that reach global memory: the constant buffer words (slot, word index) the
     /// bases of their accesses are pointers from (each a storage buffer's entry: the address, then
     /// the size, A-258), in order; `global_unknown` when the base of an access is not known to come

@@ -469,6 +469,7 @@ pub(super) fn guarded(
 /// with two atomic operations on that word, since other invocations may be writing its other
 /// bytes.
 pub(super) fn stg(tx: &mut Tx<'_>, i: &I) -> R<()> {
+    tx.info.global_writes = true;
     let inst = i.inst;
     let uniform = inst.opcode() == op::STG_U;
     let size = inst.field(73, 3);
@@ -526,6 +527,7 @@ pub(super) fn stg(tx: &mut Tx<'_>, i: &I) -> R<()> {
 /// address as for `STG` with a uniform register, the register a pair with bit 70 (`ATOMG`) or 90
 /// (`RED`), or (opcode 0x3a8) a register alone, a pair with bit 72. The operation is relaxed, at the scope of the device (docs/ASSUMPTIONS.md A-253).
 pub(super) fn atomg(tx: &mut Tx<'_>, i: &I) -> R<()> {
+    tx.info.global_writes = true;
     let inst = i.inst;
     let red = inst.opcode() == op::RED;
     let ty = inst.field(73, 3);

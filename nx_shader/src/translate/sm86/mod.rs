@@ -796,6 +796,24 @@ mod tests {
     }
 
     #[test]
+    fn a_program_that_only_loads_from_global_memory_does_not_write_it() {
+        // LDG.E R4, [R2.64]
+        let ldg = word(&[
+            (0, 12, 0x381),
+            (12, 4, 7),
+            (16, 8, 4),
+            (24, 8, 2),
+            (64, 6, u64::from(URZ)),
+            (72, 1, 1),
+            (73, 3, 4),
+            (81, 3, u64::from(PT)),
+        ]);
+        let t = kernel(&[ldg]);
+        assert!(t.info.global_memory);
+        assert!(!t.info.global_writes);
+    }
+
+    #[test]
     fn global_atomics_carries_and_matches_translate() {
         // IMAD.X R5, RZ, RZ, R6, P0 (form 1: registers)
         let imad_x = word(&[
@@ -858,6 +876,7 @@ mod tests {
         ]);
         let t = kernel(&[imad_x, atomg, red, exch, matching]);
         assert!(t.info.global_memory);
+        assert!(t.info.global_writes);
         // Inc and dec have no SPIR-V operation of their own: they are refused.
         let inc = word(&[
             (0, 12, 0x9a8),

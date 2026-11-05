@@ -238,6 +238,7 @@ pub(super) fn ldg(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
 }
 
 pub(super) fn stg(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
+    tx.info.global_writes = true;
     let size = inst.bits(48, 3);
     let Some(words) = words_of(size) else {
         return tx.fail("STG of less than a word");
