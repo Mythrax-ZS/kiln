@@ -27,6 +27,10 @@ pub const ALLOC_GPFIFO_EX: u32 = 0x18;
 pub const ALLOC_GPFIFO_EX2: u32 = 0x1A;
 pub const SUBMIT_GPFIFO2: u32 = 0x1B;
 pub const SET_TIMESLICE: u32 = 0x1D;
+/// The Switch 2's: the runlist the channel runs on (A-203).
+pub const SET_RUNLIST: u32 = 0x20;
+/// The Switch 2's: how the channel's graphics and compute work may be preempted (A-206).
+pub const SET_PREEMPTION_MODE: u32 = 0x1F;
 
 const SET_USER_DATA: u32 = 0x14;
 const GET_USER_DATA: u32 = 0x15;
@@ -61,6 +65,8 @@ pub fn name(code: Ioctl) -> Option<&'static str> {
         ALLOC_GPFIFO_EX2 => "NVGPU_IOCTL_CHANNEL_ALLOC_GPFIFO_EX2",
         SUBMIT_GPFIFO2 => "NVGPU_IOCTL_CHANNEL_SUBMIT_GPFIFO2",
         SET_TIMESLICE => "NVGPU_IOCTL_CHANNEL_SET_TIMESLICE",
+        SET_RUNLIST => "the channel's runlist (Switch 2)",
+        SET_PREEMPTION_MODE => "NVGPU_IOCTL_CHANNEL_SET_PREEMPTION_MODE",
         _ => return None,
     })
 }
@@ -94,6 +100,33 @@ impl Nvdrv {
             (TYPE, SET_TIMEOUT, 4) => {
                 let t = args.u32(0);
                 self.channel(id)?.timeout = t;
+            }
+            // The Switch 2's (u32 runlist): one of the runlists GET_ENGINE_INFO lists, from
+            // NvRmGpuChannelCreate. The channels here run in the order of their submissions
+            // whatever their runlist, so it is checked and not kept (A-203).
+            (TYPE, SET_RUNLIST, 4) if self.is_switch_2() => {
+                let runlist = args.u32(0);
+                if !super::ctrl_gpu::SWITCH_2_ENGINES
+                    .iter()
+                    .any(|e| e[2] == runlist)
+                {
+                    return unimplemented(format!(
+                        "a channel on the runlist {runlist}, which GET_ENGINE_INFO does not list"
+                    ));
+                }
+                self.channel(id)?;
+            }
+            // The Switch 2's SET_PREEMPTION_MODE(u32 graphics, u32 compute): 0 leaves a mode as it
+            // is, graphics 1 WFI and 2 GFXP, compute 1 WFI, 2 CTA and 4 CILP (NvRm sends compute
+            // CTA). Nothing preempts here, so the modes are checked and not kept (A-206).
+            (TYPE, SET_PREEMPTION_MODE, 8) if self.is_switch_2() => {
+                let (graphics, compute) = (args.u32(0), args.u32(4));
+                if graphics > 2 || ![0, 1, 2, 4].contains(&compute) {
+                    return unimplemented(format!(
+                        "preemption modes {graphics:#x} (graphics) and {compute:#x} (compute)"
+                    ));
+                }
+                self.channel(id)?;
             }
             (TYPE, SET_PRIORITY, 4) => {
                 let p = args.u32(0);
@@ -129,18 +162,32 @@ impl Nvdrv {
             // u32 class, u32 flags, u64 object id (out)
             (TYPE, ALLOC_OBJ_CTX, 16) => {
                 let class_num = args.u32(0);
-                let known = [
-                    class::THREED,
-                    class::COMPUTE,
-                    class::TWOD,
-                    class::INLINE_TO_MEMORY,
-                    class::DMA_COPY,
-                ];
+                let switch_2 = self.is_switch_2();
+                // The Switch 2's driver has the Ampere classes instead (A-199, A-204).
+                let known: &[u32] = if switch_2 {
+                    &[
+                        class::AMPERE_THREED,
+                        class::AMPERE_COMPUTE,
+                        class::AMPERE_DMA_COPY,
+                        class::TWOD,
+                        class::INLINE_TO_MEMORY,
+                    ]
+                } else {
+                    &[
+                        class::THREED,
+                        class::COMPUTE,
+                        class::TWOD,
+                        class::INLINE_TO_MEMORY,
+                        class::DMA_COPY,
+                    ]
+                };
                 if !known.contains(&class_num) {
                     return unimplemented(format!("an object context of class {class_num:#x}"));
                 }
                 let ch = self.channel(id)?;
-                if ch.space.is_none() || ch.syncpt.is_none() {
+                // On the Switch 2 a channel of a timeslice group asks for its object contexts
+                // before it has an address space and a queue (A-204).
+                if !switch_2 && (ch.space.is_none() || ch.syncpt.is_none()) {
                     // The address space and the queue must exist first (Switchbrew).
                     return Err(NvError::INVALID_STATE.into());
                 }

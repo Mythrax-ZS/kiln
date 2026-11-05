@@ -42,6 +42,12 @@ enum Node {
     AsGpu(u32),
     Gpu(u32),
     Decoder(decoder::Decoder),
+    /// The Switch 2's `/dev/nvhost-tsg-gpu`: a timeslice group, which channels join (A-202):
+    /// the channels' descriptors and their subcontexts, and its timeslice in microseconds.
+    Tsg {
+        channels: Vec<(u32, u32)>,
+        timeslice: u32,
+    },
 }
 
 impl Node {
@@ -53,6 +59,7 @@ impl Node {
             Node::AsGpu(_) => "/dev/nvhost-as-gpu",
             Node::Gpu(_) => "/dev/nvhost-gpu",
             Node::Decoder(d) => d.path,
+            Node::Tsg { .. } => "/dev/nvhost-tsg-gpu",
         }
     }
 }
@@ -183,6 +190,10 @@ impl Nvdrv {
             "/dev/nvhost-as-gpu" if self.switch_2 => Node::AsGpu(self.switch_2_space()),
             "/dev/nvhost-as-gpu" => Node::AsGpu(self.gpu.new_space()),
             "/dev/nvhost-gpu" => Node::Gpu(self.gpu.new_channel()),
+            "/dev/nvhost-tsg-gpu" if self.switch_2 => Node::Tsg {
+                channels: Vec::new(),
+                timeslice: TSG_DEFAULT_TIMESLICE,
+            },
             // The media engines: nodes that accept their work and decode nothing (A-119).
             "/dev/nvhost-nvdec" => Node::Decoder(decoder::Decoder::new("/dev/nvhost-nvdec")),
             "/dev/nvhost-nvjpg" => Node::Decoder(decoder::Decoder::new("/dev/nvhost-nvjpg")),
@@ -233,7 +244,7 @@ impl Nvdrv {
                     self.gpu.syncpoints.release(sp);
                 }
             }
-            Node::CtrlGpu | Node::Nvmap => {}
+            Node::CtrlGpu | Node::Nvmap | Node::Tsg { .. } => {}
         }
         NvError::SUCCESS
     }
@@ -299,6 +310,7 @@ impl Nvdrv {
                 self.channel_ioctl(channel, ioctl, &mut args, extra_in)
             }
             Some(Node::Decoder(_)) => self.decoder_ioctl(fd, ioctl, &mut args),
+            Some(Node::Tsg { .. }) => self.tsg_ioctl(fd, ioctl, &mut args),
             None => Err(Fail::Nv(NvError::BAD_PARAMETER)),
         };
         let error = match outcome {
@@ -333,6 +345,9 @@ impl Nvdrv {
             None => Err(Fail::Nv(NvError::BAD_PARAMETER)),
             Some(Node::Ctrl { .. }) => self.ctrl_query_event(fd, event_id),
             Some(Node::Gpu(_)) if (1..=3).contains(&event_id) => Ok(self.token(fd, event_id)),
+            // The Switch 2's channels have an event 7 too, whose cause is not known: nothing sets
+            // it (NVN waits on it with its syncpoints' events; A-205).
+            Some(Node::Gpu(_)) if self.switch_2 && event_id == 7 => Ok(self.token(fd, event_id)),
             Some(Node::CtrlGpu) if (1..=2).contains(&event_id) => Ok(self.token(fd, event_id)),
             Some(node) => unimplemented(format!(
                 "QueryEvent of event {event_id:#x} on `{}` (fd {fd})",
@@ -416,6 +431,90 @@ impl Nvdrv {
             Node::AsGpu(_) => as_gpu::name(code),
             Node::Gpu(_) => channel::name(code),
             Node::Decoder(_) => decoder::name(code),
+            Node::Tsg { .. } => tsg_name(code),
+        }
+    }
+}
+
+/// The type byte of nvgpu's timeslice group ioctls (`'T'`) and the ones known (A-202).
+const TSG_TYPE: u32 = 0x54;
+const TSG_BIND_CHANNEL_EX: u32 = 0xB;
+const TSG_SET_TIMESLICE: u32 = 8;
+const TSG_GET_TIMESLICE: u32 = 0xA;
+/// nvgpu's default timeslice of a TSG, in microseconds (A-207).
+const TSG_DEFAULT_TIMESLICE: u32 = 1024;
+/// The subcontexts of a TSG: the characteristics' most (A-199).
+const TSG_SUBCONTEXTS: u32 = 64;
+
+fn tsg_name(code: Ioctl) -> Option<&'static str> {
+    if code.ty() != TSG_TYPE {
+        return None;
+    }
+    Some(match code.nr() {
+        TSG_BIND_CHANNEL_EX => "NVGPU_TSG_IOCTL_BIND_CHANNEL_EX",
+        TSG_SET_TIMESLICE => "the TSG's timeslice (Switch 2)",
+        TSG_GET_TIMESLICE => "NVGPU_IOCTL_TSG_GET_TIMESLICE",
+        _ => return None,
+    })
+}
+
+impl Nvdrv {
+    /// A command of a timeslice group (A-202).
+    fn tsg_ioctl(&mut self, fd: u32, code: Ioctl, args: &mut Args) -> IoResult {
+        match (code.ty(), code.nr(), code.size()) {
+            // BIND_CHANNEL_EX(s32 channel fd, u32 subcontext, u32 active TPCs, u8 TPC power
+            // gating, 11 bytes): the channel joins the group in that subcontext, once. Channels
+            // here run in the order of their submissions, so the group changes nothing else.
+            (TSG_TYPE, TSG_BIND_CHANNEL_EX, 24) => {
+                let (channel, subcontext) = (args.u32(0), args.u32(4));
+                if !matches!(self.nodes.get(&channel), Some(Node::Gpu(_))) {
+                    return Err(NvError::BAD_VALUE.into());
+                }
+                if subcontext >= TSG_SUBCONTEXTS || args.u32(8) != 0 || args.bytes(12, 1)[0] != 0 {
+                    return unimplemented(format!(
+                        "BIND_CHANNEL_EX of the subcontext {subcontext} with {} active TPCs and \
+                         power gating {}",
+                        args.u32(8),
+                        args.bytes(12, 1)[0]
+                    ));
+                }
+                let bound = self
+                    .nodes
+                    .values()
+                    .any(|n| matches!(n, Node::Tsg { channels, .. } if channels.iter().any(|&(ch, _)| ch == channel)));
+                if bound {
+                    return Err(NvError::ALREADY_ALLOCATED.into());
+                }
+                if let Some(Node::Tsg { channels, .. }) = self.nodes.get_mut(&fd) {
+                    channels.push((channel, subcontext));
+                }
+                Ok(())
+            }
+            // The Switch 2's timeslice (u32 microseconds; NvRm sends 1024), and nvgpu's
+            // GET_TIMESLICE (u32): kept, and changing nothing, since channels run in the order of
+            // their submissions (A-207).
+            (TSG_TYPE, TSG_SET_TIMESLICE, 4) => {
+                let us = args.u32(0);
+                if us == 0 {
+                    return Err(NvError::BAD_VALUE.into());
+                }
+                if let Some(Node::Tsg { timeslice, .. }) = self.nodes.get_mut(&fd) {
+                    *timeslice = us;
+                }
+                Ok(())
+            }
+            (TSG_TYPE, TSG_GET_TIMESLICE, 4) => {
+                if let Some(Node::Tsg { timeslice, .. }) = self.nodes.get(&fd) {
+                    args.set_u32(0, *timeslice);
+                }
+                Ok(())
+            }
+            _ => unimplemented(format!(
+                "timeslice group command {:#x} (type {:#x}) of size {}",
+                code.nr(),
+                code.ty(),
+                code.size()
+            )),
         }
     }
 }
@@ -481,6 +580,41 @@ mod tests {
         assert_eq!(nv.close(a), NvError::SUCCESS);
         assert_eq!(nv.close(a), NvError::BAD_PARAMETER);
         assert_eq!(nv.open("/dev/nvmap"), Ok(3));
+    }
+
+    #[test]
+    fn the_switch_2_driver_has_one_address_space_and_timeslice_groups() {
+        let (mut nv, _) = nvdrv();
+        assert!(
+            nv.open("/dev/nvhost-tsg-gpu").is_err(),
+            "not on the Switch 1"
+        );
+        nv.set_switch_2(true);
+        let (a, b) = (
+            nv.open("/dev/nvhost-as-gpu").unwrap(),
+            nv.open("/dev/nvhost-as-gpu").unwrap(),
+        );
+        assert!(matches!(
+            (nv.nodes.get(&a), nv.nodes.get(&b)),
+            (Some(Node::AsGpu(x)), Some(Node::AsGpu(y))) if x == y
+        ));
+        nv.close(a);
+        nv.close(b);
+        assert_eq!(nv.gpu.spaces.len(), 1, "the one space outlives its nodes");
+        let tsg = nv.open("/dev/nvhost-tsg-gpu").unwrap();
+        let channel = nv.open("/dev/nvhost-gpu").unwrap();
+        let bind = |fd: u32, subcontext: u32| u32s(&[fd, subcontext, 0, 0, 0, 0]);
+        let (e, _) = call(&mut nv, tsg, 0xC018_540B, &bind(channel, 0));
+        assert_eq!(e, NvError::SUCCESS);
+        let (e, _) = call(&mut nv, tsg, 0xC018_540B, &bind(channel, 0));
+        assert_eq!(e, NvError::ALREADY_ALLOCATED, "a channel joins once");
+        let (e, _) = call(&mut nv, tsg, 0xC018_540B, &bind(tsg, 0));
+        assert_eq!(e, NvError::BAD_VALUE, "only a channel joins");
+        assert!(nv.ioctl(tsg, 0xC018_540B, &bind(channel, 64), &[]).is_err());
+        assert!(
+            nv.ioctl(tsg, 0x0000_5403, &[], &[]).is_err(),
+            "another command stops"
+        );
     }
 
     #[test]
