@@ -359,6 +359,17 @@ impl Service for HidServer {
                 self.shared.input().ids = Some(ids);
                 Ok(Response::ok())
             }
+            // DisconnectNpad(u32 npad id, u64 aruid, pid): a title lets go of the players' npads
+            // it does not use. Only the handheld controls are connected, and their disconnection
+            // is not modelled (docs/ASSUMPTIONS.md A-265).
+            107 => {
+                if req.u32_at(0) == NPAD_ID_HANDHELD {
+                    return Err(Stop(
+                        "hid 107 disconnects the handheld controls, which is not modelled".into(),
+                    ));
+                }
+                Ok(Response::ok())
+            }
             // ActivateNpad(u64 aruid, pid); ActivateNpadWithRevision(s32 revision, u64 aruid, pid)
             103 | 109 => {
                 self.shared.input().activated = true;
@@ -479,6 +490,29 @@ mod tests {
             activated: true,
             ..Input::default()
         }
+    }
+
+    #[test]
+    fn a_players_npad_is_let_go_and_the_handheld_controls_stay() {
+        let shared = Arc::new(Shared {
+            memory: Mutex::new(None),
+            input: Mutex::new(connected()),
+            ticking: AtomicBool::new(false),
+        });
+        let mut hid = HidServer::new(Weak::new(), shared.clone());
+        let disconnect = |id: u32| Request {
+            command: 107,
+            data: [id.to_le_bytes(), [0; 4], [0; 4], [0; 4]].concat(),
+            ..Request::default()
+        };
+        for player in 0..8 {
+            assert!(hid.request(&disconnect(player)).is_ok(), "player {player}");
+        }
+        assert!(shared.input().handheld_connected());
+        assert!(
+            hid.request(&disconnect(NPAD_ID_HANDHELD)).is_err(),
+            "the handheld controls' disconnection is not modelled"
+        );
     }
 
     #[test]
