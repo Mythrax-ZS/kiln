@@ -410,81 +410,96 @@ fn f2i(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
     if size == 3 {
         return tx.fail("F2I to a 64-bit integer");
     }
-    if size < 2 {
-        // 8 and 16 bits: saturate to the range of the destination, NaN gives zero. The result is
-        // the integer in a 32-bit register, sign-extended for the signed types.
-        let (lo, hi) = match (size, signed) {
-            (0, false) => (0.0, 255.0),
-            (0, true) => (-128.0, 127.0),
-            (_, false) => (0.0, 65535.0),
-            (_, true) => (-32768.0, 32767.0),
-        };
-        let src = src_b_f(tx, inst)?;
-        let src = fmods(tx, src, inst.bit(45), inst.bit(49));
-        let rounded = round_float(tx, src, inst.bits(39, 2));
-        let f = tx.t.f32;
-        let lo_c = tx.cf32(lo);
-        let hi_c = tx.cf32(hi);
-        let above_lo = tx.ext(f, glsl::N_MAX, &[rounded, lo_c]);
-        let clamped = tx.ext(f, glsl::N_MIN, &[above_lo, hi_c]);
-        let r = if signed {
-            let i = tx.t.i32;
-            let conv = tx.op1(op::CONVERT_F_TO_S, i, clamped);
-            tx.as_u32(conv)
-        } else {
-            let u = tx.t.u32;
-            tx.op1(op::CONVERT_F_TO_U, u, clamped)
-        };
-        let nan = tx.op1(op::IS_NAN, tx.t.bool_, rounded);
-        let zero = tx.c32(0);
-        let r = tx.select_u32(nan, zero, r);
-        tx.write(inst, inst.rd(), r);
-        return Ok(());
-    }
     let src = src_b_f(tx, inst)?;
     let src = fmods(tx, src, inst.bit(45), inst.bit(49));
     let rounded = round_float(tx, src, inst.bits(39, 2));
-    let f = tx.t.f32;
-    let nan = tx.op1(op::IS_NAN, tx.t.bool_, rounded);
-    let r = if signed {
-        let lo = tx.cf32(-2147483648.0);
-        let hi = tx.cf32(2147483648.0);
-        let below = tx.cmp(op::F_ORD_LESS_THAN_EQUAL, rounded, lo);
-        let above = tx.cmp(op::F_ORD_GREATER_THAN_EQUAL, rounded, hi);
-        // Keep the conversion in range so it is defined.
-        let top = tx_prev_float(tx, 2147483648.0);
-        let safe = tx.ext(f, glsl::F_CLAMP, &[rounded, lo, top]);
-        let i = tx.t.i32;
-        let conv = tx.op1(op::CONVERT_F_TO_S, i, safe);
-        let conv = tx.as_u32(conv);
-        let min = tx.c32(0x8000_0000);
-        let max = tx.c32(0x7FFF_FFFF);
-        let r = tx.select_u32(above, max, conv);
-        let r = tx.select_u32(below, min, r);
-        let zero = tx.c32(0);
-        tx.select_u32(nan, zero, r)
-    } else {
-        let zero_f = tx.cf32(0.0);
-        let hi = tx.cf32(4294967296.0);
-        let below = tx.cmp(op::F_ORD_LESS_THAN_EQUAL, rounded, zero_f);
-        let above = tx.cmp(op::F_ORD_GREATER_THAN_EQUAL, rounded, hi);
-        let top = tx_prev_float(tx, 4294967296.0);
-        let safe = tx.ext(f, glsl::F_CLAMP, &[rounded, zero_f, top]);
-        let u = tx.t.u32;
-        let conv = tx.op1(op::CONVERT_F_TO_U, u, safe);
-        let max = tx.c32(0xFFFF_FFFF);
-        let r = tx.select_u32(above, max, conv);
-        let zero = tx.c32(0);
-        let r = tx.select_u32(below, zero, r);
-        tx.select_u32(nan, zero, r)
-    };
+    let r = float_to_int(tx, rounded, size, signed);
     tx.write(inst, inst.rd(), r);
     Ok(())
 }
 
-/// The largest float below `v` (a power of two): the top of the range a conversion can take.
-pub(super) fn tx_prev_float(tx: &mut Tx<'_>, v: f32) -> Id {
-    tx.cf32(f32::from_bits(v.to_bits() - 1))
+/// A rounded float to an integer of 2^`size` bytes, saturating to its range; NaN gives zero. The
+/// result is the integer in a 32-bit register (sign-extended for the signed types).
+///
+/// The cases are branches, the conversion made only of a number inside the range (where it is
+/// defined): an NVIDIA driver makes code that loses the device of the same choice made with
+/// selects of all its cases (docs/ASSUMPTIONS.md A-257).
+pub(super) fn float_to_int(tx: &mut Tx<'_>, rounded: Id, size: u64, signed: bool) -> Id {
+    use crate::spirv::storage;
+    let (lo, hi) = match (size, signed) {
+        (0, false) => (0.0, 255.0),
+        (0, true) => (-128.0, 127.0),
+        (1, false) => (0.0, 65535.0),
+        (1, true) => (-32768.0, 32767.0),
+        (_, false) => (0.0, 4294967296.0),
+        (_, true) => (-2147483648.0, 2147483648.0),
+    };
+    // The ends: a narrow type's are integers the float reaches, a 32-bit type's top is 2^31 (or
+    // 2^32), just past the range, so the values from it on saturate.
+    let (min, max) = match (size, signed) {
+        (0, false) => (0, 255),
+        (0, true) => (0xFFFF_FF80, 127),
+        (1, false) => (0, 65535),
+        (1, true) => (0xFFFF_8000, 32767),
+        (_, false) => (0, 0xFFFF_FFFF),
+        (_, true) => (0x8000_0000, 0x7FFF_FFFF),
+    };
+    let narrow = size < 2;
+    let u = tx.t.u32;
+    let ptr = tx.m.ty_pointer(storage::FUNCTION, u);
+    let result = tx.m.id();
+    let zero = tx.c32(0);
+    tx.f.local_with_init(ptr, result, zero);
+    let lo_c = tx.cf32(lo);
+    let hi_c = tx.cf32(hi);
+    // Not a number: zero.
+    let nan = tx.op1(op::IS_NAN, tx.t.bool_, rounded);
+    let (is_nan, number, after_nan) = (tx.m.id(), tx.m.id(), tx.m.id());
+    tx.f.selection_merge(after_nan);
+    tx.f.branch_conditional(nan, is_nan, number);
+    tx.f.label(is_nan);
+    tx.f.store(result, zero);
+    tx.f.branch(after_nan);
+    tx.f.label(number);
+    // At or below the bottom: the smallest integer.
+    let below = tx.cmp(op::F_ORD_LESS_THAN_EQUAL, rounded, lo_c);
+    let (low, rest, after_low) = (tx.m.id(), tx.m.id(), tx.m.id());
+    tx.f.selection_merge(after_low);
+    tx.f.branch_conditional(below, low, rest);
+    tx.f.label(low);
+    let min_c = tx.c32(min);
+    tx.f.store(result, min_c);
+    tx.f.branch(after_low);
+    tx.f.label(rest);
+    // At or above the top (a narrow type's top is in the range and converts as it is).
+    let above = if narrow {
+        tx.cmp(op::F_ORD_GREATER_THAN, rounded, hi_c)
+    } else {
+        tx.cmp(op::F_ORD_GREATER_THAN_EQUAL, rounded, hi_c)
+    };
+    let (high, inside, after_high) = (tx.m.id(), tx.m.id(), tx.m.id());
+    tx.f.selection_merge(after_high);
+    tx.f.branch_conditional(above, high, inside);
+    tx.f.label(high);
+    let max_c = tx.c32(max);
+    tx.f.store(result, max_c);
+    tx.f.branch(after_high);
+    tx.f.label(inside);
+    let value = if signed {
+        let it = tx.t.i32;
+        let c = tx.op1(op::CONVERT_F_TO_S, it, rounded);
+        tx.as_u32(c)
+    } else {
+        tx.op1(op::CONVERT_F_TO_U, u, rounded)
+    };
+    tx.f.store(result, value);
+    tx.f.branch(after_high);
+    tx.f.label(after_high);
+    tx.f.branch(after_low);
+    tx.f.label(after_low);
+    tx.f.branch(after_nan);
+    tx.f.label(after_nan);
+    tx.f.load(&mut tx.m, u, result)
 }
 
 fn i2f(tx: &mut Tx<'_>, inst: Inst) -> R<()> {

@@ -163,3 +163,181 @@ fn a_counted_wait_lands_the_oldest_writes_first() {
     // Everything lands at the end of the program.
     assert_eq!(out.regs[4], f(0.125));
 }
+
+/// `F2I.type.F32.TRUNC Rd, Rs` (bits 75..76: 0 8-bit, 1 16-bit, 2 32-bit; bit 72 signed).
+fn f2i(d: u64, s: u64, size: u64, signed: bool) -> u128 {
+    with(
+        vec![
+            (0, 12, 0x305),
+            (12, 4, 7),
+            (16, 8, d),
+            (32, 8, s),
+            (72, 1, u64::from(signed)),
+            (75, 2, size),
+            (78, 2, 3),
+            (84, 2, 2),
+        ],
+        sched(7, 0),
+    )
+}
+
+/// What the hardware's conversion gives: toward zero, saturating to the type's range (sign
+/// extended to 32 bits), NaN 0. Rust's `as` saturates the same way.
+fn f2i_reference(x: f32, size: u64, signed: bool) -> u32 {
+    let t = x.trunc();
+    match (size, signed) {
+        (0, false) => u32::from(t as u8),
+        (0, true) => t as i8 as i32 as u32,
+        (1, false) => u32::from(t as u16),
+        (1, true) => t as i16 as i32 as u32,
+        (_, false) => t as u32,
+        (_, true) => t as i32 as u32,
+    }
+}
+
+#[test]
+fn a_float_converts_to_an_integer_saturating_and_nan_gives_zero() {
+    let Some(vk) = vulkan() else { return };
+    let sets: [[f32; 7]; 3] = [
+        [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            3e9,
+            -3e9,
+            2147483520.0,
+            2147483648.0,
+        ],
+        [-2147483648.0, 1.7, -1.7, 255.9, 300.0, -129.5, 65535.5],
+        [
+            -0.0,
+            4294967040.0,
+            4294967296.0,
+            70000.0,
+            -40000.0,
+            -32768.9,
+            127.5,
+        ],
+    ];
+    for size in 0..3 {
+        for signed in [false, true] {
+            let code = program(
+                &(0..7)
+                    .map(|k| f2i(7 + k, k, size, signed))
+                    .collect::<Vec<_>>(),
+            );
+            for values in &sets {
+                let mut input = State::default();
+                for (k, v) in values.iter().enumerate() {
+                    input.regs[k] = v.to_bits();
+                }
+                let out = run(&vk, &code, input);
+                for (k, v) in values.iter().enumerate() {
+                    assert_eq!(
+                        out.regs[7 + k],
+                        f2i_reference(*v, size, signed),
+                        "{v} to size {size}, signed {signed}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `SHF.{L|R}[.W].type[.HI] Rd, Ra, Rb, Rc` (the register form): the 64-bit funnel `Rc:Ra`
+/// shifted by `Rb`.
+fn shf(d: u64, kind: u64, wrap: bool, right: bool, high: bool) -> u128 {
+    with(
+        vec![
+            (0, 12, 0x219),
+            (12, 4, 7),
+            (16, 8, d),
+            (24, 8, 0),
+            (32, 8, 2),
+            (64, 8, 1),
+            (73, 2, kind),
+            (75, 1, u64::from(wrap)),
+            (76, 1, u64::from(right)),
+            (80, 1, u64::from(high)),
+        ],
+        sched(7, 0),
+    )
+}
+
+/// The funnel shift as a 64-bit number: the amount clamped to (or wrapped in) 64 bits for the
+/// 64-bit types and 32 for the others, a right shift of a signed type bringing in the sign.
+fn shf_reference(
+    lo: u32,
+    hi: u32,
+    amount: u32,
+    kind: u64,
+    wrap: bool,
+    right: bool,
+    high: bool,
+) -> u32 {
+    let width = if kind < 2 { 64 } else { 32 };
+    let signed = kind == 0 || kind == 2;
+    let s = if wrap {
+        amount & (width - 1)
+    } else {
+        amount.min(width)
+    };
+    let v = u64::from(hi) << 32 | u64::from(lo);
+    let r = match (right, signed) {
+        (true, true) => ((v as i64) >> s.min(63)) as u64,
+        (true, false) => v.checked_shr(s).unwrap_or(0),
+        (false, _) => v.checked_shl(s).unwrap_or(0),
+    };
+    if high {
+        (r >> 32) as u32
+    } else {
+        r as u32
+    }
+}
+
+#[test]
+fn a_funnel_shift_moves_the_bits_of_both_words() {
+    let Some(vk) = vulkan() else { return };
+    // Every form, twelve to a program (R3 to R14).
+    let forms: Vec<(u64, bool, bool, bool)> = (0..4u64)
+        .flat_map(|kind| {
+            [false, true].into_iter().flat_map(move |wrap| {
+                [false, true]
+                    .into_iter()
+                    .flat_map(move |right| [false, true].map(move |high| (kind, wrap, right, high)))
+            })
+        })
+        .collect();
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 16) as u32
+    };
+    let amounts = [0, 1, 7, 31, 32, 33, 47, 63, 64, 65, 100, 0xFFFF_FFFF];
+    for chunk in forms.chunks(12) {
+        let code = program(
+            &chunk
+                .iter()
+                .enumerate()
+                .map(|(k, &(kind, wrap, right, high))| shf(3 + k as u64, kind, wrap, right, high))
+                .collect::<Vec<_>>(),
+        );
+        for &amount in &amounts {
+            let (lo, hi) = (next() | 0x8000_0001, next() | 0x8000_0000);
+            let mut input = State::default();
+            input.regs[0] = lo;
+            input.regs[1] = hi;
+            input.regs[2] = amount;
+            let out = run(&vk, &code, input);
+            for (k, &(kind, wrap, right, high)) in chunk.iter().enumerate() {
+                assert_eq!(
+                    out.regs[3 + k],
+                    shf_reference(lo, hi, amount, kind, wrap, right, high),
+                    "{hi:#x}:{lo:#x} by {amount}, type {kind}, wrap {wrap}, right {right}, high {high}"
+                );
+            }
+        }
+    }
+}

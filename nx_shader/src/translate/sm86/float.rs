@@ -5,7 +5,9 @@
 //! 78..79 (0 to nearest even, 1 down, 2 up, 3 towards zero), flush to zero in bit 80, the
 //! multiply-by-zero rule (`.FMZ`) in bit 76, `FMUL`'s power-of-two result scale in bits 84..86.
 
-use super::super::alu::{bool_op, fcompare, fmz_product, fsat, round_float, set_value};
+use super::super::alu::{
+    bool_op, fcompare, float_to_int, fmz_product, fsat, round_float, set_value,
+};
 use super::super::emit::{Tx, R};
 use super::{a, b, bc, dst, float, operand, pred, write, write_f, write_pred, I};
 use crate::spirv::{glsl, op};
@@ -218,61 +220,6 @@ pub(super) fn f2i(tx: &mut Tx<'_>, i: &I) -> R<()> {
     let r = float_to_int(tx, rounded, dsize, signed);
     write(tx, i, dst(i), r);
     Ok(())
-}
-
-/// A rounded float to an integer of 2^`size` bytes, saturating to its range; NaN gives zero. The
-/// result is the integer in a 32-bit register (sign-extended for the signed types).
-pub(super) fn float_to_int(
-    tx: &mut Tx<'_>,
-    rounded: crate::spirv::Id,
-    size: u64,
-    signed: bool,
-) -> crate::spirv::Id {
-    let f = tx.t.f32;
-    let (lo, hi) = match (size, signed) {
-        (0, false) => (0.0, 255.0),
-        (0, true) => (-128.0, 127.0),
-        (1, false) => (0.0, 65535.0),
-        (1, true) => (-32768.0, 32767.0),
-        (_, false) => (0.0, 4294967296.0),
-        (_, true) => (-2147483648.0, 2147483648.0),
-    };
-    let nan = tx.op1(op::IS_NAN, tx.t.bool_, rounded);
-    let zero = tx.c32(0);
-    if size < 2 {
-        let lo_c = tx.cf32(lo);
-        let hi_c = tx.cf32(hi);
-        let clamped = tx.ext(f, glsl::F_CLAMP, &[rounded, lo_c, hi_c]);
-        let r = if signed {
-            let it = tx.t.i32;
-            let c = tx.op1(op::CONVERT_F_TO_S, it, clamped);
-            tx.as_u32(c)
-        } else {
-            let u = tx.t.u32;
-            tx.op1(op::CONVERT_F_TO_U, u, clamped)
-        };
-        return tx.select_u32(nan, zero, r);
-    }
-    // 32 bits: the range ends just below 2^31 (or 2^32); the conversion of a value in it is
-    // defined, the ends saturate.
-    let lo_c = tx.cf32(lo);
-    let hi_c = tx.cf32(hi);
-    let below = tx.cmp(op::F_ORD_LESS_THAN_EQUAL, rounded, lo_c);
-    let above = tx.cmp(op::F_ORD_GREATER_THAN_EQUAL, rounded, hi_c);
-    let top = super::super::alu::tx_prev_float(tx, hi);
-    let safe = tx.ext(f, glsl::F_CLAMP, &[rounded, lo_c, top]);
-    let (min, max, conv) = if signed {
-        let it = tx.t.i32;
-        let c = tx.op1(op::CONVERT_F_TO_S, it, safe);
-        (tx.c32(0x8000_0000), tx.c32(0x7FFF_FFFF), tx.as_u32(c))
-    } else {
-        let u = tx.t.u32;
-        let c = tx.op1(op::CONVERT_F_TO_U, u, safe);
-        (tx.c32(0), tx.c32(0xFFFF_FFFF), c)
-    };
-    let r = tx.select_u32(above, max, conv);
-    let r = tx.select_u32(below, min, r);
-    tx.select_u32(nan, zero, r)
 }
 
 /// `I2F.F32.type Rd, B` and `I2FP.F32.type Rd, B`: an integer of 8, 16 or 32 bits (bit 74
