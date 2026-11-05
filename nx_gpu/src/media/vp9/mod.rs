@@ -956,5 +956,79 @@ pub fn decode_parts(
     Ok(state.finish())
 }
 
+/// An 8x8 key frame of profile 0 that decodes to mid-gray (every sample 128), with the color
+/// space and range given: one block, DC-predicted with nothing coded in it, no loop filter. A
+/// stream for the tests of what carries VP9 frames (the Switch 2's video decoder service).
+pub fn gray_key_frame(color: Color) -> Vec<u8> {
+    let probs = Probs::default();
+    // The compressed header (section 6.3): ONLY_4X4, and nothing updated.
+    let mut e = bool::BoolEncoder::new();
+    e.write(false, 128);
+    e.write(false, 128); // tx_mode
+    e.write(false, 128); // update_probs of TX_4X4
+    for _ in 0..3 {
+        e.write(false, 252); // the skip probabilities
+    }
+    let compressed = e.finish();
+    // The one tile: PARTITION_NONE at 8x8 (the larger sizes split, past the frame's edge), skip,
+    // DC_PRED for luma and chroma.
+    let dc = usize::from(tile::DC_PRED);
+    let mut e = bool::BoolEncoder::new();
+    e.write(false, probs.kf_partition[0][0]);
+    e.write(true, probs.skip[0]);
+    e.write(false, probs.kf_y_mode[dc][dc][0]);
+    e.write(false, probs.kf_uv_mode[dc][0]);
+    let tile = e.finish();
+    // The uncompressed header (section 6.2).
+    let fields: [(u32, u32); 30] = [
+        (2, 2),    // frame_marker
+        (0, 1),    // profile_low_bit
+        (0, 1),    // profile_high_bit
+        (0, 1),    // show_existing_frame
+        (0, 1),    // frame_type: KEY_FRAME
+        (1, 1),    // show_frame
+        (0, 1),    // error_resilient_mode
+        (0x49, 8), // frame_sync_code
+        (0x83, 8),
+        (0x42, 8),
+        (u32::from(color.space), 3),
+        (u32::from(color.full_range), 1),
+        (7, 16), // frame_width_minus_1
+        (7, 16), // frame_height_minus_1
+        (0, 1),  // render_and_frame_size_different
+        (1, 1),  // refresh_frame_context
+        (0, 1),  // frame_parallel_decoding_mode
+        (0, 2),  // frame_context_idx
+        (0, 6),  // loop_filter_level
+        (0, 3),  // loop_filter_sharpness
+        (0, 1),  // loop_filter_delta_enabled
+        (60, 8), // base_q_idx
+        (0, 1),  // delta_coded (y dc)
+        (0, 1),  // delta_coded (uv dc)
+        (0, 1),  // delta_coded (uv ac)
+        (0, 1),  // segmentation_enabled
+        (0, 1),  // tile_rows_log2
+        (compressed.len() as u32, 16),
+        (0, 0),
+        (0, 0),
+    ];
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u64, 0u32);
+    for (value, width) in fields {
+        acc = acc << width | u64::from(value);
+        bits += width;
+        while bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    if bits > 0 {
+        out.push((acc << (8 - bits)) as u8);
+    }
+    out.extend_from_slice(&compressed);
+    out.extend_from_slice(&tile);
+    out
+}
+
 #[cfg(test)]
 mod tests;

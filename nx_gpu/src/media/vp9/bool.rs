@@ -163,70 +163,71 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// An encoder, for the frames written for tests: the counterpart of the decoder (libvpx's writer, as the
+/// specification's decoder implies it).
+pub(crate) struct BoolEncoder {
+    low: u64,
+    range: u32,
+    count: i32,
+    out: Vec<u8>,
+}
+
+#[allow(clippy::new_without_default)]
+impl BoolEncoder {
+    pub fn new() -> BoolEncoder {
+        let mut e = BoolEncoder {
+            low: 0,
+            range: 255,
+            count: -24,
+            out: Vec::new(),
+        };
+        e.write(false, 128); // the marker bit
+        e
+    }
+
+    pub fn write(&mut self, bit: bool, p: u8) {
+        let split = 1 + (((self.range - 1) * u32::from(p)) >> 8);
+        let (mut range, mut low) = (split, self.low);
+        if bit {
+            low += u64::from(split);
+            range = self.range - split;
+        }
+        let mut shift = (range as u8).leading_zeros() as i32;
+        range <<= shift;
+        self.count += shift;
+        if self.count >= 0 {
+            let offset = shift - self.count;
+            if (low << (offset - 1)) & 0x8000_0000 != 0 {
+                // Carry into the bytes written.
+                let mut x = self.out.len();
+                while x > 0 && self.out[x - 1] == 0xFF {
+                    self.out[x - 1] = 0;
+                    x -= 1;
+                }
+                self.out[x - 1] += 1;
+            }
+            self.out.push(((low >> (24 - offset)) & 0xFF) as u8);
+            low <<= offset;
+            shift = self.count;
+            low &= 0xFF_FFFF;
+            self.count -= 8;
+        }
+        low <<= shift;
+        self.range = range;
+        self.low = low;
+    }
+
+    pub fn finish(mut self) -> Vec<u8> {
+        for _ in 0..32 {
+            self.write(false, 128);
+        }
+        self.out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// An encoder for the tests: the counterpart of the decoder (libvpx's writer, as the
-    /// specification's decoder implies it).
-    pub struct BoolEncoder {
-        low: u64,
-        range: u32,
-        count: i32,
-        out: Vec<u8>,
-    }
-
-    impl BoolEncoder {
-        pub fn new() -> BoolEncoder {
-            let mut e = BoolEncoder {
-                low: 0,
-                range: 255,
-                count: -24,
-                out: Vec::new(),
-            };
-            e.write(false, 128); // the marker bit
-            e
-        }
-
-        pub fn write(&mut self, bit: bool, p: u8) {
-            let split = 1 + (((self.range - 1) * u32::from(p)) >> 8);
-            let (mut range, mut low) = (split, self.low);
-            if bit {
-                low += u64::from(split);
-                range = self.range - split;
-            }
-            let mut shift = (range as u8).leading_zeros() as i32;
-            range <<= shift;
-            self.count += shift;
-            if self.count >= 0 {
-                let offset = shift - self.count;
-                if (low << (offset - 1)) & 0x8000_0000 != 0 {
-                    // Carry into the bytes written.
-                    let mut x = self.out.len();
-                    while x > 0 && self.out[x - 1] == 0xFF {
-                        self.out[x - 1] = 0;
-                        x -= 1;
-                    }
-                    self.out[x - 1] += 1;
-                }
-                self.out.push(((low >> (24 - offset)) & 0xFF) as u8);
-                low <<= offset;
-                shift = self.count;
-                low &= 0xFF_FFFF;
-                self.count -= 8;
-            }
-            low <<= shift;
-            self.range = range;
-            self.low = low;
-        }
-
-        pub fn finish(mut self) -> Vec<u8> {
-            for _ in 0..32 {
-                self.write(false, 128);
-            }
-            self.out
-        }
-    }
 
     #[test]
     fn bools_written_with_their_probabilities_read_back() {
