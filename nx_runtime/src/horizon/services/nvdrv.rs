@@ -451,6 +451,25 @@ impl Shared {
         Ok(())
     }
 
+    /// Show a frame that is not in a buffer queue, after the commands queued before it.
+    pub fn present_native(&self, request: nx_gpu::render::Present) -> Result<(), String> {
+        let Some(worker) = &self.worker else {
+            let mut core = self.lock();
+            core.gpu.note_frame(request.frame);
+            return core.gpu.present_native(request);
+        };
+        worker.wait_for_room(true);
+        let request = {
+            let mut core = self.lock();
+            core.gpu.note_frame(request.frame);
+            core.gpu.native_present_request(request)
+        };
+        if let Some(request) = request {
+            worker.push(Task::Present(request));
+        }
+        Ok(())
+    }
+
     /// Print what the command processor counted (`NX_TRACE_GPU`), once the process has ended.
     pub fn report(&self) {
         if let Some(w) = &self.worker {

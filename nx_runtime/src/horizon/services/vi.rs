@@ -12,7 +12,7 @@ use super::super::service::{Request, Response, Service, ServiceResult, Stop};
 use nx_gpu::display::Compositor;
 use nx_gpu::event::EventToken;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,8 @@ pub struct Shared {
     /// Events set at every vsync besides the displays' own: the native events of the Switch 2's
     /// `vi2` that are bound to the vsync (A-198), under keys their sessions choose.
     vsync_listeners: Mutex<HashMap<u64, KObject>>,
+    /// The frames shown that were in no buffer queue: the Switch 2's native images (`vi2` 229).
+    native_frames: AtomicU64,
 }
 
 impl Shared {
@@ -77,7 +79,50 @@ impl Shared {
                 .filter(|&n| n > 0)
                 .unwrap_or(u32::MAX),
             vsync_listeners: Mutex::new(HashMap::new()),
+            native_frames: AtomicU64::new(0),
         }
+    }
+
+    /// Every frame presented so far, queued buffers and native images.
+    fn frames_presented(&self) -> u64 {
+        self.comp().frames_presented() + self.native_frames.load(Ordering::Acquire)
+    }
+
+    /// Show a frame that is in no buffer queue (the Switch 2's native images, `vi2` 229), with
+    /// swap interval `interval`: held to the display's grid and handed to the renderer as a
+    /// queued buffer is (A-181), and counted with them for `NX_MAX_FRAMES` and the input script.
+    /// The request's frame number and due time are set here.
+    pub fn present_native(
+        &self,
+        kernel: &Kernel,
+        mut request: nx_gpu::render::Present,
+        interval: u32,
+    ) -> Result<(), Stop> {
+        let number = self.native_frames.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.trace {
+            let mut seen = self.interval.lock().unwrap_or_else(|e| e.into_inner());
+            if *seen != Some(interval) {
+                eprintln!(
+                    "[vi] frame {number}: the program presents its images with swap interval {interval}"
+                );
+                *seen = Some(interval);
+            }
+        }
+        let tick = self.pace(self.capped(interval), number);
+        request.frame = number;
+        request.due = tick.map(|t| t + VSYNC_PERIOD);
+        if let Some(gpu) = self.gpu() {
+            gpu.present_native(request).map_err(|why| {
+                Stop(format!("the renderer could not show frame {number}: {why}"))
+            })?;
+        }
+        let frames = self.frames_presented();
+        super::super::input::frames_presented(frames);
+        if self.frame_limit.is_some_and(|limit| frames >= limit) {
+            eprintln!("kiln runtime: NX_MAX_FRAMES reached after {frames} presented frames");
+            kernel.exit_process(0);
+        }
+        Ok(())
     }
 
     /// The swap interval a frame is paced with: the one the program asked for, up to the cap.
@@ -505,11 +550,11 @@ impl BinderDriver {
         }
         if code == nx_gpu::display::code::QUEUE_BUFFER {
             // The clock of `NX_INPUT_SCRIPT`.
-            let frames = self.shared.comp().frames_presented();
+            let frames = self.shared.frames_presented();
             super::super::input::frames_presented(frames);
         }
         if let Some(limit) = self.shared.frame_limit {
-            let frames = self.shared.comp().frames_presented();
+            let frames = self.shared.frames_presented();
             if code == nx_gpu::display::code::QUEUE_BUFFER && frames >= limit {
                 eprintln!("kiln runtime: NX_MAX_FRAMES reached after {frames} presented frames");
                 kernel.exit_process(0);

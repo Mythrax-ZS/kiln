@@ -196,6 +196,33 @@ impl Gpu {
         }
     }
 
+    /// A frame that is not in a buffer queue (the Switch 2's native images, which the program
+    /// names by their memory): the request as it is, nothing without a renderer.
+    pub fn native_present_request(
+        &self,
+        request: crate::render::Present,
+    ) -> Option<crate::render::Present> {
+        self.backend.as_ref()?;
+        if self.level >= 1 && request.frame <= 2 {
+            eprintln!(
+                "[gpu] frame {} shows the native image at {:#x}, {}x{}, crop {:?}",
+                request.frame, request.address, request.width, request.height, request.crop
+            );
+        }
+        Some(request)
+    }
+
+    /// Show a native frame (see [`Gpu::native_present_request`]).
+    pub fn present_native(&mut self, request: crate::render::Present) -> Result<(), String> {
+        let Some(request) = self.native_present_request(request) else {
+            return Ok(());
+        };
+        match self.backend.as_deref_mut() {
+            Some(backend) => backend.present(&request),
+            None => Ok(()),
+        }
+    }
+
     /// What showing a queued buffer asks of the renderer; nothing without one.
     pub fn present_request(
         &self,

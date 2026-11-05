@@ -126,6 +126,15 @@ impl NativeObjects {
         }
         Some((u64::from(handle - first) * pool.layout.size, pool.layout))
     }
+
+    /// The address in the process of the image `handle` and its layout; None unless its native
+    /// memory is bound.
+    pub fn image_address(&self, handle: u32) -> Option<(u64, ImageLayout)> {
+        let (offset, layout) = self.image_in_memory(handle)?;
+        let (_, pool) = self.pools.range(..=handle).next_back()?;
+        let base = self.memories.get(&pool.memory)?.address?;
+        Some((base + offset, layout))
+    }
 }
 
 impl Supervisor {
@@ -456,6 +465,9 @@ impl Service for Camera {
                 let event = self.event.get_or_insert_with(|| kernel.new_event());
                 Ok(Response::ok().with_copy_handle(event.1.clone()))
             }
+            // Polled every frame, with a u32 (0x180): answered with success and nothing, as
+            // Eglantine answers it (A-234).
+            29 => Ok(Response::ok()),
             other => Err(Stop::unknown_command(self.name(), other)),
         }
     }
@@ -1166,7 +1178,6 @@ pub struct Vi2Session {
     /// low byte.
     key: u64,
     /// The graphics system's native images, which 229 presents (A-212).
-    #[allow(dead_code)]
     images: Arc<std::sync::Mutex<NativeObjects>>,
     /// The (writable, readable) ends of each native event slot's event, once acquired (31).
     native: [Option<(KObject, KObject)>; VI2_NATIVE_EVENTS],
@@ -1240,6 +1251,56 @@ impl Vi2Session {
 
     fn listener(&self, slot: usize) -> u64 {
         self.key | slot as u64
+    }
+
+    /// PresentClientBuffer (229), from nn::wsi::ounce::native::NativeWindow::Present: (u64 layer,
+    /// u32 slot, u32 native image, ..., u32 shown size at byte 20 as ((height - 1) << 16) |
+    /// (width - 1), u32 timing at byte 40 as (swap interval << 16) | refresh rate, the fence at
+    /// bytes 80 and 88) -> (u64 slots the client may draw into, 16 bytes). The image is shown
+    /// from its memory, after the commands submitted before the call (the renderer's order, so
+    /// the fence is not waited on); the display holds no slot afterwards (A-236).
+    fn present_client_buffer(&self, kernel: &Kernel, req: &Request) -> ServiceResult {
+        let (layer, image) = (req.u64_at(0), req.u32_at(12));
+        if !self.layers.contains(&layer) {
+            return Err(Stop(format!("nx2:vi2 229 of the unknown layer {layer:#x}")));
+        }
+        let found = self
+            .images
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .image_address(image);
+        let Some((address, layout)) = found else {
+            return Err(Stop(format!(
+                "nx2:vi2 229 presents the native image {image}, which is not in bound memory"
+            )));
+        };
+        let shown = req.u32_at(20);
+        let (width, height) = ((shown & 0xFFFF) + 1, (shown >> 16) + 1);
+        if width > layout.width || height > layout.height {
+            return Err(Stop(format!(
+                "nx2:vi2 229 shows {width}x{height} of the {}x{} image {image}",
+                layout.width, layout.height
+            )));
+        }
+        let request = nx_gpu::render::Present {
+            address,
+            width: layout.width,
+            height: layout.height,
+            pitch: layout.pitch as u32,
+            // What the renderer shows is the render target at the address, in its own format.
+            format: nx_gpu::display::FORMAT_RGBA_8888,
+            layout: 3,
+            block_height_log2: layout.block_rows.trailing_zeros().saturating_sub(3),
+            crop: [0, 0, width as i32, height as i32],
+            frame: 0,
+            due: None,
+        };
+        self.display
+            .present_native(kernel, request, req.u32_at(40) >> 16)?;
+        Ok(Response::ok()
+            .with_u64(VI2_ALL_SLOTS)
+            .with_u64(0)
+            .with_u64(0))
     }
 }
 
@@ -1409,6 +1470,14 @@ impl Service for Vi2Session {
                 self.display.unlisten_vsync(self.listener(slot));
                 Ok(Response::ok())
             }
+            // (u64, u64), from nn::wsi::ounce::native::NativeWindow::Present before the frame is
+            // handed over; only the result is read, and nothing here depends on it (A-235).
+            351 => Ok(Response::ok()),
+            // (u64 layer, f32, f32, f32), from the same Present when three values of the window
+            // that it keeps have changed; only the result is read, and the display here does
+            // nothing with them (A-235).
+            352 => Ok(Response::ok()),
+            229 => self.present_client_buffer(&kernel, req),
             other => Err(Stop::unknown_command(self.name(), other)),
         }
     }
