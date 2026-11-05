@@ -7,6 +7,7 @@
 //! number, as every service here does.
 
 use super::super::kernel::Kernel;
+use super::super::layout;
 use super::super::object::KObject;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
 use super::{nvdrv, vi};
@@ -24,6 +25,95 @@ pub struct Supervisor {
     gpu_state: Arc<std::sync::Mutex<GpuState>>,
     /// The GPU address spaces attached with 434, by id.
     attached: std::collections::BTreeSet<u32>,
+    /// The native memory and images of the graphics system, which `vi2` presents (A-212).
+    native: Arc<std::sync::Mutex<NativeObjects>>,
+}
+
+/// The layout of a native image, from the 16 words of its preference (A-212): the kind at word 1,
+/// the width and height less one at word 2, the block height (log2 of its rows) at word 4, the row
+/// pitch in 64-byte units at word 5, the format at word 6. The image is block-linear: its size is
+/// the pitch times its height rounded up to a block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageLayout {
+    pub kind: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub pitch: u64,
+    pub block_rows: u64,
+    pub size: u64,
+    pub alignment: u64,
+}
+
+impl ImageLayout {
+    pub fn from_preference(words: &[u32]) -> Result<ImageLayout, String> {
+        let word = |n: usize| words.get(n).copied().unwrap_or(0);
+        let (width, height) = ((word(2) & 0xFFFF) + 1, (word(2) >> 16) + 1);
+        let (block_log2, units) = (word(4), u64::from(word(5)));
+        // The pitch the SDK gives holds the width at four bytes a pixel or more.
+        let least = (u64::from(width) * 4).div_ceil(64);
+        if block_log2 > 8 || !(least..=4096).contains(&units) {
+            return Err(format!(
+                "a native image of {width}x{height} with a block of 2^{block_log2} rows and a \
+                 pitch of {units} units of 64 bytes (preference {:x?})",
+                &words[..words.len().min(8)]
+            ));
+        }
+        let (pitch, block_rows) = (units * 64, 1u64 << block_log2);
+        Ok(ImageLayout {
+            kind: word(1),
+            width,
+            height,
+            format: word(6),
+            pitch,
+            block_rows,
+            size: pitch * u64::from(height).next_multiple_of(block_rows),
+            alignment: (64 * block_rows).max(0x1000),
+        })
+    }
+}
+
+/// Native memory: its size and, once bound (114, 423), its address.
+#[derive(Clone, Copy, Debug, Default)]
+struct NativeMemory {
+    size: u64,
+    address: Option<u64>,
+}
+
+/// A pool of native images made with 429: `count` images of one layout, one after the other in
+/// a native memory.
+#[derive(Clone, Copy, Debug)]
+#[expect(dead_code, reason = "read by NativeObjects::image, which vi2's present will call")]
+struct NativePool {
+    memory: u32,
+    count: u32,
+    layout: ImageLayout,
+}
+
+/// The native memory and image pools of the graphics system (A-212).
+#[derive(Debug, Default)]
+pub struct NativeObjects {
+    memories: std::collections::BTreeMap<u32, NativeMemory>,
+    pools: std::collections::BTreeMap<u32, NativePool>,
+    next_memory: u32,
+    next_image: u32,
+}
+
+impl NativeObjects {
+    /// The address and layout of the image `handle` (the first image of its pool and those after
+    /// it), once its memory is bound.
+    #[expect(dead_code, reason = "vi2's present (229) is not modelled yet")]
+    pub fn image(&self, handle: u32) -> Option<(u64, ImageLayout)> {
+        let (&first, pool) = self.pools.range(..=handle).next_back()?;
+        if handle - first >= pool.count {
+            return None;
+        }
+        let address = self.memories.get(&pool.memory)?.address?;
+        Some((
+            address + u64::from(handle - first) * pool.layout.size,
+            pool.layout,
+        ))
+    }
 }
 
 impl Supervisor {
@@ -39,8 +129,121 @@ impl Supervisor {
             client_registered: false,
             gpu_state: Arc::default(),
             attached: Default::default(),
+            native: Arc::default(),
         }
     }
+
+    /// The native memory and image commands (A-212); `None` for another command.
+    fn native_command(&mut self, req: &Request) -> Option<ServiceResult> {
+        let mut st = self.native.lock().unwrap_or_else(|e| e.into_inner());
+        let preference = || ImageLayout::from_preference(&words_of(req, 16));
+        let count = req.u32_at(64).max(1);
+        Some(match req.command {
+            // CalculateRequirements(preference, u32) -> (u64 size, u64 alignment), from
+            // nn::gsv::shim::CalculateRequirements.
+            1510 => preference()
+                .map(|l| Response::ok().with_u64(l.size).with_u64(l.alignment))
+                .map_err(|e| Stop(format!("nx2:gsv 1510: {e}"))),
+            // CalculateNativeImageSize(preference, u32 count) -> u64 size
+            435 => preference()
+                .map(|l| Response::ok().with_u64(l.size * u64::from(count)))
+                .map_err(|e| Stop(format!("nx2:gsv 435: {e}"))),
+            // CreateNativeMemory(u8 mode, u64 size) -> u32 id (from 1)
+            111 => {
+                st.next_memory += 1;
+                let id = st.next_memory;
+                st.memories.insert(
+                    id,
+                    NativeMemory {
+                        size: req.u64_at(4),
+                        address: None,
+                    },
+                );
+                Ok(Response::ok().with_u32(id))
+            }
+            // DestroyNativeMemory(u32 id)
+            112 => match st.memories.remove(&req.u32_at(0)) {
+                Some(_) => Ok(Response::ok()),
+                None => Err(Stop(format!(
+                    "nx2:gsv 112 of the native memory {}, which 111 did not make",
+                    req.u32_at(0)
+                ))),
+            },
+            // BindNativeMemory(u32 id, u64 address, u64 size, u64 flags, u64 offset) and
+            // BindNativeGpuMemory(u32 id, u64 address, u64 size, u32 GPU memory, u64 offset): the
+            // memory is at the address plus the offset.
+            114 | 423 => {
+                let id = req.u32_at(0);
+                let offset = if req.command == 114 {
+                    req.u64_at(28)
+                } else {
+                    req.u64_at(24)
+                };
+                let Some(memory) = st.memories.get_mut(&id) else {
+                    return Some(Err(Stop(format!(
+                        "nx2:gsv {} of the native memory {id}, which 111 did not make",
+                        req.command
+                    ))));
+                };
+                memory.address = Some(req.u64_at(4) + offset);
+                if memory.size == 0 {
+                    memory.size = req.u64_at(12);
+                }
+                Ok(Response::ok())
+            }
+            // CreateNativeImage(preference, u32 count, u32 memory) -> u32 first image: the pool
+            // takes as many handles as it has images.
+            429 => {
+                let memory = req.u32_at(68);
+                if !st.memories.contains_key(&memory) {
+                    return Some(Err(Stop(format!(
+                        "nx2:gsv 429 in the native memory {memory}, which 111 did not make"
+                    ))));
+                }
+                match preference() {
+                    Ok(layout) => {
+                        let first = st.next_image + 1;
+                        st.next_image += count;
+                        st.pools.insert(
+                            first,
+                            NativePool {
+                                memory,
+                                count,
+                                layout,
+                            },
+                        );
+                        Ok(Response::ok().with_u32(first))
+                    }
+                    Err(e) => Err(Stop(format!("nx2:gsv 429: {e}"))),
+                }
+            }
+            // DestroyNativeImage(u32 first image)
+            430 => match st.pools.remove(&req.u32_at(0)) {
+                Some(_) => Ok(Response::ok()),
+                None => Err(Stop(format!(
+                    "nx2:gsv 430 of the native image {}, which 429 did not make",
+                    req.u32_at(0)
+                ))),
+            },
+            // (u32 image, u32 count) / (u32 image): a pool becomes or stops being a window's.
+            314 | 315 => {
+                if !st.pools.contains_key(&req.u32_at(0)) {
+                    return Some(Err(Stop(format!(
+                        "nx2:gsv {} of the native image {}, which 429 did not make",
+                        req.command,
+                        req.u32_at(0)
+                    ))));
+                }
+                Ok(Response::ok())
+            }
+            _ => return None,
+        })
+    }
+}
+
+/// The first `n` u32s of a request's data.
+fn words_of(req: &Request, n: usize) -> Vec<u32> {
+    (0..n).map(|i| req.u32_at(4 * i)).collect()
 }
 
 /// The layout of the syncpoint pages (A-196): in the read-only page, a header, the values from
@@ -254,6 +457,78 @@ pub struct GpuState {
     memories: std::collections::BTreeMap<u32, (u64, u64)>,
     /// The handle the next memory gets.
     next_memory: u32,
+    /// The GPU-only regions made with 214, by first GPU address: the CPU address of their
+    /// backing and their size (A-215).
+    regions: std::collections::BTreeMap<u64, (u64, u64)>,
+    /// Backing that 215 gave back, kept mapped for a later region of the same size: the guest's
+    /// memory does not give unmapped pages back to the host.
+    spare: Vec<(u64, u64)>,
+    /// The end of the backing handed out so far, from [`layout::GPU_SERVER_BASE`].
+    server_end: u64,
+}
+
+impl GpuState {
+    /// Backing for a GPU-only region of `size` bytes, zeroed: spare backing of that size, or fresh
+    /// pages past what was handed out.
+    fn back(&mut self, kernel: &Kernel, size: u64) -> Result<u64, String> {
+        if let Some(i) = self.spare.iter().position(|&(_, s)| s == size) {
+            let (address, _) = self.spare.swap_remove(i);
+            let zeros = vec![0u8; 1 << 20];
+            let mut at = 0;
+            while at < size {
+                let n = (size - at).min(zeros.len() as u64);
+                crate::rt::runtime::rt()
+                    .mem
+                    .write_bytes(address + at, &zeros[..n as usize], false)
+                    .map_err(|e| format!("zeroing the backing at {:#x}: {e:?}", address + at))?;
+                at += n;
+            }
+            return Ok(address);
+        }
+        let address = layout::GPU_SERVER_BASE + self.server_end;
+        if self.server_end + size > layout::GPU_SERVER_SIZE {
+            return Err(format!(
+                "{size:#x} bytes of GPU-only memory do not fit: {:#x} bytes are handed out",
+                self.server_end
+            ));
+        }
+        kernel
+            .map_server_memory(address, size)
+            .map_err(|e| format!("mapping {size:#x} bytes at {address:#x}: {e:?}"))?;
+        self.server_end += size;
+        Ok(address)
+    }
+}
+
+/// The flag of 214 that makes a region sparse: the program maps its own memory into parts of it
+/// (216), and the rest reads zero.
+const SPARSE_REGION: u32 = 0x200;
+
+/// The size of a request of 216.
+const SPARSE_MAP_REQUEST: usize = 40;
+
+/// A request of 216 (`nn::gpu::sdk::SparseMapRequest`, A-216): a GPU range, the kind wanted, and
+/// the GPU memory (101's handle, 0 for none) and the offset into it that the range shows.
+#[derive(Clone, Copy, Debug)]
+struct SparseMap {
+    gpu_address: u64,
+    size: u64,
+    kind: u8,
+    memory: u32,
+    offset: u64,
+}
+
+impl SparseMap {
+    fn parse(b: &[u8; SPARSE_MAP_REQUEST]) -> SparseMap {
+        let u64_at = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        SparseMap {
+            gpu_address: u64_at(0),
+            size: u64_at(8),
+            kind: b[19],
+            memory: u32::from_le_bytes(b[24..28].try_into().unwrap()),
+            offset: u64_at(32),
+        }
+    }
 }
 
 /// The graphics devices there may be at once: ids 1 to 63 (A-197).
@@ -300,7 +575,12 @@ impl GpuSession {
 
     /// Stop unless the request's u32 at 0 names an address space made with 33.
     fn space(&self, req: &Request) -> Result<u32, Stop> {
-        let id = req.u32_at(0);
+        self.space_at(req, 0)
+    }
+
+    /// Stop unless the request's u32 at `at` names an address space made with 33.
+    fn space_at(&self, req: &Request, at: usize) -> Result<u32, Stop> {
+        let id = req.u32_at(at);
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !st.spaces.contains(&id) {
             return Err(Stop(format!(
@@ -309,6 +589,45 @@ impl GpuSession {
             )));
         }
         Ok(id)
+    }
+
+    /// Carry out one request of 216: the range shows the memory and offset named, or with no
+    /// memory what it showed before any was mapped there (a GPU-only region's own backing, else
+    /// nothing).
+    fn sparse_map(&self, r: &SparseMap) -> Result<(), String> {
+        if r.size == 0 {
+            return Ok(());
+        }
+        if r.gpu_address.checked_add(r.size).is_none() {
+            return Err("the range wraps around".into());
+        }
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if r.memory == 0 {
+            let own = st
+                .regions
+                .range(..=r.gpu_address)
+                .next_back()
+                .filter(|&(&s, &(_, n))| r.gpu_address + r.size <= s + n)
+                .map(|(&s, &(backing, _))| backing + (r.gpu_address - s));
+            drop(st);
+            return match own {
+                Some(backing) => self.gpu.switch_2_map(r.gpu_address, r.size, backing, 0),
+                None => self.gpu.switch_2_unmap(r.gpu_address, r.size),
+            };
+        }
+        let &(start, len) = st
+            .memories
+            .get(&r.memory)
+            .ok_or_else(|| format!("the GPU memory {}, which 101 did not make", r.memory))?;
+        if r.offset.checked_add(r.size).is_none_or(|end| end > len) {
+            return Err(format!(
+                "past the end of the memory {}, of {len:#x} bytes",
+                r.memory
+            ));
+        }
+        drop(st);
+        self.gpu
+            .switch_2_map(r.gpu_address, r.size, start + r.offset, u32::from(r.kind))
     }
 
     fn event(&self, kernel: &Kernel, id: u32) -> (KObject, KObject) {
@@ -455,6 +774,106 @@ impl Service for GpuSession {
                 self.complete(&kernel, req.u32_at(24));
                 Ok(Response::ok())
             }
+            // CreateSparseRegion(u32 address space, u64 first, u64 last, u32 flags, ..., u32 slot
+            // at 36), nn::gpu::sdk::CreateSparseRegion: GPU memory the program does not map from
+            // its own. Without the flag 0x200 the graphics server backs it, the program never
+            // reaching it (render targets): here zeroed pages outside the program's regions
+            // (A-215). A sparse region stops the run.
+            214 => {
+                self.space(req)?;
+                let (first, last, flags) = (req.u64_at(4), req.u64_at(12), req.u32_at(20));
+                let len = Self::span(req, first, last)?;
+                if flags & SPARSE_REGION != 0 {
+                    return Err(Stop(format!(
+                        "nx2:gpu 214 makes a sparse region [{first:#x}, {last:#x}] (flags \
+                         {flags:#x}), which is not modelled"
+                    )));
+                }
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if st
+                    .regions
+                    .range(..=last)
+                    .next_back()
+                    .is_some_and(|(&s, &(_, n))| s + n > first)
+                {
+                    return Err(Stop(format!(
+                        "nx2:gpu 214 makes [{first:#x}, {last:#x}] over another region"
+                    )));
+                }
+                let backing = st
+                    .back(&kernel, len)
+                    .map_err(|e| Stop(format!("nx2:gpu 214 of [{first:#x}, {last:#x}]: {e}")))?;
+                st.regions.insert(first, (backing, len));
+                drop(st);
+                self.gpu
+                    .switch_2_map(first, len, backing, 0)
+                    .map_err(|e| Stop(format!("nx2:gpu 214 of [{first:#x}, {last:#x}]: {e}")))?;
+                self.complete(&kernel, req.u32_at(36));
+                Ok(Response::ok())
+            }
+            // DestroySparseRegion(u32 address space, u64 first, u64 last, ..., u32 slot at 24):
+            // the region 214 made goes; its backing is kept for a region of the same size.
+            215 => {
+                self.space(req)?;
+                let (first, last) = (req.u64_at(4), req.u64_at(12));
+                let len = Self::span(req, first, last)?;
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let backing = match st.regions.get(&first) {
+                    Some(&(backing, n)) if n == len => backing,
+                    _ => {
+                        return Err(Stop(format!(
+                            "nx2:gpu 215 of [{first:#x}, {last:#x}], which 214 did not make"
+                        )))
+                    }
+                };
+                st.regions.remove(&first);
+                st.spare.push((backing, len));
+                drop(st);
+                self.gpu
+                    .switch_2_unmap(first, len)
+                    .map_err(|e| Stop(format!("nx2:gpu 215 of [{first:#x}, {last:#x}]: {e}")))?;
+                self.complete(&kernel, req.u32_at(24));
+                Ok(Response::ok())
+            }
+            // ExecuteSparseMapRequests(u64 count, u32 address space, u64 request size, u32 sync,
+            // u32 slot), nn::gpu::sdk::ExecuteSparseMapRequests: the requests are in the A buffer,
+            // the B buffer gets the kind applied to each, the reply is how many were done (A-216).
+            216 => {
+                self.space_at(req, 8)?;
+                let (count, size) = (req.u64_at(0), req.u64_at(12));
+                if size != SPARSE_MAP_REQUEST as u64 {
+                    return Err(Stop(format!(
+                        "nx2:gpu 216 with requests of {size} bytes; they are of \
+                         {SPARSE_MAP_REQUEST}"
+                    )));
+                }
+                let bytes = count
+                    .checked_mul(size)
+                    .filter(|&n| req.input_buffer(0).is_some_and(|b| b.size >= n))
+                    .ok_or_else(|| {
+                        Stop(format!(
+                            "nx2:gpu 216 of {count} requests, which its buffer does not hold"
+                        ))
+                    })?;
+                let raw = kernel
+                    .read_buffer(req.input_buffer(0).unwrap(), bytes)
+                    .ok_or_else(|| Stop("nx2:gpu 216: its requests are not readable".into()))?;
+                let mut kinds = Vec::with_capacity(raw.len() / SPARSE_MAP_REQUEST);
+                for r in raw.as_chunks::<SPARSE_MAP_REQUEST>().0 {
+                    let r = SparseMap::parse(r);
+                    self.sparse_map(&r)
+                        .map_err(|e| Stop(format!("nx2:gpu 216 {r:x?}: {e}")))?;
+                    kinds.push(r.kind);
+                }
+                if let Some(out) = req.output_buffer(0) {
+                    let n = (out.size as usize).min(kinds.len());
+                    if !kernel.write_memory(out.addr, &kinds[..n]) {
+                        return Err(Stop("nx2:gpu 216: its kinds buffer is not writable".into()));
+                    }
+                }
+                self.complete(&kernel, req.u32_at(24));
+                Ok(Response::ok().with_u64(count))
+            }
             // DestroyGraphicsDevice(u8 id)
             42 => {
                 let id = req.u32_at(0) as u8;
@@ -499,6 +918,9 @@ pub struct Vi2Session {
     /// This session's keys in the display's list of vsync listeners: this, with the slot in the
     /// low byte.
     key: u64,
+    /// The graphics system's native images, which 229 presents (A-212).
+    #[allow(dead_code)]
+    images: Arc<std::sync::Mutex<NativeObjects>>,
     /// The (writable, readable) ends of each native event slot's event, once acquired (31).
     native: [Option<(KObject, KObject)>; VI2_NATIVE_EVENTS],
 }
@@ -531,13 +953,18 @@ fn vi2_default_display(req: &Request, at: usize) -> Result<(), Stop> {
 }
 
 impl Vi2Session {
-    pub fn new(kernel: Weak<Kernel>, display: Arc<vi::Shared>) -> Vi2Session {
+    pub fn new(
+        kernel: Weak<Kernel>,
+        display: Arc<vi::Shared>,
+        images: Arc<std::sync::Mutex<NativeObjects>>,
+    ) -> Vi2Session {
         static SESSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Vi2Session {
             kernel,
             display,
             layers: Default::default(),
             key: SESSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 8,
+            images,
             native: Default::default(),
         }
     }
@@ -773,6 +1200,9 @@ impl Service for Supervisor {
     }
 
     fn request_tipc(&mut self, req: &Request) -> ServiceResult {
+        if let Some(answer) = self.native_command(req) {
+            return answer;
+        }
         match req.command {
             // nn::gsv::BootWithRemoteMemory: the program's remote memory (the region of
             // `GetInfo` 29 and 30) and a handle, for a graphics server in another process to map.
@@ -836,7 +1266,11 @@ impl Service for Supervisor {
             ),
             // OpenViSession(u64): presentation (A-198).
             305 => Ok(Response::ok().with_copy_handle(KObject::session(Box::new(
-                Vi2Session::new(self.kernel.clone(), self.display.clone()),
+                Vi2Session::new(
+                    self.kernel.clone(),
+                    self.display.clone(),
+                    self.native.clone(),
+                ),
             )))),
             // nn::nvsrv::BootWithRemoteMemory: a session of the GPU driver (A-194).
             1402 => Ok(
@@ -1035,6 +1469,212 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_gpu_only_region_is_backed_by_the_server_and_its_backing_reused() {
+        let _serial = SERVER_MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        use super::super::super::kernel::{ProcessInfo, ProcessKind};
+        use crate::rt::runtime::rt;
+        let kernel = Kernel::new(ProcessInfo::new("gpu", ProcessKind::Nso, None));
+        let gpu = nvdrv::Shared::new();
+        gpu.set_switch_2(true);
+        let mut g = GpuSession {
+            kernel: Arc::downgrade(&kernel),
+            gpu: gpu.clone(),
+            state: Arc::default(),
+        };
+        let region = |command: u32, first: u64, last: u64, flags: u32, slot: (usize, u32)| {
+            let mut data = vec![0u8; 64];
+            data[0..4].copy_from_slice(&1u32.to_le_bytes());
+            data[4..12].copy_from_slice(&first.to_le_bytes());
+            data[12..20].copy_from_slice(&last.to_le_bytes());
+            data[20..24].copy_from_slice(&flags.to_le_bytes());
+            data[slot.0..slot.0 + 4].copy_from_slice(&slot.1.to_le_bytes());
+            Request {
+                command,
+                data,
+                ..Request::default()
+            }
+        };
+        g.request_tipc(&with_u32(33, 0)).unwrap();
+        // Two pages at GPU address 0x81_0000_0000, the flags a render target's region has.
+        g.request_tipc(&region(214, 0x81_0000_0000, 0x81_0000_1FFF, 0xC, (36, 5)))
+            .unwrap();
+        let backing = gpu.switch_2_translate(0x81_0000_0000).unwrap();
+        assert_eq!(backing, layout::GPU_SERVER_BASE);
+        assert_eq!(
+            gpu.switch_2_translate(0x81_0000_1008),
+            Some(backing + 0x1008)
+        );
+        assert!(kernel.event_signaled(&g.event(&kernel, 5).0));
+        let block = kernel.query_memory(backing);
+        assert_eq!(
+            (block.base, block.size, block.info.mem_type),
+            (backing, 0x2000, layout::mem_type::INACCESSIBLE),
+            "the backing is a block of its own the program is told it cannot use"
+        );
+        // Over the region, or a sparse one: stops.
+        assert!(g
+            .request_tipc(&region(214, 0x81_0000_1000, 0x81_0000_2FFF, 0xC, (36, 5)))
+            .is_err());
+        assert!(g
+            .request_tipc(&region(214, 0x82_0000_0000, 0x82_0000_FFFF, 0x60C, (36, 5)))
+            .is_err());
+        // 215 unmaps it; a region of the same size gets the backing again, zeroed.
+        rt().mem.write_bytes(backing + 8, &[7], false).unwrap();
+        g.request_tipc(&region(215, 0x81_0000_0000, 0x81_0000_1FFF, 0, (24, 6)))
+            .unwrap();
+        assert_eq!(gpu.switch_2_translate(0x81_0000_0000), None);
+        assert!(kernel.event_signaled(&g.event(&kernel, 6).0));
+        assert!(
+            g.request_tipc(&region(215, 0x81_0000_0000, 0x81_0000_1FFF, 0, (24, 6)))
+                .is_err(),
+            "destroyed once"
+        );
+        g.request_tipc(&region(214, 0x90_0000_0000, 0x90_0000_1FFF, 0xC, (36, 7)))
+            .unwrap();
+        assert_eq!(gpu.switch_2_translate(0x90_0000_0000), Some(backing));
+        let mut byte = [1u8];
+        rt().mem.read_bytes(backing + 8, &mut byte, false).unwrap();
+        assert_eq!(byte, [0]);
+    }
+
+    #[test]
+    fn sparse_map_requests_point_ranges_at_gpu_memory_and_back() {
+        let _serial = SERVER_MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        use super::super::super::kernel::{ProcessInfo, ProcessKind};
+        use super::super::super::service::Buffer;
+        use crate::rt::{abi::perm, runtime::rt};
+        // The requests and the kinds, in a page of guest memory of this test's own.
+        const PAGE: u64 = 0x3E_0000_0000;
+        let _ = rt().mem.unmap(PAGE, 0x1000);
+        rt().mem.map(PAGE, 0x1000, perm::R | perm::W).unwrap();
+        let kernel = Kernel::new(ProcessInfo::new("gpu", ProcessKind::Nso, None));
+        let gpu = nvdrv::Shared::new();
+        gpu.set_switch_2(true);
+        let mut g = GpuSession {
+            kernel: Arc::downgrade(&kernel),
+            gpu: gpu.clone(),
+            state: Arc::default(),
+        };
+        let fields = |command: u32, fields: &[(usize, u64, usize)]| {
+            let mut data = vec![0u8; 64];
+            for &(at, value, width) in fields {
+                data[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+            }
+            Request {
+                command,
+                data,
+                ..Request::default()
+            }
+        };
+        g.request_tipc(&with_u32(33, 0)).unwrap();
+        // Four pages of GPU memory at 0x30_0010_0000, and a GPU-only region of four pages.
+        g.request_tipc(&fields(
+            101,
+            &[(0, 0x30_0010_0000, 8), (8, 0x30_0010_3FFF, 8)],
+        ))
+        .unwrap();
+        let region = [
+            (0, 1, 4),
+            (4, 0x81_0000_0000, 8),
+            (12, 0x81_0000_3FFF, 8),
+            (20, 0xC, 4),
+        ];
+        g.request_tipc(&fields(214, &region)).unwrap();
+        let backing = gpu.switch_2_translate(0x81_0000_0000).unwrap();
+        // The region's second page shows the memory's third, kind 0xFE; a range outside any
+        // region shows its first.
+        let request = |gpu_address: u64, size: u64, kind: u8, memory: u32, offset: u64| {
+            let mut r = [0u8; 40];
+            r[0..8].copy_from_slice(&gpu_address.to_le_bytes());
+            r[8..16].copy_from_slice(&size.to_le_bytes());
+            r[19] = kind;
+            r[24..28].copy_from_slice(&memory.to_le_bytes());
+            r[32..40].copy_from_slice(&offset.to_le_bytes());
+            r
+        };
+        let send = |g: &mut GpuSession, requests: &[[u8; 40]], slot: u64| {
+            let raw = requests.concat();
+            rt().mem.write_bytes(PAGE, &raw, false).unwrap();
+            let mut r = fields(
+                216,
+                &[
+                    (0, requests.len() as u64, 8),
+                    (8, 1, 4),
+                    (12, 40, 8),
+                    (24, slot, 4),
+                ],
+            );
+            r.send_buffers = vec![Buffer {
+                addr: PAGE,
+                size: raw.len() as u64,
+            }];
+            r.receive_buffers = vec![Buffer {
+                addr: PAGE + 0x800,
+                size: requests.len() as u64,
+            }];
+            g.request_tipc(&r)
+        };
+        let done = send(
+            &mut g,
+            &[
+                request(0x81_0000_1000, 0x1000, 0xFE, 1, 0x2000),
+                request(0x50_0000_0000, 0x1000, 0, 1, 0),
+            ],
+            9,
+        )
+        .unwrap();
+        assert_eq!(done.data, 2u64.to_le_bytes());
+        assert_eq!(gpu.switch_2_translate(0x81_0000_1010), Some(0x30_0010_2010));
+        assert_eq!(
+            gpu.switch_2_translate(0x81_0000_2000),
+            Some(backing + 0x2000)
+        );
+        assert_eq!(gpu.switch_2_translate(0x50_0000_0004), Some(0x30_0010_0004));
+        let mut kinds = [0u8; 2];
+        rt().mem
+            .read_bytes(PAGE + 0x800, &mut kinds, false)
+            .unwrap();
+        assert_eq!(kinds, [0xFE, 0]);
+        assert!(kernel.event_signaled(&g.event(&kernel, 9).0));
+        // Without memory: the region's page shows its own backing again, the other nothing.
+        send(
+            &mut g,
+            &[
+                request(0x81_0000_1000, 0x1000, 0, 0, 0),
+                request(0x50_0000_0000, 0x1000, 0, 0, 0),
+            ],
+            9,
+        )
+        .unwrap();
+        assert_eq!(
+            gpu.switch_2_translate(0x81_0000_1010),
+            Some(backing + 0x1010)
+        );
+        assert_eq!(gpu.switch_2_translate(0x50_0000_0004), None);
+        // Memory 101 did not make, past its end, or more requests than the buffer holds: stops.
+        assert!(send(&mut g, &[request(0x50_0000_0000, 0x1000, 0, 2, 0)], 9).is_err());
+        assert!(send(&mut g, &[request(0x50_0000_0000, 0x2000, 0, 1, 0x3000)], 9).is_err());
+        let mut short = fields(216, &[(0, 3, 8), (8, 1, 4), (12, 40, 8)]);
+        short.send_buffers = vec![Buffer {
+            addr: PAGE,
+            size: 80,
+        }];
+        assert!(g.request_tipc(&short).is_err());
+        rt().mem.unmap(PAGE, 0x1000).unwrap();
+    }
+
+    /// The tests whose kernels map GPU-only backing, at the same addresses, one at a time.
+    static SERVER_MEMORY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_u32(command: u32, v: u32) -> Request {
+        Request {
+            command,
+            data: v.to_le_bytes().to_vec(),
+            ..Request::default()
+        }
+    }
+
     /// A vi2 request naming a display and a slot (the shape of 261 to 272).
     fn named(command: u32, display: &[u8; 8], slot: u32) -> Request {
         Request {
@@ -1048,7 +1688,11 @@ mod tests {
     fn a_vi2_native_event_is_set_by_the_source_it_is_bound_to() {
         use super::super::super::kernel::{ProcessInfo, ProcessKind};
         let kernel = Kernel::new(ProcessInfo::new("vi2", ProcessKind::Nso, None));
-        let mut v = Vi2Session::new(Arc::downgrade(&kernel), Arc::new(vi::Shared::new()));
+        let mut v = Vi2Session::new(
+            Arc::downgrade(&kernel),
+            Arc::new(vi::Shared::new()),
+            Arc::default(),
+        );
         let display = b"default\0";
         assert!(
             v.request_tipc(&named(261, display, 0)).is_err(),

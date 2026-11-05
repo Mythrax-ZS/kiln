@@ -1101,6 +1101,22 @@ impl Kernel {
         }
     }
 
+    /// Map `size` bytes of fresh memory at `addr` for the graphics server's own use: GPU-only
+    /// memory, which the program never reaches and is told is inaccessible (A-215).
+    pub fn map_server_memory(&self, addr: u64, size: u64) -> Result<(), ResultCode> {
+        let mut st = self.lock();
+        self.map_owned(
+            &mut st,
+            addr,
+            size,
+            Info {
+                mem_type: mem_type::INACCESSIBLE,
+                perm: perm::R | perm::W,
+                attr: 0,
+            },
+        )
+    }
+
     /// Whether the event one of whose ends is `end` is signaled.
     #[cfg(test)]
     pub fn event_signaled(&self, end: &KObject) -> bool {

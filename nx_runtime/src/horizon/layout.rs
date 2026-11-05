@@ -66,6 +66,12 @@ pub mod attr {
     pub const PERMISSION_LOCKED: u32 = 0x10;
 }
 
+/// Pages the Switch 2's graphics server keeps for itself (the backing of GPU-only memory, A-215),
+/// which no region the program is told of covers: from 0x40_0000_0000 to the kernel's scratch
+/// pages.
+pub const GPU_SERVER_BASE: u64 = 0x40_0000_0000;
+pub const GPU_SERVER_SIZE: u64 = KERNEL_SCRATCH_BASE - GPU_SERVER_BASE;
+
 /// Pages the kernel layer keeps for objects the program cannot see (the backing of shared memory
 /// a service fills): the last 4 GiB below the end of the address space.
 pub const KERNEL_SCRATCH_BASE: u64 = ADDRESS_SPACE_END - KERNEL_SCRATCH_SIZE;
