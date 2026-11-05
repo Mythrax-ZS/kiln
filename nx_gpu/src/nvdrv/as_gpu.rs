@@ -17,6 +17,7 @@ pub const MAP_BUFFER_EX: u32 = 6;
 pub const ALLOC_AS: u32 = 7;
 pub const GET_VA_REGIONS: u32 = 8;
 pub const ALLOC_AS_EX: u32 = 9;
+pub const GET_SYNC_RO_MAP: u32 = 0xB;
 pub const REMAP: u32 = 0x14;
 
 pub fn name(code: Ioctl) -> Option<&'static str> {
@@ -32,6 +33,7 @@ pub fn name(code: Ioctl) -> Option<&'static str> {
         ALLOC_AS => "NVGPU_AS_IOCTL_ALLOC_AS",
         GET_VA_REGIONS => "NVGPU_AS_IOCTL_GET_VA_REGIONS",
         ALLOC_AS_EX => "NVGPU_AS_IOCTL_ALLOC_AS_EX",
+        GET_SYNC_RO_MAP => "NVGPU_AS_IOCTL_GET_SYNC_RO_MAP",
         REMAP => "NVGPU_AS_IOCTL_REMAP",
         _ => return None,
     })
@@ -141,8 +143,38 @@ impl Nvdrv {
             (ALLOC_AS_EX, 40) => {
                 let (flags, big_page_size) = (args.u32(0), args.u32(8));
                 let (start, end, split) = (args.u64(16), args.u64(24), args.u64(32));
-                self.space_mut(space)?
-                    .initialize(flags, big_page_size, start, end, split)?;
+                // The Switch 2's driver takes a split of 0 with a range for one range of both page
+                // sizes, as NVN2 sends its user partition (A-199).
+                let unified = self.is_switch_2() && split == 0 && (start, end) != (0, 0);
+                let space = self.space_mut(space)?;
+                if unified {
+                    space.initialize_unified(flags, big_page_size, start, end)?;
+                } else {
+                    space.initialize(flags, big_page_size, start, end, split)?;
+                }
+            }
+            // The Switch 2's GET_SYNC_RO_MAP -> (u64 GPU address, u32 stride, u32 count): the
+            // read-only syncpoint shim NVN waits on syncpoints through, 4 GiB above the end of
+            // the range less a page, out of what the program maps (A-200).
+            (GET_SYNC_RO_MAP, 16) if self.is_switch_2() => {
+                let a = self.space_mut(space)?;
+                if !a.is_initialized() {
+                    return unimplemented(
+                        "GET_SYNC_RO_MAP of an address space ALLOC_AS_EX has not set up",
+                    );
+                }
+                let at = a.range().1 + (1 << 32) - 0x1000;
+                if at + 0x1000 > crate::vm::DEFAULT_END {
+                    return unimplemented(format!(
+                        "GET_SYNC_RO_MAP: the shim of a range ending at {:#x} is past the GPU's \
+                         addresses",
+                        a.range().1
+                    ));
+                }
+                a.set_syncpoint_shim(at);
+                args.set_u64(0, at);
+                args.set_u32(8, crate::vm::SHIM_STRIDE);
+                args.set_u32(12, crate::syncpt::COUNT as u32);
             }
             // An array of operations, 20 bytes each: u16 flags (bit 2 cacheable), u16 kind,
             // u32 nvmap handle (0 unmaps), u32 offset in the handle in big pages, u32 offset in
@@ -266,6 +298,41 @@ mod tests {
         a[32..40].copy_from_slice(&0x1_0000_0000u64.to_le_bytes());
         let (e, _) = call(nv, fd, ALLOC_AS_EX_CODE, &a);
         assert_eq!(e, NvError::SUCCESS);
+    }
+
+    #[test]
+    fn the_switch_2_driver_takes_nvn2s_partition_as_one_range_for_both_page_sizes() {
+        // va_start 0x800_0000, va_end 0xC0_0000_0000 and a split of 0, as NVN2 sends them.
+        let mut a = vec![0u8; 40];
+        a[16..24].copy_from_slice(&0x800_0000u64.to_le_bytes());
+        a[24..32].copy_from_slice(&0xC0_0000_0000u64.to_le_bytes());
+        let (mut nv, _, fd) = setup();
+        let (e, _) = call(&mut nv, fd, ALLOC_AS_EX_CODE, &a);
+        assert_eq!(e, NvError::BAD_VALUE, "the Switch 1's driver has a split");
+        let (mut nv, _, fd) = setup();
+        nv.set_switch_2(true);
+        let (e, _) = call(&mut nv, fd, ALLOC_AS_EX_CODE, &a);
+        assert_eq!(e, NvError::SUCCESS);
+        // The syncpoint shim: 4 GiB above the end, less a page; four bytes a syncpoint, 192.
+        let (e, out) = call(&mut nv, fd, 0x8010_410B, &[]);
+        assert_eq!(e, NvError::SUCCESS);
+        assert_eq!(
+            (out.u64(0), out.u32(8), out.u32(12)),
+            (0xC0_FFFF_F000, 4, 192)
+        );
+        // Small and big pages are both reserved from the start of the range.
+        for page in [0x1000u32, 0x10000] {
+            let mut r = vec![0u8; 24];
+            r[0..4].copy_from_slice(&1u32.to_le_bytes());
+            r[4..8].copy_from_slice(&page.to_le_bytes());
+            let (e, out) = call(&mut nv, fd, ALLOC_SPACE_CODE, &r);
+            assert_eq!(e, NvError::SUCCESS);
+            assert!(
+                (0x800_0000..0x800_0000 + 0x20000).contains(&out.u64(16)),
+                "{:#x}",
+                out.u64(16)
+            );
+        }
     }
 
     #[test]

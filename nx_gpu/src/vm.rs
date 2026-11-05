@@ -30,6 +30,9 @@ pub mod map_flags {
 pub const DEFAULT_START: u64 = 0x0400_0000;
 pub const DEFAULT_END: u64 = 1 << 40;
 
+/// The bytes between two syncpoints in the Switch 2's syncpoint shim (A-200).
+pub const SHIM_STRIDE: u32 = 4;
+
 /// A region reserved with `ALLOC_SPACE`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Region {
@@ -86,6 +89,11 @@ pub struct AddressSpace {
     end: u64,
     /// Small pages below, big pages from here up.
     split: u64,
+    /// Both page sizes share the whole range (a unified address space, a split of 0 in
+    /// `ALLOC_AS_EX`: the Switch 2's, A-199); `split` is then `start`.
+    unified: bool,
+    /// Where the Switch 2's syncpoint shim is, once handed out (`GET_SYNC_RO_MAP`, A-200).
+    syncpoint_shim: Option<u64>,
     pub big_page_size: u32,
     initialized: bool,
     /// The program chooses every address itself (`ALLOC_AS_EX` flag 0).
@@ -121,6 +129,8 @@ impl AddressSpace {
             start: DEFAULT_START,
             end: DEFAULT_END,
             split: DEFAULT_START + (DEFAULT_END - DEFAULT_START) / 2,
+            unified: false,
+            syncpoint_shim: None,
             big_page_size: BIG_PAGE,
             initialized: false,
             userspace_managed: false,
@@ -164,6 +174,39 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// `ALLOC_AS_EX` with a split of 0, from the Switch 2's driver: one range from `start` to
+    /// `end` for both page sizes (nvgpu's unified address space; A-199). The rules are those of
+    /// `initialize`.
+    pub fn initialize_unified(
+        &mut self,
+        flags: u32,
+        big_page_size: u32,
+        start: u64,
+        end: u64,
+    ) -> NvResult<()> {
+        self.initialize(flags, big_page_size, start, end, start)?;
+        self.unified = true;
+        Ok(())
+    }
+
+    /// Whether `ALLOC_AS_EX` has set the range.
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Put the Switch 2's syncpoint shim at `va`: a read-only page in which the u32 at
+    /// `SHIM_STRIDE * id` reads as syncpoint `id` (A-200).
+    pub fn set_syncpoint_shim(&mut self, va: u64) {
+        self.syncpoint_shim = Some(va);
+    }
+
+    /// The syncpoint a read at `va` names, when `va` is in the syncpoint shim.
+    pub fn shim_syncpoint(&self, va: u64) -> Option<u32> {
+        let off = va.checked_sub(self.syncpoint_shim?)?;
+        let id = off / u64::from(SHIM_STRIDE);
+        (id < crate::syncpt::COUNT as u64).then_some(id as u32)
+    }
+
     /// `GET_VA_REGIONS`: the small-page range, then the big-page range.
     pub fn va_regions(&self) -> [(u64, u32, u64); 2] {
         let pages = |lo: u64, hi: u64, size: u32| (hi - lo) / u64::from(size);
@@ -199,7 +242,9 @@ impl AddressSpace {
 
     /// The first free range of `len` bytes aligned to `align` whose page size class is `page_size`.
     fn find_free(&self, len: u64, align: u64, page_size: u32) -> Option<u64> {
-        let (lo, hi) = if page_size >= BIG_PAGE {
+        let (lo, hi) = if self.unified {
+            (self.start, self.end)
+        } else if page_size >= BIG_PAGE {
             (self.split, self.end)
         } else {
             (self.start, self.split)
@@ -417,6 +462,48 @@ impl AddressSpace {
                     cacheable: t.cacheable,
                 },
             );
+        }
+        Ok(())
+    }
+
+    /// The Switch 2's mapping of GPU memory (`nx2:gpu`, A-201): make `[start, start + len)`, in
+    /// small pages, a window onto the CPU memory at `cpu`, replacing whatever was mapped there.
+    pub fn map_range(&mut self, start: u64, len: u64, cpu: u64, kind: u32) -> NvResult<()> {
+        self.check_range(start, len)?;
+        self.carve(start, len);
+        self.maps.insert(
+            start,
+            Mapping {
+                start,
+                len,
+                handle: 0,
+                cpu,
+                kind,
+                page_size: SMALL_PAGE,
+                cacheable: true,
+            },
+        );
+        Ok(())
+    }
+
+    /// The Switch 2's unmapping of GPU memory (`nx2:gpu`, A-201): nothing is mapped in
+    /// `[start, start + len)` any more.
+    pub fn unmap_range(&mut self, start: u64, len: u64) -> NvResult<()> {
+        self.check_range(start, len)?;
+        self.carve(start, len);
+        Ok(())
+    }
+
+    /// A range of whole small pages inside the address space's.
+    fn check_range(&self, start: u64, len: u64) -> NvResult<()> {
+        let page = u64::from(SMALL_PAGE);
+        if len == 0
+            || !start.is_multiple_of(page)
+            || !len.is_multiple_of(page)
+            || start < self.start
+            || start.checked_add(len).is_none_or(|e| e > self.end)
+        {
+            return Err(NvError::BAD_VALUE);
         }
         Ok(())
     }

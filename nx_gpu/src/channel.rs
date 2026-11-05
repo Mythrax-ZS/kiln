@@ -281,6 +281,42 @@ mod tests {
     }
 
     #[test]
+    fn a_semaphore_acquire_reads_a_syncpoint_through_the_switch_2s_shim() {
+        let (mem, mut space) = env();
+        let shim = 0xC0_FFFF_F000;
+        space.set_syncpoint_shim(shim);
+        let mut sp = Syncpoints::new();
+        sp.increment(5, 3);
+        let (mut woken, mut stats) = (Vec::new(), Stats::default());
+        let mut cx = Cx {
+            mem: &mem,
+            space: &space,
+            syncpoints: &mut sp,
+            woken: &mut woken,
+            stats: &mut stats,
+            backend: None,
+            lenient: false,
+            channel: 1,
+            syncpt: 1,
+            level: 0,
+        };
+        let mut ch = Channel::default();
+        // SEMAPHOREA..D at syncpoint 5's word of the shim, payload `want`, operation `op`.
+        let mut semaphore = |cx: &mut Cx<'_>, want: u32, op: u32| {
+            let va = shim + 5 * 4;
+            ch.execute(cx, write(0, 0x10, (va >> 32) as u32, false))?;
+            ch.execute(cx, write(0, 0x14, va as u32, false))?;
+            ch.execute(cx, write(0, 0x18, want, false))?;
+            ch.execute(cx, write(0, 0x1C, op, true))
+        };
+        assert_eq!(semaphore(&mut cx, 3, 1), Ok(()), "acquire: the value is 3");
+        assert_eq!(semaphore(&mut cx, 2, 4 | 1 << 31), Ok(()), "acquire-geq 2");
+        assert!(semaphore(&mut cx, 4, 1).is_err(), "4 is not reached");
+        let release = semaphore(&mut cx, 9, 2 | 1 << 24).unwrap_err();
+        assert!(release.contains("read-only"), "{release}");
+    }
+
+    #[test]
     fn set_object_binds_engine_classes_once_the_channel_has_a_context() {
         // One context (for the 3D class) is enough for the other graphics classes.
         let mut ch = channel_with(&[class::THREED]);

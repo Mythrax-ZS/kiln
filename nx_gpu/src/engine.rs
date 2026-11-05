@@ -183,6 +183,13 @@ pub struct Cx<'a> {
 
 impl Cx<'_> {
     pub fn read_u32(&self, va: u64) -> Result<u32, String> {
+        // The Switch 2's syncpoint shim reads as the syncpoints (A-200).
+        if let Some(id) = self.space.shim_syncpoint(va) {
+            return self
+                .syncpoints
+                .value(id)
+                .ok_or_else(|| format!("a read of the syncpoint shim for syncpoint {id}"));
+        }
         let mut b = [0u8; 4];
         if self.space.read(self.mem, va, &mut b) {
             Ok(u32::from_le_bytes(b))
@@ -194,6 +201,11 @@ impl Cx<'_> {
     }
 
     pub fn write(&self, va: u64, data: &[u8]) -> Result<(), String> {
+        if self.space.shim_syncpoint(va).is_some() {
+            return Err(format!(
+                "a write to GPU address {va:#x}, in the read-only syncpoint shim"
+            ));
+        }
         if self.space.write(self.mem, va, data) {
             Ok(())
         } else {
