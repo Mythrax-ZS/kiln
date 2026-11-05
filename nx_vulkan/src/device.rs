@@ -28,6 +28,8 @@ pub struct Capabilities {
     /// `VK_NV_device_diagnostic_checkpoints` is enabled (`NX_DEBUG_CHECKPOINTS`): commands can say
     /// where they are, and a lost device can say which it reached.
     pub checkpoints: bool,
+    /// `VK_EXT_memory_budget`: the driver says how much of each heap is used and may be.
+    pub memory_budget: bool,
     /// `VK_EXT_device_fault` is enabled (with the checkpoints): a lost device says what it knows of
     /// the fault (addresses, the vendor's codes).
     pub device_fault: bool,
@@ -69,6 +71,8 @@ pub struct Vk {
     pub external_memory_host: Option<ash::ext::external_memory_host::Device>,
     checkpoints: Option<ash::nv::device_diagnostic_checkpoints::Device>,
     device_fault: Option<ash::ext::device_fault::Device>,
+    /// The bytes of device memory the images and device buffers made here hold.
+    pub allocated: std::sync::atomic::AtomicU64,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
 }
 
@@ -288,6 +292,7 @@ impl Vk {
             &mut caps.custom_border_color,
         );
         want(khr::index_type_uint8::NAME, &mut caps.index_type_uint8);
+        want(ash::ext::memory_budget::NAME, &mut caps.memory_budget);
         want(
             ash::ext::vertex_input_dynamic_state::NAME,
             &mut caps.vertex_input_dynamic_state,
@@ -502,8 +507,32 @@ impl Vk {
             external_memory_host,
             checkpoints,
             device_fault,
+            allocated: std::sync::atomic::AtomicU64::new(0),
             debug,
         })
+    }
+
+    /// Each memory heap's bytes in use and the bytes the driver lets this process use (the budget),
+    /// with whether it is the device's own memory; empty without `VK_EXT_memory_budget`.
+    pub fn heaps(&self) -> Vec<(u64, u64, bool)> {
+        if !self.caps.memory_budget {
+            return Vec::new();
+        }
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+        // SAFETY: a query with a valid chain.
+        unsafe {
+            self.instance
+                .get_physical_device_memory_properties2(self.physical, &mut props)
+        };
+        let count = props.memory_properties.memory_heap_count as usize;
+        let local: Vec<bool> = props.memory_properties.memory_heaps[..count]
+            .iter()
+            .map(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .collect();
+        (0..count)
+            .map(|i| (budget.heap_usage[i], budget.heap_budget[i], local[i]))
+            .collect()
     }
 
     /// What `VK_EXT_device_fault` says of the fault that lost the device: its description, the

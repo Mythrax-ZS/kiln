@@ -311,6 +311,23 @@ impl Frame {
         for line in vk.fault_report() {
             eprintln!("[vulkan]   {line}");
         }
+        let heaps: Vec<String> = vk
+            .heaps()
+            .iter()
+            .map(|(used, budget, local)| {
+                format!(
+                    "{}{}/{} MiB",
+                    if *local { "device " } else { "host " },
+                    used >> 20,
+                    budget >> 20
+                )
+            })
+            .collect();
+        eprintln!(
+            "[vulkan]   the renderer held {} MiB of images and buffers; heaps used/budget: {}",
+            vk.allocated.load(std::sync::atomic::Ordering::Relaxed) >> 20,
+            heaps.join(", ")
+        );
         let reached = vk.checkpoints_reached();
         eprintln!(
             "[vulkan]   {} commands were marked in the submission; the device reached {}:",

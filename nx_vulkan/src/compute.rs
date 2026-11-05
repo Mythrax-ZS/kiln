@@ -82,6 +82,8 @@ pub struct DeviceBuffer {
     pub buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     pub size: u64,
+    /// The bytes of device memory it holds.
+    bytes: u64,
 }
 
 impl Vk {
@@ -216,10 +218,13 @@ impl Vk {
                 self.device.destroy_buffer(buffer, None);
                 return Err(format!("binding buffer memory: {e}"));
             }
+            self.allocated
+                .fetch_add(req.size, std::sync::atomic::Ordering::Relaxed);
             Ok(DeviceBuffer {
                 buffer,
                 memory,
                 size,
+                bytes: req.size,
             })
         }
     }
@@ -230,6 +235,8 @@ impl Vk {
             self.device.destroy_buffer(b.buffer, None);
             self.device.free_memory(b.memory, None);
         }
+        self.allocated
+            .fetch_sub(b.bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The device address of a buffer made with `SHADER_DEVICE_ADDRESS` usage.

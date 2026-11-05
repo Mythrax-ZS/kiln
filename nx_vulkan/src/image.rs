@@ -32,6 +32,8 @@ pub struct Image {
     pub info: ImageInfo,
     /// Other views of the image, by the swizzle they apply (see [`Vk::swizzled_view`]).
     pub extra_views: Vec<(vk::ComponentMapping, vk::ImageView)>,
+    /// The bytes of device memory it holds.
+    pub bytes: u64,
 }
 
 /// The aspect an image of `format` is read through.
@@ -196,13 +198,18 @@ impl Vk {
                 Ok(vk::ImageView::null())
             };
             match view {
-                Ok(view) => Ok(Image {
-                    image,
-                    view,
-                    memory,
-                    info,
-                    extra_views: Vec::new(),
-                }),
+                Ok(view) => {
+                    self.allocated
+                        .fetch_add(req.size, std::sync::atomic::Ordering::Relaxed);
+                    Ok(Image {
+                        image,
+                        view,
+                        memory,
+                        info,
+                        extra_views: Vec::new(),
+                        bytes: req.size,
+                    })
+                }
                 Err(e) => {
                     d.free_memory(memory, None);
                     d.destroy_image(image, None);
@@ -267,6 +274,8 @@ impl Vk {
             self.device.destroy_image(image.image, None);
             self.device.free_memory(image.memory, None);
         }
+        self.allocated
+            .fetch_sub(image.bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Fill all layers of an image from `texels` (the layers one after another, rows tightly

@@ -1124,6 +1124,34 @@ impl Renderer {
                         p.frame
                     );
                 }
+                // Where the device's memory is: what the renderer holds, the guest memory it
+                // imported, and what the driver says of each heap.
+                let mib = |b: u64| b >> 20;
+                let heaps: Vec<String> = core
+                    .vk
+                    .heaps()
+                    .iter()
+                    .map(|(used, budget, local)| {
+                        format!(
+                            "{}{}/{}",
+                            if *local { "device " } else { "host " },
+                            mib(*used),
+                            mib(*budget)
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "[vulkan] frame {}: device memory: {} MiB in images and buffers, {} MiB of guest memory imported in {} runs ({} MiB of it distinct); heaps used/budget (MiB): {}",
+                    p.frame,
+                    mib(core
+                        .vk
+                        .allocated
+                        .load(std::sync::atomic::Ordering::Relaxed)),
+                    mib(core.global.bytes()),
+                    core.global.runs(),
+                    mib(core.global.union_bytes()),
+                    heaps.join(", ")
+                );
                 if ph.compute.iter().any(|d| !d.is_zero()) {
                     let ms: Vec<String> = ph
                         .compute
