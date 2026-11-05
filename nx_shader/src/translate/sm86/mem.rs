@@ -484,7 +484,10 @@ pub(super) fn atomg(tx: &mut Tx<'_>, i: &I) -> R<()> {
         (o, _) => return tx.fail(format!("the atomic operation {o} on global memory")),
     };
     let gpu = match inst.opcode() {
-        op::RED => global_address(tx, inst, inst.bit(90), Some(64)),
+        // `RED` with a uniform base (bit 91) adds the uniform register pair in bits 64..69; without
+        // one its address is the register pair (bit 72), as NeXium has it.
+        op::RED if inst.bit(91) => global_address(tx, inst, false, Some(64)),
+        op::RED => global_address(tx, inst, inst.bit(72), None),
         op::ATOMG_U => global_address(tx, inst, inst.bit(70), Some(64)),
         // The form without a uniform register: the register a pair with bit 72.
         _ => global_address(tx, inst, inst.bit(72), None),
