@@ -38,7 +38,7 @@ impl Key {
     /// How many bytes of memory the surface (one layer) takes, for a color format whose texel size
     /// is known.
     pub fn memory_bytes(&self) -> Option<u64> {
-        let bytes = pixel_bytes(self.format)?;
+        let bytes = pixel_bytes(self.format).or_else(|| depth_bytes(self.format))?;
         Some(match self.tiling {
             Tiling::Pitch(pitch) => u64::from(pitch) * u64::from(self.height),
             Tiling::Block(log2) => self.geometry(bytes, log2).tiled_size(),
@@ -338,6 +338,27 @@ impl Targets {
         for (&address, placed) in self.by_address.range(from..end) {
             // Most of the targets in the range are further away than the texture reaches.
             if !placed.color || placed.bytes == 0 || address + placed.bytes <= start {
+                continue;
+            }
+            if let Some(t) = self.map.get(&placed.key) {
+                found.push(Covering {
+                    key: t.key,
+                    serial: t.serial,
+                    dirty: t.dirty,
+                });
+            }
+        }
+        found.sort_by_key(|c| c.serial);
+        found
+    }
+
+    /// The depth targets whose memory overlaps `[start, end)`, in the order they were drawn to:
+    /// the cascades of a shadow map that a texture samples as the layers of one array (A-275).
+    pub fn depth_covering(&self, start: u64, end: u64) -> Vec<Covering> {
+        let from = start.saturating_sub(self.largest);
+        let mut found: Vec<Covering> = Vec::new();
+        for (&address, placed) in self.by_address.range(from..end) {
+            if placed.color || placed.bytes == 0 || address + placed.bytes <= start {
                 continue;
             }
             if let Some(t) = self.map.get(&placed.key) {
@@ -733,6 +754,17 @@ impl Targets {
 }
 
 /// Bytes per pixel of the formats a picture can be made of.
+/// The bytes a pixel of a depth target takes in memory: where its texture's layers are (A-275).
+fn depth_bytes(format: vk::Format) -> Option<u32> {
+    Some(match format {
+        vk::Format::D16_UNORM => 2,
+        vk::Format::D32_SFLOAT
+        | vk::Format::D24_UNORM_S8_UINT
+        | vk::Format::X8_D24_UNORM_PACK32 => 4,
+        _ => return None,
+    })
+}
+
 fn pixel_bytes(format: vk::Format) -> Option<u32> {
     Some(match format {
         vk::Format::R8G8B8A8_UNORM

@@ -617,6 +617,16 @@ pub fn overlay_of(
     if format.astc || format.block != (1, 1) || format.vk != target.format {
         return None;
     }
+    // A depth target goes into a texture whose image has its format: 16 or 32 bits. A 24-bit
+    // depth texture's image is made of the depth in its words (A-255), in another format (A-275).
+    if aspect_of(target.format) != vk::ImageAspectFlags::COLOR
+        && !matches!(
+            target.format,
+            vk::Format::D16_UNORM | vk::Format::D32_SFLOAT
+        )
+    {
+        return None;
+    }
     let plan = plan(tic, shape, format).ok()?;
     let gobs = |width: u32, bytes: u32| (u64::from(width) * u64::from(bytes)).div_ceil(64);
     for layer in 0..plan.layers {
@@ -2076,6 +2086,43 @@ mod tests {
             ..line
         };
         assert!(shape_of(&tic, &array).is_err());
+    }
+
+    #[test]
+    fn a_depth_target_is_a_layer_of_a_depth_texture_of_its_own_format() {
+        // A 16-bit depth array of 3 layers of 64 x 32 (the cascades of a shadow map), a block of
+        // one GOB: each layer is 64 x 32 x 2 bytes.
+        let depth_header = |components: u32| {
+            tic_with(&[
+                (0, 7, components),
+                (7, 3, 2),
+                (10, 3, 2),
+                (13, 3, 2),
+                (16, 3, 2),
+                (85, 3, 3),
+                (99, 3, 0),
+                (124, 4, 0),
+                (128, 16, 63),
+                (151, 4, 5),
+                (160, 16, 31),
+                (176, 14, 2),
+            ])
+        };
+        let used = TextureUse {
+            arrayed: true,
+            shadow: true,
+            ..plain_2d()
+        };
+        let tic = depth_header(0x3a);
+        let base = 0x8000_0000u64;
+        let layer = 64 * 32 * 2;
+        let t = target(base + layer, vk::Format::D16_UNORM, (64, 32), 0);
+        let o = overlay_of(&tic, &used, base, &t, 3).expect("the second layer");
+        assert_eq!((o.layer, o.level, o.width, o.height), (1, 0, 64, 32));
+        // A 24-bit depth and stencil target is not copied: the texture's image is not its format.
+        let tic = depth_header(0x29);
+        let t = target(base + 2 * layer, vk::Format::D24_UNORM_S8_UINT, (64, 32), 0);
+        assert!(overlay_of(&tic, &used, base, &t, 3).is_none());
     }
 
     #[test]

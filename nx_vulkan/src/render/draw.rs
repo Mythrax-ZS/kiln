@@ -1031,7 +1031,11 @@ impl Core {
             return Ok(Vec::new());
         };
         let covering = self.targets.covering(cpu, cpu + bytes);
-        if covering.is_empty() {
+        // Depth targets that are layers or parts of the texture (the cascades of a shadow map
+        // sampled as one array) are copied into it too; one that is not is not put into memory
+        // (A-275).
+        let depths = self.targets.depth_covering(cpu, cpu + bytes);
+        if covering.is_empty() && depths.is_empty() {
             return Ok(Vec::new());
         }
         let mut overlays = Vec::new();
@@ -1043,6 +1047,12 @@ impl Core {
                 None => {}
             }
         }
+        overlays.extend(
+            depths
+                .iter()
+                .filter_map(|c| super::textures::overlay_of(tic, used, cpu, &c.key, c.serial)),
+        );
+        overlays.sort_by_key(|o| o.serial);
         // A target drawn to before the overlays that hold the whole texture lies under them: what
         // it drew is not in the texture, and putting it in memory would cost a wait for the
         // device and the layout of every pixel for nothing (A-121).
@@ -1122,8 +1132,10 @@ impl Core {
         // The rendering in progress ends: neither a copy nor a layout change can be in one.
         self.end_pass();
         let cmd = self.frame.cmd(&self.vk)?;
+        // A depth target goes into a depth texture of its own format (A-275).
+        let aspect = |c: &Copy| crate::image::aspect_of(c.overlay.key.format);
         let range = |c: &Copy| vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+            aspect_mask: aspect(c),
             base_mip_level: 0,
             level_count: c.levels,
             base_array_layer: 0,
@@ -1155,13 +1167,13 @@ impl Core {
             });
             let region = [vk::ImageCopy::default()
                 .src_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    aspect_mask: aspect(c),
                     mip_level: 0,
                     base_array_layer: 0,
                     layer_count: 1,
                 })
                 .dst_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    aspect_mask: aspect(c),
                     mip_level: o.level,
                     base_array_layer: o.layer,
                     layer_count: 1,
