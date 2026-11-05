@@ -1253,10 +1253,14 @@ impl Engine {
             }
             Source::Inline { count } | Source::Unsupported { count } => (0, count),
         };
-        let stages = self.regs().stages_of(self.class);
-        let mut shaders = std::mem::take(&mut cx.stats.shaders);
-        shaders.observe(cx, &stages);
-        cx.stats.shaders = shaders;
+        // The programs a draw uses are counted for the report of `NX_TRACE_GPU`, which alone shows
+        // them: counting compares each with memory, at every draw.
+        if cx.level >= 1 {
+            let stages = self.regs().stages_of(self.class);
+            let mut shaders = std::mem::take(&mut cx.stats.shaders);
+            shaders.observe(cx, &stages);
+            cx.stats.shaders = shaders;
+        }
         let d = &mut cx.stats.draws;
         *d.by_kind.entry(kind).or_default() += 1;
         d.elements += u64::from(count);
@@ -1925,6 +1929,8 @@ mod tests {
             exit(Guard::ALWAYS),
         ]));
         let ((), mem, stats) = with_cx(|cx| {
+            // The programs are counted for the trace's report.
+            cx.level = 1;
             // Put the program at GPU address 0x500_0100.
             cx.write(0x500_0100, &program).unwrap();
             let mut e = Engine::new(class::THREED);
@@ -1960,6 +1966,7 @@ mod tests {
     #[test]
     fn a_stage_whose_program_cannot_be_read_is_reported_not_skipped() {
         let ((), _, stats) = with_cx(|cx| {
+            cx.level = 1;
             let mut e = Engine::new(class::THREED);
             // The region is not mapped at all.
             e.write(cx, 0x160c / 4, 0x900_0000, false).unwrap();
