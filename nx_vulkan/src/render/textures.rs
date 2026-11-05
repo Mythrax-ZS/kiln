@@ -71,9 +71,11 @@ impl Tic {
         matches!(self.version(), 1 | 2)
     }
 
-    /// The GPU address of the first byte.
+    /// The GPU address of the first byte. The Switch 2's headers have 17 bits of the address's
+    /// upper part where the Switch's have 16 (NVN2 guide 8.2; docs/ASSUMPTIONS.md A-251).
     pub fn address(&self) -> u64 {
-        let high = u64::from(self.bits(64, 16)) << 32;
+        let upper_bits = if nx_gpu::gob::is_switch_2() { 17 } else { 16 };
+        let high = u64::from(self.bits(64, upper_bits)) << 32;
         match self.version() {
             3 | 4 => u64::from(self.bits(41, 23)) << 9 | high,
             1 | 2 => u64::from(self.bits(37, 27)) << 5 | high,
@@ -515,6 +517,21 @@ fn swizzle(source: u32) -> vk::ComponentSwizzle {
     }
 }
 
+/// The depths of the 32-bit words of a 24-bit depth texture, as 32-bit floats in place: the depth is
+/// the first component, the low 24 bits, of Z24S8 (0x2B) and X8Z24 (0x2A), and the second, the high
+/// 24 bits, of S8Z24 (0x29), whose first is the stencil (A-152, A-255).
+pub fn depth_from_words(components: u32, words: &mut [u8]) {
+    for w in words.as_chunks_mut::<4>().0 {
+        let v = u32::from_le_bytes(*w);
+        let depth = if components == 0x29 {
+            v >> 8
+        } else {
+            v & 0xFF_FFFF
+        };
+        w.copy_from_slice(&(depth as f32 / 16_777_215.0).to_le_bytes());
+    }
+}
+
 /// The elements (texels, or blocks of `block` texels) across mip level `level` of a texture that is
 /// `texels` wide at level 0: half as many texels each level, and at least one element.
 pub fn level_elements(texels: u32, block: u32, level: u32) -> u32 {
@@ -693,6 +710,10 @@ struct Texture {
     overlays: FastMap<Key, u64>,
     levels: u32,
     layers: u32,
+    /// The largest levels left out of the image (A-250).
+    skip: u32,
+    /// The hash of each layer's memory, of the levels the image holds.
+    layer_hashes: Vec<u64>,
 }
 
 /// How a shader sees a texture: the type of image view the descriptor needs.
@@ -855,6 +876,39 @@ pub(super) fn plan(tic: &Tic, shape: Shape, format: TexFormat) -> Result<Plan, S
     })
 }
 
+/// The bytes an image of a texture may take on the device. A texture whose image would be larger
+/// is made from a smaller level, the levels above it left out (docs/ASSUMPTIONS.md A-250).
+pub const IMAGE_BUDGET: u64 = 512 << 20;
+
+/// How many of the largest levels of a texture are left out so that its image fits in
+/// [`IMAGE_BUDGET`]: `width` x `height` x `depth` texels at level 0, `layers` layers, `levels`
+/// levels, each element (a texel, or a block of them) of `bytes` bytes on the device. At least one
+/// level is kept.
+pub fn levels_left_out(
+    (width, height, depth): (u32, u32, u32),
+    layers: u32,
+    levels: u32,
+    block: (u32, u32),
+    bytes: u32,
+) -> u32 {
+    let size = |skip: u32| -> u64 {
+        (skip..levels)
+            .map(|l| {
+                let w = u64::from(level_elements(width, block.0, l));
+                let h = u64::from(level_elements(height, block.1, l));
+                let d = u64::from((depth >> l).max(1));
+                w * h * d * u64::from(bytes)
+            })
+            .sum::<u64>()
+            * u64::from(layers)
+    };
+    let mut skip = 0;
+    while skip + 1 < levels && size(skip) > IMAGE_BUDGET {
+        skip += 1;
+    }
+    skip
+}
+
 #[derive(Default)]
 pub struct Textures {
     map: FastMap<(Tic, Shape), Texture>,
@@ -871,6 +925,8 @@ pub struct Textures {
     spans: FastMap<(Tic, Shape), Option<u64>>,
     /// What a slot whose header is all zeros samples, by kind and by whether it is a depth.
     nulls: FastMap<(Kind, bool), Image>,
+    /// The textures made from a smaller level so far (A-250), said once each.
+    reduced: Vec<u64>,
 }
 
 /// A texture's `checked` that matches no frame: it is compared with memory again.
@@ -927,7 +983,7 @@ impl Textures {
         let shape = shape_of(&tic, used)?;
         let view = self.texture(vk, frame, scene, tic, shape)?;
         let mut copies = Vec::new();
-        if let Some(t) = self.map.get_mut(&(tic, shape)) {
+        if let Some(t) = self.map.get_mut(&(tic, shape)).filter(|t| t.skip == 0) {
             for o in overlays {
                 if t.overlays.get(&o.key) != Some(&o.serial) {
                     t.overlays.insert(o.key, o.serial);
@@ -1150,14 +1206,24 @@ impl Textures {
         };
         // The memory of a 24-bit depth texture holds the GPU's own arrangement of depth and
         // stencil, which is not read into an image: such a texture is a render target's picture.
-        if aspect_of(format.vk).contains(vk::ImageAspectFlags::STENCIL)
-            || format.vk == vk::Format::X8_D24_UNORM_PACK32
-        {
+        // On the Switch 2 its memory is what a compute launch or the title wrote there, and the
+        // depth is read out of its words (docs/ASSUMPTIONS.md A-255).
+        let depth24 = aspect_of(format.vk).contains(vk::ImageAspectFlags::STENCIL)
+            || format.vk == vk::Format::X8_D24_UNORM_PACK32;
+        if depth24 && !nx_gpu::gob::is_switch_2() {
             return Err(format!(
                 "a 24-bit depth texture of format {:#x} that is not a render target's picture",
                 tic.components()
             ));
         }
+        let format = if depth24 {
+            TexFormat {
+                vk: vk::Format::D32_SFLOAT,
+                ..format
+            }
+        } else {
+            format
+        };
         if !vk.format_supports(format.vk, vk::FormatFeatureFlags::SAMPLED_IMAGE) {
             return Err(format!(
                 "the device cannot sample {:?} (texture format {:#x})",
@@ -1189,36 +1255,85 @@ impl Textures {
                 return Ok(t.image.view);
             }
         }
-        // The memory as it is now, compared in place: a texture that has not changed (nearly
-        // all of them, nearly always) is not copied.
-        let (hash, readable) = scene.hash(tic.address(), total);
+        // What the device holds of each element: an ASTC block becomes its texels.
+        let device_bytes = if format.astc { 4 } else { format.bytes };
+        let device_block = if format.astc { (1, 1) } else { format.block };
+        let skip = levels_left_out(
+            (width, height, depth),
+            layers,
+            levels,
+            device_block,
+            device_bytes,
+        );
+        // The memory of each layer the image holds (its levels from `skip` on, A-250), as it is
+        // now, compared in place: a texture that has not changed (nearly all of them, nearly
+        // always) is not copied, and of a layered one only the layers that changed are.
+        let (held_from, held_len) = if tic.is_block_linear() {
+            let (left_out, kept) = level_geometry.split_at(skip as usize);
+            (
+                left_out.iter().map(Geometry::tiled_size).sum::<u64>(),
+                kept.iter().map(Geometry::tiled_size).sum::<u64>(),
+            )
+        } else {
+            (0, layer_stride)
+        };
+        let mut readable = 0;
+        let layer_hashes: Vec<u64> = (0..layers)
+            .map(|l| {
+                let at = tic.address() + u64::from(l) * layer_stride + held_from;
+                let (h, n) = scene.hash(at, held_len);
+                readable += n;
+                h
+            })
+            .collect();
         if readable == 0 {
             return Err(format!(
                 "a texture at GPU address {:#x} ({total} bytes), which is not mapped",
                 tic.address()
             ));
         }
+        let hash = layer_hashes
+            .iter()
+            .fold(layers as u64, |a, h| a.rotate_left(7) ^ h);
+        let mut update: Option<(vk::Image, vk::ImageView, Vec<u32>)> = None;
         if let Some(t) = self.map.get_mut(&key) {
-            if t.hash == hash {
+            if t.layer_hashes == layer_hashes {
                 t.checked = current;
                 t.epoch = self.epoch;
                 return Ok(t.image.view);
             }
-            // The contents changed: the old image goes once the submission is over.
-            if let Some(old) = self.map.remove(&key) {
+            if layers > 1 && t.skip == skip && t.overlays.is_empty() {
+                let changed: Vec<u32> = (0..layers)
+                    .filter(|&l| t.layer_hashes.get(l as usize) != Some(&layer_hashes[l as usize]))
+                    .collect();
+                update = Some((t.image.image, t.image.view, changed));
+            } else if let Some(old) = self.map.remove(&key) {
+                // The contents changed: the old image goes once the submission is over.
                 frame.garbage.push(Garbage::Image(old.image));
             }
         }
         let _phase = nx_gpu::progress::enter(nx_gpu::progress::MAKING_TEXTURE);
-        let mut raw = vec![0u8; total as usize];
-        let readable = read_partial(scene, tic.address(), &mut raw);
-        if self.trace {
-            let filled = raw[..readable.min(raw.len())]
-                .iter()
-                .filter(|b| **b != 0)
-                .count();
+        if skip > 0 && !self.reduced.contains(&tic.address()) {
+            self.reduced.push(tic.address());
             eprintln!(
-                "[vulkan] a texture at GPU address {:#x} (guest address {:x?}): {:?} {width}x{height} (depth {depth}, {layers} layers, {levels} levels) as {:?}; {filled} of {} bytes are not zero ({readable} could be read)",
+                "[vulkan] the texture at GPU address {:#x} ({width}x{height}, {layers} layers, {levels} levels, {:?}) is larger than {} MiB on the device: it is made from level {skip}",
+                tic.address(),
+                format.vk,
+                IMAGE_BUDGET >> 20
+            );
+        }
+        // The bytes of memory from `at` on that a level takes (`len`), as far as they can be read.
+        let read_at = |at: u64, len: u64| -> Vec<u8> {
+            let mut v = vec![0u8; len.min(total.saturating_sub(at)) as usize];
+            let n = read_partial(scene, tic.address() + at, &mut v);
+            v.truncate(n);
+            v
+        };
+        if self.trace {
+            let raw = read_at(0, total);
+            let filled = raw.iter().filter(|b| **b != 0).count();
+            eprintln!(
+                "[vulkan] a texture at GPU address {:#x} (guest address {:x?}): {:?} {width}x{height} (depth {depth}, {layers} layers, {levels} levels, from level {skip}) as {:?}; {filled} of {total} bytes are not zero ({} could be read)",
                 tic.address(),
                 scene.host_address(tic.address()).map(|(cpu, _)| cpu),
                 format.vk,
@@ -1229,8 +1344,8 @@ impl Textures {
         // `NX_DUMP_TEXTURES_BELOW=<bytes>`: only the textures whose memory is smaller than that.
         let small_enough = std::env::var("NX_DUMP_TEXTURES_BELOW")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .is_none_or(|limit| raw.len() < limit);
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_none_or(|limit| total < limit);
         if let Some(dir) = std::env::var_os("NX_DUMP_TEXTURES").filter(|_| small_enough) {
             // The bytes the memory held, as they are (the pictures are made level by level below).
             let _ = std::fs::create_dir_all(&dir);
@@ -1239,50 +1354,73 @@ impl Textures {
                 tic.address(),
                 shape.kind
             ));
-            let _ = std::fs::write(path, &raw);
+            let _ = std::fs::write(path, read_at(0, total));
         }
         let components = tic.view_mapping();
-        let image = vk.create_image(ImageInfo {
-            format: format.vk,
-            width,
-            height,
-            depth,
-            layers,
-            levels,
-            usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
-            view_type: match shape.kind {
-                Kind::D1 => vk::ImageViewType::TYPE_1D,
-                Kind::D2 => vk::ImageViewType::TYPE_2D,
-                Kind::D2Array => vk::ImageViewType::TYPE_2D_ARRAY,
-                Kind::Cube => vk::ImageViewType::CUBE,
-                Kind::CubeArray => vk::ImageViewType::CUBE_ARRAY,
-                Kind::D3 => vk::ImageViewType::TYPE_3D,
-            },
-            components,
-        })?;
+        let made = if update.is_some() {
+            None
+        } else {
+            Some(vk.create_image(ImageInfo {
+                format: format.vk,
+                width: (width >> skip).max(1),
+                height: (height >> skip).max(1),
+                depth: (depth >> skip).max(1),
+                layers,
+                levels: levels - skip,
+                usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+                view_type: match shape.kind {
+                    Kind::D1 => vk::ImageViewType::TYPE_1D,
+                    Kind::D2 => vk::ImageViewType::TYPE_2D,
+                    Kind::D2Array => vk::ImageViewType::TYPE_2D_ARRAY,
+                    Kind::Cube => vk::ImageViewType::CUBE,
+                    Kind::CubeArray => vk::ImageViewType::CUBE_ARRAY,
+                    Kind::D3 => vk::ImageViewType::TYPE_3D,
+                },
+                components,
+            })?)
+        };
+        let (image_handle, view) = match (&update, &made) {
+            (Some((image, view, _)), _) => (*image, *view),
+            (None, Some(image)) => (image.image, image.view),
+            (None, None) => unreachable!("an image is made when there is none to update"),
+        };
+        let uploaded: Vec<u32> = match &update {
+            Some((_, _, changed)) => changed.clone(),
+            None => (0..layers).collect(),
+        };
         // Linear texels of every level and layer in upload order.
         let mut packed: Vec<u8> = Vec::new();
         let mut not_numbers = 0usize;
         let is_cube = matches!(shape.kind, Kind::Cube | Kind::CubeArray);
         let mut regions = Vec::new();
-        for layer in 0..layers {
+        for &layer in &uploaded {
             let mut at = u64::from(layer) * layer_stride;
             for (level, g) in level_geometry.iter().enumerate() {
+                if (level as u32) < skip {
+                    if tic.is_block_linear() {
+                        at += g.tiled_size();
+                    }
+                    continue;
+                }
                 let linear_size = g.linear_size() as usize;
                 let mut linear = vec![0u8; linear_size];
                 if tic.is_block_linear() {
-                    let end = (at + g.tiled_size()).min(raw.len() as u64) as usize;
-                    deswizzle(g, &raw[(at as usize).min(end)..end], &mut linear);
+                    deswizzle(g, &read_at(at, g.tiled_size()), &mut linear);
                     at += g.tiled_size();
                 } else {
                     // Rows are `pitch` apart in memory and packed in the upload.
                     let row = (g.width * g.bytes_per_element) as usize;
+                    let pitch = tic.pitch() as usize;
+                    let rows = read_at(at, (pitch * g.height as usize) as u64);
                     for y in 0..g.height as usize {
-                        let from = at as usize + y * tic.pitch() as usize;
-                        if from + row <= raw.len() {
-                            linear[y * row..(y + 1) * row].copy_from_slice(&raw[from..from + row]);
+                        let from = y * pitch;
+                        if from + row <= rows.len() {
+                            linear[y * row..(y + 1) * row].copy_from_slice(&rows[from..from + row]);
                         }
                     }
+                }
+                if depth24 {
+                    depth_from_words(tic.components(), &mut linear);
                 }
                 if format.astc {
                     linear = crate::astc::decode_image(
@@ -1343,7 +1481,7 @@ impl Textures {
                         .buffer_offset(offset)
                         .image_subresource(vk::ImageSubresourceLayers {
                             aspect_mask: aspect,
-                            mip_level: level as u32,
+                            mip_level: level as u32 - skip,
                             base_array_layer: layer,
                             layer_count: 1,
                         })
@@ -1369,43 +1507,86 @@ impl Textures {
         for r in &mut regions {
             r.buffer_offset += base_offset;
         }
+        // The uploads run before the draws of the batch. A texture is compared with memory at its
+        // first use in a frame, so no draw of the batch has read the image as it was; the draws of
+        // earlier submissions, which may have, come first in the queue, and the barrier waits for
+        // them. (The commands of the batch may be inside a rendering, where no copy can be made.)
         let cmd = frame.upload_cmd(vk)?;
         frame.mark(vk, cmd, || {
             format!(
-                "upload of the texture at {:#x}: {width}x{height}, {layers} layers, {levels} levels, {:?}",
+                "upload of the texture at {:#x}: {width}x{height}, {} of {layers} layers, {levels} levels, {:?}",
                 tic.address(),
+                uploaded.len(),
                 format.vk
             )
         });
-        let range = vk::ImageSubresourceRange {
-            aspect_mask: aspect,
-            base_mip_level: 0,
-            level_count: levels,
-            base_array_layer: 0,
-            layer_count: layers,
+        let ranges: Vec<vk::ImageSubresourceRange> = if update.is_some() {
+            uploaded
+                .iter()
+                .map(|&l| vk::ImageSubresourceRange {
+                    aspect_mask: aspect,
+                    base_mip_level: 0,
+                    level_count: levels - skip,
+                    base_array_layer: l,
+                    layer_count: 1,
+                })
+                .collect()
+        } else {
+            vec![vk::ImageSubresourceRange {
+                aspect_mask: aspect,
+                base_mip_level: 0,
+                level_count: levels - skip,
+                base_array_layer: 0,
+                layer_count: layers,
+            }]
         };
-        let to_dst = [vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image.image)
-            .subresource_range(range)];
-        let to_read = [vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image.image)
-            .subresource_range(range)];
-        // SAFETY: the upload command buffer is recording; the handles are valid.
+        let (old_layout, src_access, src_stage) = if update.is_some() {
+            (
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+            )
+        } else {
+            (
+                vk::ImageLayout::UNDEFINED,
+                vk::AccessFlags::empty(),
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+            )
+        };
+        let to_dst: Vec<vk::ImageMemoryBarrier> = ranges
+            .iter()
+            .map(|r| {
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(old_layout)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_access_mask(src_access)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image_handle)
+                    .subresource_range(*r)
+            })
+            .collect();
+        let to_read: Vec<vk::ImageMemoryBarrier> = ranges
+            .iter()
+            .map(|r| {
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image_handle)
+                    .subresource_range(*r)
+            })
+            .collect();
+        // SAFETY: the upload command buffer is recording, outside any rendering; the handles are
+        // valid.
         unsafe {
             vk.device.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                src_stage,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -1415,7 +1596,7 @@ impl Textures {
             vk.device.cmd_copy_buffer_to_image(
                 cmd,
                 buffer,
-                image.image,
+                image_handle,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &regions,
             );
@@ -1429,21 +1610,34 @@ impl Textures {
                 &to_read,
             );
         }
-        let view = image.view;
-        self.map.insert(
-            key,
-            Texture {
-                image,
-                checked: current,
-                hash,
-                epoch: self.epoch,
-                bytes: total,
-                cpu: scene.host_address(tic.address()).map_or(0, |(cpu, _)| cpu),
-                overlays: FastMap::default(),
-                levels,
-                layers,
-            },
-        );
+        match made {
+            None => {
+                if let Some(t) = self.map.get_mut(&key) {
+                    t.layer_hashes = layer_hashes;
+                    t.hash = hash;
+                    t.checked = current;
+                    t.epoch = self.epoch;
+                }
+            }
+            Some(image) => {
+                self.map.insert(
+                    key,
+                    Texture {
+                        image,
+                        checked: current,
+                        hash,
+                        epoch: self.epoch,
+                        bytes: total,
+                        cpu: scene.host_address(tic.address()).map_or(0, |(cpu, _)| cpu),
+                        overlays: FastMap::default(),
+                        levels: levels - skip,
+                        layers,
+                        skip,
+                        layer_hashes,
+                    },
+                );
+            }
+        }
         Ok(view)
     }
 
@@ -1487,6 +1681,38 @@ pub(super) fn read_partial(scene: &Scene<'_>, va: u64, out: &mut [u8]) -> usize 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_depth_of_a_24_bit_word_is_where_its_format_has_it() {
+        let words = |v: &[u32]| v.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        let floats = |b: &[u8]| {
+            b.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect::<Vec<f32>>()
+        };
+        // Z24S8: the depth in the low 24 bits, a stencil of 0x7F above it.
+        let mut z = words(&[0x7FFF_FFFF, 0x7F80_0000, 0x7F00_0000]);
+        depth_from_words(0x2B, &mut z);
+        assert_eq!(floats(&z), [1.0, 0x80_0000 as f32 / 16_777_215.0, 0.0]);
+        // S8Z24: the stencil in the low 8 bits, the depth above it.
+        let mut s = words(&[0xFFFF_FF12, 0x0000_0034]);
+        depth_from_words(0x29, &mut s);
+        assert_eq!(floats(&s), [1.0, 0.0]);
+    }
+
+    #[test]
+    fn a_texture_too_large_for_the_device_leaves_out_its_largest_levels() {
+        // 8192 x 8192, 68 layers, 12 levels, four bytes a texel: about 23 GB with every level,
+        // 380 MB from level 3 on.
+        assert_eq!(levels_left_out((8192, 8192, 1), 68, 12, (1, 1), 4), 3);
+        // A texture that fits keeps everything; one level is always kept.
+        assert_eq!(levels_left_out((2048, 2048, 1), 1, 12, (1, 1), 4), 0);
+        assert_eq!(levels_left_out((32768, 32768, 1), 2048, 1, (1, 1), 16), 0);
+        // Blocks of 4 x 4 texels of 16 bytes: a byte a texel.
+        assert_eq!(levels_left_out((16384, 16384, 1), 4, 15, (4, 4), 16), 1);
+    }
 
     fn tic_with(set: &[(usize, usize, u32)]) -> Tic {
         let mut w = [0u32; 8];

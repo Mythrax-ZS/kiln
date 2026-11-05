@@ -264,6 +264,90 @@ fn a_texture_is_compared_with_memory_once_a_frame() {
     assert_eq!(&rgba[..4], [0, 200, 0, 255]);
 }
 
+/// Samples layer `layer` of the 2D array texture 0 at level zero, at the coordinates of the
+/// varying.
+fn array_pixel(layer: u32) -> Vec<u8> {
+    pixel_program_with(
+        &[(0, 0), (0, 1)],
+        3,
+        &[
+            nx_shader::asm::mov32i(3, layer),
+            ipa(4, 0x80),
+            ipa(5, 0x84),
+            texs(0, 3, 5, 2, 0, 4, 8),
+            exit(Guard::ALWAYS),
+        ],
+    )
+}
+
+/// Layer `layer` of a 4x4 array of A8B8G8R8 texels at `TEXELS`, one GOB a layer, all `rgba`.
+fn put_layer(w: &World, layer: u64, rgba: [u8; 4]) {
+    let g = Geometry {
+        width: 4,
+        height: 4,
+        depth: 1,
+        bytes_per_element: 4,
+        block_height_log2: 0,
+        block_depth_log2: 0,
+    };
+    let linear: Vec<u8> = (0..16).flat_map(|_| rgba).collect();
+    let mut tiled = vec![0u8; g.tiled_size() as usize];
+    swizzle(&g, &linear, &mut tiled);
+    w.put(TEXELS + layer * 512, &tiled);
+}
+
+/// Shows the target: the next frame begins.
+fn next_frame(r: &mut Renderer, w: &World, target: u64, frame: u64) {
+    r.present(&Present {
+        address: w.cpu(target),
+        width: 8,
+        height: 8,
+        pitch: 0,
+        format: 1,
+        layout: 3,
+        block_height_log2: 4,
+        crop: [0; 4],
+        frame,
+        due: None,
+    })
+    .unwrap();
+}
+
+#[test]
+fn a_layer_that_changes_is_uploaded_again_and_the_others_are_kept() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    // Three layers of 4x4 texels.
+    let mut tic = header(0x08, 2, 4, 4, TEXELS);
+    set_bits(&mut tic, 151, 4, 5);
+    set_bits(&mut tic, 176, 14, 2);
+    let w = textured(8, target, tic, nearest_sampler());
+    w.put(REGION + PIXEL_PROGRAM, &array_pixel(1));
+    let colors = [[200, 0, 0, 255], [0, 200, 0, 255], [0, 0, 200, 255]];
+    for (l, c) in colors.iter().enumerate() {
+        put_layer(&w, l as u64, *c);
+    }
+    let mut r = Renderer::new(RenderConfig::default());
+    let sampled = |r: &mut Renderer| {
+        r.draw(&w.scene(), &DRAW).unwrap();
+        let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+        [rgba[0], rgba[1], rgba[2], rgba[3]]
+    };
+    assert_eq!(sampled(&mut r), colors[1]);
+    // A frame later, only layer 1 has changed: the draw sees it.
+    next_frame(&mut r, &w, target, 1);
+    put_layer(&w, 1, [255, 255, 255, 255]);
+    assert_eq!(sampled(&mut r), [255, 255, 255, 255]);
+    // The layers that did not change keep their texels.
+    for (frame, layer) in [(2, 2), (3, 0)] {
+        next_frame(&mut r, &w, target, frame);
+        w.put(REGION + PIXEL_PROGRAM, &array_pixel(layer));
+        assert_eq!(sampled(&mut r), colors[layer as usize], "layer {layer}");
+    }
+}
+
 #[test]
 fn a_handle_that_names_no_header_stops_the_draw_with_what_it_named() {
     if vulkan().is_none() {
