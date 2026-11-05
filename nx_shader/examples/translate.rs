@@ -45,9 +45,12 @@ fn main() {
                         Err(e) => format!("INVALID: {}", e.lines().next().unwrap_or("")),
                     };
                     println!(
-                        "{name}: Kernel, {} instructions, {} words of SPIR-V, {verdict}",
+                        "{name}: Kernel, {} instructions, {} words of SPIR-V, {verdict}; global memory {} (bases {:?}{})",
                         t.info.instructions,
-                        t.spirv.len()
+                        t.spirv.len(),
+                        t.info.global_memory,
+                        t.info.global_bases,
+                        if t.info.global_unknown { ", and an unknown one" } else { "" }
                     );
                 }
                 Err(e) => println!("{name}: Kernel: {e}"),

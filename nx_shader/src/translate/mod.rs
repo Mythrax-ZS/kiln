@@ -216,6 +216,12 @@ pub struct Info {
     /// covers, then from word 4 six words per entry: the first GPU address (low, high), one past
     /// the last (low, high) and the device address of the first byte (low, high).
     pub global_memory: bool,
+    /// sm_86 programs that reach global memory: the constant buffer words (slot, word index) the
+    /// bases of their accesses are pointers from (each a storage buffer's entry: the address, then
+    /// the size, A-258), in order; `global_unknown` when the base of an access is not known to come
+    /// from one, and every mapping is to be reachable.
+    pub global_bases: Vec<(u32, u32)>,
+    pub global_unknown: bool,
     /// Vertex stage: the program reads the instance id. The counter of the draw (the hardware runs
     /// the instances of a draw one after another, each counting up from 0) is then the 32-bit
     /// push constant at offset 0 of the vertex stage, which the caller sets before the draw.

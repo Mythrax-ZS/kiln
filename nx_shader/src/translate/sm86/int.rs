@@ -96,6 +96,7 @@ pub(super) fn iadd3(tx: &mut Tx<'_>, i: &I) -> R<()> {
     }
     let extended = inst.bit(74);
     let terms = [sa, sb, sc];
+    let pointer = super::pointer_of(tx, &terms);
     let carry_out = [inst.pred_dst(81, i.uniform), inst.pred_dst(84, i.uniform)];
     let wants_carry = carry_out.iter().any(|p| *p != PT);
     let mut ones = 0u32;
@@ -136,6 +137,7 @@ pub(super) fn iadd3(tx: &mut Tx<'_>, i: &I) -> R<()> {
             sum = tx.iadd(sum, c);
         }
         write(tx, i, dst(i), sum);
+        super::set_pointer(tx, i, dst(i), pointer);
         return Ok(());
     }
     // The carries need the sum's bits above 32: add as 64-bit numbers.
@@ -149,6 +151,7 @@ pub(super) fn iadd3(tx: &mut Tx<'_>, i: &I) -> R<()> {
     let sum = low(tx, total);
     let carry = high(tx, total);
     write(tx, i, dst(i), sum);
+    super::set_pointer(tx, i, dst(i), pointer);
     for (k, p) in carry_out.into_iter().enumerate() {
         if p == PT {
             continue;
@@ -166,6 +169,7 @@ pub(super) fn iadd3(tx: &mut Tx<'_>, i: &I) -> R<()> {
 pub(super) fn lea(tx: &mut Tx<'_>, i: &I) -> R<()> {
     let inst = i.inst;
     let (sb, sc) = bc(tx, i)?;
+    let pointer = super::pointer_of(tx, &[a(i), sb, sc]);
     let shift = inst.field(75, 5) as u32;
     let x = raw(tx, a(i))?;
     let y = raw(tx, sb)?;
@@ -225,6 +229,7 @@ pub(super) fn lea(tx: &mut Tx<'_>, i: &I) -> R<()> {
             sum = tx.iadd(sum, c);
         }
         write(tx, i, dst(i), sum);
+        super::set_pointer(tx, i, dst(i), pointer);
         return Ok(());
     }
     tx.m.capability(crate::spirv::cap::INT64);
@@ -241,6 +246,7 @@ pub(super) fn lea(tx: &mut Tx<'_>, i: &I) -> R<()> {
     let zero = tx.c32(0);
     let set = tx.cmp(op::I_NOT_EQUAL, carry, zero);
     write(tx, i, dst(i), sum);
+    super::set_pointer(tx, i, dst(i), pointer);
     write_pred(tx, i, carry_out, set);
     Ok(())
 }
@@ -443,6 +449,7 @@ pub(super) fn imad(tx: &mut Tx<'_>, i: &I) -> R<()> {
     }
     let sa = a(i);
     let (sb, sc) = bc(tx, i)?;
+    let pointer = super::pointer_of(tx, &[sa, sb, sc]);
     let x = raw(tx, sa)?;
     let y = raw(tx, sb)?;
     let z = raw(tx, sc)?;
@@ -464,6 +471,7 @@ pub(super) fn imad(tx: &mut Tx<'_>, i: &I) -> R<()> {
         r = tx.iadd(r, c);
     }
     write(tx, i, dst(i), r);
+    super::set_pointer(tx, i, dst(i), pointer);
     Ok(())
 }
 
@@ -475,6 +483,7 @@ pub(super) fn imad_wide(tx: &mut Tx<'_>, i: &I) -> R<()> {
     if sa.neg || sb.neg || sc.neg {
         return tx.fail("IMAD.WIDE with a negated operand");
     }
+    let pointer = super::pointer_of(tx, &[sa, sb, sc]);
     let x = raw(tx, sa)?;
     let y = raw(tx, sb)?;
     let (zl, zh) = match sc.operand {
@@ -502,6 +511,7 @@ pub(super) fn imad_wide(tx: &mut Tx<'_>, i: &I) -> R<()> {
     let d = dst(i);
     write(tx, i, d, lo);
     write(tx, i, reg_at(i, d, 1), hi);
+    super::set_pointer(tx, i, d, pointer);
     Ok(())
 }
 

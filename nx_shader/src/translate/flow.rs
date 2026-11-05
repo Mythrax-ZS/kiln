@@ -245,6 +245,8 @@ fn body(tx: &mut Tx<'_>, code: Program<'_>, graph: &Cfg, block: &Block) -> R<()>
     let known = entry_state(tx, block);
     tx.reg_origin = known.origin;
     tx.reg_const = known.constant;
+    tx.ptr_origin = known.pointer;
+    tx.uptr_origin = known.upointer;
     match code {
         Program::Maxwell(code) => {
             let mut insts: Vec<(u32, Inst)> = graph.instructions(code, block).collect();
@@ -318,6 +320,8 @@ fn body(tx: &mut Tx<'_>, code: Program<'_>, graph: &Cfg, block: &Block) -> R<()>
     let state = ExitState {
         origin: tx.reg_origin.clone(),
         constant: tx.reg_const.clone(),
+        pointer: tx.ptr_origin.clone(),
+        upointer: tx.uptr_origin.clone(),
     };
     tx.exit_state.insert(block.start, state);
     Ok(())
@@ -343,6 +347,8 @@ fn entry_state(tx: &Tx<'_>, block: &Block) -> ExitState {
     for s in rest {
         known.origin.retain(|r, o| s.origin.get(r) == Some(o));
         known.constant.retain(|r, c| s.constant.get(r) == Some(c));
+        known.pointer.retain(|r, o| s.pointer.get(r) == Some(o));
+        known.upointer.retain(|r, o| s.upointer.get(r) == Some(o));
     }
     known
 }

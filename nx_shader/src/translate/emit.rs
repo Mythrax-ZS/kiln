@@ -42,6 +42,8 @@ pub(super) struct Types {
 pub(super) struct ExitState {
     pub origin: std::collections::HashMap<u8, (u32, u32)>,
     pub constant: std::collections::HashMap<u8, u32>,
+    pub pointer: std::collections::HashMap<u8, (u32, u32)>,
+    pub upointer: std::collections::HashMap<u8, (u32, u32)>,
 }
 
 /// The flags of the condition code: zero, sign (negative), carry and overflow, as function-local
@@ -111,6 +113,14 @@ pub(super) struct Tx<'a> {
     /// The immediate a register is known to hold in the block being translated (a `MOV32I`): what a
     /// texture instruction with texel offsets needs to know about its offset register.
     pub reg_const: std::collections::HashMap<u8, u32>,
+    /// The constant buffer word (slot, word index) a register's value is a pointer from, made of
+    /// it and offsets added to it: the base of a global access (A-258).
+    pub ptr_origin: std::collections::HashMap<u8, (u32, u32)>,
+    /// The same for the uniform registers.
+    pub uptr_origin: std::collections::HashMap<u8, (u32, u32)>,
+    /// The uniform registers that hold a pointer from one word wherever they are read
+    /// (`scan_uniform_pointers`).
+    pub ureg_static_pointer: std::collections::HashMap<u8, (u32, u32)>,
     /// The blocks that lead to each block, and what `reg_origin` and `reg_const` held at the end
     /// of each block translated so far: a block starts knowing what all of its predecessors agree
     /// on, and nothing when one of them is not translated yet (a jump back).
@@ -181,6 +191,9 @@ impl<'a> Tx<'a> {
             images: std::collections::HashMap::new(),
             texture_dims: std::collections::HashMap::new(),
             reg_origin: std::collections::HashMap::new(),
+            ptr_origin: std::collections::HashMap::new(),
+            uptr_origin: std::collections::HashMap::new(),
+            ureg_static_pointer: std::collections::HashMap::new(),
             reg_const: std::collections::HashMap::new(),
             block_preds: std::collections::HashMap::new(),
             exit_state: std::collections::HashMap::new(),
@@ -419,6 +432,7 @@ impl<'a> Tx<'a> {
             return;
         }
         self.reg_origin.remove(&r);
+        self.ptr_origin.remove(&r);
         self.reg_const.remove(&r);
         if self.hold(Dest::Reg(r), value) {
             return;
@@ -536,6 +550,7 @@ impl<'a> Tx<'a> {
         if r >= crate::sm86::URZ {
             return;
         }
+        self.uptr_origin.remove(&r);
         let value = match cond {
             None => value,
             Some(c) => {
@@ -931,6 +946,7 @@ pub fn translate_sm86(code: &[u8], sph: Option<&Sph>, cfg: &Config) -> Result<Tr
     tx.texture_dims = super::sm86::scan_dims(code, &graph);
     tx.local_min_words = super::sm86::scan_memory(code, &graph, super::local::Space::Local);
     tx.shared_min_words = super::sm86::scan_memory(code, &graph, super::local::Space::Shared);
+    tx.ureg_static_pointer = super::sm86::scan_uniform_pointers(code, &graph);
     super::flow::build(&mut tx, super::flow::Program::Sm86(code), &graph)?;
     Ok(finish(tx, cfg))
 }

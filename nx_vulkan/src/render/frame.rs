@@ -70,6 +70,8 @@ pub struct Frame {
 pub enum Garbage {
     Image(crate::image::Image),
     Device(DeviceBuffer),
+    /// Guest memory imported for global memory (released once no batch can use it).
+    Imported(crate::compute::ImportedMemory),
 }
 
 impl Frame {
@@ -460,6 +462,7 @@ impl Frame {
             match g {
                 Garbage::Image(i) => vk.destroy_image(i),
                 Garbage::Device(b) => vk.destroy_device_buffer(b),
+                Garbage::Imported(m) => vk.destroy_imported(m),
             }
         }
         Ok(())
@@ -502,6 +505,7 @@ impl Frame {
             match g {
                 Garbage::Image(i) => vk.destroy_image(i),
                 Garbage::Device(b) => vk.destroy_device_buffer(b),
+                Garbage::Imported(m) => vk.destroy_imported(m),
             }
         }
     }

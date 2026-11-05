@@ -120,7 +120,7 @@ fn words_of(size: u64) -> Option<u32> {
 }
 
 /// The constant buffer slot an instruction names (the unbound one is the spare slot).
-fn slot_of(inst: Inst) -> u32 {
+pub(super) fn slot_of(inst: Inst) -> u32 {
     match inst.field(54, 5) as u32 {
         super::UNBOUND_SLOT => super::SPARE_SLOT,
         s => s,
@@ -183,12 +183,22 @@ pub(super) fn ldc(tx: &mut Tx<'_>, i: &I) -> R<()> {
     let index = (r != RZ).then(|| tx.read(r));
     let words = load_cbuf(tx, slot, index, off, size)?;
     let d = dst(i);
+    let count = words.len() as u32;
     for (k, v) in words.into_iter().enumerate() {
         write(tx, i, reg_at(i, d, k as u32), v);
     }
     // The word the register now holds, for a texture instruction that takes its handle from it.
     if size == 4 && r == RZ && off.is_multiple_of(4) && i.cond.is_none() && d != RZ {
         tx.reg_origin.insert(d, (slot, off / 4));
+    }
+    // The words the registers hold, for a global access whose base they are (A-258).
+    if r == RZ && off.is_multiple_of(4) && size >= 4 {
+        for k in 0..count {
+            let reg = reg_at(i, d, k);
+            if reg != RZ {
+                tx.ptr_origin.insert(reg, (slot, off / 4 + k));
+            }
+        }
     }
     Ok(())
 }
@@ -210,9 +220,16 @@ pub(super) fn uldc(tx: &mut Tx<'_>, i: &I) -> R<()> {
     };
     let words = load_cbuf(tx, slot, index, off, size)?;
     let d = inst.ureg(16);
+    let count = words.len() as u32;
     for (k, v) in words.into_iter().enumerate() {
         let r = if d == URZ { URZ } else { d + k as u8 };
         tx.write_u_if(i.cond, r, v);
+    }
+    // The words the registers hold, for a global access whose base they are (A-258).
+    if index.is_none() && off.is_multiple_of(4) && size >= 4 && d != URZ {
+        for k in 0..count {
+            tx.uptr_origin.insert(d + k as u8, (slot, off / 4 + k));
+        }
     }
     Ok(())
 }
@@ -304,6 +321,32 @@ fn pair(tx: &mut Tx<'_>, lo: Id, hi: Id) -> Id {
 /// The GPU address of a global access: the register (a pair when `reg_pair`), plus the uniform
 /// register at `ureg_at` (a pair with bit 72) for the forms that have one, plus the offset.
 fn global_address(tx: &mut Tx<'_>, inst: Inst, reg_pair: bool, ureg_at: Option<u32>) -> Id {
+    // The storage buffer the access is in: the constant buffer word its base is a pointer from
+    // (the uniform register pair, else the register pair), for the host to make reachable (A-258).
+    let ubase = ureg_at
+        .map(|at| inst.ureg(at))
+        .filter(|u| *u != URZ && inst.bit(72));
+    // The one of the two that holds a pointer is the base (a uniform register the program does not
+    // load holds an offset, as zero does).
+    let from_uniform = ubase.and_then(|u| {
+        tx.uptr_origin
+            .get(&u)
+            .or_else(|| tx.ureg_static_pointer.get(&u))
+            .copied()
+    });
+    let from_register = (reg_pair && inst.reg(24) != RZ)
+        .then(|| tx.ptr_origin.get(&inst.reg(24)).copied())
+        .flatten();
+    let base = from_uniform.or(from_register);
+    match base {
+        Some(b) => {
+            if !tx.info.global_bases.contains(&b) {
+                tx.info.global_bases.push(b);
+                tx.info.global_bases.sort_unstable();
+            }
+        }
+        None => tx.info.global_unknown = true,
+    }
     tx.m.capability(cap::INT64);
     let u64t = tx.m.ty_int(64, false);
     let r = inst.reg(24);

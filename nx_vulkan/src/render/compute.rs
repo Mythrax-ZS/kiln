@@ -103,12 +103,34 @@ impl Core {
             }
         }
         if program.info.global_memory {
-            let (buffer, size) = self.global.table(&self.vk, &mut self.frame, scene)?;
+            // The storage buffers the program's accesses are in, read from the launch's constant
+            // buffers (A-258); all of memory for a program whose accesses are not attributed.
+            let now = self.textures.frame;
+            let read = |slot: u32, at: u32| -> Option<[u8; 12]> {
+                let c = d.cbufs.get(slot as usize).copied().flatten()?;
+                if u64::from(at) + 12 > u64::from(c.size) {
+                    return None;
+                }
+                scene
+                    .read_vec(c.address + u64::from(at), 12)?
+                    .try_into()
+                    .ok()
+            };
+            let (buffer, offset, size) = match super::global::storage_buffers(&program.info, read) {
+                Some(buffers) => {
+                    self.global
+                        .table_for(&self.vk, &mut self.frame, scene, &buffers, now)?
+                }
+                None => {
+                    let (b, s) = self.global.table(&self.vk, &mut self.frame, scene, now)?;
+                    (b, 0, s)
+                }
+            };
             buffer_infos.push((
                 base + 20,
                 vk::DescriptorBufferInfo::default()
                     .buffer(buffer)
-                    .offset(0)
+                    .offset(offset)
                     .range(size),
             ));
         }

@@ -316,7 +316,9 @@ fn mov(tx: &mut Tx<'_>, i: &I) -> R<()> {
     let src = b(tx, i)?;
     let v = operand(tx, src.operand)?;
     let d = dst(i);
+    let pointer = pointer_of(tx, &[src]);
     write(tx, i, d, v);
+    set_pointer(tx, i, d, pointer);
     // The immediate a register is known to hold, for a texture instruction's texel offsets.
     if let (Operand::Imm(k), false, None) = (src.operand, i.uniform, i.cond) {
         if d != RZ {
@@ -324,6 +326,46 @@ fn mov(tx: &mut Tx<'_>, i: &I) -> R<()> {
         }
     }
     Ok(())
+}
+
+/// A pointer from a constant buffer word stays one through an instruction that adds offsets to it
+/// or moves it (`IADD3`, `LEA`, `IMAD`, `IMAD.WIDE`, `MOV`): the word the destination's value is a
+/// pointer from when exactly one source's is, a constant buffer operand being its own word (A-258).
+/// Read before the instruction writes (its destination may be a source).
+pub(super) fn pointer_of(tx: &Tx<'_>, sources: &[Source]) -> Option<(u32, u32)> {
+    let mut found = None;
+    let mut count = 0;
+    for s in sources {
+        let o = match s.operand {
+            Operand::Reg(r) if r != RZ => tx.ptr_origin.get(&r).copied(),
+            Operand::UReg(u) if u != URZ => tx.uptr_origin.get(&u).copied(),
+            // A word of a constant buffer at a fixed offset is the pointer itself.
+            Operand::Cbuf { slot, offset } if offset.is_multiple_of(4) => Some((slot, offset / 4)),
+            _ => None,
+        };
+        if o.is_some() {
+            found = o;
+            count += 1;
+        }
+    }
+    if count == 1 {
+        found
+    } else {
+        None
+    }
+}
+
+/// The destination of the instruction holds a pointer from `origin` (see [`pointer_of`]); a
+/// guarded instruction counts too, the access it makes the base for being guarded alike.
+pub(super) fn set_pointer(tx: &mut Tx<'_>, i: &I, d: u8, origin: Option<(u32, u32)>) {
+    let Some(o) = origin else { return };
+    if i.uniform {
+        if d != URZ {
+            tx.uptr_origin.insert(d, o);
+        }
+    } else if d != RZ {
+        tx.ptr_origin.insert(d, o);
+    }
 }
 
 /// The constant buffer slot that holds a bound texture instruction's handle (bits 54..58).
@@ -493,6 +535,51 @@ pub(super) fn scan_dims(code: &[u8], graph: &Cfg) -> HashMap<u32, (Dim, bool)> {
         }
     }
     dims
+}
+
+/// The uniform registers every write of which, in the whole program, is a load of the same
+/// constant buffer word (`ULDC` at a fixed offset): what they hold anywhere is a pointer from that
+/// word, where the per-block tracking has lost it (after a loop, A-258).
+pub(super) fn scan_uniform_pointers(code: &[u8], graph: &Cfg) -> HashMap<u8, (u32, u32)> {
+    let mut seen: HashMap<u8, Option<(u32, u32)>> = HashMap::new();
+    let mut note = |r: u8, o: Option<(u32, u32)>| {
+        if r >= URZ {
+            return;
+        }
+        let e = seen.entry(r).or_insert(o);
+        if *e != o {
+            *e = None;
+        }
+    };
+    for block in graph.blocks.values() {
+        for (_, inst) in sm86::cfg::instructions(code, block) {
+            let d = inst.ureg(16);
+            if inst.opcode() == op::ULDC && inst.field(73, 3) >= 4 && inst.field(38, 16) % 4 == 0 {
+                let words = match inst.field(73, 3) {
+                    4 => 1,
+                    5 => 2,
+                    _ => 4,
+                };
+                let (slot, word) = (mem::slot_of(inst), inst.field(38, 16) as u32 / 4);
+                for k in 0..words {
+                    note(d.saturating_add(k as u8), Some((slot, word + k)));
+                }
+            } else if inst.is_uniform()
+                || matches!(
+                    inst.opcode(),
+                    op::ULDC | op::ULDC_INDEXED | op::R2UR | op::S2UR | op::UPLOP3
+                )
+                || inst.base() == op::alu::VOTEU
+            {
+                // Any other write of a uniform register (its pair too, for a 64-bit one).
+                note(d, None);
+                note(d.saturating_add(1), None);
+            }
+        }
+    }
+    seen.into_iter()
+        .filter_map(|(r, o)| o.map(|o| (r, o)))
+        .collect()
 }
 
 /// How many words of local (or shared) memory the constant-offset accesses of a program reach.
