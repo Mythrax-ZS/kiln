@@ -79,7 +79,10 @@ Small chunks. Title at most 50 characters. No body. No attribution lines of any 
   M12 passed 2026-11-05: the title submits and presents its frames, and every draw then stops at
   its sm_86 programs (`docs/reports/M12-switch2-gpu-front.md`). M13 passed 2026-11-06: the draws
   and launches run their sm_86 programs translated as they are, and the title reaches its title
-  screen, drawn, without a lost device (`docs/reports/M13-switch2-shaders.md`); M14 is next.
+  screen, drawn, without a lost device (`docs/reports/M13-switch2-shaders.md`). M14 passed
+  2026-11-06: the title goes from its menus into a race, and the race is drawn (frames dumped and
+  looked at), at about 5 frames a second (`docs/reports/M14-switch2-renderer.md`); its rate is
+  next.
   Every NX2 difference is gated on `Npdm::platform` (A-188), never on a title. M8 passed (2026-10-12): the owner approved the GPU front, the `nx_gpu` crate
   (`nvdrv` and its device nodes, the display and buffer-queue path, a tracing command processor
   with a macro engine). The owner approved shader translation (Maxwell SASS to SPIR-V, crate
