@@ -326,8 +326,9 @@ impl Service for HidServer {
                 Ok(Response::ok())
             }
             205 => Ok(Response::ok().with_bytes(&[u8::from(self.vibration_permitted)])),
-            // SendVibrationValues(aruid, pid, pointer buffers of handles and values)
-            206 => Ok(Response::ok()),
+            // SendVibrationValues(aruid, pid, pointer buffers of handles and values); 214 is the
+            // Switch 2 SDK's (docs/ASSUMPTIONS.md A-259): nothing vibrates
+            206 | 214 => Ok(Response::ok()),
             // BeginPermitVibrationSession(aruid), EndPermitVibrationSession()
             209 | 210 => Ok(Response::ok()),
             // SetSupportedNpadStyleSet(u32 style set, u64 aruid, pid)
