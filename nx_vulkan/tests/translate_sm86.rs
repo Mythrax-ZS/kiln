@@ -295,6 +295,54 @@ fn shf_reference(
     }
 }
 
+/// `IMAD.HI[.U32] Rd, R0, R1, R2`: the high word of the product, plus R2.
+fn imad_hi(d: u64, signed: bool) -> u128 {
+    with(
+        vec![
+            (0, 12, 0x227),
+            (12, 4, 7),
+            (16, 8, d),
+            (24, 8, 0),
+            (32, 8, 1),
+            (64, 8, 2),
+            (73, 1, u64::from(signed)),
+        ],
+        sched(7, 0),
+    )
+}
+
+#[test]
+fn the_high_word_of_a_product_is_added_to() {
+    let Some(vk) = vulkan() else { return };
+    let code = program(&[imad_hi(3, false), imad_hi(4, true)]);
+    let values = [
+        (0u32, 0u32, 0u32),
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 1),
+        (0x8000_0000, 2, 5),
+        (0x1234_5678, 0x9ABC_DEF0, 0xFFFF_FFFF),
+        (0x7FFF_FFFF, 0x8000_0001, 0x10),
+    ];
+    for (x, y, c) in values {
+        let mut input = State::default();
+        input.regs[0] = x;
+        input.regs[1] = y;
+        input.regs[2] = c;
+        let out = run(&vk, &code, input);
+        let unsigned = ((u64::from(x) * u64::from(y)) >> 32) as u32;
+        let signed = ((i64::from(x as i32) * i64::from(y as i32)) >> 32) as u32;
+        assert_eq!(
+            out.regs[3],
+            unsigned.wrapping_add(c),
+            "{x:#x} * {y:#x} + {c:#x}"
+        );
+        assert_eq!(
+            out.regs[4],
+            signed.wrapping_add(c),
+            "signed {x:#x} * {y:#x} + {c:#x}"
+        );
+    }
+}
+
 #[test]
 fn a_funnel_shift_moves_the_bits_of_both_words() {
     let Some(vk) = vulkan() else { return };

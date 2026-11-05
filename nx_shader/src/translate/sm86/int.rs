@@ -515,9 +515,33 @@ pub(super) fn imad_wide(tx: &mut Tx<'_>, i: &I) -> R<()> {
     Ok(())
 }
 
-/// `IMAD.HI`: not yet.
-pub(super) fn imad_hi(tx: &mut Tx<'_>, _i: &I) -> R<()> {
-    tx.fail("IMAD.HI is not translated")
+/// `IMAD.HI[.U32] Rd, Ra, B, ±C`: the high word of the 64-bit product of `Ra` and `B` (signed with
+/// bit 73), plus `C` (docs/ASSUMPTIONS.md A-271).
+pub(super) fn imad_hi(tx: &mut Tx<'_>, i: &I) -> R<()> {
+    if i.inst.bit(74) {
+        return tx.fail("IMAD.HI.X");
+    }
+    let sa = a(i);
+    let (sb, sc) = bc(tx, i)?;
+    if sa.neg || sb.neg {
+        return tx.fail("IMAD.HI with a negated factor");
+    }
+    let x = raw(tx, sa)?;
+    let y = raw(tx, sb)?;
+    let z = raw(tx, sc)?;
+    let u = tx.t.u32;
+    let pair = tx.m.ty_struct(&[u, u]);
+    let wide = if i.inst.bit(73) {
+        tx.op2(op::S_MUL_EXTENDED, pair, x, y)
+    } else {
+        tx.op2(op::U_MUL_EXTENDED, pair, x, y)
+    };
+    let high =
+        tx.f.emit_result(&mut tx.m, op::COMPOSITE_EXTRACT, u, &[wide, 1]);
+    let addend = if sc.neg { tx.ineg(z) } else { z };
+    let r = tx.iadd(high, addend);
+    write(tx, i, dst(i), r);
+    Ok(())
 }
 
 /// `FLO[.U32|.S32][.SH] Rd, B`: the place of the highest one bit (for `.S32`, bit 73, the highest
