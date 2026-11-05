@@ -43,6 +43,32 @@ fn a_clear_fills_the_target_with_the_clear_color() {
 }
 
 #[test]
+fn a_color_target_of_format_zero_is_off() {
+    if vulkan().is_none() {
+        return;
+    }
+    let mut w = World::new();
+    let target = GPU_BASE + 0x10000;
+    for (i, v) in [0.0f32, 1.0, 0.0, 1.0].iter().enumerate() {
+        w.set(0xd80 + 4 * i as u32, v.to_bits());
+    }
+    let mut r = Renderer::new(RenderConfig::default());
+    // The only target is off: a color clear of it clears nothing, and makes no target.
+    w.color_target(0, target, 64, 32, 0);
+    r.clear(&w.scene(), &clear_all()).unwrap();
+    r.finish().unwrap();
+    assert!(r.picture_at(w.cpu(target)).unwrap().is_none());
+    // Two targets, the second off: the first is cleared as ever (A-273).
+    w.color_target(0, target, 64, 32, 0xD5);
+    w.color_target(1, GPU_BASE + 0x40000, 64, 32, 0);
+    w.set(0x121c, 2 | 1 << 7);
+    r.clear(&w.scene(), &clear_all()).unwrap();
+    r.finish().unwrap();
+    let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    assert_eq!(&rgba[..4], &[0, 255, 0, 255]);
+}
+
+#[test]
 fn a_clear_rectangle_leaves_the_rest_alone_and_bgra_targets_swap_channels() {
     if vulkan().is_none() {
         return;

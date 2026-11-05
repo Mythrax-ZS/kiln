@@ -656,7 +656,14 @@ impl Core {
     /// The keys of the color and depth targets the registers name.
     fn attachments(&mut self, scene: &Scene<'_>) -> Result<(Vec<Key>, Option<Key>), String> {
         let mut colors = Vec::new();
-        for (output, t) in scene.regs.color_targets_in_use() {
+        // A target of format 0 is off: nothing is drawn to it. Those that no target after them is
+        // on are left out (A-273).
+        let targets = scene.regs.color_targets_in_use();
+        let on = targets
+            .iter()
+            .rposition(|(_, t)| t.format != 0)
+            .map_or(0, |last| last + 1);
+        for (output, t) in targets.into_iter().take(on) {
             let Some(format) = color_format(t.format) else {
                 return Err(format!(
                     "color target {output} has format {:#x}, which is not a color format",
@@ -750,7 +757,13 @@ impl Core {
     }
 
     fn clear(&mut self, scene: &Scene<'_>, clear: &Clear) -> Result<(), String> {
-        let wants_color = clear.red || clear.green || clear.blue || clear.alpha;
+        // A clear of a color target that is off (format 0) clears nothing in color (A-273).
+        let target_on = scene
+            .regs
+            .color_targets_in_use()
+            .get(clear.target as usize)
+            .is_none_or(|(_, t)| t.format != 0);
+        let wants_color = target_on && (clear.red || clear.green || clear.blue || clear.alpha);
         if wants_color && !(clear.red && clear.green && clear.blue && clear.alpha) {
             return Err(format!(
                 "a clear of only some color channels (r {} g {} b {} a {})",
