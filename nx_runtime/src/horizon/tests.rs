@@ -1580,12 +1580,20 @@ fn sm_answers_tipc_messages() {
         .send_tipc(sm, &tipc_request_bytes(1, &[0; 8], false))
         .unwrap();
     assert_eq!((result, moved), (ResultCode::new(21, 6).0, vec![0]));
-    // Type 15 closes the session.
-    let (result, _, _) = e.send_tipc(sm, &15u32.to_le_bytes()).unwrap();
-    assert_eq!(result, 0);
-    // A command the service manager has not got over TIPC stops the run and says so.
+    // A command the service manager has not got over TIPC stops the run and says so; on another
+    // session, the first being closed below.
+    let other = e.connect_sm();
+    // Type 15 closes the session: the server lets it go, and the request fails with
+    // `SessionClosed`, as does every request after it (A-267).
+    for _ in 0..2 {
+        let mut close = 15u32.to_le_bytes().to_vec();
+        close.resize(0x100, 0);
+        e.write(e.tls(), &close);
+        assert_eq!(e.svc(0x21, &[sm]), Flow::Continue);
+        assert_eq!(e.r(), 0xF601, "SessionClosed");
+    }
     assert!(e
-        .send_tipc(sm, &tipc_request_bytes(9, &[], false))
+        .send_tipc(other, &tipc_request_bytes(9, &[], false))
         .is_none());
     match e.kernel.exit_state() {
         Some(Exit::Fatal(m)) => assert!(m.contains("sm: (TIPC)") && m.contains("command 9"), "{m}"),

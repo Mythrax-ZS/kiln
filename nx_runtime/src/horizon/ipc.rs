@@ -185,7 +185,27 @@ enum Routed {
     Reply(Response, bool),
     /// A TIPC reply: the result, then the data, and no CMIF header.
     Tipc(Response),
+    /// The server closed the session (a TIPC close): the request fails with `SessionClosed`.
+    Closed,
     Stop(Stop),
+}
+
+/// What stands in a session for the service its server let go of (A-267). Nothing reaches it:
+/// a request on a closed session fails before it is routed.
+#[derive(Debug)]
+struct ClosedSession;
+
+impl Service for ClosedSession {
+    fn name(&self) -> &str {
+        "a closed session"
+    }
+
+    fn request(&mut self, req: &Request) -> super::service::ServiceResult {
+        Err(Stop(format!(
+            "command {} on a session its server closed",
+            req.command
+        )))
+    }
 }
 
 /// A reply to write.
@@ -344,10 +364,14 @@ impl Kernel {
         let Some((copies, moves)) = self.resolve_handles(current, &msg) else {
             return Ok(err::INVALID_HANDLE);
         };
+        if session.lock().unwrap_or_else(|e| e.into_inner()).closed {
+            return Ok(err::SESSION_CLOSED);
+        }
         let receive_list = msg.receive_list.clone();
         let routed = self.route(current, &session, msg, copies, moves);
         let (response, domain, tipc, object_ids) = match routed {
             Routed::Stop(s) => return Err(s),
+            Routed::Closed => return Ok(err::SESSION_CLOSED),
             Routed::Reply(r, domain) => {
                 let (r, ids) = self.finish_objects(&session, r, domain);
                 (r, domain, false, ids)
@@ -515,7 +539,16 @@ impl Kernel {
             // TIPC: the payload is all of the raw data, which starts right after the descriptors
             // (the 16-byte alignment is CMIF's), with no CMIF header; there are no domains, so
             // the session's one object is the target.
-            msg::TIPC_CLOSE => Routed::Tipc(Response::ok()),
+            // The server lets go of the session without a reply, and the client's request fails with
+            // `SessionClosed`, which `nn::tipc` waits for before it closes its handle (A-267).
+            msg::TIPC_CLOSE => {
+                sess.closed = true;
+                sess.domain = None;
+                let served = std::mem::replace(&mut sess.root, Box::new(ClosedSession));
+                drop(sess);
+                drop(served);
+                Routed::Closed
+            }
             kind if kind >= msg::TIPC_REQUEST => {
                 let req = Request {
                     command: kind - msg::TIPC_REQUEST,
@@ -857,6 +890,41 @@ mod tests {
         let out = build_reply(&plain).unwrap();
         assert_eq!(u32_at(&out, 4), Some(2));
         assert_eq!(&out[8..16], &[0x15, 0x04, 0, 0, 9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn a_tipc_close_lets_the_service_go_and_fails_with_session_closed() {
+        use super::super::kernel::{ProcessInfo, ProcessKind};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        /// A service that says when it is let go of.
+        #[derive(Debug)]
+        struct Probe(Arc<AtomicBool>);
+        impl Service for Probe {
+            fn name(&self) -> &str {
+                "probe"
+            }
+            fn request(&mut self, _: &Request) -> super::super::service::ServiceResult {
+                Ok(Response::ok())
+            }
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let kernel = Kernel::new(ProcessInfo::new("tipc", ProcessKind::Nso, None));
+        let gone = Arc::new(AtomicBool::new(false));
+        let KObject::Session(session) = KObject::session(Box::new(Probe(gone.clone()))) else {
+            unreachable!("a session");
+        };
+        let mut m = vec![0u8; MESSAGE_BYTES];
+        m[0..4].copy_from_slice(&msg::TIPC_CLOSE.to_le_bytes());
+        let close = parse_message(&m).unwrap();
+        let routed = kernel.route(0, &session, close, vec![], vec![]);
+        assert!(matches!(routed, Routed::Closed));
+        assert!(gone.load(Ordering::Relaxed), "the service is let go of");
+        assert!(session.lock().unwrap().closed);
     }
 
     #[test]

@@ -10,6 +10,9 @@ pub struct Session {
     pub root: Box<dyn Service>,
     /// Set once the session was converted to a domain, which holds many objects behind one handle.
     pub domain: Option<Domain>,
+    /// The server closed its end (a TIPC close, docs/ASSUMPTIONS.md A-267): every request fails
+    /// with `SessionClosed`.
+    pub closed: bool,
 }
 
 /// The objects of a domain by id. Id 1 is the object the session started with.
@@ -40,7 +43,11 @@ pub enum KObject {
 
 impl KObject {
     pub fn session(root: Box<dyn Service>) -> KObject {
-        KObject::Session(Arc::new(Mutex::new(Session { root, domain: None })))
+        KObject::Session(Arc::new(Mutex::new(Session {
+            root,
+            domain: None,
+            closed: false,
+        })))
     }
 
     pub fn kind(&self) -> &'static str {
