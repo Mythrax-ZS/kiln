@@ -170,19 +170,30 @@ struct Writes {
     scratch: Vec<usize>,
     /// How many pages the harvests found (for the trace).
     pages: usize,
+    /// The harvests made by questions about parts not harvested yet, and the time they took,
+    /// since the last trace (`NX_TRACE_PERF`).
+    asked_harvests: usize,
+    asked_time: std::time::Duration,
 }
 
 struct Watched {
     base: usize,
     len: usize,
     /// For each [`CHUNK`] of the block, whether it is harvested at each epoch: only the parts
-    /// somebody asked about are, as asking costs less than reading the system's bits of memory
-    /// nobody looks at (a block of the title's is 3 GB).
+    /// somebody asked about lately are, as asking costs less than reading the system's bits of
+    /// memory nobody looks at (a block of the title's is 3 GB).
     active: Vec<bool>,
+    /// For each chunk, the epoch it was last asked about in.
+    asked: Vec<u32>,
 }
 
 /// The part of a block that is harvested, or not, as a whole.
 const CHUNK: usize = 16 << 20;
+
+/// The epochs a chunk nobody asks about stays harvested. Harvesting is the system walking the
+/// chunk's pages, every epoch; a chunk let go keeps its pages' written bits with the system, and
+/// the next question about it harvests it again and is answered "not known" (A-277).
+const IDLE_EPOCHS: u32 = 60;
 
 /// The most the system is asked about in one call.
 const HARVEST_STEP: usize = 64 << 20;
@@ -418,6 +429,7 @@ impl GuestMemory {
                     base: host as usize,
                     len: size as usize,
                     active: vec![false; (size as usize).div_ceil(CHUNK)],
+                    asked: vec![0; (size as usize).div_ceil(CHUNK)],
                 },
             );
         }
@@ -507,18 +519,29 @@ impl GuestMemory {
         let began = std::time::Instant::now();
         w.pages = 0;
         let mut chunks = 0;
+        let epoch = w.epoch;
         for i in 0..w.blocks.len() {
-            chunks += w.blocks[i].active.iter().filter(|a| **a).count();
+            let b = &mut w.blocks[i];
+            for (active, asked) in b.active.iter_mut().zip(&b.asked) {
+                if *active && epoch.wrapping_sub(*asked) > IDLE_EPOCHS {
+                    *active = false;
+                }
+            }
+            chunks += b.active.iter().filter(|a| **a).count();
             w.harvest_active(i);
         }
         if w.epoch.is_multiple_of(100) && std::env::var_os("NX_TRACE_PERF").is_some() {
             eprintln!(
-                "[memory] epoch {}: harvested {chunks} chunks of {} MB in {:?}, {} pages written",
+                "[memory] epoch {}: harvested {chunks} chunks of {} MB in {:?}, {} pages written; since the last line, questions about parts not harvested harvested {} times in {:?}",
                 w.epoch,
                 CHUNK >> 20,
                 began.elapsed(),
-                w.pages
+                w.pages,
+                w.asked_harvests,
+                w.asked_time
             );
+            w.asked_harvests = 0;
+            w.asked_time = std::time::Duration::ZERO;
         }
         w.epoch
     }
@@ -543,17 +566,23 @@ impl GuestMemory {
             return None;
         }
         let (first, last) = ((start - b.base) / CHUNK, (end - 1 - b.base) / CHUNK);
+        let now = w.epoch;
+        w.blocks[i].asked[first..=last].fill(now);
+        let b = &w.blocks[i];
         if !b.active[first..=last].iter().all(|a| *a) {
             // Bring the bits of the chunks up to date: the next epoch stamps what is written from
             // now.
+            let began = std::time::Instant::now();
             for c in first..=last {
                 if !w.blocks[i].active[c] {
                     w.blocks[i].active[c] = true;
                     let base = w.blocks[i].base + c * CHUNK;
                     let len = CHUNK.min(w.blocks[i].len - c * CHUNK);
                     w.harvest_range(base, len);
+                    w.asked_harvests += 1;
                 }
             }
+            w.asked_time += began.elapsed();
             return None;
         }
         let mut page = start >> 12;
@@ -1313,6 +1342,40 @@ mod tests {
             mem.untouched_since(host(base + size - 4096), 8192, e3),
             None
         );
+    }
+
+    /// A chunk nobody asks about is let go after a while; the next question about it is not
+    /// answered, and the writes made meanwhile are still found after it (A-277).
+    #[cfg(windows)]
+    #[test]
+    fn a_chunk_nobody_asks_about_is_let_go_and_its_writes_are_still_found() {
+        let mem = GuestMemory::new();
+        let base = 0x4000_0000u64;
+        mem.map(base, 4 << 20, perm::R | perm::W).unwrap();
+        let host = |a: u64| mem.host_run(a, 4096).unwrap().0 as *const u8;
+        let e = mem.begin_epoch();
+        assert_eq!(mem.untouched_since(host(base), 4096, e), None);
+        let looked = mem.begin_epoch();
+        assert_eq!(mem.untouched_since(host(base), 4096, looked), Some(true));
+        // Nobody asks for longer than a chunk stays harvested, and the page is written meanwhile.
+        for _ in 0..IDLE_EPOCHS + 2 {
+            mem.begin_epoch();
+        }
+        mem.write_bytes(base + 16, &[7], true).unwrap();
+        let later = mem.begin_epoch();
+        assert_eq!(
+            mem.untouched_since(host(base), 4096, looked),
+            None,
+            "a chunk let go cannot say"
+        );
+        let after = mem.begin_epoch();
+        assert_eq!(
+            mem.untouched_since(host(base), 4096, looked),
+            Some(false),
+            "the write made while it was let go is found"
+        );
+        assert_eq!(mem.untouched_since(host(base), 4096, after), Some(true));
+        let _ = later;
     }
 
     /// A block too small to be tracked is not answered for.
