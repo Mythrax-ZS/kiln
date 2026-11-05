@@ -239,6 +239,13 @@ struct Phases {
     launch_kinds: [u64; 4],
     /// Why launches were waited for (A-274), by [`compute::settle`] cause.
     settles: [u64; 5],
+    /// Of the waits of a launch that reads what one before it writes, by what it reads and what
+    /// wrote it: constant buffers after global writes and after surfaces, textures the same,
+    /// global memory over a surface still to be put, and surfaces after global writes and after
+    /// surfaces.
+    hazard_kinds: [u64; 7],
+    /// Surfaces that were the image a launch before wrote (A-280).
+    forwarded: u64,
 }
 
 /// Calls of one kind and the time they took.
@@ -1267,7 +1274,7 @@ impl Renderer {
                         .map(|d| format!("{:.0}", d.as_secs_f64() * 1000.0))
                         .collect();
                     eprintln!(
-                        "[vulkan] frame {}: the compute launches spent {} ms (program, constant buffers, textures, pipeline, recording, sending and waiting, putting surfaces back); {} wrote {} surfaces, {} reached global memory, in {} runs; waited for at the GPU front {} (for bytes it reaches {}), at another command {}, at a launch reading what one before it wrote {}, at once {}",
+                        "[vulkan] frame {}: the compute launches spent {} ms (program, constant buffers, textures, pipeline, recording, sending and waiting, putting surfaces back); {} wrote {} surfaces, {} reached global memory, in {} runs; waited for at the GPU front {} (for bytes it reaches {}), at another command {}, at a launch reading what one before it wrote {} {:?}, at once {}; {} surfaces were the image of a launch before",
                         p.frame,
                         ms.join(", "),
                         ph.launch_kinds[0],
@@ -1278,7 +1285,9 @@ impl Renderer {
                         ph.settles[4],
                         ph.settles[1],
                         ph.settles[2],
-                        ph.settles[3]
+                        ph.hazard_kinds,
+                        ph.settles[3],
+                        ph.forwarded
                     );
                 }
                 let s = std::mem::take(&mut self.spent);

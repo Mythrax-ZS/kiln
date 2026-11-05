@@ -592,13 +592,6 @@ impl Core {
         Some(self.releases.iter().fold(word, |w, r| r.applied_to(va, w)))
     }
 
-    /// Whether a launch recorded and not waited for may write `[from, to)` (GPU addresses).
-    fn pending_write(&self, from: u64, to: u64) -> bool {
-        self.writes_everywhere
-            || overlaps(&self.pending_writes, from, to)
-            || self.deferred.iter().any(|s| s.overlaps(from, to))
-    }
-
     /// Wait for the launches before this one when it reads what they write: its constant buffers,
     /// textures and surfaces are copied on the host from memory, and what it reaches of global
     /// memory in place must not be where a surface is still to be put (A-274).
@@ -611,12 +604,27 @@ impl Core {
         if !self.launches_pending() {
             return Ok(());
         }
-        let hazard = |core: &mut Core| core.settle(scene.space, scene.mem, settle::HAZARD);
+        // What a launch before it writes there: 0 global memory, 1 a surface still to be put.
+        let writer = |core: &Core, from: u64, to: u64| -> Option<usize> {
+            if core.writes_everywhere || overlaps(&core.pending_writes, from, to) {
+                Some(0)
+            } else if core.deferred.iter().any(|s| s.overlaps(from, to)) {
+                Some(1)
+            } else {
+                None
+            }
+        };
+        // The kinds counted for the report: a constant buffer (0, 1), a texture or surface (2,
+        // 3), after global writes and after surfaces; global memory over a surface (4).
+        let hazard = |core: &mut Core, kind: usize| {
+            core.phases.hazard_kinds[kind] += 1;
+            core.settle(scene.space, scene.mem, settle::HAZARD)
+        };
         for (cb, bound) in d.cbufs.iter().enumerate().take(18) {
             let used = program.info.cbuf_extent[cb] != 0 || program.info.cbuf_dynamic[cb];
             if let (true, Some(c)) = (used, bound) {
-                if self.pending_write(c.address, c.address + u64::from(c.size)) {
-                    return hazard(self);
+                if let Some(w) = writer(self, c.address, c.address + u64::from(c.size)) {
+                    return hazard(self, w);
                 }
             }
         }
@@ -641,28 +649,41 @@ impl Core {
                     }))
                 })
         };
+        // (address, bytes, the kind of a hazard there after global writes).
         let mut spans = Vec::new();
         for used in &program.info.textures {
             let slot = used.source.unwrap_or(TEXTURE_TABLE);
             if let Some(tic) = handle(slot, used.index).and_then(header) {
                 let span = self.textures.span(&tic, used).unwrap_or(1);
-                spans.push((tic.address(), span));
+                spans.push((tic.address(), span, 2));
             }
         }
         for used in &program.info.images {
             let slot = used.source.unwrap_or(TEXTURE_TABLE);
             if let Some(tic) = handle(slot, used.index).and_then(header) {
+                // A surface a launch before wrote, with the same image, is used as it is: no wait
+                // (A-280), unless global writes reach it too.
+                let forwarded = self
+                    .surface_plan(&tic, used)
+                    .ok()
+                    .and_then(|(info, place)| self.forwardable(&info, &place).map(|_| place));
+                if let Some(place) = forwarded {
+                    if writer(self, place.address, place.end()) == Some(1) {
+                        continue;
+                    }
+                }
                 spans.push((
                     tic.address(),
                     super::surfaces::span(&tic, used).unwrap_or(1),
+                    5,
                 ));
             }
         }
-        if spans
+        if let Some(kind) = spans
             .iter()
-            .any(|&(at, len)| self.pending_write(at, at.saturating_add(len)))
+            .find_map(|&(at, len, kind)| writer(self, at, at.saturating_add(len)).map(|w| kind + w))
         {
-            return hazard(self);
+            return hazard(self, kind);
         }
         if program.info.global_memory && !self.deferred.is_empty() {
             let read = |slot: u32, at: u32| -> Option<[u8; 12]> {
@@ -684,7 +705,7 @@ impl Core {
                 None => false,
             };
             if !clear {
-                return hazard(self);
+                return hazard(self, 4);
             }
         }
         Ok(())

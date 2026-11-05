@@ -19,9 +19,9 @@ use nx_shader::translate::{Dim, ImageUse};
 
 /// Where a surface's texels lie in memory.
 #[derive(Clone, Copy)]
-struct Place {
+pub(super) struct Place {
     /// The GPU address of the texture's memory and the bytes from one layer to the next.
-    address: u64,
+    pub(super) address: u64,
     layer_stride: u64,
     layers: u32,
     /// Level 0 of a layer as it lies in memory (block linear), or its rows (pitch linear).
@@ -39,7 +39,7 @@ impl Place {
     }
 
     /// One past the last byte of its memory (a GPU address).
-    fn end(&self) -> u64 {
+    pub(super) fn end(&self) -> u64 {
         self.address
             + self.layer_stride * u64::from(self.layers.saturating_sub(1))
             + self.layer_bytes()
@@ -82,16 +82,47 @@ const POOLED: usize = 8;
 
 /// A surface made for a launch.
 pub struct Surface {
-    image: Image,
+    image: SurfaceImage,
     place: Place,
     written: bool,
 }
 
+/// The image of a surface: its own, filled from memory, or the image of the same surface a
+/// launch before wrote, whose texels are not in memory yet (A-280).
+enum SurfaceImage {
+    Own(Image),
+    Forwarded {
+        image: vk::Image,
+        view: vk::ImageView,
+        info: ImageInfo,
+        /// The staged surface it is the image of, in the list of those not put into memory yet.
+        from: usize,
+    },
+}
+
+impl SurfaceImage {
+    fn image(&self) -> vk::Image {
+        match self {
+            SurfaceImage::Own(i) => i.image,
+            SurfaceImage::Forwarded { image, .. } => *image,
+        }
+    }
+
+    fn info(&self) -> &ImageInfo {
+        match self {
+            SurfaceImage::Own(i) => &i.info,
+            SurfaceImage::Forwarded { info, .. } => info,
+        }
+    }
+}
+
 /// What a launch stored in a surface, copied out for the host, to be put into the surface's
-/// memory once the launch has run (A-274).
+/// memory once the launch has run (A-274), and the image it stored it in, kept for a later launch
+/// of the run that uses the same surface (A-280).
 pub struct Staged {
     staging: crate::compute::HostBuffer,
     place: Place,
+    image: Option<Image>,
 }
 
 impl Staged {
@@ -122,7 +153,10 @@ pub fn span(tic: &Tic, used: &ImageUse) -> Option<u64> {
 
 impl Surface {
     pub fn view(&self) -> vk::ImageView {
-        self.image.view
+        match &self.image {
+            SurfaceImage::Own(i) => i.view,
+            SurfaceImage::Forwarded { view, .. } => *view,
+        }
     }
 
     fn region(&self, layer: u32, offset: u64) -> vk::BufferImageCopy {
@@ -135,9 +169,9 @@ impl Surface {
                 layer_count: 1,
             })
             .image_extent(vk::Extent3D {
-                width: self.image.info.width,
-                height: self.image.info.height,
-                depth: self.image.info.depth,
+                width: self.image.info().width,
+                height: self.image.info().height,
+                depth: self.image.info().depth,
             })
     }
 
@@ -178,6 +212,59 @@ impl Core {
         tic: Tic,
         used: &ImageUse,
     ) -> Result<Surface, String> {
+        let (info, place) = self.surface_plan(&tic, used)?;
+        // The image of the same surface a launch before wrote, which memory does not hold yet.
+        if let Some((from, image, view)) = self.forwardable(&info, &place) {
+            self.phases.forwarded += 1;
+            return Ok(Surface {
+                image: SurfaceImage::Forwarded {
+                    image,
+                    view,
+                    info,
+                    from,
+                },
+                place,
+                written: used.written,
+            });
+        }
+        let image = self.surface_image(info)?;
+        let surface = Surface {
+            image: SurfaceImage::Own(image),
+            place,
+            written: used.written,
+        };
+        self.fill_surface(scene, &surface)?;
+        Ok(surface)
+    }
+
+    /// The image a launch before this one wrote for the surface of `info` at `place` and memory
+    /// does not hold yet, when the last surface staged over that memory is that one: its place in
+    /// the staged list, and its image and view (A-280).
+    pub(super) fn forwardable(
+        &self,
+        info: &ImageInfo,
+        place: &Place,
+    ) -> Option<(usize, vk::Image, vk::ImageView)> {
+        let (from, to) = (place.address, place.end());
+        let (index, staged) = self
+            .deferred
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, s)| s.overlaps(from, to))?;
+        let image = staged.image.as_ref()?;
+        (staged.place.address == place.address
+            && staged.place.end() == to
+            && shape_of_image(&image.info) == shape_of_image(info))
+        .then_some((index, image.image, image.view))
+    }
+
+    /// The image a surface of header `tic` used as `used` is made in, and where its texels lie.
+    pub(super) fn surface_plan(
+        &self,
+        tic: &Tic,
+        used: &ImageUse,
+    ) -> Result<(ImageInfo, Place), String> {
         let describe = || format!("a surface of header {:08x?}", tic.0);
         let format = texture_format(tic.components(), tic.types()[0], false)
             .ok_or_else(|| format!("{}: its format {:#x}", describe(), tic.components()))?;
@@ -236,7 +323,7 @@ impl Core {
             }
         };
         let p = plan(
-            &tic,
+            tic,
             Shape {
                 kind,
                 layers,
@@ -244,7 +331,7 @@ impl Core {
             },
             format,
         )?;
-        let image = self.surface_image(ImageInfo {
+        let info = ImageInfo {
             format: format.vk,
             width: tic.width(),
             height: tic.height(),
@@ -256,18 +343,20 @@ impl Core {
                 | vk::ImageUsageFlags::TRANSFER_SRC,
             view_type,
             components: vk::ComponentMapping::default(),
-        })?;
-        let surface = Surface {
-            image,
-            place: Place {
-                address: tic.address(),
-                layer_stride: p.layer_stride,
-                layers,
-                geometry: p.level_geometry[0],
-                pitch: tic.is_pitch().then(|| tic.pitch()),
-            },
-            written: used.written,
         };
+        let place = Place {
+            address: tic.address(),
+            layer_stride: p.layer_stride,
+            layers,
+            geometry: p.level_geometry[0],
+            pitch: tic.is_pitch().then(|| tic.pitch()),
+        };
+        Ok((info, place))
+    }
+
+    /// Fill a surface's own image with what its memory holds.
+    fn fill_surface(&mut self, scene: &Scene<'_>, surface: &Surface) -> Result<(), String> {
+        let layers = surface.place.layers;
         // What memory holds, layer by layer.
         let mut packed = Vec::new();
         let mut regions = Vec::new();
@@ -302,7 +391,7 @@ impl Core {
         }
         let cmd = self.frame.upload_cmd(&self.vk)?;
         let range = surface.range();
-        let img = surface.image.image;
+        let img = surface.image.image();
         // SAFETY: the upload command buffer is recording; the image was just made.
         unsafe {
             let d = &self.vk.device;
@@ -351,7 +440,7 @@ impl Core {
                 )],
             );
         }
-        Ok(surface)
+        Ok(())
     }
 
     /// After a launch is recorded: copy what it stored in its surfaces out for the host (after
@@ -378,7 +467,7 @@ impl Core {
                         &[],
                         &[],
                         &[barrier(
-                            s.image.image,
+                            s.image.image(),
                             s.range(),
                             (
                                 vk::ImageLayout::GENERAL,
@@ -392,15 +481,37 @@ impl Core {
                     );
                     d.cmd_copy_image_to_buffer(
                         cmd,
-                        s.image.image,
+                        s.image.image(),
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                         staging.buffer,
                         &regions,
+                    );
+                    // Back to the general layout, for a later launch to use as it is (A-280).
+                    d.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[barrier(
+                            s.image.image(),
+                            s.range(),
+                            (
+                                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                                vk::ImageLayout::GENERAL,
+                            ),
+                            (
+                                vk::AccessFlags::TRANSFER_READ,
+                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                            ),
+                        )],
                     );
                 }
                 staged.push(Staged {
                     staging,
                     place: s.place,
+                    image: None,
                 });
             }
             let to_host = [vk::MemoryBarrier::default()
@@ -419,11 +530,22 @@ impl Core {
                 );
             }
         }
-        // The images serve later launches once the batch is over.
+        // A written image stays with its staged texels (a forwarded one is taken from the launch
+        // that wrote it before); the others serve later launches once the batch is over.
+        let mut next = staged.iter_mut();
         for s in surfaces {
-            self.frame
-                .garbage
-                .push(super::frame::Garbage::Surface(s.image));
+            let mine = if s.written { next.next() } else { None };
+            match (s.image, mine) {
+                (SurfaceImage::Own(image), Some(slot)) => slot.image = Some(image),
+                (SurfaceImage::Own(image), None) => self
+                    .frame
+                    .garbage
+                    .push(super::frame::Garbage::Surface(image)),
+                (SurfaceImage::Forwarded { from, .. }, Some(slot)) => {
+                    slot.image = self.deferred.get_mut(from).and_then(|d| d.image.take());
+                }
+                (SurfaceImage::Forwarded { .. }, None) => {}
+            }
         }
         Ok(staged)
     }
@@ -504,6 +626,11 @@ impl Core {
                         self.targets.release(&stale, &mut self.frame);
                     }
                 }
+            }
+            if let Some(image) = s.image {
+                self.frame
+                    .garbage
+                    .push(super::frame::Garbage::Surface(image));
             }
             let list = self.staging_buffers.entry(s.staging.size).or_default();
             if list.len() < POOLED {
