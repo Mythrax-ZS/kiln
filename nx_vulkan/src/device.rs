@@ -33,7 +33,7 @@ pub struct Capabilities {
     /// `VK_EXT_mesh_shader` with task and mesh shaders: the task and mesh pipelines of the Switch
     /// 2 (docs/ASSUMPTIONS.md A-270).
     pub mesh_shader: bool,
-    /// `VK_EXT_device_fault` is enabled (with the checkpoints): a lost device says what it knows of
+    /// `VK_EXT_device_fault` is enabled: a lost device says what it knows of
     /// the fault (addresses, the vendor's codes).
     pub device_fault: bool,
     pub swapchain: bool,
@@ -308,8 +308,10 @@ impl Vk {
                 ash::nv::device_diagnostic_checkpoints::NAME,
                 &mut caps.checkpoints,
             );
-            want(ash::ext::device_fault::NAME, &mut caps.device_fault);
         }
+        // What a lost device knows of its fault costs nothing until it is asked, and the marks of
+        // the checkpoints change the timing of a race enough to hide it.
+        want(ash::ext::device_fault::NAME, &mut caps.device_fault);
 
         // Properties that depend on extensions.
         let mut host_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();

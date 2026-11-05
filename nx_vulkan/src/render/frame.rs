@@ -302,14 +302,14 @@ impl Frame {
             "[vulkan] the device was lost {:.2} s after the commands were submitted",
             after.as_secs_f64()
         );
+        for line in vk.fault_report() {
+            eprintln!("[vulkan]   {line}");
+        }
         if !vk.caps.checkpoints {
             eprintln!(
                 "[vulkan]   (NX_DEBUG_CHECKPOINTS=1 makes it say which command it was running)"
             );
             return;
-        }
-        for line in vk.fault_report() {
-            eprintln!("[vulkan]   {line}");
         }
         let heaps: Vec<String> = vk
             .heaps()
