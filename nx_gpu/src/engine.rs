@@ -782,11 +782,33 @@ impl Engine {
                     launch.block()
                 );
             }
-            if launch.has_work() && cx.backend.is_some() {
-                cx.renderer_failed(
-                    "a compute launch",
-                    "the programs of QMD version 3 (sm_86) are not translated yet".into(),
-                )?;
+            if !launch.has_work() {
+                continue;
+            }
+            dump_compute_program(cx, launch.program());
+            if cx.backend.is_none() {
+                continue;
+            }
+            let dispatch = match compute::Dispatch::decode_v3(launch.address, &launch.qmd) {
+                Ok(d) => d,
+                Err(why) => {
+                    cx.renderer_failed("a compute launch", why)?;
+                    continue;
+                }
+            };
+            let scene = Scene {
+                regs: Regs(&self.regs),
+                class: self.class,
+                cbufs: &self.cbufs,
+                mem: cx.mem,
+                space: cx.space,
+            };
+            let _phase = crate::progress::enter(crate::progress::DISPATCHING);
+            let Some(backend) = cx.backend.as_mut() else {
+                continue;
+            };
+            if let Err(why) = backend.dispatch(&scene, &dispatch) {
+                cx.renderer_failed("a compute launch", why)?;
             }
         }
         Ok(())

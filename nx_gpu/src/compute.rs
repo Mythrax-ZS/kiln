@@ -35,6 +35,8 @@ pub struct Dispatch {
     pub shared_bytes: u32,
     /// The constant buffers bound to slots 0..8.
     pub cbufs: [Option<CbufBinding>; 8],
+    /// The program is sm_86 code (a QMD of version 3, the Switch 2's), not Maxwell code.
+    pub sm86: bool,
 }
 
 impl Dispatch {
@@ -82,7 +84,33 @@ impl Dispatch {
             block,
             shared_bytes: words[17] & 0x3_FFFF,
             cbufs,
+            sm86: false,
         })
+    }
+
+    /// Decode a QMD of version 3 (the Switch 2's, A-210, A-247): the program's whole address in
+    /// words 48 and 49 (17 bits), the grid in words 12, 13 and 14 (16 bits each but the first), the
+    /// shared memory, the workgroup and the mask of bound constant buffers where version 2 has
+    /// them (words 17 to 20), and the constant buffers from word 32, two words each: the low 32
+    /// bits of the address, then the high 8 bits and, in bits 19..31, the size in 16-byte units
+    /// (as NeXium converts a version 3 QMD into a version 2 one).
+    pub fn decode_v3(qmd: u64, words: &[u32; QMD_WORDS]) -> Result<Dispatch, String> {
+        let mut v2 = [0u32; QMD_WORDS];
+        v2[12] = words[12];
+        v2[13] = (words[13] & 0xFFFF) | (words[14] & 0xFFFF) << 16;
+        v2[17] = words[17] & 0x3_FFFF;
+        v2[18] = words[18] & 0xFFFF_0000;
+        v2[19] = words[19];
+        v2[20] = words[20] & 0xFF;
+        for slot in 0..8 {
+            let high = words[33 + 2 * slot];
+            v2[29 + 2 * slot] = words[32 + 2 * slot];
+            v2[30 + 2 * slot] = (high & 0xFF) | ((high >> 19 & 0x1FFF) << 4) << 15;
+        }
+        let program = u64::from(words[49] & 0x1_FFFF) << 32 | u64::from(words[48]);
+        let mut d = Dispatch::decode(qmd, &v2, program)?;
+        d.sm86 = true;
+        Ok(d)
     }
 }
 
@@ -135,6 +163,50 @@ mod tests {
         // The valid bits decide, not the words.
         assert!(d.cbufs[1].is_none() && d.cbufs[2].is_none());
         assert!(d.cbufs[4..].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_version_3_descriptor_has_its_program_address_and_constant_buffers_elsewhere() {
+        let mut w = [0u32; QMD_WORDS];
+        // The program's address in words 48 and 49 (17 bits).
+        w[48] = 0x4c14_2000;
+        w[49] = 0x1_0020;
+        w[12] = 18;
+        w[13] = 4;
+        w[14] = 2;
+        w[17] = 0x800;
+        w[18] = 32 << 16;
+        w[19] = 1 | 1 << 16;
+        // Constant buffers 0 and 2, from word 32: the size in 16-byte units in bits 19..31.
+        w[20] = 0b101;
+        w[32] = 0x0450_0100;
+        w[33] = 0x30 | 0x40 << 19;
+        w[36] = 0x9000_0000;
+        w[37] = 0x81 | 0x1000 << 19;
+        // What version 2 has at word 29 is not a constant buffer in version 3.
+        w[29] = 0xDEAD_BEEF;
+        let d = Dispatch::decode_v3(0x30_0000_0000, &w).unwrap();
+        assert!(d.sm86);
+        assert_eq!(d.program, 0x1_0020_4c14_2000 & 0x1_FFFF_FFFF_FFFF);
+        assert_eq!(
+            (d.grid, d.block, d.shared_bytes),
+            ([18, 4, 2], [32, 1, 1], 0x800)
+        );
+        assert_eq!(
+            d.cbufs[0],
+            Some(CbufBinding {
+                address: 0x30_0450_0100,
+                size: 0x400
+            })
+        );
+        assert_eq!(
+            d.cbufs[2],
+            Some(CbufBinding {
+                address: 0x81_9000_0000,
+                size: 0x10000
+            })
+        );
+        assert!(d.cbufs[1].is_none());
     }
 
     #[test]
