@@ -101,7 +101,16 @@ impl Service for Sm {
     fn request_tipc(&mut self, req: &Request) -> ServiceResult {
         match req.command {
             // The same two commands as over CMIF: the payload is the same name, or nothing.
-            cmd::REGISTER_CLIENT | cmd::GET_SERVICE_HANDLE => self.request(req),
+            cmd::REGISTER_CLIENT => self.request(req),
+            // A refusal keeps the slot of the handle, holding 0: the SDK reads the handle at 12
+            // and the result at 16 whatever the result (A-129).
+            cmd::GET_SERVICE_HANDLE => self.request(req).map(|r| {
+                if r.result.is_success() {
+                    r
+                } else {
+                    r.with_empty_move_handle()
+                }
+            }),
             other => Err(Stop::unknown_command("sm: (TIPC)", other)),
         }
     }

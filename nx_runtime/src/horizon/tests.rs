@@ -1377,10 +1377,9 @@ impl Env {
                 off += 4;
             }
         }
-        // The result is the first word of the data, which starts at the next 16 bytes.
-        let raw_start = off.next_multiple_of(16);
+        // The result is the first word of the data, which follows the handles at once.
         let raw_end = off + 4 * (h1 & 0x3FF) as usize;
-        Some((word(raw_start), out[raw_start + 4..raw_end].to_vec(), moved))
+        Some((word(off), out[off + 4..raw_end].to_vec(), moved))
     }
 
     fn connect_sm(&mut self) -> u64 {
@@ -1485,11 +1484,15 @@ fn sm_answers_tipc_messages() {
     // the reply starts with the result (docs/ASSUMPTIONS.md A-129).
     let mut e = calc_env(None);
     let sm = e.connect_sm();
-    // GetServiceHandle (type 17) before RegisterClient (type 16) is refused, as over CMIF.
+    // GetServiceHandle (type 17) before RegisterClient (type 16) is refused, as over CMIF. The
+    // refusal keeps the slot of the handle, with 0 in it, so its result is at 16, where the SDK
+    // reads it.
     let (result, data, moved) = e
         .send_tipc(sm, &tipc_request_bytes(1, b"tst:calc", false))
         .unwrap();
-    assert_eq!((result, data.len(), moved.len()), (0x415, 0, 0));
+    assert_eq!((result, data.len(), moved), (0x415, 0, vec![0]));
+    let out = e.read(e.tls(), 0x14);
+    assert_eq!(u32::from_le_bytes(out[16..20].try_into().unwrap()), 0x415);
     // Without the process id of the header the client is not accepted.
     let (result, _, _) = e.send_tipc(sm, &tipc_request_bytes(0, &[], false)).unwrap();
     assert_eq!(result, 0x415);
@@ -1513,7 +1516,7 @@ fn sm_answers_tipc_messages() {
     let (result, _, moved) = e
         .send_tipc(sm, &tipc_request_bytes(1, &[0; 8], false))
         .unwrap();
-    assert_eq!((result, moved.len()), (ResultCode::new(21, 6).0, 0));
+    assert_eq!((result, moved), (ResultCode::new(21, 6).0, vec![0]));
     // Type 15 closes the session.
     let (result, _, _) = e.send_tipc(sm, &15u32.to_le_bytes()).unwrap();
     assert_eq!(result, 0);

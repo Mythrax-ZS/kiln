@@ -98,6 +98,10 @@ pub struct Response {
     /// Data written into the caller's receive-list (C) entries: (entry index, bytes written).
     /// The reply tells the caller where each went.
     pub pointer_replies: Vec<(u8, u64)>,
+    /// Move-handle slots after `move_handles` that hold no handle (0): a TIPC reply keeps its
+    /// command's layout whatever the result, so a refused command that hands over a handle still
+    /// has the handle's slot (docs/ASSUMPTIONS.md A-129).
+    pub empty_move_handles: usize,
 }
 
 impl Response {
@@ -109,6 +113,7 @@ impl Response {
             move_handles: Vec::new(),
             objects: Vec::new(),
             pointer_replies: Vec::new(),
+            empty_move_handles: 0,
         }
     }
 
@@ -153,6 +158,12 @@ impl Response {
 
     pub fn with_move_handle(mut self, o: KObject) -> Response {
         self.move_handles.push(o);
+        self
+    }
+
+    /// A move-handle slot that holds no handle (see `empty_move_handles`).
+    pub fn with_empty_move_handle(mut self) -> Response {
+        self.empty_move_handles += 1;
         self
     }
 }

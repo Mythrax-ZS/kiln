@@ -222,10 +222,15 @@ pub fn build_reply(r: &Reply) -> Option<[u8; MESSAGE_BYTES]> {
             .copy_from_slice(&pointer_reply_descriptor(index, addr, size));
         off += 8;
     }
-    // A reply's data starts at the next 16 bytes, CMIF or TIPC: a TIPC request has none of this
-    // padding, but a program that gets a refusal from the service manager (no handle, so the
-    // data would start at 8) took the result for a success when it was written there.
-    let raw_start = off.next_multiple_of(16);
+    // A CMIF reply's data starts at the next 16 bytes. A TIPC reply's starts right after the
+    // handles, as a TIPC request's does: the SDK reads each command's reply at fixed places (the
+    // result at 8 when the command hands over no handle, at 16 after one), so a refusal keeps the
+    // slots of the handles its command hands over (`Response::empty_move_handles`, A-129).
+    let raw_start = if r.tipc {
+        off
+    } else {
+        off.next_multiple_of(16)
+    };
     let mut raw = Vec::new();
     if r.tipc {
         raw.extend_from_slice(&r.result.0.to_le_bytes());
@@ -381,6 +386,7 @@ impl Kernel {
                     Err(e) => return Ok(e),
                 }
             }
+            move_handles.extend(std::iter::repeat_n(0, response.empty_move_handles));
         }
         // Data the service returned through a pointer buffer went to the caller's receive-list
         // entry; the reply says where, and how much.
@@ -842,16 +848,15 @@ mod tests {
         // The special header takes 8 + 4 + 4 bytes, so the data starts at 16 at once.
         assert_eq!(&out[16..24], &[0x15, 0x04, 0, 0, 9, 8, 7, 6]);
         assert_eq!(u32_at(&out, 4), Some(2 | (1 << 31)));
-        // With no handle the header ends at 8 and the data is aligned to 16 as in a CMIF reply:
-        // the 8 bytes between are padding, counted in the words of the raw data.
+        // With no handle the header ends at 8 and the data follows at once, with no padding (what
+        // the SDK's stub of a command that returns a count reads: the result at 8, the count at 12).
         let plain = Reply {
             move_handles: vec![],
             ..r
         };
         let out = build_reply(&plain).unwrap();
-        assert_eq!(u32_at(&out, 4), Some(4));
-        assert_eq!(&out[8..16], &[0; 8]);
-        assert_eq!(&out[16..24], &[0x15, 0x04, 0, 0, 9, 8, 7, 6]);
+        assert_eq!(u32_at(&out, 4), Some(2));
+        assert_eq!(&out[8..16], &[0x15, 0x04, 0, 0, 9, 8, 7, 6]);
     }
 
     #[test]
