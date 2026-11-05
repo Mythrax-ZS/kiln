@@ -11,8 +11,10 @@
 //! next instruction that runs (a delay slot), and a branch to the offset -4096 stops it at once.
 //!
 //! The semantics are Mesa's (`src/nouveau/mme/mme_tu104_sim.c`, MIT licence), with what the
-//! Switch 2's NVN2 needs on top: a loop of zero passes skips its body, and only a taken branch with
-//! bit 14 of its immediate keeps an end mark from ending the macro.
+//! Switch 2's NVN2 needs on top: a loop of zero passes skips its body, only a taken branch with
+//! bit 14 of its immediate keeps an end mark from ending the macro, and a parameter read past those
+//! of the call is 0 (NVN2's macros fall through into the next and read more than they are
+//! given; A-237).
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -65,8 +67,6 @@ pub trait Host {
 /// What stopped a macro from finishing.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Fault {
-    /// The macro read a parameter the call did not have.
-    TooFewParameters,
     /// An instruction or an operand this code does not know.
     Unknown(String),
     /// The macro ran past the instruction RAM.
@@ -80,9 +80,6 @@ pub enum Fault {
 impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Fault::TooFewParameters => {
-                write!(f, "the macro read more parameters than it was called with")
-            }
             Fault::Unknown(s) | Fault::Write(s) => write!(f, "{s}"),
             Fault::OutOfCode(ip) => {
                 write!(f, "the macro went to instruction {ip:#x}, outside its code")
@@ -99,6 +96,8 @@ pub struct Summary {
     pub steps: u64,
     /// Method writes made.
     pub emitted: u64,
+    /// Parameters read past the end of those the call had (each read as 0).
+    pub short_reads: u64,
 }
 
 // Register numbers that are not registers.
@@ -260,8 +259,8 @@ impl Instruction {
     }
 }
 
-/// The macro code: the instruction RAM, decoded, and where each macro starts. It is shared by the
-/// channels of a process and by their 3D and compute engines (A-208).
+/// The macro code of a channel: the instruction RAM, decoded, and where each macro starts. The
+/// channel's 3D and compute engines share it (A-208).
 #[derive(Clone, Debug)]
 pub struct Program {
     words: Vec<u32>,
@@ -345,21 +344,27 @@ impl Program {
     }
 }
 
-/// The macro code and the data RAM of each channel of a process, as the GPU keeps them.
+/// The macro code and the data RAM of each channel of a process, as the GPU keeps them: a
+/// channel's 3D and compute engines share its code, and no channel sees another's (A-208).
 #[derive(Debug, Default)]
 pub struct Store {
-    pub program: Arc<Program>,
+    programs: std::collections::HashMap<u32, Arc<Program>>,
     data: std::collections::HashMap<u32, Box<[u32]>>,
 }
 
 impl Store {
-    /// A write to a method that loads code, applied to the shared program; `false` for another
-    /// method.
-    pub fn load(&mut self, method: u32, data: u32) -> bool {
+    /// A write of `channel` to a method that loads code, applied to its program; `false` for
+    /// another method.
+    pub fn load(&mut self, channel: u32, method: u32, data: u32) -> bool {
         if !(method::INSTRUCTION_RAM_POINTER..=method::START_ADDRESS_RAM).contains(&method) {
             return false;
         }
-        Arc::make_mut(&mut self.program).load(method, data)
+        Arc::make_mut(self.programs.entry(channel).or_default()).load(method, data)
+    }
+
+    /// The code of `channel` (empty until it loads some).
+    pub fn program(&mut self, channel: u32) -> Arc<Program> {
+        Arc::clone(self.programs.entry(channel).or_default())
     }
 
     /// The data RAM of `channel`, made the first time.
@@ -394,7 +399,13 @@ pub fn run(
         let mut load = [0u32; 2];
         for (n, slot) in load.iter_mut().enumerate() {
             if i.loads[n] {
-                *slot = params.pop_front().ok_or(Fault::TooFewParameters)?;
+                *slot = match params.pop_front() {
+                    Some(v) => v,
+                    None => {
+                        summary.short_reads += 1;
+                        0
+                    }
+                };
             }
         }
         let read = |reg: u8, lane: usize, regs: &[u32; 24]| -> Result<u32, Fault> {
@@ -970,12 +981,11 @@ mod tests {
         run(&p, p.start(1), vec![0xAB], &mut host).unwrap();
         assert_eq!(host.ram[0x27], 0xAB);
         assert_eq!(host.writes.last(), Some(&(0x70, 0xAB + 0x300)));
-        // Reading past the parameters stops the macro.
+        // A parameter read past those of the call is 0, and counted.
         let mut short = Recorder::default();
-        assert_eq!(
-            run(&p, p.start(1), vec![0xAB], &mut short),
-            Err(Fault::TooFewParameters)
-        );
+        let summary = run(&p, p.start(1), vec![0xAB], &mut short).unwrap();
+        assert_eq!(summary.short_reads, 2);
+        assert_eq!(short.writes.last(), Some(&(0x70, 0xAB)));
     }
 
     #[test]

@@ -663,7 +663,7 @@ impl Engine {
         if !matches!(kind, class::Kind::ThreeD | class::Kind::Compute) {
             return Ok(false);
         }
-        if cx.macros.load(method, data) {
+        if cx.macros.load(cx.channel, method, data) {
             return Ok(true);
         }
         match method {
@@ -822,7 +822,7 @@ impl Engine {
         let e = cx.stats.macro_calls.entry(id).or_default();
         e.0 += 1;
         e.1 += params.len() as u64;
-        let program = std::sync::Arc::clone(&cx.macros.program);
+        let program = cx.macros.program(cx.channel);
         let start = program.start(id);
         let count = params.len();
         if cx.level >= 2 || traced_macro(id) {
@@ -860,6 +860,12 @@ impl Engine {
         match outcome {
             Ok(summary) => {
                 cx.stats.macro_steps += summary.steps;
+                if summary.short_reads > 0 && (cx.level >= 2 || traced_macro(id)) {
+                    eprintln!(
+                        "[gpu]   macro {id} read {} parameters past the {count} of its call (as 0)",
+                        summary.short_reads
+                    );
+                }
                 Ok(())
             }
             Err(fault) => {
@@ -1455,12 +1461,25 @@ mod tests {
             assert_eq!(cx.macros.data_ram(cx.channel)[4..6], [1, 0x1234]);
             e.write(cx, 0xE04, 7, true).unwrap();
             assert_eq!((e.reg(0x200), e.reg(0x201)), (7, 0x1234));
-            // The code is the process's: another 3D engine (another channel's) has it too, with
-            // its own data RAM.
-            let mut other = Engine::new(class::AMPERE_THREED);
+            // The code is the channel's: channel 2 loads other code at the same place, which runs
+            // there with channel 2's data RAM, and channel 1 keeps its own (A-237).
             cx.channel = 2;
+            let mut other = Engine::new(class::AMPERE_THREED);
+            other.write(cx, 0x45, 4, false).unwrap();
+            for w in mme64::testing::store_macro(0x210, 5) {
+                other.write(cx, 0x46, w, false).unwrap();
+            }
+            other.write(cx, 0x47, 2, false).unwrap();
+            other.write(cx, 0x48, 4, true).unwrap();
             other.write(cx, 0xE04, 9, true).unwrap();
-            assert_eq!((other.reg(0x200), other.reg(0x201)), (9, 0));
+            assert_eq!(
+                (other.reg(0x210), other.reg(0x211), other.reg(0x200)),
+                (9, 0, 0)
+            );
+            cx.channel = 1;
+            e.write(cx, 0xE04, 8, true).unwrap();
+            assert_eq!((e.reg(0x200), e.reg(0x201), e.reg(0x210)), (8, 0x1234, 0));
+            cx.channel = 2;
             // A request to the falcon is acknowledged in the scratch register at once.
             e.write(cx, 0x8C4, 1, true).unwrap();
             assert_eq!(e.reg(0xD00), 1);
@@ -1488,7 +1507,7 @@ mod tests {
             compute.write(cx, 0xB0, 2, true).unwrap();
             assert_eq!(cx.read_u32(0x500_0800).unwrap(), 0x77);
         });
-        assert_eq!(stats.macro_calls.get(&2), Some(&(2, 2)));
+        assert_eq!(stats.macro_calls.get(&2), Some(&(3, 3)));
         assert_eq!(stats.compute_launches, 2);
     }
 
