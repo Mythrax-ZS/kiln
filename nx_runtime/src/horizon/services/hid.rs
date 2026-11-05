@@ -91,7 +91,10 @@ impl Input {
     /// The writes that publish the next sample of the handheld npad, with the controls in the
     /// state `pad`, and move the lifo on. The slot is written before the header that makes it
     /// visible.
-    fn next_sample(&mut self, pad: &Pad) -> Vec<Patch> {
+    /// A Switch 2 program's SDK reads each slot's first word as a sequence lock (`seqlock`,
+    /// A-229): odd while the slot is written, even once it is, and the slot is read again until
+    /// that word is even and unchanged.
+    fn next_sample(&mut self, pad: &Pad, seqlock: bool) -> Vec<Patch> {
         let entry = NPAD_BASE + NPAD_HANDHELD_ENTRY * NPAD_ENTRY_SIZE;
         let word = |v: u32| v.to_le_bytes().to_vec();
         let mut out = vec![
@@ -140,10 +143,16 @@ impl Input {
         state.extend(0u32.to_le_bytes());
         debug_assert_eq!(state.len(), LIFO_SLOT_SIZE);
         let lifo = entry + NPAD_HANDHELD_LIFO;
-        out.push((
-            lifo + LIFO_HEADER_SIZE + slot as usize * LIFO_SLOT_SIZE,
-            state,
-        ));
+        let at = lifo + LIFO_HEADER_SIZE + slot as usize * LIFO_SLOT_SIZE;
+        if seqlock {
+            // Odd (being written), then the state, then even: 2n for the nth sample.
+            let word = self.sampling * 2;
+            out.push((at, (word - 1).to_le_bytes().to_vec()));
+            out.push((at + 8, state[8..].to_vec()));
+            out.push((at, word.to_le_bytes().to_vec()));
+        } else {
+            out.push((at, state));
+        }
         let mut header = Vec::with_capacity(LIFO_HEADER_SIZE);
         header.extend(0u64.to_le_bytes());
         header.extend(LIFO_SLOTS.to_le_bytes());
@@ -180,7 +189,8 @@ impl Shared {
             let Some(base) = input.memory else {
                 return;
             };
-            (base, input.next_sample(pad))
+            let seqlock = kernel.process.platform() == crate::npdm::Platform::Nx2;
+            (base, input.next_sample(pad, seqlock))
         };
         for (offset, bytes) in patches {
             kernel.write_memory(base + offset as u64, &bytes);
@@ -476,7 +486,7 @@ mod tests {
         let entry = NPAD_BASE + NPAD_HANDHELD_ENTRY * NPAD_ENTRY_SIZE;
         let ask = |input: &mut Input| {
             let mut m = memory.clone();
-            apply(&mut m, &input.next_sample(&Pad::default()));
+            apply(&mut m, &input.next_sample(&Pad::default(), false));
             u32_at(&m, entry + NPAD_STYLE_SET)
         };
         // Not activated, not supporting the style, not listing the id: each leaves it unplugged.
@@ -514,7 +524,7 @@ mod tests {
             activated: false,
             ..connected()
         };
-        apply(&mut memory, &input.next_sample(&Pad::default()));
+        apply(&mut memory, &input.next_sample(&Pad::default(), false));
         assert_eq!(
             u64_at(&memory, entry + NPAD_HANDHELD_LIFO + 0x18),
             0,
@@ -528,7 +538,7 @@ mod tests {
         let mut input = connected();
         let lifo = NPAD_BASE + NPAD_HANDHELD_ENTRY * NPAD_ENTRY_SIZE + NPAD_HANDHELD_LIFO;
         for sample in 1..=20u64 {
-            apply(&mut memory, &input.next_sample(&Pad::default()));
+            apply(&mut memory, &input.next_sample(&Pad::default(), false));
             let (buffers, tail, count) = (
                 u64_at(&memory, lifo + 8),
                 u64_at(&memory, lifo + 0x10),
@@ -553,6 +563,31 @@ mod tests {
     }
 
     #[test]
+    fn a_switch_2_slot_is_a_sequence_lock_odd_while_written() {
+        let mut memory = vec![0u8; SHARED_MEMORY_SIZE as usize];
+        let mut input = connected();
+        let lifo = NPAD_BASE + NPAD_HANDHELD_ENTRY * NPAD_ENTRY_SIZE + NPAD_HANDHELD_LIFO;
+        for sample in 1..=20u64 {
+            let patches = input.next_sample(&Pad::default(), true);
+            let slot = lifo + LIFO_HEADER_SIZE + (sample % 17) as usize * LIFO_SLOT_SIZE;
+            let writes: Vec<&Patch> = patches.iter().filter(|(at, _)| *at == slot).collect();
+            assert_eq!(writes.len(), 2, "the word twice: odd, then even");
+            assert_eq!(
+                u64::from_le_bytes(writes[0].1[..8].try_into().unwrap()),
+                2 * sample - 1
+            );
+            apply(&mut memory, &patches);
+            assert_eq!(u64_at(&memory, slot), 2 * sample, "even once written");
+            assert_eq!(
+                u64_at(&memory, slot + 8),
+                sample,
+                "the state's own number counts by one"
+            );
+            assert_eq!(u32_at(&memory, slot + 0x28), 0x3F);
+        }
+    }
+
+    #[test]
     fn a_sample_carries_the_buttons_and_the_sticks_of_the_pad() {
         use super::super::super::input::{button, STICK_MAX};
         let mut memory = vec![0u8; SHARED_MEMORY_SIZE as usize];
@@ -568,7 +603,7 @@ mod tests {
             left: (-STICK_MAX, 123),
             right: (-5, STICK_MAX),
         };
-        apply(&mut memory, &input.next_sample(&held));
+        apply(&mut memory, &input.next_sample(&held, false));
         let slot = newest(&memory);
         assert_eq!(u64_at(&memory, slot + 0x10), held.buttons);
         // The left stick's x and y, then the right stick's, each a signed 32-bit word.
@@ -578,7 +613,7 @@ mod tests {
         assert_eq!(i32_at(&memory, slot + 0x24), STICK_MAX);
         assert_eq!(u32_at(&memory, slot + 0x28), 0x3F, "still attached");
         // Letting go is the next sample: all zero again, in a new slot with the next number.
-        apply(&mut memory, &input.next_sample(&Pad::default()));
+        apply(&mut memory, &input.next_sample(&Pad::default(), false));
         let released = newest(&memory);
         assert_ne!(released, slot);
         assert_eq!(u64_at(&memory, released), 2);
@@ -591,7 +626,10 @@ mod tests {
     #[test]
     fn the_entry_says_what_kind_of_controller_it_is() {
         let mut memory = vec![0u8; SHARED_MEMORY_SIZE as usize];
-        apply(&mut memory, &connected().next_sample(&Pad::default()));
+        apply(
+            &mut memory,
+            &connected().next_sample(&Pad::default(), false),
+        );
         let entry = NPAD_BASE + NPAD_HANDHELD_ENTRY * NPAD_ENTRY_SIZE;
         assert_eq!(u32_at(&memory, entry + NPAD_DEVICE_TYPE), 0b1100);
         let props = u64_at(&memory, entry + NPAD_SYSTEM_PROPERTIES);
