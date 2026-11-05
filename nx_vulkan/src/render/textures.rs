@@ -627,7 +627,7 @@ pub fn overlay_of(
     {
         return None;
     }
-    let plan = plan(tic, shape, format).ok()?;
+    let plan = cached_plan(tic, shape, format)?;
     let gobs = |width: u32, bytes: u32| (u64::from(width) * u64::from(bytes)).div_ceil(64);
     // The layer the target starts in, found from its offset: a large array has thousands of
     // levels in all, and a texture is looked at for every target near it at every draw.
@@ -680,7 +680,7 @@ pub fn overlays_cover(tic: &Tic, used: &TextureUse, overlays: &[Overlay]) -> boo
     let Some(format) = texture_format(tic.components(), tic.types()[0], tic.srgb()) else {
         return false;
     };
-    let Ok(plan) = plan(tic, shape, format) else {
+    let Some(plan) = cached_plan(tic, shape, format) else {
         return false;
     };
     if shape.kind == Kind::D3 || overlays.is_empty() {
@@ -811,6 +811,28 @@ fn texels_that_are_not_numbers(format: vk::Format, data: &[u8]) -> usize {
         .filter_map(|px| super::targets::pixel_floats(format, px))
         .filter(|c| c.iter().any(|v| !v.is_finite()))
         .count()
+}
+
+/// The plan of a texture, made once: a texture is looked at for every target near it at every
+/// draw that samples it, which made its plan again thousands of times a frame.
+fn cached_plan(tic: &Tic, shape: Shape, format: TexFormat) -> Option<std::rc::Rc<Plan>> {
+    type Plans = FastMap<(Tic, Shape, i32), std::rc::Rc<Plan>>;
+    thread_local! {
+        static PLANS: std::cell::RefCell<Plans> = std::cell::RefCell::new(Plans::default());
+    }
+    let key = (*tic, shape, format.vk.as_raw());
+    PLANS.with(|plans| {
+        let mut plans = plans.borrow_mut();
+        if let Some(p) = plans.get(&key) {
+            return Some(p.clone());
+        }
+        let made = std::rc::Rc::new(plan(tic, shape, format).ok()?);
+        if plans.len() >= 8192 {
+            plans.clear();
+        }
+        plans.insert(key, made.clone());
+        Some(made)
+    })
 }
 
 /// Where the bytes of a texture are in memory and what image they make.
