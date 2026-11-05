@@ -81,6 +81,17 @@ pub struct Debug {
     /// these addresses runs its vertex stage and rasterizes nothing (does the device get lost in
     /// the vertex stage or after it?).
     pub discard_programs: Vec<u64>,
+    /// `NX_DEBUG_NULL_TEXTURES=<hex address>[,...]`: every texture the programs at these addresses
+    /// sample is a texel of zeros (does the loss of a device come from a texture, or from the
+    /// program's code?).
+    pub null_textures: Vec<u64>,
+    /// `NX_DEBUG_ZERO_CBUF_DATA=<hex program address>:<slot>:<hex from>:<hex to>[,...]`: the bytes
+    /// in that range of that constant buffer read as zeros for those programs' draws, the program
+    /// unchanged (the values' fault, or the code's?).
+    pub zero_cbuf_data: Vec<(u64, u32, u32, u32)>,
+    /// `NX_DEBUG_NO_OPTIMIZE=<hex address>[,...]`: the pipelines of the draws of those vertex
+    /// programs are made with the driver's optimizations off (the driver's compiler, or the code?).
+    pub no_optimize: Vec<u64>,
 }
 
 impl Debug {
@@ -129,6 +140,28 @@ impl Debug {
             no_save_targets: set("NX_DEBUG_NO_SAVE_TARGETS"),
             skip_programs: addresses("NX_DEBUG_SKIP_PROGRAMS"),
             discard_programs: addresses("NX_DEBUG_DISCARD_PROGRAMS"),
+            null_textures: addresses("NX_DEBUG_NULL_TEXTURES"),
+            no_optimize: addresses("NX_DEBUG_NO_OPTIMIZE"),
+            zero_cbuf_data: std::env::var("NX_DEBUG_ZERO_CBUF_DATA")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .filter_map(|e| {
+                            let mut f = e.trim().split(':');
+                            let hex = |s: Option<&str>| {
+                                s.and_then(|s| {
+                                    u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+                                })
+                            };
+                            let program = hex(f.next())?;
+                            let slot = f.next()?.trim().parse::<u32>().ok()?;
+                            let from = hex(f.next())? as u32;
+                            let to = hex(f.next())? as u32;
+                            Some((program, slot, from, to))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }

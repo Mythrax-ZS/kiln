@@ -416,7 +416,14 @@ impl Core {
                 } else {
                     p.info.cbuf_extent[cb as usize]
                 };
+                self.scratch.zero_data = self
+                    .debug
+                    .zero_cbuf_data
+                    .iter()
+                    .find(|z| z.0 == slot.address && z.1 == cb)
+                    .map(|z| (z.2, z.3));
                 let (buffer, offset, range) = self.constant_buffer(scene, slot.group, cb, want)?;
+                self.scratch.zero_data = None;
                 buffer_infos.push((
                     base + cb,
                     vk::DescriptorBufferInfo::default()
@@ -495,7 +502,9 @@ impl Core {
             layout_bindings.clone(),
             self.debug.discard_programs.contains(&vs_slot.address),
         );
-        let pipeline = self.pipeline(&key, &vs, ps.as_deref(), pipeline_layout, &blend)?;
+        let optimize = !self.debug.no_optimize.contains(&vs_slot.address);
+        let pipeline =
+            self.pipeline(&key, &vs, ps.as_deref(), pipeline_layout, &blend, optimize)?;
         self.scratch.attributes = attributes;
         self.scratch.streams = streams;
         self.scratch.binding_state = binding_state;
@@ -813,7 +822,10 @@ impl Core {
             let words = |b: &[u8]| -> [u32; 8] {
                 std::array::from_fn(|i| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()))
             };
-            let (tic, tsc) = (Tic(words(&tic_bytes)), Tsc(words(&tsc_bytes)));
+            let (mut tic, tsc) = (Tic(words(&tic_bytes)), Tsc(words(&tsc_bytes)));
+            if self.debug.null_textures.contains(&address) {
+                tic = Tic([0; 8]);
+            }
             if self.sync_on {
                 self.last_textures.push(format!(
                     "texture {} of the {kind_name} program: handle {handle:#x} from {}, header {tic_id} {:08x?} sampler {tsc_id} {:08x?}",
@@ -860,10 +872,11 @@ impl Core {
             lap(&mut mark, &mut self.phases.texture_target, "texture_target");
             let decorate = |e: String| {
                 format!(
-                    "{e} [texture {}: handle {handle:#x} from {}, header {tic_id} at {:#x}, sampler {tsc_id} at {:#x}]",
+                    "{e} [texture {}: handle {handle:#x} from {}, header {tic_id} at {:#x} {:08x?}, sampler {tsc_id} at {:#x}]",
                     used.index,
                     from.describe(scene),
                     pools.header_address + 32 * u64::from(tic_id),
+                    tic.0,
                     pools.sampler_address + 32 * u64::from(tsc_id)
                 )
             };
@@ -1211,6 +1224,12 @@ impl Core {
             ));
         }
         data[readable..].fill(0);
+        if let Some((from, to)) = self.scratch.zero_data {
+            let end = (to as usize).min(data.len());
+            if (from as usize) < end {
+                data[from as usize..end].fill(0);
+            }
+        }
         if self.debug.trace_cbufs && self.traced().is_some() {
             // The first words of the buffer, then the others that are not zero, as `word:value`
             // (`NX_TRACE_CBUF_WORDS` says how many, 64 by default).
@@ -1506,6 +1525,7 @@ impl Core {
         ps: Option<&Program>,
         layout: vk::PipelineLayout,
         _blend: &Blend,
+        optimize: bool,
     ) -> Result<vk::Pipeline, String> {
         if let Some(p) = self.pipelines.map.get(key) {
             return Ok(*p);
@@ -1626,7 +1646,13 @@ impl Core {
                 rendering = rendering.stencil_attachment_format(depth_format);
             }
         }
+        let flags = if optimize {
+            vk::PipelineCreateFlags::empty()
+        } else {
+            vk::PipelineCreateFlags::DISABLE_OPTIMIZATION
+        };
         let info = [vk::GraphicsPipelineCreateInfo::default()
+            .flags(flags)
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&assembly)

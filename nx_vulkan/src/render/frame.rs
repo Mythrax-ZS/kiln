@@ -295,6 +295,9 @@ impl Frame {
             );
             return;
         }
+        for line in vk.fault_report() {
+            eprintln!("[vulkan]   {line}");
+        }
         let reached = vk.checkpoints_reached();
         eprintln!(
             "[vulkan]   {} commands were marked in the submission; the device reached {}:",

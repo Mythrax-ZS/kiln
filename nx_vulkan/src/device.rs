@@ -28,6 +28,9 @@ pub struct Capabilities {
     /// `VK_NV_device_diagnostic_checkpoints` is enabled (`NX_DEBUG_CHECKPOINTS`): commands can say
     /// where they are, and a lost device can say which it reached.
     pub checkpoints: bool,
+    /// `VK_EXT_device_fault` is enabled (with the checkpoints): a lost device says what it knows of
+    /// the fault (addresses, the vendor's codes).
+    pub device_fault: bool,
     pub swapchain: bool,
     pub shader_int64: bool,
     pub shader_float64: bool,
@@ -65,6 +68,7 @@ pub struct Vk {
     pub push_descriptor: Option<khr::push_descriptor::Device>,
     pub external_memory_host: Option<ash::ext::external_memory_host::Device>,
     checkpoints: Option<ash::nv::device_diagnostic_checkpoints::Device>,
+    device_fault: Option<ash::ext::device_fault::Device>,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
 }
 
@@ -293,6 +297,7 @@ impl Vk {
                 ash::nv::device_diagnostic_checkpoints::NAME,
                 &mut caps.checkpoints,
             );
+            want(ash::ext::device_fault::NAME, &mut caps.device_fault);
         }
 
         // Properties that depend on extensions.
@@ -319,6 +324,7 @@ impl Vk {
         let mut border = vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default();
         let mut uint8 = vk::PhysicalDeviceIndexTypeUint8FeaturesKHR::default();
         let mut vertex_input = vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT::default();
+        let mut fault = vk::PhysicalDeviceFaultFeaturesEXT::default();
         let mut features2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut f11)
             .push_next(&mut f12)
@@ -338,6 +344,9 @@ impl Vk {
         if caps.vertex_input_dynamic_state {
             features2 = features2.push_next(&mut vertex_input);
         }
+        if caps.device_fault {
+            features2 = features2.push_next(&mut fault);
+        }
         // SAFETY: the chain is valid for the call.
         unsafe { instance.get_physical_device_features2(physical, &mut features2) };
         let supported = features2.features;
@@ -356,6 +365,7 @@ impl Vk {
             border.custom_border_colors != 0 && border.custom_border_color_without_format != 0;
         caps.index_type_uint8 &= uint8.index_type_uint8 != 0;
         caps.vertex_input_dynamic_state &= vertex_input.vertex_input_dynamic_state != 0;
+        caps.device_fault &= fault.device_fault != 0;
 
         // Everything the supported set offers that the backend can use is enabled.
         let enabled = vk::PhysicalDeviceFeatures {
@@ -429,6 +439,8 @@ impl Vk {
             .index_type_uint8(caps.index_type_uint8);
         let mut e_vertex = vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT::default()
             .vertex_input_dynamic_state(caps.vertex_input_dynamic_state);
+        let mut e_fault =
+            vk::PhysicalDeviceFaultFeaturesEXT::default().device_fault(caps.device_fault);
 
         let priorities = [1.0f32];
         let queues = [vk::DeviceQueueCreateInfo::default()
@@ -456,6 +468,9 @@ impl Vk {
         if caps.vertex_input_dynamic_state {
             create = create.push_next(&mut e_vertex);
         }
+        if caps.device_fault {
+            create = create.push_next(&mut e_fault);
+        }
         // SAFETY: the create info chain and the arrays it points to live through the call.
         let device = unsafe { instance.create_device(physical, &create, None) }
             .map_err(|e| format!("creating the Vulkan device on {}: {e}", caps.name))?;
@@ -471,6 +486,9 @@ impl Vk {
         let checkpoints = caps
             .checkpoints
             .then(|| ash::nv::device_diagnostic_checkpoints::Device::new(&instance, &device));
+        let device_fault = caps
+            .device_fault
+            .then(|| ash::ext::device_fault::Device::new(&instance, &device));
         Ok(Vk {
             entry,
             instance,
@@ -483,8 +501,63 @@ impl Vk {
             push_descriptor,
             external_memory_host,
             checkpoints,
+            device_fault,
             debug,
         })
+    }
+
+    /// What `VK_EXT_device_fault` says of the fault that lost the device: its description, the
+    /// addresses involved and the vendor's codes (nothing when the extension is off).
+    pub fn fault_report(&self) -> Vec<String> {
+        let Some(f) = &self.device_fault else {
+            return Vec::new();
+        };
+        let get = f.fp().get_device_fault_info_ext;
+        let mut counts = vk::DeviceFaultCountsEXT::default();
+        // SAFETY: a query of the counts, with no info to fill.
+        let r = unsafe { get(self.device.handle(), &mut counts, std::ptr::null_mut()) };
+        if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
+            return vec![format!("the fault information could not be read: {r}")];
+        }
+        let mut addresses =
+            vec![vk::DeviceFaultAddressInfoEXT::default(); counts.address_info_count as usize];
+        let mut vendor =
+            vec![vk::DeviceFaultVendorInfoEXT::default(); counts.vendor_info_count as usize];
+        counts.vendor_binary_size = 0;
+        let mut info = vk::DeviceFaultInfoEXT {
+            p_address_infos: addresses.as_mut_ptr(),
+            p_vendor_infos: vendor.as_mut_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: the arrays have room for the counts the first call gave.
+        let r = unsafe { get(self.device.handle(), &mut counts, &mut info) };
+        if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
+            return vec![format!("the fault information could not be read: {r}")];
+        }
+        let text = |chars: &[std::ffi::c_char]| {
+            let bytes: Vec<u8> = chars
+                .iter()
+                .take_while(|c| **c != 0)
+                .map(|c| *c as u8)
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let mut lines = vec![format!("fault: {}", text(&info.description))];
+        for a in addresses.iter().take(counts.address_info_count as usize) {
+            lines.push(format!(
+                "fault address {:?} {:#x} (precision {:#x})",
+                a.address_type, a.reported_address, a.address_precision
+            ));
+        }
+        for v in vendor.iter().take(counts.vendor_info_count as usize) {
+            lines.push(format!(
+                "vendor information: {} (code {:#x}, data {:#x})",
+                text(&v.description),
+                v.vendor_fault_code,
+                v.vendor_fault_data
+            ));
+        }
+        lines
     }
 
     /// Say in `cmd` that the commands recorded before are done when the device reaches this

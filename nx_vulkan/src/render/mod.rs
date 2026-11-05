@@ -173,6 +173,8 @@ struct Scratch {
     streams: Vec<u32>,
     bound: Vec<(u32, vk::Buffer, u64)>,
     binding_state: Vec<(u32, u32, bool)>,
+    /// The bytes of the next constant buffer uploaded that read as zeros (`NX_DEBUG_ZERO_CBUF_DATA`).
+    zero_data: Option<(u32, u32)>,
 }
 
 /// The time the draws spent in each of their steps (reported with `NX_TRACE_GPU`).
@@ -1387,7 +1389,20 @@ impl Backend for Renderer {
 
     fn dispatch(&mut self, scene: &Scene<'_>, dispatch: &Dispatch) -> Result<(), String> {
         let started = stopwatch();
-        let result = self.core().and_then(|core| core.dispatch(scene, dispatch));
+        let mut result = self.core().and_then(|core| core.dispatch(scene, dispatch));
+        // With `NX_DEBUG_SYNC_DRAWS` a launch waits for the device too, so that the launch that
+        // loses it is the one named.
+        if let (Ok(()), Ok(core)) = (&result, self.core()) {
+            if core.sync_on {
+                if let Err(e) = core.flush() {
+                    eprintln!(
+                        "[vulkan] the commands up to this compute launch failed: {e}; program {:#x}, grid {:?}, block {:?}",
+                        dispatch.program, dispatch.grid, dispatch.block
+                    );
+                    result = Err(e);
+                }
+            }
+        }
         self.spent.dispatch.add(started);
         if result.is_err() {
             self.spent.failed += 1;
@@ -1537,6 +1552,48 @@ fn describe_draw(scene: &Scene<'_>, draw: &Draw) -> Vec<String> {
         let a = regs.vertex_attribute(i);
         if a.active {
             lines.push(format!("attribute {i} {a:?}"));
+        }
+    }
+    // The constant buffers of the stages' groups: where they are and the words that are not zero
+    // (`NX_TRACE_CBUF_WORDS` says how many, 64 by default), as `word:value`.
+    let limit = std::env::var("NX_TRACE_CBUF_WORDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(64);
+    for stage in scene.stages() {
+        for slot in 0..18u32 {
+            let Some(b) = scene.cbufs.get(stage.group, slot) else {
+                continue;
+            };
+            let n = (b.size as usize).min(0x4000);
+            let words = match scene.read_vec(b.address, n) {
+                Some(bytes) => bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| **c != [0u8; 4])
+                    .take(limit)
+                    .map(|(i, c)| {
+                        let w = u32::from_le_bytes(*c);
+                        let f = f32::from_bits(w);
+                        if f.is_finite() && f != 0.0 && f.abs() > 1e-6 && f.abs() < 1e7 {
+                            format!("{:#x}:{f}", 4 * i)
+                        } else {
+                            format!("{:#x}:{w:#x}", 4 * i)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                None => "unreadable".to_string(),
+            };
+            lines.push(format!(
+                "constant buffer {slot} of group {} ({}) at {:#x}, {} bytes: {words}",
+                stage.group,
+                stage.kind.name(),
+                b.address,
+                b.size
+            ));
         }
     }
     lines

@@ -196,7 +196,21 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   `NX_DEBUG_SKIP_PROGRAMS=<hex address>[,...]` draws nothing with those programs,
   `NX_DEBUG_DISCARD_PROGRAMS=<hex address>[,...]` runs the vertex stage of the draws of those vertex
   programs and rasterizes nothing, `NX_DEBUG_TRIVIAL_VERTEX=<hex address>[,...]` gives those vertex
-  programs a body that writes a constant position, `NX_DEBUG_DISPATCH_LOOP=1` translates every
+  programs a body that writes a constant position, `NX_DEBUG_NULL_TEXTURES=<hex address>[,...]`
+  gives every texture those programs sample a texel of zeros (a texture's fault, or the code's?),
+  `NX_DEBUG_SKIP_FROM=<hex program address>:<hex offset>[:<hex end>][,...]` leaves the
+  instructions of that sm_86 program from that offset on (up to the end one; several ranges with
+  commas) untranslated (its control flow stays), to find by halving which instruction a lost
+  device follows, `NX_DEBUG_FINITE_POSITION=1` makes every component of a vertex program's outputs
+  that is not a number or infinite 0, `NX_DEBUG_ZERO_CBUFS=<hex address>[,...]` makes every word
+  those programs read of a constant buffer 0 (`NX_DEBUG_ZERO_CBUF_SLOTS=<slot>[,...]` of those slots
+  only, `NX_DEBUG_ZERO_CBUF_KIND=static|dynamic` only the reads at a fixed offset or only those at
+  a computed one, `NX_DEBUG_ZERO_CBUF_RANGE=<hex from>:<hex to>` only the fixed ones in that byte
+  range) and `NX_DEBUG_ZERO_INPUTS=<hex address>[,...]` every vertex attribute they read,
+  `NX_DEBUG_ZERO_CBUF_DATA=<hex program address>:<slot>:<hex from>:<hex to>[,...]` makes those
+  bytes of the buffer itself zeros for the draws of those programs, the program unchanged (the
+  values' fault, or the code's?), `NX_DEBUG_NO_OPTIMIZE=<hex address>[,...]` makes the pipelines of
+  the draws of those vertex programs with the driver's optimizations off, `NX_DEBUG_DISPATCH_LOOP=1` translates every
   program with the loop around a `switch` (A-114), `NX_SPIRV_OPT=<arguments>` passes every graphics
   program through `spirv-opt` first),
   `NX_DEBUG_EQUAL_AS_LEQUAL=1`, `NX_DEBUG_NO_DEPTH_TEST=1`, `NX_DEBUG_FLIP_FRONT=1`,
@@ -210,16 +224,21 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   without putting their pixels into memory first (A-171); `NX_DEBUG_WAIT_FINISH=1` waits for the device at the end
   of every submission of the guest (the renderer otherwise lets the device run behind the
   recording, A-123); `NX_DEBUG_SYNC_DRAWS=<n>` waits for the device after
-  every draw (slow), from the first frame with `n` draws on (`NX_DEBUG_SYNC_FROM=<frame>`: from
+  every draw and compute launch (slow), from the first frame with `n` draws on (`NX_DEBUG_SYNC_FROM=<frame>`: from
   that presented frame on), so that the draw that loses the device is named with its state,
   programs and textures, and how long after its submission the device was lost (a hang takes the
   2 s of the operating system's watchdog, a fault does not); `NX_DEBUG_CHECKPOINTS=1` (an NVIDIA device) marks the
   commands of a submission so that a lost device says which it was running;
   `NX_VULKAN_VALIDATE=1` turns the validation layer on; `NX_SHADER_DUMP=<dir>` writes the programs
   draws use and the compute programs launched, as `COMPUTE_<address>.bin` without a header (read
-  them with `cargo run --release -p nx_shader --example sass -- <file>`; the `audit` example lists
-  what the translator lacks and the `translate` example translates a dump and runs `spirv-val` on
-  it, a `COMPUTE_*` one too). To find why a frame is wrong: `NX_DUMP_BUSY=<draws>` dumps the first
+  them with `cargo run --release -p nx_shader --example sass -- <file>`, the Switch 2's sm_86 ones
+  with the `sm86` example (`-- <file> [<first offset> <last offset>]`); the `audit` example lists
+  what the translator lacks, the `translate` example translates a dump and runs `spirv-val` on
+  it, a `COMPUTE_*` one too, and the `corpus` example does so for a directory of dumps and counts
+  the reasons of those that do not translate; `cargo run --release -p nx_vulkan --example replay --
+  [--zero <slot>:<from>:<to>] [--skip <from>:<to>] [--no-draw] <VERTEX_*.bin>` makes the pipeline of
+  a vertex program dump away from the title and draws it once with zeros, and its `--crash-test
+  <dump> <file.spv>` is the test `spirv-reduce` needs to shrink a module the driver cannot compile). To find why a frame is wrong: `NX_DUMP_BUSY=<draws>` dumps the first
   frame with that many draws and every target, `NX_TRACE_AFTER_BUSY=1` traces the frame after it
   (what `NX_TRACE_DRAWS` does), `NX_DUMP_PASSES=<dir>` writes a picture of each pass of a traced
   frame, `NX_DUMP_DRAWS=<dir>` with `NX_DUMP_FROM=<n>` and `NX_DUMP_UNTIL=<n>` one after each
