@@ -340,38 +340,44 @@ pub(super) fn shf(tx: &mut Tx<'_>, i: &I) -> R<()> {
         let w = tx.c32(width);
         tx.ext(u, glsl::U_MIN, &[amount, w])
     };
-    let v = join(tx, lo, hi);
-    let u64t = tx.m.ty_int(64, false);
-    let s64 = u64_of(tx, s);
-    // A shift by 64 is not defined in SPIR-V: it is done as two shifts of 32.
-    let sixty_four = tx.c32(64);
-    let full = tx.cmp(op::I_EQUAL, s, sixty_four);
-    let one = tx.m.const_u64(1);
-    let less = tx.op2(op::I_SUB, u64t, s64, one);
-    let safe = tx.select(u64t, full, less, s64);
-    let shifted = if right {
-        if signed {
-            let i64t = tx.m.ty_int(64, true);
-            let sv = tx.op1(op::BITCAST, i64t, v);
-            let first = tx.op2(op::SHIFT_RIGHT_ARITHMETIC, i64t, sv, safe);
-            let again = tx.op2(op::SHIFT_RIGHT_ARITHMETIC, i64t, first, one);
-            let r = tx.select(i64t, full, again, first);
-            tx.op1(op::BITCAST, u64t, r)
+    // The 64-bit funnel `hi:lo` shifted by `s` (0..=64), word by word: every shift of SPIR-V here
+    // is by less than 32, so each is defined, and no 64-bit integer is needed.
+    let c1 = tx.c32(1);
+    let c31 = tx.c32(31);
+    let c32 = tx.c32(32);
+    let c64 = tx.c32(64);
+    let zero = tx.c32(0);
+    let big = tx.cmp(op::U_GREATER_THAN_EQUAL, s, c32);
+    let all = tx.cmp(op::I_EQUAL, s, c64);
+    let m = tx.and(s, c31);
+    let rest = tx.isub(c31, m);
+    let (rlo, rhi) = if right {
+        // The bits of `hi` that come into `lo`: `hi << (32 - m)`, none when `m` is 0.
+        let hi1 = tx.shl(hi, c1);
+        let cross = tx.shl(hi1, rest);
+        let lo_part = tx.shr(lo, m);
+        let lo_small = tx.or(lo_part, cross);
+        let (hi_shifted, fill) = if signed {
+            (tx.sar(hi, m), tx.sar(hi, c31))
         } else {
-            let first = tx.op2(op::SHIFT_RIGHT_LOGICAL, u64t, v, safe);
-            let again = tx.op2(op::SHIFT_RIGHT_LOGICAL, u64t, first, one);
-            tx.select(u64t, full, again, first)
-        }
+            (tx.shr(hi, m), zero)
+        };
+        // Below 32: both words move; from 32: `hi` comes into `lo`; 64: only the fill is left.
+        let rlo = tx.select_u32(big, hi_shifted, lo_small);
+        let rhi = tx.select_u32(big, fill, hi_shifted);
+        (tx.select_u32(all, fill, rlo), tx.select_u32(all, fill, rhi))
     } else {
-        let first = tx.op2(op::SHIFT_LEFT_LOGICAL, u64t, v, safe);
-        let again = tx.op2(op::SHIFT_LEFT_LOGICAL, u64t, first, one);
-        tx.select(u64t, full, again, first)
+        // The bits of `lo` that come into `hi`: `lo >> (32 - m)`, none when `m` is 0.
+        let lo1 = tx.shr(lo, c1);
+        let cross = tx.shr(lo1, rest);
+        let hi_part = tx.shl(hi, m);
+        let hi_small = tx.or(hi_part, cross);
+        let lo_shifted = tx.shl(lo, m);
+        let rlo = tx.select_u32(big, zero, lo_shifted);
+        let rhi = tx.select_u32(big, lo_shifted, hi_small);
+        (rlo, tx.select_u32(all, zero, rhi))
     };
-    let r = if inst.bit(80) {
-        high(tx, shifted)
-    } else {
-        low(tx, shifted)
-    };
+    let r = if inst.bit(80) { rhi } else { rlo };
     write(tx, i, dst(i), r);
     Ok(())
 }
