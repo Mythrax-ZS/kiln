@@ -18,6 +18,7 @@ mod friend;
 mod fsp;
 mod gsv;
 mod hid;
+mod hwopus;
 mod lm;
 mod mm;
 mod nfp;
@@ -91,6 +92,7 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     register(kernel, "hid", move |k| {
         hid::HidServer::new(k, input.clone())
     });
+    register(kernel, "hwopus", hwopus::Manager::new);
     register(kernel, "lm", lm::LogService::new);
     register(kernel, "mm:u", |_| mm::Requests::new());
     register(kernel, "nfp:user", nfp::UserManager::new);

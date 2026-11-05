@@ -640,6 +640,8 @@ struct Device {
     /// The events of the device and of its inputs and outputs: nothing changes, so none is set.
     events: [(KObject, KObject); 3],
     volume: f32,
+    /// What the program last set with 19 (A-224).
+    volume_auto_tune: bool,
 }
 
 impl Device {
@@ -648,6 +650,7 @@ impl Device {
             kernel: Arc::downgrade(kernel),
             events: [kernel.new_event(), kernel.new_event(), kernel.new_event()],
             volume: 1.0,
+            volume_auto_tune: false,
         }
     }
 
@@ -723,10 +726,18 @@ impl Service for Device {
             12 => Ok(Response::ok().with_copy_handle(self.events[2].1.clone())),
             // GetActiveChannelCount() -> u32
             5 => Ok(Response::ok().with_u32(ACTIVE_CHANNELS)),
-            // IsAudioDeviceOutputVolumeAutoTuneEnabled() -> bool [18.0.0+]: the console's output
-            // volume is not tuned to what plays (a setting, off unless the user turns it on;
-            // docs/ASSUMPTIONS.md A-224).
-            20 => Ok(Response::ok().with_bytes(&[0])),
+            // SetAudioDeviceOutputVolumeAutoTuneEnabled(bool) [18.0.0+] and
+            // IsAudioDeviceOutputVolumeAutoTuneEnabled() -> bool: whether the output volume is to be
+            // tuned to what plays, off until the program turns it on; nothing here tunes the
+            // volume either way (docs/ASSUMPTIONS.md A-224).
+            19 => match req.data.first() {
+                Some(&b @ (0 | 1)) => {
+                    self.volume_auto_tune = b == 1;
+                    Ok(Response::ok())
+                }
+                other => Err(Stop(format!("IAudioDevice 19 with {other:?}, not a bool"))),
+            },
+            20 => Ok(Response::ok().with_bytes(&[u8::from(self.volume_auto_tune)])),
             other => Err(Stop::unknown_command("IAudioDevice", other)),
         }
     }
@@ -774,6 +785,8 @@ struct Renderer {
     event: (KObject, KObject),
     started: bool,
     time_limit: u32,
+    /// The voice drop parameter 12 set (A-227): voices are never dropped here.
+    voice_drop: f32,
     /// Ends the frame timer when the renderer is closed.
     stop: Arc<AtomicBool>,
     /// Where the samples go.
@@ -805,6 +818,7 @@ impl Renderer {
             event,
             started: false,
             time_limit: 80,
+            voice_drop: 1.0,
             stop,
             outputs: Outputs::open(params.sample_rate),
         }
@@ -880,6 +894,20 @@ impl Service for Renderer {
                 Ok(Response::ok())
             }
             9 => Ok(Response::ok().with_u32(self.time_limit)),
+            // SetVoiceDropParameter(f32) and GetVoiceDropParameter() -> f32 [15.0.0+]: how readily
+            // the renderer drops voices when a frame runs over its time; none is dropped here, so
+            // the value is only kept (docs/ASSUMPTIONS.md A-227).
+            12 => {
+                let value = f32::from_bits(req.u32_at(0));
+                if !value.is_finite() || value < 0.0 {
+                    return Err(Stop(format!(
+                        "IAudioRenderer 12 with the parameter {value}"
+                    )));
+                }
+                self.voice_drop = value;
+                Ok(Response::ok())
+            }
+            13 => Ok(Response::ok().with_u32(self.voice_drop.to_bits())),
             other => Err(Stop::unknown_command("IAudioRenderer", other)),
         }
     }

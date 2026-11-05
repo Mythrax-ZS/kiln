@@ -190,6 +190,10 @@ impl Service for StaticService {
             }
             // IsStandardUserSystemClockAutomaticCorrectionEnabled() -> bool
             100 => Ok(Response::ok().with_bytes(&[0])),
+            // IsStandardNetworkSystemClockAccuracySufficient() -> bool [3.0.0+]: the network clock
+            // is accurate once it was set from the network lately, which an offline console never
+            // does (docs/ASSUMPTIONS.md A-072, A-228).
+            200 => Ok(Response::ok().with_bytes(&[0])),
             other => Err(Stop::unknown_command("time:u", other)),
         }
     }

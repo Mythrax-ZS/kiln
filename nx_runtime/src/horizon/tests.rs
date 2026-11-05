@@ -3061,6 +3061,8 @@ fn the_time_service_shares_its_clocks_in_a_memory_the_program_reads() {
     let memory = e.call(time, &Message::new(20)).copied[0];
     let again = e.call(time, &Message::new(20)).copied[0];
     assert_ne!(memory, 0);
+    // The network clock was never set from the network: not accurate enough (A-228).
+    assert_eq!(e.call(time, &Message::new(200)).data.first(), Some(&0));
     e.svc(0x13, &[u64::from(memory), 0x6100_0000, 0x1000, 1]);
     assert_eq!(e.r(), 0);
     e.svc(0x14, &[u64::from(memory), 0x6100_0000, 0x1000]);
@@ -3603,6 +3605,14 @@ fn the_audio_renderer_answers_updates_and_sets_its_event_every_frame() {
         [0, 0, 0, 0],
         "started"
     );
+    // The voice drop parameter is kept (12) and read back (13).
+    let mut drop = Message::new(12);
+    drop.payload = 0.5f32.to_bits().to_le_bytes().to_vec();
+    assert_eq!(e.call(renderer, &drop).result, 0);
+    assert_eq!(
+        e.call(renderer, &Message::new(13)).data,
+        0.5f32.to_bits().to_le_bytes()
+    );
 
     // One update: no memory pool is asked for anything; the answer holds every section.
     let input = SCRATCH + 0x2000;
@@ -3697,6 +3707,14 @@ fn the_audio_device_names_itself_and_is_stereo() {
     );
     let auto_tune = e.call(device, &Message::new(20)).data;
     assert_eq!(auto_tune.first(), Some(&0), "no automatic volume tuning");
+    let mut on = Message::new(19);
+    on.payload = vec![1, 0, 0, 0];
+    assert_eq!(e.call(device, &on).result, 0);
+    assert_eq!(
+        e.call(device, &Message::new(20)).data.first(),
+        Some(&1),
+        "as the program set it"
+    );
     assert_eq!(e.call(device, &Message::new(2)).data, 1.0f32.to_le_bytes());
     assert_eq!(
         e.call(device, &Message::new(4)).copied.len(),
