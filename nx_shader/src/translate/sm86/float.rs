@@ -328,7 +328,7 @@ pub(super) fn f2fp(tx: &mut Tx<'_>, i: &I) -> R<()> {
     Ok(())
 }
 
-/// `HADD2`, `HMUL2`, `HFMA2`: not yet.
+/// `HADD2`, `HMUL2`, `HFMA2` on pairs of halves.
 pub(super) fn half_arith(tx: &mut Tx<'_>, i: &I) -> R<()> {
     // `HADD2`, `HMUL2`, `HFMA2 Rd, Ra, B[, C]` on pairs of halves, as floats (NAK's fields): `Ra`
     // with its halves in bits 74..75, negated with 72 and absolute with 73; the operand of bits
@@ -426,7 +426,54 @@ fn halves(
     ]
 }
 
-/// `HSETP2`: not yet.
+/// `HSETP2.cmp.bop Pu, Pv, Ra, B, Pc`: the lanes of `Ra` and `B` (pairs of halves, read as
+/// `HADD2` reads them) compared by the code at bits 76..79, halves below the smallest normal one
+/// flushed to zero with bit 80. With `.H_AND` (bit 71) `Pu` is both lanes' comparisons together and
+/// `Pv` its negation, else `Pu` is the low lane's and `Pv` the high lane's; each is then combined
+/// with `Pc` (bits 87..90) by the operation of bits 69..70 (docs/ASSUMPTIONS.md A-276).
 pub(super) fn hsetp2(tx: &mut Tx<'_>, i: &I) -> R<()> {
-    tx.fail(format!("{} is not translated", crate::sm86::name(i.inst)))
+    use crate::sm86::Operand;
+    let inst = i.inst;
+    if inst.bit(65) || inst.bit(91) || !matches!(inst.form(), 1..=3) {
+        return tx.fail(format!(
+            "HSETP2 in operand form {} with bit 65 {} and bit 91 {}",
+            inst.form(),
+            inst.bit(65),
+            inst.bit(91)
+        ));
+    }
+    let ra = tx.read(inst.reg(24));
+    let mut x = halves(tx, ra, inst.field(74, 2), inst.bit(72), inst.bit(73));
+    let Some(slot) = inst.slot32() else {
+        return tx.fail(format!("HSETP2 in operand form {}", inst.form()));
+    };
+    let raw = operand(tx, slot.operand)?;
+    let select = if matches!(slot.operand, Operand::Imm(_)) {
+        0
+    } else {
+        inst.field(60, 2)
+    };
+    let mut y = halves(tx, raw, select, slot.neg, slot.abs);
+    if inst.bit(80) {
+        for v in x.iter_mut().chain(y.iter_mut()) {
+            *v = super::super::half::flush(tx, *v);
+        }
+    }
+    let code = inst.field(76, 4);
+    let lo = fcompare(tx, code, x[0], y[0])?;
+    let hi = fcompare(tx, code, x[1], y[1])?;
+    let (u, v) = if inst.bit(71) {
+        let both = tx.land(lo, hi);
+        let none = tx.lnot(both);
+        (both, none)
+    } else {
+        (lo, hi)
+    };
+    let p = pred(tx, inst.pred(87, 90, i.uniform));
+    let bop = inst.field(69, 2);
+    let first = bool_op(tx, bop, u, p)?;
+    let second = bool_op(tx, bop, v, p)?;
+    write_pred(tx, i, inst.pred_dst(81, i.uniform), first);
+    write_pred(tx, i, inst.pred_dst(84, i.uniform), second);
+    Ok(())
 }

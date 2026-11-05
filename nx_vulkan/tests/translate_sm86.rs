@@ -389,3 +389,66 @@ fn a_funnel_shift_moves_the_bits_of_both_words() {
         }
     }
 }
+
+/// `HSETP2.cmp.bop P0, P1, R0, R1, PT` (the register form, both pairs as they are), `.H_AND`
+/// with `h_and`.
+fn hsetp2(cmp: u64, h_and: bool) -> u128 {
+    with(
+        vec![
+            (0, 12, 0x234),
+            (12, 4, 7),
+            (24, 8, 0),
+            (32, 8, 1),
+            (69, 2, 0),
+            (71, 1, u64::from(h_and)),
+            (76, 4, cmp),
+            (81, 3, 0),
+            (84, 3, 1),
+            (87, 3, 7),
+        ],
+        sched(7, 0),
+    )
+}
+
+/// `@Pp MOV Rd, imm32`.
+fn mov_if(p: u64, d: u64, imm: u32) -> u128 {
+    with(
+        vec![
+            (0, 12, 0x802),
+            (12, 4, p),
+            (16, 8, d),
+            (32, 32, u64::from(imm)),
+            (72, 4, 0xF),
+        ],
+        sched(7, 0),
+    )
+}
+
+#[test]
+fn hsetp2_compares_the_lanes_alone_or_both_together() {
+    let Some(vk) = vulkan() else { return };
+    // Halves: 1.0 0x3C00, 1.5 0x3E00, 2.0 0x4000, 3.0 0x4200; the low lane first.
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    let cases = [
+        // LT (1) lane by lane: 1 < 2, not 3 < 2.
+        (1, false, pair(0x3C00, 0x4200), (1, 0)),
+        // LT with .H_AND: not both, so the first is false and the second true.
+        (1, true, pair(0x3C00, 0x4200), (0, 1)),
+        // GT (4) lane by lane: not 1 > 2, 3 > 2.
+        (4, false, pair(0x3C00, 0x4200), (0, 1)),
+        // LT with .H_AND where both lanes are below: 1 and 1.5 < 2.
+        (1, true, pair(0x3C00, 0x3E00), (1, 0)),
+    ];
+    for (cmp, h_and, a, (p0, p1)) in cases {
+        let code = program(&[hsetp2(cmp, h_and), mov_if(0, 10, 1), mov_if(1, 11, 1)]);
+        let mut input = State::default();
+        input.regs[0] = a;
+        input.regs[1] = pair(0x4000, 0x4000);
+        let out = run(&vk, &code, input);
+        assert_eq!(
+            (out.regs[10], out.regs[11]),
+            (p0, p1),
+            "compare {cmp}, .H_AND {h_and}, Ra {a:#x}"
+        );
+    }
+}

@@ -95,7 +95,7 @@ fn round_half(tx: &mut Tx<'_>, x: Id) -> Id {
 }
 
 /// A result without the values a half cannot hold below its smallest normal number (`FTZ`).
-fn flush(tx: &mut Tx<'_>, x: Id) -> Id {
+pub(super) fn flush(tx: &mut Tx<'_>, x: Id) -> Id {
     let magnitude = tx.fabs(x);
     let smallest = tx.cf32(6.103_515_6e-5);
     let tiny = tx.cmp(op::F_ORD_LESS_THAN, magnitude, smallest);
