@@ -709,9 +709,11 @@ impl Kernel {
         size: u64,
         info: Info,
     ) -> Result<(), ResultCode> {
-        rt().mem
-            .map(addr, size, info.perm)
-            .map_err(|_| err::OUT_OF_MEMORY)?;
+        rt().mem.map(addr, size, info.perm).map_err(|e| {
+            // The result names no cause; the run's report should.
+            eprintln!("kiln runtime: mapping {size:#x} bytes at {addr:#x} failed: {e:?}");
+            err::OUT_OF_MEMORY
+        })?;
         st.mapped.push((addr, size));
         if !st.memory.insert(addr, size, info) {
             let _ = rt().mem.unmap(addr, size);

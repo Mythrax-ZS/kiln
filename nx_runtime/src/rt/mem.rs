@@ -371,6 +371,12 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// The bytes of host memory behind guest pages, in all.
+    fn mapped_bytes(&self) -> usize {
+        let blocks = self.blocks.lock().unwrap_or_else(|e| e.into_inner());
+        blocks.iter().map(|b| b.layout.size()).sum()
+    }
+
     /// Map fresh zeroed pages at `addr`.
     pub fn map(&self, addr: u64, size: u64, permissions: u32) -> Result<(), MapError> {
         Self::check_range(addr, size)?;
@@ -389,6 +395,13 @@ impl GuestMemory {
             unsafe { alloc_zeroed(layout) }
         };
         if host.is_null() {
+            // Said here, as the kernel's result for it names no cause.
+            eprintln!(
+                "kiln runtime: the host gave no memory for {size:#x} bytes of guest memory at \
+                 {addr:#x} ({}; {:#x} bytes mapped before)",
+                std::io::Error::last_os_error(),
+                self.mapped_bytes()
+            );
             return Err(MapError::OutOfMemory);
         }
         self.blocks.lock().unwrap().push(Block {
