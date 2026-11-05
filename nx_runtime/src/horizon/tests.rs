@@ -428,6 +428,35 @@ fn query_memory_describes_modules_gaps_and_the_ends() {
 }
 
 #[test]
+fn a_switch_2_program_maps_no_shared_memory_where_its_graphics_server_backs_memory() {
+    // Far into the range, past what any test hands out as GPU-only backing.
+    let at = GPU_SERVER_BASE + 0x30_0000_0000;
+    for (platform, answer) in [
+        (crate::npdm::Platform::Nx2, err::INVALID_CURRENT_MEMORY.0),
+        (crate::npdm::Platform::Nx, 0),
+    ] {
+        let spec = builder::NpdmSpec {
+            platform,
+            kc: vec![builder::enable_svcs(0, &[0x13, 0x14])],
+            ..builder::NpdmSpec::default()
+        };
+        let mut e = Env::with(
+            ProcessKind::Nso,
+            Some(Npdm::parse(&builder::build(&spec)).unwrap()),
+            Vec::new(),
+        );
+        let (object, _) = e.kernel.create_shared_memory(0x4000).unwrap();
+        let handle = u64::from(e.kernel.lock().handles.insert(object).unwrap());
+        e.svc(0x13, &[handle, at, 0x4000, 3]);
+        assert_eq!(e.r(), answer, "{platform:?}");
+        if answer == 0 {
+            e.svc(0x14, &[handle, at, 0x4000]);
+            assert_eq!(e.r(), 0, "unmapped again");
+        }
+    }
+}
+
+#[test]
 fn a_switch_2_process_gets_the_switch_2_answers() {
     let nx2 = |platform| {
         let spec = builder::NpdmSpec {

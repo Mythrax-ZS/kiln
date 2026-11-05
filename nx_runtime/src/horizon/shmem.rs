@@ -10,8 +10,9 @@
 use super::handle::Handle;
 use super::kernel::Kernel;
 use super::layout::{
-    mem_type, ADDRESS_SPACE_END, ALIAS_BASE, ALIAS_SIZE, ASLR_BASE, HEAP_BASE, KERNEL_SCRATCH_BASE,
-    KERNEL_SCRATCH_SIZE, PAGE, STACK_BASE, STACK_REGION_SIZE, TLS_BASE, TLS_REGION_SIZE,
+    mem_type, ADDRESS_SPACE_END, ALIAS_BASE, ALIAS_SIZE, ASLR_BASE, GPU_SERVER_BASE,
+    GPU_SERVER_SIZE, HEAP_BASE, KERNEL_SCRATCH_BASE, KERNEL_SCRATCH_SIZE, PAGE, STACK_BASE,
+    STACK_REGION_SIZE, TLS_BASE, TLS_REGION_SIZE,
 };
 use super::memory::Info;
 use super::object::KObject;
@@ -113,8 +114,13 @@ impl Kernel {
             (TLS_BASE, TLS_REGION_SIZE),
             (KERNEL_SCRATCH_BASE, KERNEL_SCRATCH_SIZE),
         ];
+        // A Switch 2 program's graphics server backs GPU-only memory there, past what it has handed
+        // out so far (A-215).
+        let server = (self.process.platform() == crate::npdm::Platform::Nx2)
+            .then_some((GPU_SERVER_BASE, GPU_SERVER_SIZE));
         if reserved
             .iter()
+            .chain(server.as_ref())
             .any(|&(base, length)| addr < base + length && base < end)
         {
             return err::INVALID_CURRENT_MEMORY;
