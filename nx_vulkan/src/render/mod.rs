@@ -703,6 +703,10 @@ impl Core {
                     Layout::Pitch => Tiling::Pitch(t.width),
                     Layout::BlockLinear { block } => Tiling::Block(block[1]),
                 },
+                block_depth_log2: match t.layout {
+                    Layout::Pitch => 0,
+                    Layout::BlockLinear { block } => block[2],
+                },
             });
         }
         let depth = match scene.regs.depth_target() {
@@ -726,6 +730,10 @@ impl Core {
                     tiling: match z.layout {
                         Layout::Pitch => Tiling::Pitch(z.width),
                         Layout::BlockLinear { block } => Tiling::Block(block[1]),
+                    },
+                    block_depth_log2: match z.layout {
+                        Layout::Pitch => 0,
+                        Layout::BlockLinear { block } => block[2],
                     },
                 })
             }

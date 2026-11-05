@@ -113,6 +113,10 @@ impl Core {
                 Layout::Pitch => Tiling::Pitch(b.dst.pitch),
                 Layout::BlockLinear { block } => Tiling::Block(block[1]),
             },
+            block_depth_log2: match b.dst.layout {
+                Layout::Pitch => 0,
+                Layout::BlockLinear { block } => block[2],
+            },
         };
         if dst_key == src_key {
             return Ok(());

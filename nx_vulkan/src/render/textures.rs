@@ -606,7 +606,7 @@ pub fn overlay_of(
     let Tiling::Block(log2) = target.tiling else {
         return None;
     };
-    if !tic.is_block_linear() || target.layers != 1 {
+    if !tic.is_block_linear() || target.layers != 1 || target.block_depth_log2 != 0 {
         return None;
     }
     let shape = shape_of(tic, used).ok()?;
@@ -2046,6 +2046,7 @@ mod tests {
             height: size.1,
             layers: 1,
             tiling: Tiling::Block(block),
+            block_depth_log2: 0,
         }
     }
 

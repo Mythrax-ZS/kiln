@@ -916,6 +916,51 @@ fn a_render_target_that_a_texture_reads_through_memory_is_written_to_it_first() 
 }
 
 #[test]
+fn the_slices_of_a_3d_layout_drawn_as_targets_go_to_their_own_gobs() {
+    if vulkan().is_none() {
+        return;
+    }
+    let source = GPU_BASE + 0x50_0000;
+    let target = GPU_BASE + 0x20_0000;
+    // A 3D texture of 32x16 texels and 16 slices whose blocks are one GOB high and 16 slices deep:
+    // a slice is 2x2 GOBs, each in its own block (8 KiB apart), slice z's 512 * z bytes into it.
+    // Each slice is drawn as a target at its first GOB with that block depth (A-266); the 32 KiB
+    // are then read as a 2D texture, which makes the renderer put every slice into memory.
+    let mut w = textured(
+        8,
+        target,
+        header(0x08, 2, 32, 256, source),
+        nearest_sampler(),
+    );
+    let mut r = Renderer::new(RenderConfig::default());
+    let color = |z: u64| {
+        [
+            (z * 16) as f32 / 255.0,
+            0.0,
+            (255 - z * 16) as f32 / 255.0,
+            1.0,
+        ]
+    };
+    for z in 0..16u64 {
+        w.color_target_blocks(0, source + 512 * z, 32, 16, 0xD5, 0);
+        w.set(0x800 + 0x14, 4 << 8);
+        clear_to(&mut r, &mut w, color(z), None);
+    }
+    w.color_target(0, target, 8, 8, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    for z in 0..16u64 {
+        let want = color(z).map(|c| (c * 255.0).round() as u8);
+        for block in 0..4u64 {
+            let mut gob = [0u8; 512];
+            assert!(w.mem.read(w.cpu(source) + 8192 * block + 512 * z, &mut gob));
+            for px in gob.as_chunks::<4>().0 {
+                assert_eq!(px, &want, "slice {z}, block {block}");
+            }
+        }
+    }
+}
+
+#[test]
 fn a_render_target_nothing_draws_to_for_long_is_not_written_over_reused_memory() {
     if vulkan().is_none() {
         return;

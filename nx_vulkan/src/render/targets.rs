@@ -28,6 +28,10 @@ pub struct Key {
     pub height: u32,
     pub layers: u32,
     pub tiling: Tiling,
+    /// The depth of a block of the block-linear layout, in GOBs as a power of two: a target
+    /// that is one slice of a 3D texture lies in its memory with the texture's blocks, which hold
+    /// that many slices, so that its GOBs are a whole block apart (docs/ASSUMPTIONS.md A-266).
+    pub block_depth_log2: u32,
 }
 
 impl Key {
@@ -48,7 +52,7 @@ impl Key {
             depth: 1,
             bytes_per_element: bytes,
             block_height_log2,
-            block_depth_log2: 0,
+            block_depth_log2: self.block_depth_log2,
         }
     }
 }
@@ -453,7 +457,21 @@ impl Targets {
                     .map(|c| c.key)
                     .filter(|k| *k != key && self.memory_unchanged(mem, k))
                     .collect();
-                mem.write(key.address, &tiled);
+                match key.tiling {
+                    Tiling::Block(log2) if key.block_depth_log2 > 0 => {
+                        // One slice of a 3D texture's layout (A-266): of each block, only the
+                        // first `1 << log2` GOBs are the target's, the rest the other slices'.
+                        let own = 512usize << log2;
+                        let block = own << key.block_depth_log2;
+                        for at in (0..tiled.len()).step_by(block) {
+                            let end = (at + own).min(tiled.len());
+                            mem.write(key.address + at as u64, &tiled[at..end]);
+                        }
+                    }
+                    _ => {
+                        mem.write(key.address, &tiled);
+                    }
+                }
                 for k in overlapped {
                     let baseline = memory_hash(mem, &k);
                     if let Some(t) = self.map.get_mut(&k) {

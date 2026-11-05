@@ -376,6 +376,7 @@ mod tests {
             height: 8,
             layers: 1,
             tiling: crate::render::targets::Tiling::Block(0),
+            block_depth_log2: 0,
         };
         targets.get(&vk, &mut frame, key).unwrap();
         // The zero fill of the new target runs before its texels are put there.
