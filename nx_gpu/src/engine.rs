@@ -640,6 +640,9 @@ impl Engine {
         if kind == class::Kind::TwoD && method * 4 == twod::reg::PIXELS_FROM_MEMORY_SRC_Y0_INT {
             self.blit_2d(cx)?;
         }
+        if kind == class::Kind::Copy && method * 4 == crate::dma::reg::LAUNCH_DMA {
+            self.launch_dma(cx, data)?;
+        }
         // A launch: the descriptor `SEND_PCAS_A` named is scheduled (bit 1 of the signal; bit 0
         // only invalidates what was cached of descriptors).
         if self.class == class::COMPUTE
@@ -928,6 +931,43 @@ impl Engine {
             Ok(()) => Ok(()),
             Err(why) => cx.renderer_failed("a 2D copy", why),
         }
+    }
+
+    /// `LAUNCH_DMA` of the copy engine (A-268): the copy, in memory (through the renderer, whose
+    /// targets may stand for it), then the semaphore.
+    fn launch_dma(&mut self, cx: &mut Cx<'_>, data: u32) -> Result<(), String> {
+        let launch = crate::dma::Launch::from_regs(|r| self.reg(r / 4), data)?;
+        if cx.level >= 1 || trace_2d() {
+            eprintln!("[gpu] copy engine launch {data:#x}: {launch:?}");
+        }
+        if let Some(copy) = &launch.copy {
+            let scene = Scene {
+                regs: Regs(&self.regs),
+                class: self.class,
+                cbufs: &self.cbufs,
+                mem: cx.mem,
+                space: cx.space,
+            };
+            let done = match cx.backend.as_mut() {
+                Some(backend) => backend.dma_copy(&scene, copy),
+                None => copy.run(cx.mem, cx.space),
+            };
+            if let Err(why) = done {
+                return Err(format!("a copy engine copy: {why}"));
+            }
+        }
+        if let Some((va, payload, four_words)) = launch.semaphore {
+            if four_words {
+                let mut out = [0u8; 16];
+                out[..4].copy_from_slice(&payload.to_le_bytes());
+                out[8..].copy_from_slice(&cx.timestamp().to_le_bytes());
+                cx.write(va, &out)?;
+            } else {
+                cx.write(va, &payload.to_le_bytes())?;
+            }
+            cx.stats.semaphore_releases += 1;
+        }
+        Ok(())
     }
 
     /// A compute launch was signalled: read the descriptor and give the launch to the renderer.

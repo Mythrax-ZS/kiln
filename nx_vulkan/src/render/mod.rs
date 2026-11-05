@@ -1460,6 +1460,10 @@ impl Backend for Renderer {
         self.core().and_then(|core| core.copy_surface(scene, blit))
     }
 
+    fn dma_copy(&mut self, scene: &Scene<'_>, copy: &nx_gpu::dma::Copy) -> Result<(), String> {
+        self.core().and_then(|core| core.copy_engine(scene, copy))
+    }
+
     fn dispatch(&mut self, scene: &Scene<'_>, dispatch: &Dispatch) -> Result<(), String> {
         let started = stopwatch();
         let mut result = self.core().and_then(|core| core.dispatch(scene, dispatch));

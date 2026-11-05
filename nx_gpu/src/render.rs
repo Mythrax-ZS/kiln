@@ -184,6 +184,12 @@ pub trait Backend: Send {
     fn blit(&mut self, _scene: &Scene<'_>, _blit: &Blit) -> Result<(), String> {
         Err("this renderer does not copy surfaces".to_string())
     }
+
+    /// A copy made with the copy engine (A-268): the bytes are in memory when this returns. A
+    /// renderer whose render targets stand for memory puts their pixels there first.
+    fn dma_copy(&mut self, scene: &Scene<'_>, copy: &crate::dma::Copy) -> Result<(), String> {
+        copy.run(scene.mem, scene.space)
+    }
 }
 
 #[cfg(test)]

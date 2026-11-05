@@ -254,3 +254,56 @@ impl Core {
         Ok(())
     }
 }
+
+impl Core {
+    /// A copy of the copy engine (A-268), made in guest memory as a 2D copy that the device
+    /// cannot make is: the render targets that stand for either side's memory put their pixels
+    /// there first, and those over what was written are let go of after.
+    pub(super) fn copy_engine(
+        &mut self,
+        scene: &Scene<'_>,
+        copy: &nx_gpu::dma::Copy,
+    ) -> Result<(), String> {
+        let [src, dst] = copy.spans().map(|(start, end)| {
+            scene
+                .host_address(start)
+                .map(|(cpu, _)| (cpu, cpu + (end - start)))
+        });
+        if self.global_pending {
+            self.flush()?;
+        }
+        let mut dirty: Vec<Key> = Vec::new();
+        for (start, end) in [src, dst].into_iter().flatten() {
+            for c in self.targets.covering(start, end) {
+                if c.dirty
+                    && !dirty.contains(&c.key)
+                    && self.targets.memory_unchanged(scene.mem, &c.key)
+                {
+                    dirty.push(c.key);
+                }
+            }
+        }
+        if !dirty.is_empty() {
+            self.end_pass();
+            let _phase = nx_gpu::progress::enter(nx_gpu::progress::WRITING_BACK);
+            self.targets
+                .write_back(&self.vk, &mut self.frame, scene.mem, &dirty)?;
+        }
+        copy.run(scene.mem, scene.space)?;
+        if let Some((start, end)) = dst {
+            let stale: Vec<Key> = self
+                .targets
+                .covering(start, end)
+                .into_iter()
+                .map(|c| c.key)
+                .collect();
+            if !stale.is_empty() {
+                self.end_pass();
+                self.targets.release(&stale, &mut self.frame);
+            }
+            self.textures.memory_written(start, end);
+        }
+        self.memory_copies += 1;
+        Ok(())
+    }
+}

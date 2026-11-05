@@ -14,6 +14,7 @@
 pub mod channel;
 pub mod compute;
 pub mod display;
+pub mod dma;
 pub mod draw_state;
 pub mod engine;
 pub mod error;
