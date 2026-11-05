@@ -74,6 +74,9 @@ pub struct Target {
     pub baseline: Option<u64>,
     /// Made and not yet looked at for its baseline.
     pub fresh: bool,
+    /// What [`Targets::memory_unchanged`] found in a submission, against a baseline: the memory is
+    /// hashed once a submission, not at every texture that reads it.
+    pub unchanged: std::cell::Cell<Option<(u64, Option<u64>, bool)>>,
 }
 
 /// A hash of the memory a color target stands for, if all of it can be read.
@@ -168,9 +171,9 @@ pub struct Targets {
     /// The target at each guest address (one at a time: a new shape retires the old one), so that
     /// a texture's memory finds its targets without looking at all of them.
     by_address: std::collections::BTreeMap<u64, Placed>,
-    /// The most memory any target stands for: no target that overlaps an address starts further
-    /// below it than this.
-    largest: u64,
+    /// The addresses of the targets whose memory reaches into each 2 MiB of the guest's address
+    /// space, so that the targets over a texture are found without looking at those near it.
+    buckets: std::collections::BTreeMap<u64, Vec<u64>>,
     /// How many submissions have run, to age targets by.
     pub submissions: u64,
     /// Counts the draws to targets, for [`Target::serial`].
@@ -252,7 +255,7 @@ impl Targets {
                 if let Some(s) = self.snapshots.remove(&k) {
                     frame.garbage.push(Garbage::Image(s.image));
                 }
-                self.by_address.remove(&k.address);
+                self.unplace(k.address);
             }
             let depth = aspect_of(key.format) != vk::ImageAspectFlags::COLOR;
             let usage = if depth {
@@ -286,6 +289,7 @@ impl Targets {
                 serial: 0,
                 baseline: None,
                 fresh: true,
+                unchanged: std::cell::Cell::new(None),
             };
             match frame.cmd(vk) {
                 Ok(cmd) => target.zero(vk, cmd),
@@ -296,15 +300,11 @@ impl Targets {
             }
             self.map.insert(key, target);
             let bytes = key.memory_bytes().unwrap_or(0);
-            self.by_address.insert(
-                key.address,
-                Placed {
-                    key,
-                    bytes,
-                    color: aspect_of(key.format) == vk::ImageAspectFlags::COLOR,
-                },
-            );
-            self.largest = self.largest.max(bytes);
+            self.place(Placed {
+                key,
+                bytes,
+                color: aspect_of(key.format) == vk::ImageAspectFlags::COLOR,
+            });
         }
         let submissions = self.submissions;
         self.next_serial += 1;
@@ -330,14 +330,53 @@ impl Targets {
         (aspect_of(t.key.format) != vk::ImageAspectFlags::COLOR).then_some(t)
     }
 
-    /// The color targets whose memory overlaps `[start, end)` (addresses in the guest process),
-    /// in the order they were drawn to.
-    pub fn covering(&self, start: u64, end: u64) -> Vec<Covering> {
-        let from = start.saturating_sub(self.largest);
+    /// The 2 MiB parts of the address space `[start, end)` reaches.
+    fn buckets_of(start: u64, end: u64) -> std::ops::RangeInclusive<u64> {
+        (start >> 21)..=(end.max(start + 1) - 1) >> 21
+    }
+
+    fn place(&mut self, placed: Placed) {
+        let address = placed.key.address;
+        for b in Self::buckets_of(address, address + placed.bytes) {
+            self.buckets.entry(b).or_default().push(address);
+        }
+        self.by_address.insert(address, placed);
+    }
+
+    fn unplace(&mut self, address: u64) {
+        let Some(placed) = self.by_address.remove(&address) else {
+            return;
+        };
+        for b in Self::buckets_of(address, address + placed.bytes) {
+            if let Some(list) = self.buckets.get_mut(&b) {
+                list.retain(|a| *a != address);
+                if list.is_empty() {
+                    self.buckets.remove(&b);
+                }
+            }
+        }
+    }
+
+    /// The targets of one aspect (color or not) whose memory overlaps `[start, end)`, in the
+    /// order they were drawn to.
+    fn overlapping(&self, start: u64, end: u64, color: bool) -> Vec<Covering> {
+        let mut addresses: Vec<u64> = self
+            .buckets
+            .range(Self::buckets_of(start, end))
+            .flat_map(|(_, list)| list.iter().copied())
+            .collect();
+        addresses.sort_unstable();
+        addresses.dedup();
         let mut found: Vec<Covering> = Vec::new();
-        for (&address, placed) in self.by_address.range(from..end) {
-            // Most of the targets in the range are further away than the texture reaches.
-            if !placed.color || placed.bytes == 0 || address + placed.bytes <= start {
+        for address in addresses {
+            let Some(placed) = self.by_address.get(&address) else {
+                continue;
+            };
+            if placed.color != color
+                || placed.bytes == 0
+                || address >= end
+                || address + placed.bytes <= start
+            {
                 continue;
             }
             if let Some(t) = self.map.get(&placed.key) {
@@ -352,25 +391,16 @@ impl Targets {
         found
     }
 
+    /// The color targets whose memory overlaps `[start, end)` (addresses in the guest process),
+    /// in the order they were drawn to.
+    pub fn covering(&self, start: u64, end: u64) -> Vec<Covering> {
+        self.overlapping(start, end, true)
+    }
+
     /// The depth targets whose memory overlaps `[start, end)`, in the order they were drawn to:
     /// the cascades of a shadow map that a texture samples as the layers of one array (A-275).
     pub fn depth_covering(&self, start: u64, end: u64) -> Vec<Covering> {
-        let from = start.saturating_sub(self.largest);
-        let mut found: Vec<Covering> = Vec::new();
-        for (&address, placed) in self.by_address.range(from..end) {
-            if placed.color || placed.bytes == 0 || address + placed.bytes <= start {
-                continue;
-            }
-            if let Some(t) = self.map.get(&placed.key) {
-                found.push(Covering {
-                    key: t.key,
-                    serial: t.serial,
-                    dirty: t.dirty,
-                });
-            }
-        }
-        found.sort_by_key(|c| c.serial);
-        found
+        self.overlapping(start, end, false)
     }
 
     /// Put the pixels of the color targets `keys` into the memory they stand for, in the layout
@@ -670,7 +700,15 @@ impl Targets {
         let Some(t) = self.map.get(key) else {
             return false;
         };
-        t.baseline.is_some() && t.baseline == memory_hash(mem, key)
+        if let Some((at, baseline, answer)) = t.unchanged.get() {
+            if at == self.submissions && baseline == t.baseline {
+                return answer;
+            }
+        }
+        let answer = t.baseline.is_some() && t.baseline == memory_hash(mem, key);
+        t.unchanged
+            .set(Some((self.submissions, t.baseline, answer)));
+        answer
     }
 
     /// The targets nothing has drawn to for a long time, and whether each still waits to have its
@@ -710,7 +748,7 @@ impl Targets {
                 .get(&key.address)
                 .is_some_and(|p| p.key == *key)
             {
-                self.by_address.remove(&key.address);
+                self.unplace(key.address);
             }
         }
     }
@@ -1083,6 +1121,87 @@ fn small_float(bits: u32, mantissa_bits: u32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A target of `width` x 8 R8G8B8A8 texels (pitch linear) at `address`, without an image.
+    fn put(targets: &mut Targets, address: u64, width: u32, color: bool) -> Key {
+        let key = Key {
+            address,
+            format: if color {
+                vk::Format::R8G8B8A8_UNORM
+            } else {
+                vk::Format::D32_SFLOAT
+            },
+            width,
+            height: 8,
+            layers: 1,
+            tiling: Tiling::Pitch(width * 4),
+            block_depth_log2: 0,
+        };
+        let bytes = key.memory_bytes().unwrap();
+        targets.map.insert(
+            key,
+            Target {
+                key,
+                image: Image {
+                    image: vk::Image::null(),
+                    view: vk::ImageView::null(),
+                    memory: vk::DeviceMemory::null(),
+                    info: ImageInfo {
+                        format: key.format,
+                        width,
+                        height: 8,
+                        depth: 1,
+                        layers: 1,
+                        levels: 1,
+                        usage: vk::ImageUsageFlags::empty(),
+                        view_type: vk::ImageViewType::TYPE_2D,
+                        components: vk::ComponentMapping::default(),
+                    },
+                    extra_views: Vec::new(),
+                    bytes: 0,
+                },
+                layout: vk::ImageLayout::UNDEFINED,
+                touched: 0,
+                dirty: true,
+                serial: address,
+                baseline: None,
+                fresh: false,
+                unchanged: std::cell::Cell::new(None),
+            },
+        );
+        targets.place(Placed { key, bytes, color });
+        key
+    }
+
+    #[test]
+    fn the_targets_over_memory_are_found_by_its_parts() {
+        let mut t = Targets::default();
+        let mb = 1u64 << 20;
+        // One straddling the 2 MiB boundary at 0x4020_0000, one far below, one far above, and a
+        // depth target inside the first.
+        let a = put(&mut t, 0x4000_0000 + 2 * mb - 64, 64, true);
+        let far = put(&mut t, 0x3000_0000, 64, true);
+        let above = put(&mut t, 0x5000_0000, 64, true);
+        let depth = put(&mut t, 0x4000_0000, 16, false);
+        let keys = |v: Vec<Covering>| v.into_iter().map(|c| c.key).collect::<Vec<_>>();
+        // The bytes just past the boundary are the first target's.
+        assert_eq!(keys(t.covering(0x4020_0000, 0x4020_0010)), vec![a]);
+        assert_eq!(
+            keys(t.depth_covering(0x4000_0000, 0x4100_0000)),
+            vec![depth]
+        );
+        // A large range finds every color target in it, in the order they were drawn to.
+        assert_eq!(
+            keys(t.covering(0x2000_0000, 0x6000_0000)),
+            vec![far, a, above]
+        );
+        // Nothing beside them.
+        assert!(t.covering(0x4100_0000, 0x4800_0000).is_empty());
+        // Let go, a target is not found.
+        t.unplace(a.address);
+        t.map.remove(&a);
+        assert!(t.covering(0x4020_0000, 0x4020_0010).is_empty());
+    }
 
     #[test]
     fn half_floats_convert() {
