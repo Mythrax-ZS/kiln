@@ -328,7 +328,12 @@ impl Core {
             );
         }
         lap(&mut self.phases.compute[4]);
-        let flushed = self.flush();
+        let flushed = if self.debug.no_compute_wait && surfaces.is_empty() {
+            self.global_pending = true;
+            self.send_batch()
+        } else {
+            self.flush()
+        };
         if let Some(pool) = timestamps {
             let mut ticks = [0u64; 2];
             // SAFETY: the pool has two queries written by the launch that has run.

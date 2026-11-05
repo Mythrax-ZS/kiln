@@ -223,6 +223,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   `NX_DEBUG_ALWAYS_COMPARE=1` (every texture is compared with memory once a frame even where the
   tracking of writes says its memory is unchanged: that tracking does not see what the device writes
   into guest memory in place),
+  `NX_DEBUG_NO_COMPUTE_WAIT=1` (a compute launch that writes no surface is sent to the device and not
+  waited for: what the waits of A-110 cost, and whether a frame needs them),
   `NX_TRACE_TARGETS=1` (each render target configuration, the first time it is drawn to) and
   `NX_GPU_SYNC=1` runs the commands of a submission in the call that makes it (with a renderer they
   otherwise run on a thread of their own, A-124, and so do the media engines' jobs, A-184); `NX_GPU_LENIENT=1` skips a draw the renderer

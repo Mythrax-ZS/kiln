@@ -92,6 +92,10 @@ pub struct Debug {
     /// `NX_DEBUG_NO_OPTIMIZE=<hex address>[,...]`: the pipelines of the draws of those vertex
     /// programs are made with the driver's optimizations off (the driver's compiler, or the code?).
     pub no_optimize: Vec<u64>,
+    /// `NX_DEBUG_NO_COMPUTE_WAIT=1`: a compute launch that writes no surface is sent to the
+    /// device and not waited for (A-110 waits, so that later copies of guest memory see its
+    /// writes): what the waits cost, and whether a frame needs them.
+    pub no_compute_wait: bool,
 }
 
 impl Debug {
@@ -142,6 +146,7 @@ impl Debug {
             discard_programs: addresses("NX_DEBUG_DISCARD_PROGRAMS"),
             null_textures: addresses("NX_DEBUG_NULL_TEXTURES"),
             no_optimize: addresses("NX_DEBUG_NO_OPTIMIZE"),
+            no_compute_wait: set("NX_DEBUG_NO_COMPUTE_WAIT"),
             zero_cbuf_data: std::env::var("NX_DEBUG_ZERO_CBUF_DATA")
                 .ok()
                 .map(|v| {
