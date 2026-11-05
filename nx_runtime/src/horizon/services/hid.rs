@@ -251,6 +251,44 @@ impl Service for HidServer {
             }))),
             // ActivateDebugPad, ActivateTouchScreen, ActivateMouse, ActivateKeyboard (aruid, pid)
             1 | 11 | 21 | 31 => Ok(Response::ok()),
+            // InitializeJcms(u64 aruid, u64 size, transfer memory, pid), from
+            // nn::hid::InitializeJcms: the work memory of the Joy-Con mouse sensor, which
+            // publishes no samples here, so nothing is written to it (A-214).
+            3110 => {
+                if req.copy_handles.len() != 1 || req.u64_at(8) == 0 {
+                    return Err(Stop(format!(
+                        "hid 3110 with {} handles and {:#x} bytes",
+                        req.copy_handles.len(),
+                        req.u64_at(8)
+                    )));
+                }
+                Ok(Response::ok())
+            }
+            // InitializeNmouse(u8 pointer type, u32 width, u32 height, u32, u64 aruid, u64 size,
+            // transfer memory, pid), from nn::hid::InitializeNmouse: the work memory of the
+            // Joy-Con mouse pointer and its space, which no mouse moves here (A-214).
+            3139 => {
+                let (width, height, size) = (req.u32_at(4), req.u32_at(8), req.u64_at(24));
+                if req.copy_handles.len() != 1 || size == 0 || width == 0 || height == 0 {
+                    return Err(Stop(format!(
+                        "hid 3139 with {} handles, {size:#x} bytes and a {width}x{height} space",
+                        req.copy_handles.len()
+                    )));
+                }
+                Ok(Response::ok())
+            }
+            // SetTouchScreenResolution(u32 width, u32 height, aruid, pid) [17.0.0+]: the space of
+            // the touch coordinates; nobody touches the screen here (A-213).
+            1004 => {
+                if req.u32_at(0) == 0 || req.u32_at(4) == 0 {
+                    return Err(Stop(format!(
+                        "hid 1004: a touch screen of {}x{}",
+                        req.u32_at(0),
+                        req.u32_at(4)
+                    )));
+                }
+                Ok(Response::ok())
+            }
             // StartSixAxisSensor(handle, aruid, pid), StopSixAxisSensor(handle): the sensors
             // publish no samples (docs/ASSUMPTIONS.md A-070), so there is nothing to start
             66 | 67 => Ok(Response::ok()),
