@@ -6,6 +6,7 @@
 //! like are stable between runs. Nothing here talks to a network.
 
 use super::super::kernel::Kernel;
+use super::super::result::ResultCode;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
 use std::sync::Weak;
 
@@ -208,8 +209,14 @@ impl Service for Profile {
     }
 }
 
+/// The result `CheckAvailability` answers for a user without a network service account: 2124-0200,
+/// the first of the descriptions 200 to 271 that `nn::account::IsNetworkServiceAccountAvailable`
+/// takes to mean "unavailable" (docs/ASSUMPTIONS.md A-066).
+const NETWORK_SERVICE_ACCOUNT_UNAVAILABLE: ResultCode = ResultCode::new(124, 200);
+
 /// `nn::account::baas::IManagerForApplication`: the user's network service account, which this
-/// user does not have. Every command stops the run and names itself.
+/// user does not have. `CheckAvailability` says so; every other command stops the run and names
+/// itself.
 #[derive(Debug)]
 struct BaasManager;
 
@@ -219,9 +226,37 @@ impl Service for BaasManager {
     }
 
     fn request(&mut self, req: &Request) -> ServiceResult {
-        Err(Stop::unknown_command(
-            "IManagerForApplication (the user has no network service account)",
-            req.command,
-        ))
+        match req.command {
+            // CheckAvailability(): there is no account to use.
+            0 => Ok(Response::error(NETWORK_SERVICE_ACCOUNT_UNAVAILABLE)),
+            other => Err(Stop::unknown_command(
+                "IManagerForApplication (the user has no network service account)",
+                other,
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_network_service_account_is_unavailable_as_the_sdk_reads_it() {
+        let r = BaasManager.request(&Request::default()).unwrap();
+        let code = r.result.0;
+        // nn::account::IsNetworkServiceAccountAvailable: the account module, a description in
+        // 200..=271 once its lowest bit is cleared.
+        assert_eq!(code & 0x1FF, 124);
+        assert!((200..=271).contains(&((code >> 9) & 0x1FFE)));
+        let other = Request {
+            command: 1,
+            ..Request::default()
+        };
+        assert!(BaasManager
+            .request(&other)
+            .unwrap_err()
+            .0
+            .contains("network service account"));
     }
 }

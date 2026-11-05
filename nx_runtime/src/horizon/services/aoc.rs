@@ -35,6 +35,9 @@ impl Service for AddOnContent {
                 let _ = &self.kernel;
                 Ok(Response::ok().with_u32(0))
             }
+            // CheckAddOnContentMountStatus(pid) [9.0.0+]: fails when content the program mounted
+            // has gone (a card pulled out). None is installed, so none is mounted or lost.
+            50 => Ok(Response::ok()),
             other => Err(Stop::unknown_command("aoc:u", other)),
         }
     }
@@ -53,6 +56,8 @@ mod tests {
         };
         assert_eq!(a.request(&req(2)).unwrap().data, [0, 0, 0, 0]);
         assert_eq!(a.request(&req(3)).unwrap().data, [0, 0, 0, 0]);
+        let mounted = a.request(&req(50)).unwrap();
+        assert!(mounted.result.is_success() && mounted.data.is_empty());
         assert!(a.request(&req(7)).is_err());
     }
 }
