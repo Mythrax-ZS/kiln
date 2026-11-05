@@ -3695,6 +3695,8 @@ fn the_audio_device_names_itself_and_is_stereo() {
         [2, 0, 0, 0],
         "two channels"
     );
+    let auto_tune = e.call(device, &Message::new(20)).data;
+    assert_eq!(auto_tune.first(), Some(&0), "no automatic volume tuning");
     assert_eq!(e.call(device, &Message::new(2)).data, 1.0f32.to_le_bytes());
     assert_eq!(
         e.call(device, &Message::new(4)).copied.len(),

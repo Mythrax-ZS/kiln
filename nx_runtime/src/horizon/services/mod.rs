@@ -8,6 +8,7 @@ pub(super) mod acc;
 mod aoc;
 mod apm;
 mod applet;
+mod aud;
 mod audout;
 mod audren;
 mod bsd;
@@ -113,6 +114,8 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     if kernel.process.platform() == crate::npdm::Platform::Nx2 {
         // GameChat, which nn::chat::Initialize opens at start-up (A-219).
         register(kernel, "chat:u", chat::ChatService::new);
+        // The audio services' Switch 2 entry (A-223).
+        register(kernel, "aud:u", aud::UserClient::new);
     }
 }
 

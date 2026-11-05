@@ -1,6 +1,6 @@
 //! `audren:u`, the audio renderer (Switchbrew, "Audio services"; the layouts of the update buffers
 //! are those `libnx` documents for the revisions 1 to 6 of the renderer, used as they are for 7 to
-//! 11: docs/ASSUMPTIONS.md A-140).
+//! 15: docs/ASSUMPTIONS.md A-140).
 //!
 //! The renderer is what a program can see of the console's audio DSP (docs/ASSUMPTIONS.md A-075,
 //! A-125). Each update is answered with the state of the memory pools, voices and sinks, and plays
@@ -30,10 +30,17 @@ const FRAME_PERIOD: Duration = Duration::from_millis(5);
 
 /// The `REV` tag every revision number carries in its low three bytes.
 const REVISION_TAG: u32 = 0x0056_4552;
+/// The tag of a Switch 2 program's revisions, `REv`: the same numbers (docs/ASSUMPTIONS.md A-140).
+const SWITCH_2_REVISION_TAG: u32 = 0x0076_4552;
+
+/// Whether `revision` carries one of the two tags.
+fn is_revision_tag(revision: u32) -> bool {
+    matches!(revision & 0x00FF_FFFF, REVISION_TAG | SWITCH_2_REVISION_TAG)
+}
 
 /// The newest revision a program may ask for: 6 is the last whose layouts `libnx` documents, and
-/// 7 to 11 are taken to have the same section sizes (docs/ASSUMPTIONS.md A-140).
-const LAST_KNOWN_REVISION: u32 = 11;
+/// 7 to 15 are taken to have the same section sizes (docs/ASSUMPTIONS.md A-140).
+const LAST_KNOWN_REVISION: u32 = 15;
 
 /// The size of the parameter block `OpenAudioRenderer` and `GetWorkBufferSize` take.
 const PARAMETER_SIZE: usize = 0x34;
@@ -45,6 +52,10 @@ const HEADER_SIZE: usize = 0x40;
 const MEMPOOL_IN: usize = 0x20;
 const MEMPOOL_OUT: usize = 0x10;
 const VOICE_IN: usize = 0x170;
+/// From revision 15 on a voice's parameters are 0x188 bytes: its two biquad filters have float
+/// coefficients (0x18 bytes each, not 0xC), which moves what follows them by 0x18 (A-225).
+const VOICE_IN_V2: usize = 0x188;
+const VOICE_IN_V2_REVISION: u32 = 15;
 const VOICE_OUT: usize = 0x10;
 const CHANNEL_IN: usize = CHANNEL_SIZE;
 const EFFECT_IN: usize = 0xC0;
@@ -228,11 +239,16 @@ impl Core {
             ));
         }
         let revision = u32_at(input, 0);
-        if revision & 0x00FF_FFFF != REVISION_TAG {
+        if !is_revision_tag(revision) {
             return Err(format!(
                 "an audio renderer update with revision {revision:#x}"
             ));
         }
+        let voice_in = if revision_number(revision) >= VOICE_IN_V2_REVISION {
+            VOICE_IN_V2
+        } else {
+            VOICE_IN
+        };
         let behavior = u32_at(input, 0x04) as usize;
         let pools = u32_at(input, 0x08) as usize;
         let voices = u32_at(input, 0x0C) as usize;
@@ -254,9 +270,9 @@ impl Core {
         }
         if behavior != BEHAVIOR_IN
             || !pools.is_multiple_of(MEMPOOL_IN)
-            || !voices.is_multiple_of(VOICE_IN)
+            || !voices.is_multiple_of(voice_in)
             || !channels.is_multiple_of(CHANNEL_IN)
-            || voices / VOICE_IN != channels / CHANNEL_IN
+            || voices / voice_in != channels / CHANNEL_IN
             || total > input.len()
             || HEADER_SIZE + behavior + pools + channels + voices > total
         {
@@ -268,7 +284,7 @@ impl Core {
             ));
         }
         let pool_count = pools / MEMPOOL_IN;
-        let voice_count = voices / VOICE_IN;
+        let voice_count = voices / voice_in;
         if voice_count != self.voices.len() {
             return Err(format!(
                 "an audio renderer update with {voice_count} voices for a renderer opened with {}",
@@ -395,8 +411,13 @@ impl Core {
 
         // Voices: one audio frame of the wave buffers of every voice that is playing, mixed.
         for i in 0..voice_count {
-            let base = voices_at + i * VOICE_IN;
-            let v = VoiceIn::parse(&input[base..base + VOICE_IN]);
+            let base = voices_at + i * voice_in;
+            let entry = &input[base..base + voice_in];
+            let v = if voice_in == VOICE_IN_V2 {
+                VoiceIn::parse(&voice_v1(entry))
+            } else {
+                VoiceIn::parse(entry)
+            };
             if v.used && v.format == Format::Unsupported && self.said_formats & (1 << (i % 32)) == 0
             {
                 self.said_formats |= 1 << (i % 32);
@@ -702,12 +723,29 @@ impl Service for Device {
             12 => Ok(Response::ok().with_copy_handle(self.events[2].1.clone())),
             // GetActiveChannelCount() -> u32
             5 => Ok(Response::ok().with_u32(ACTIVE_CHANNELS)),
+            // IsAudioDeviceOutputVolumeAutoTuneEnabled() -> bool [18.0.0+]: the console's output
+            // volume is not tuned to what plays (a setting, off unless the user turns it on;
+            // docs/ASSUMPTIONS.md A-224).
+            20 => Ok(Response::ok().with_bytes(&[0])),
             other => Err(Stop::unknown_command("IAudioDevice", other)),
         }
     }
 }
 
-/// The number of a revision: its top byte is a character, '1' to '9', then ':' for 10, ';' for 11.
+/// A revision 15 voice's parameters (`VOICE_IN_V2`) in the layout of the earlier revisions (A-225):
+/// the same up to the filters, whose coefficients are dropped (filters are not applied, A-125) but
+/// whose enabled flags are kept, and the same from the wave buffer count on, 0x18 bytes further.
+fn voice_v1(v2: &[u8]) -> [u8; VOICE_IN] {
+    let mut v1 = [0u8; VOICE_IN];
+    v1[..0x24].copy_from_slice(&v2[..0x24]);
+    v1[0x24] = v2[0x24];
+    v1[0x30] = v2[0x3C];
+    v1[0x3C..].copy_from_slice(&v2[0x54..0x54 + (VOICE_IN - 0x3C)]);
+    v1
+}
+
+/// The number of a revision: its top byte is a character, '1' to '9', then ':' for 10, ';' for 11,
+/// on to '?' for 15.
 fn revision_number(revision: u32) -> u32 {
     (revision >> 24).wrapping_sub(u32::from(b'0'))
 }
@@ -715,7 +753,7 @@ fn revision_number(revision: u32) -> u32 {
 /// A program that asks for a revision newer than the layouts known here stops the run: its update
 /// buffers would be read wrongly.
 fn check_revision(params: &Parameters) -> Result<(), Stop> {
-    let tag_ok = params.revision & 0x00FF_FFFF == REVISION_TAG;
+    let tag_ok = is_revision_tag(params.revision);
     let number = revision_number(params.revision);
     match (tag_ok, number) {
         (true, n) if (1..=LAST_KNOWN_REVISION).contains(&n) => Ok(()),
@@ -1272,6 +1310,26 @@ mod tests {
     }
 
     #[test]
+    fn a_revision_15_voice_reads_as_the_earlier_layout() {
+        // A voice of the earlier layout with every byte telling, its filters' coefficients zero.
+        let mut v1 = [0u8; VOICE_IN];
+        for (i, b) in v1.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(1);
+        }
+        v1[0x25..0x30].fill(0);
+        v1[0x31..0x3C].fill(0);
+        // The same voice in revision 15's layout: float filters of 0x18 bytes each.
+        let mut v2 = vec![0u8; VOICE_IN_V2];
+        v2[..0x24].copy_from_slice(&v1[..0x24]);
+        v2[0x24] = v1[0x24];
+        v2[0x3C] = v1[0x30];
+        v2[0x54..].copy_from_slice(&v1[0x3C..]);
+        assert_eq!(voice_v1(&v2), v1);
+        let (a, b) = (VoiceIn::parse(&v1), VoiceIn::parse(&voice_v1(&v2)));
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+
+    #[test]
     fn revisions_are_checked_against_what_is_known() {
         let with = |revision: u32| Parameters {
             revision,
@@ -1282,9 +1340,14 @@ mod tests {
         assert!(check_revision(&with(0x3956_4552)).is_ok(), "REV9");
         assert!(check_revision(&with(0x3A56_4552)).is_ok(), "REV10");
         assert!(check_revision(&with(0x3B56_4552)).is_ok(), "REV11");
+        assert!(check_revision(&with(0x3F56_4552)).is_ok(), "REV15");
         assert!(
-            check_revision(&with(0x3C56_4552)).is_err(),
-            "REV12 is not known"
+            check_revision(&with(0x3F76_4552)).is_ok(),
+            "REv15, a Switch 2 title's"
+        );
+        assert!(
+            check_revision(&with(0x4056_4552)).is_err(),
+            "REV16 is not known"
         );
         assert!(check_revision(&with(0x3056_4552)).is_err(), "nor REV0");
         assert!(check_revision(&with(0x3156_4553)).is_err(), "not a REV tag");
