@@ -53,6 +53,13 @@ pub mod progress {
     /// Draws and clears given to the backend.
     pub static COMMANDS: AtomicU64 = AtomicU64::new(0);
 
+    /// Submissions stopped at a semaphore acquire, waiting for another channel (A-238).
+    pub static PARKED: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn set_parked(n: usize) {
+        PARKED.store(n as u64, Ordering::Relaxed);
+    }
+
     /// A method was written.
     pub(crate) fn method() {
         METHODS.fetch_add(1, Ordering::Relaxed);

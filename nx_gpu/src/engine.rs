@@ -187,6 +187,9 @@ pub struct Cx<'a> {
     pub macros: &'a mut mme64::Store,
     /// The QMDs of version 3 scheduled or waited for (A-210).
     pub qmds: &'a mut qmd3::Scheduler,
+    /// What the channel waits for, once a semaphore acquire that the memory does not satisfy
+    /// yet has stopped it: it goes on from there when the memory does (A-238).
+    pub blocked: Option<String>,
 }
 
 /// GPU memory as the QMD scheduler reads and writes it.
@@ -1366,6 +1369,7 @@ mod tests {
                 level: 0,
                 macros: &mut macros,
                 qmds: &mut qmds,
+                blocked: None,
             };
             f(&mut cx)
         };

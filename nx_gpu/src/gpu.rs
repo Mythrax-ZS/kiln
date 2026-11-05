@@ -5,7 +5,7 @@ use crate::error::NvError;
 use crate::event::EventToken;
 use crate::mem::GuestMemory;
 use crate::nvmap::Nvmap;
-use crate::pushbuf::GpEntry;
+use crate::pushbuf::{GpEntry, MethodWrite};
 use crate::render::Backend;
 use crate::syncpt::{reached, Syncpoints};
 use crate::vm::AddressSpace;
@@ -123,6 +123,10 @@ pub struct Gpu {
     pub mme64: crate::mme64::Store,
     /// The QMDs of version 3 scheduled or waited for, of all channels (A-210).
     pub qmds: crate::qmd3::Scheduler,
+    /// Jobs stopped at a semaphore acquire, in the order they stopped (A-238).
+    parked: Vec<Job>,
+    /// The events that kept jobs set when they ended, for the next submission that ends.
+    later: Vec<EventToken>,
     next_space: u32,
     next_channel: u32,
 }
@@ -162,6 +166,8 @@ impl Gpu {
             queue: None,
             mme64: Default::default(),
             qmds: Default::default(),
+            parked: Vec::new(),
+            later: Vec::new(),
             next_space: 1,
             next_channel: 1,
         }
@@ -352,6 +358,9 @@ impl Gpu {
             target,
             entries: parts,
             next: 0,
+            word: 0,
+            pending: None,
+            waits: String::new(),
             started: false,
             woken: Vec::new(),
         })
@@ -359,8 +368,99 @@ impl Gpu {
 
     /// Run the next entry of a job, or finish it when none is left: the renderer is told the
     /// submission ended, then the fences are completed. Returns what the submission leaves once it
-    /// is over.
+    /// is over. A job that stops at a semaphore acquire the memory does not satisfy yet is kept
+    /// here and goes on once it does; for the caller it is over, with the fence it was promised
+    /// (A-238). The jobs kept are tried again before each step.
     pub fn step(&mut self, job: &mut Job) -> Result<Option<Submitted>, SubmitError> {
+        self.retry_parked()?;
+        // The submissions of a channel run in order: behind one that waits, a later one waits.
+        if !job.started && self.parked.iter().any(|p| p.channel == job.channel) {
+            let why = "the submission before it on its channel".to_string();
+            return self.park(job, why).map(Some);
+        }
+        match self.advance(job)? {
+            Advance::More => Ok(None),
+            Advance::Blocked(why) => self.park(job, why).map(Some),
+            Advance::Done(mut done) => {
+                done.woken.append(&mut self.later);
+                Ok(Some(done))
+            }
+        }
+    }
+
+    /// Keep `job`, which waits for `why`, to be run on later; what its caller is given.
+    fn park(&mut self, job: &mut Job, why: String) -> Result<Submitted, SubmitError> {
+        if job.flags & submit_flags::FENCE_GET != 0 {
+            return Err(SubmitError::Unimplemented(format!(
+                "a submission whose fence is made when it ends waits for {why}"
+            )));
+        }
+        if self.level >= 1 {
+            eprintln!("[gpu] channel {} waits for {why}", job.channel);
+        }
+        let fence = Gpu::promised_fence(job);
+        let mut parked = std::mem::replace(job, Job::empty(job.channel));
+        parked.waits = why;
+        self.parked.push(parked);
+        crate::progress::set_parked(self.parked.len());
+        Ok(Submitted {
+            fence,
+            woken: std::mem::take(&mut self.later),
+        })
+    }
+
+    /// Run the kept jobs as far as they go, the first of each channel first, until none moves.
+    /// The events the ones that end set are given with the next submission that ends.
+    fn retry_parked(&mut self) -> Result<(), SubmitError> {
+        if self.parked.is_empty() {
+            return Ok(());
+        }
+        loop {
+            let mut moved = false;
+            let mut waiting: Vec<u32> = Vec::new();
+            let mut i = 0;
+            while i < self.parked.len() {
+                let channel = self.parked[i].channel;
+                if waiting.contains(&channel) {
+                    i += 1;
+                    continue;
+                }
+                let mut job = self.parked.remove(i);
+                loop {
+                    match self.advance(&mut job)? {
+                        Advance::More => moved = true,
+                        Advance::Blocked(why) => {
+                            job.waits = why;
+                            self.parked.insert(i, job);
+                            waiting.push(channel);
+                            i += 1;
+                            break;
+                        }
+                        Advance::Done(done) => {
+                            self.later.extend(done.woken);
+                            moved = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            crate::progress::set_parked(self.parked.len());
+            if !moved || self.parked.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// What the kept jobs wait for, one line each (for a report of a run that stopped).
+    pub fn parked(&self) -> Vec<String> {
+        self.parked
+            .iter()
+            .map(|j| format!("channel {}: {}", j.channel, j.waits))
+            .collect()
+    }
+
+    /// Run the next entry of a job (or as much of it as the semaphores let it), or finish it.
+    fn advance(&mut self, job: &mut Job) -> Result<Advance, SubmitError> {
         use submit_flags::*;
         let unimplemented = |why: String| SubmitError::Unimplemented(why);
         if !job.started {
@@ -387,19 +487,25 @@ impl Gpu {
         }
         if job.next < job.entries.len() {
             let i = job.next;
-            job.next += 1;
-            self.stats.entries += 1;
-            let (entry, bytes) = &job.entries[i];
-            if entry.words == 0 {
-                return Ok(None);
-            }
-            if self.level >= 1 {
-                eprintln!(
-                    "[gpu]   entry {i}: {} words at {:#x}{}",
-                    entry.words,
-                    entry.va,
-                    if entry.sync_wait { ", sync" } else { "" }
-                );
+            let resuming = job.word != 0 || job.pending.is_some();
+            let Job {
+                entries,
+                word,
+                pending,
+                woken,
+                ..
+            } = job;
+            let (entry, bytes) = &entries[i];
+            if !resuming {
+                self.stats.entries += 1;
+                if self.level >= 1 && entry.words != 0 {
+                    eprintln!(
+                        "[gpu]   entry {i}: {} words at {:#x}{}",
+                        entry.words,
+                        entry.va,
+                        if entry.sync_wait { ", sync" } else { "" }
+                    );
+                }
             }
             // The channel's state is out of the table while its commands run, which nobody can
             // see: the caller holds the whole device.
@@ -416,7 +522,7 @@ impl Gpu {
                     mem: &*self.mem,
                     space,
                     syncpoints: &mut self.syncpoints,
-                    woken: &mut job.woken,
+                    woken,
                     stats: &mut self.stats,
                     backend: self.backend.as_deref_mut(),
                     lenient: self.lenient,
@@ -425,22 +531,42 @@ impl Gpu {
                     level: self.level,
                     macros: &mut self.mme64,
                     qmds: &mut self.qmds,
+                    blocked: None,
                 };
                 let _phase = crate::progress::enter(crate::progress::METHODS_RUNNING);
-                for chunk in bytes.as_chunks::<4>().0 {
-                    let word = u32::from_le_bytes(*chunk);
+                // The write that stopped the channel is made again first.
+                if let Some(w) = pending.take() {
+                    ch.execute(&mut cx, w).map_err(unimplemented)?;
+                    if let Some(why) = cx.blocked.take() {
+                        *pending = Some(w);
+                        return Ok(Some(why));
+                    }
+                }
+                let words = bytes.as_chunks::<4>().0;
+                while let Some(chunk) = words.get(*word) {
+                    *word += 1;
                     cx.stats.words += 1;
-                    match ch.pusher.feed(word) {
-                        Ok(Some(w)) => ch.execute(&mut cx, w).map_err(unimplemented)?,
+                    match ch.pusher.feed(u32::from_le_bytes(*chunk)) {
+                        Ok(Some(w)) => {
+                            ch.execute(&mut cx, w).map_err(unimplemented)?;
+                            if let Some(why) = cx.blocked.take() {
+                                *pending = Some(w);
+                                return Ok(Some(why));
+                            }
+                        }
                         Ok(None) => {}
                         Err(e) => return Err(unimplemented(e.0)),
                     }
                 }
-                Ok(())
+                Ok(None)
             })();
             self.channels.insert(job.channel, ch);
-            result?;
-            return Ok(None);
+            if let Some(why) = result? {
+                return Ok(Advance::Blocked(why));
+            }
+            job.next += 1;
+            job.word = 0;
+            return Ok(Advance::More);
         }
         // What was recorded for the renderer is finished before any fence says it is.
         if let Some(backend) = self.backend.as_deref_mut() {
@@ -476,7 +602,7 @@ impl Gpu {
         if self.level >= 1 && out != fence {
             eprintln!("[gpu]   fence out ({}, {})", out.0, out.1);
         }
-        Ok(Some(Submitted { fence: out, woken }))
+        Ok(Advance::Done(Submitted { fence: out, woken }))
     }
 
     /// The fence a deferred submission gives back at once.
@@ -551,12 +677,47 @@ pub struct Job {
     /// The entries and the commands each points at, read when the submission was accepted.
     entries: Vec<(GpEntry, Vec<u8>)>,
     next: usize,
+    /// The word of entry `next` to feed next, and the method write that stopped the job at a
+    /// semaphore acquire, to be made again (A-238).
+    word: usize,
+    pending: Option<MethodWrite>,
+    /// What a job that waits waits for.
+    waits: String,
     started: bool,
     /// The events the syncpoint increments of the commands have set so far.
     woken: Vec<EventToken>,
 }
 
+/// How far a step took a job.
+enum Advance {
+    /// It has more to run.
+    More,
+    /// It stopped at a semaphore acquire, which waits for this.
+    Blocked(String),
+    /// It is over.
+    Done(Submitted),
+}
+
 impl Job {
+    /// A job with nothing in it, left with the caller of a job that was kept.
+    fn empty(channel: u32) -> Job {
+        Job {
+            channel,
+            space: 0,
+            syncpt: 0,
+            flags: 0,
+            fence: (0, 0),
+            target: 0,
+            entries: Vec::new(),
+            next: 0,
+            word: 0,
+            pending: None,
+            waits: String::new(),
+            started: true,
+            woken: Vec::new(),
+        }
+    }
+
     /// The channel the commands run on.
     pub fn channel(&self) -> u32 {
         self.channel

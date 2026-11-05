@@ -358,6 +358,31 @@ mod tests {
         u32,
         u32,
     ) {
+        let (nv, mem, _, ch, syncpt) = ready_with_space();
+        (nv, mem, ch, syncpt)
+    }
+
+    /// Another channel in the address space `as_fd`, with a queue and a 3D object: its
+    /// descriptor and syncpoint.
+    fn another_channel(nv: &mut Nvdrv, as_fd: u32) -> (u32, u32) {
+        let ch = nv.open("/dev/nvhost-gpu").unwrap();
+        call(nv, as_fd, BIND_CHANNEL_CODE, &ch.to_le_bytes());
+        let mut ex2 = vec![0u8; 32];
+        ex2[..4].copy_from_slice(&0x800u32.to_le_bytes());
+        let (_, out) = call(nv, ch, ALLOC_GPFIFO_EX2_CODE, &ex2);
+        let (e, _) = call(nv, ch, ALLOC_OBJ_CTX_CODE, &u32s(&[0xB197, 0, 0, 0]));
+        assert_eq!(e, NvError::SUCCESS);
+        (ch, out.u32(12))
+    }
+
+    /// [`ready`], with the address space's descriptor too.
+    fn ready_with_space() -> (
+        Nvdrv,
+        std::sync::Arc<crate::mem::testing::TestMemory>,
+        u32,
+        u32,
+        u32,
+    ) {
         let (mut nv, mem) = nvdrv();
         mem.map(0x2000_0000, 0x1000);
         let nvmap = nv.open("/dev/nvmap").unwrap();
@@ -384,7 +409,68 @@ mod tests {
         let syncpt = out.u32(12);
         let (e, _) = call(&mut nv, ch, ALLOC_OBJ_CTX_CODE, &u32s(&[0xB197, 0, 0, 0]));
         assert_eq!(e, NvError::SUCCESS);
-        (nv, mem, ch, syncpt)
+        (nv, mem, as_fd, ch, syncpt)
+    }
+
+    #[test]
+    fn a_channel_waits_at_an_acquire_until_another_channel_releases() {
+        let (mut nv, mem, as_fd, first, first_syncpt) = ready_with_space();
+        let (second, second_syncpt) = another_channel(&mut nv, as_fd);
+        // SEMAPHOREA..D as one increasing command: address 0x500_0200, payload, operation.
+        let semaphore = |at: u32, payload: u32, op: u32| [0x2004_0004, 0, at, payload, op];
+        let release = 2 | 1 << 24;
+        // The first channel acquires 1 at 0x500_0200, then releases 0xA at 0x500_0300.
+        let mut pb = semaphore(0x500_0200, 1, 1).to_vec();
+        pb.extend(semaphore(0x500_0300, 0xA, release));
+        assert!(mem.write(0x2000_0000, &words(&pb)));
+        let (e, out) = submit(
+            &mut nv,
+            first,
+            &[entry(0x500_0000, 10)],
+            0x104,
+            (first_syncpt, 1),
+        );
+        assert_eq!(e, NvError::SUCCESS);
+        assert_eq!(
+            (out.u32(16), out.u32(20)),
+            (first_syncpt, 1),
+            "the fence is promised"
+        );
+        assert_eq!(mem.read_u32(0x2000_0300), Some(0), "the channel waits");
+        assert_eq!(nv.gpu.syncpoints.value(first_syncpt), Some(0));
+        // A later submission of the same channel waits behind it.
+        assert!(mem.write(0x2000_0040, &words(&semaphore(0x500_0304, 0xB, release))));
+        let (e, _) = submit(
+            &mut nv,
+            first,
+            &[entry(0x500_0040, 5)],
+            0x104,
+            (first_syncpt, 1),
+        );
+        assert_eq!(e, NvError::SUCCESS);
+        assert_eq!(mem.read_u32(0x2000_0304), Some(0));
+        assert_eq!(nv.gpu.parked().len(), 2, "{:?}", nv.gpu.parked());
+        assert!(
+            nv.gpu.parked()[0].contains("holds 0x0"),
+            "{:?}",
+            nv.gpu.parked()
+        );
+        // The second channel releases 1 there: the first goes on, both of its submissions end.
+        assert!(mem.write(0x2000_0080, &words(&semaphore(0x500_0200, 1, release))));
+        let (e, _) = submit(
+            &mut nv,
+            second,
+            &[entry(0x500_0080, 5)],
+            0x104,
+            (second_syncpt, 1),
+        );
+        assert_eq!(e, NvError::SUCCESS);
+        assert_eq!(mem.read_u32(0x2000_0300), Some(0xA));
+        assert_eq!(mem.read_u32(0x2000_0304), Some(0xB));
+        assert_eq!(nv.gpu.syncpoints.value(first_syncpt), Some(2));
+        assert_eq!(nv.gpu.syncpoints.value(second_syncpt), Some(1));
+        assert!(nv.gpu.parked().is_empty());
+        assert_eq!(nv.gpu.stats.words, 20, "each word once");
     }
 
     /// A pushbuffer entry for `words` words at GPU address `va`.

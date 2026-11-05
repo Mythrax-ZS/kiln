@@ -137,6 +137,12 @@ fn watch(kernel: &Kernel, limit: Duration) {
             c - commands,
             nx_gpu::progress::phase()
         );
+        let parked = nx_gpu::progress::PARKED.load(Ordering::Relaxed);
+        if parked > 0 {
+            eprintln!(
+                "[watchdog]   {parked} submissions wait at a semaphore acquire for another channel"
+            );
+        }
         (methods, commands) = (m, c);
         report_threads(kernel, "watchdog");
     }

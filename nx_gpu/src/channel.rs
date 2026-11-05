@@ -201,14 +201,15 @@ impl Channel {
                     4 => (have as i32) >= (payload as i32),
                     _ => have & payload != 0,
                 };
-                if ok {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "a semaphore acquire at GPU address {va:#x} for {payload:#x}, which holds \
-                         {have:#x} and nothing is left to change it"
-                    ))
+                // Not yet: the channel stops here until another channel's commands (or the
+                // program) put the value there, and this write is made again then (A-238).
+                if !ok {
+                    cx.blocked = Some(format!(
+                        "a semaphore acquire at GPU address {va:#x} for {payload:#x} (operation \
+                         {d:#x}), which holds {have:#x}"
+                    ));
                 }
+                Ok(())
             }
             op => Err(format!("semaphore operation {op:#x} is not implemented")),
         }
@@ -274,8 +275,15 @@ mod tests {
                 level: 0,
                 macros: &mut macros,
                 qmds: &mut qmds,
+                blocked: None,
             };
-            ws.iter().map(|w| ch.execute(&mut cx, *w)).collect()
+            // A write that stops the channel at an acquire is reported with what it waits for.
+            ws.iter()
+                .map(|w| {
+                    ch.execute(&mut cx, *w)
+                        .and_then(|()| cx.blocked.take().map_or(Ok(()), Err))
+                })
+                .collect()
         };
         (results, mem, stats)
     }
@@ -311,6 +319,7 @@ mod tests {
             level: 0,
             macros: &mut macros,
             qmds: &mut qmds,
+            blocked: None,
         };
         let mut ch = Channel::default();
         // SEMAPHOREA..D at syncpoint 5's word of the shim, payload `want`, operation `op`.
@@ -323,7 +332,13 @@ mod tests {
         };
         assert_eq!(semaphore(&mut cx, 3, 1), Ok(()), "acquire: the value is 3");
         assert_eq!(semaphore(&mut cx, 2, 4 | 1 << 31), Ok(()), "acquire-geq 2");
-        assert!(semaphore(&mut cx, 4, 1).is_err(), "4 is not reached");
+        assert_eq!(cx.blocked, None);
+        assert_eq!(semaphore(&mut cx, 4, 1), Ok(()));
+        let blocked = cx
+            .blocked
+            .take()
+            .expect("4 is not reached: the channel waits");
+        assert!(blocked.contains("holds 0x3"), "{blocked}");
         let release = semaphore(&mut cx, 9, 2 | 1 << 24).unwrap_err();
         assert!(release.contains("read-only"), "{release}");
     }
