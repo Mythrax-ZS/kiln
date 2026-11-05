@@ -6,8 +6,11 @@
 //! QMD with `SEND_PCAS_A` and then acts on it with `SEND_SIGNALING_PCAS2_B`: it schedules it, or
 //! changes how many other launches it still waits for (its dependence count, word 4). A QMD that
 //! is scheduled and waits for nothing more is launched; when it is done its releases are made and it
-//! may act on another QMD in turn (words 15 and 16), which is how NVN2 chains its queues.
+//! may act on another QMD in turn (words 15 and 16), which is how NVN2 chains its queues. The
+//! releases are handed back with the launch, to be made once it has run (A-274).
 
+use crate::mem::GuestMemory;
+use crate::vm::AddressSpace;
 use std::collections::HashMap;
 
 /// Words of a QMD.
@@ -83,11 +86,52 @@ impl Action {
     }
 }
 
-/// A launch's QMD, read from memory when it was launched.
+/// A launch's QMD, read from memory when it was launched, and the releases it makes when it is
+/// done, in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Launch {
     pub address: u64,
     pub qmd: [u32; WORDS],
+    pub releases: Vec<Release>,
+}
+
+/// A semaphore release of one word that a QMD makes when its launch is done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Release {
+    pub va: u64,
+    pub op: ReleaseOp,
+    pub payload: u32,
+}
+
+/// What a release puts in its word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseOp {
+    /// The payload.
+    Set,
+    /// The word plus the payload.
+    Add,
+    /// The larger of the word and the payload (NVN2 counts completions so, in a word other queues
+    /// advance too).
+    Max,
+}
+
+impl Release {
+    /// Make the release in memory now.
+    pub fn apply(&self, mem: &mut dyn Memory) -> Result<(), String> {
+        let value = match self.op {
+            ReleaseOp::Set => self.payload,
+            ReleaseOp::Add | ReleaseOp::Max => {
+                let mut old = [0u32];
+                mem.read(self.va, &mut old)?;
+                if self.op == ReleaseOp::Add {
+                    old[0].wrapping_add(self.payload)
+                } else {
+                    old[0].max(self.payload)
+                }
+            }
+        };
+        mem.write(self.va, &[value])
+    }
 }
 
 impl Launch {
@@ -125,6 +169,37 @@ pub trait Memory {
     fn write(&mut self, va: u64, words: &[u32]) -> Result<(), String>;
 }
 
+/// The memory of an address space.
+pub struct GpuMemory<'a> {
+    pub mem: &'a dyn GuestMemory,
+    pub space: &'a AddressSpace,
+}
+
+impl Memory for GpuMemory<'_> {
+    fn read(&mut self, va: u64, out: &mut [u32]) -> Result<(), String> {
+        let mut bytes = vec![0u8; out.len() * 4];
+        if !self.space.read(self.mem, va, &mut bytes) {
+            return Err(format!(
+                "a QMD read of GPU address {va:#x}, which is not mapped"
+            ));
+        }
+        for (w, b) in out.iter_mut().zip(bytes.as_chunks::<4>().0) {
+            *w = u32::from_le_bytes(*b);
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, va: u64, words: &[u32]) -> Result<(), String> {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        if !self.space.write(self.mem, va, &bytes) {
+            return Err(format!(
+                "a QMD release to GPU address {va:#x}, which is not mapped"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A QMD the scheduler has heard of and that has not been launched.
 #[derive(Clone, Copy, Debug, Default)]
 struct Entry {
@@ -153,8 +228,8 @@ const RELEASE_ONE_WORD: u32 = 1 << 30;
 const RELEASES: [usize; 3] = [24, 28, 52];
 
 impl Scheduler {
-    /// Act on the QMD at `address`. Returns the QMDs launched by it, in order: their releases are
-    /// made, and the actions they take on their dependents are applied.
+    /// Act on the QMD at `address`. Returns the QMDs launched by it, in order, each with the
+    /// releases to make once it is done; the actions they take on their dependents are applied.
     pub fn signal(
         &mut self,
         address: u64,
@@ -186,10 +261,15 @@ impl Scheduler {
                 self.entries.remove(&address);
                 let mut qmd = [0u32; WORDS];
                 mem.read(address, &mut qmd)?;
-                let launch = Launch { address, qmd };
+                let mut releases = Vec::new();
                 for slot in RELEASES {
-                    release(&launch.qmd[slot..slot + 3], mem)?;
+                    releases.extend(release(&qmd[slot..slot + 3])?);
                 }
+                let launch = Launch {
+                    address,
+                    qmd,
+                    releases,
+                };
                 let dependent = launch.qmd[16];
                 if dependent & 1 != 0 {
                     let target = u64::from(launch.qmd[15]) << 8;
@@ -212,29 +292,27 @@ fn load(entry: &mut Entry, address: u64, mem: &mut dyn Memory) -> Result<(), Str
     Ok(())
 }
 
-/// Make the release of a slot (low address, flags with the high address, payload), if it is on.
-fn release(slot: &[u32], mem: &mut dyn Memory) -> Result<(), String> {
+/// The release of a slot (low address, flags with the high address, payload), if it is on.
+fn release(slot: &[u32]) -> Result<Option<Release>, String> {
     let (low, flags, payload) = (slot[0], slot[1], slot[2]);
     if flags & RELEASE_ENABLE == 0 {
-        return Ok(());
+        return Ok(None);
     }
     if flags & RELEASE_UNKNOWN != 0 || flags & RELEASE_KIND != RELEASE_ONE_WORD {
         return Err(format!("a QMD release with the flags {flags:#x}"));
     }
-    let va = u64::from(flags & 0xFF) << 32 | u64::from(low);
-    let value = if flags & (RELEASE_ADD | RELEASE_MAX) != 0 {
-        let mut old = [0u32];
-        mem.read(va, &mut old)?;
-        if flags & RELEASE_ADD != 0 {
-            old[0].wrapping_add(payload)
-        } else {
-            // NVN2 counts completions with a maximum in a word others advance too.
-            old[0].max(payload)
-        }
+    let op = if flags & RELEASE_ADD != 0 {
+        ReleaseOp::Add
+    } else if flags & RELEASE_MAX != 0 {
+        ReleaseOp::Max
     } else {
-        payload
+        ReleaseOp::Set
     };
-    mem.write(va, &[value])
+    Ok(Some(Release {
+        va: u64::from(flags & 0xFF) << 32 | u64::from(low),
+        op,
+        payload,
+    }))
 }
 
 #[cfg(test)]
@@ -257,6 +335,23 @@ mod tests {
             self.0[at..at + words.len()].copy_from_slice(words);
             Ok(())
         }
+    }
+
+    /// Act on a QMD and make the releases of what it launched, as the GPU front does once the
+    /// launches are done.
+    fn run(
+        s: &mut Scheduler,
+        at: u64,
+        action: Action,
+        ram: &mut Ram,
+    ) -> Result<Vec<Launch>, String> {
+        let launched = s.signal(at, action, ram)?;
+        for l in &launched {
+            for r in &l.releases {
+                r.apply(ram)?;
+            }
+        }
+        Ok(launched)
     }
 
     impl Ram {
@@ -295,6 +390,14 @@ mod tests {
         ram.qmd(at, 0, Some((target, 0, 7)));
         let mut s = Scheduler::default();
         let launched = s.signal(at, Action::Schedule, &mut ram).unwrap();
+        assert_eq!(
+            ram.word(target),
+            0,
+            "the release waits for the launch to be done"
+        );
+        for r in &launched[0].releases {
+            r.apply(&mut ram).unwrap();
+        }
         assert_eq!(launched.len(), 1);
         assert_eq!(
             (
@@ -313,14 +416,17 @@ mod tests {
         let (at, target) = (BASE + 0x200, BASE + 0x8000);
         ram.qmd(at, 2, Some((target, 0, 9)));
         let mut s = Scheduler::default();
-        assert!(s
-            .signal(at, Action::Decrement(1), &mut ram)
+        assert!(run(&mut s, at, Action::Decrement(1), &mut ram)
             .unwrap()
             .is_empty());
-        assert!(s.signal(at, Action::Schedule, &mut ram).unwrap().is_empty());
+        assert!(run(&mut s, at, Action::Schedule, &mut ram)
+            .unwrap()
+            .is_empty());
         assert_eq!(ram.word(target), 0, "one launch still waited for");
         assert_eq!(
-            s.signal(at, Action::Decrement(1), &mut ram).unwrap().len(),
+            run(&mut s, at, Action::Decrement(1), &mut ram)
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(ram.word(target), 9);
@@ -341,14 +447,14 @@ mod tests {
         ram.set(target, 10);
         let mut s = Scheduler::default();
         ram.qmd(BASE + 0x300, 0, Some((target, RELEASE_ADD, 5)));
-        s.signal(BASE + 0x300, Action::Reload, &mut ram).unwrap();
+        run(&mut s, BASE + 0x300, Action::Reload, &mut ram).unwrap();
         assert_eq!(ram.word(target), 15);
         ram.qmd(BASE + 0x400, 0, Some((target, RELEASE_MAX, 12)));
-        s.signal(BASE + 0x400, Action::Schedule, &mut ram).unwrap();
+        run(&mut s, BASE + 0x400, Action::Schedule, &mut ram).unwrap();
         assert_eq!(ram.word(target), 15, "a maximum does not go back");
         // Flags whose meaning is not known stop the launch.
         ram.qmd(BASE + 0x500, 0, Some((target, 1 << 24, 1)));
-        assert!(s.signal(BASE + 0x500, Action::Schedule, &mut ram).is_err());
+        assert!(run(&mut s, BASE + 0x500, Action::Schedule, &mut ram).is_err());
     }
 
     #[test]
@@ -362,11 +468,10 @@ mod tests {
         ram.set(first + 16 * 4, 1 | 4 << 1);
         ram.qmd(second, 1, Some((target, 0, 3)));
         let mut s = Scheduler::default();
-        assert!(s
-            .signal(second, Action::Schedule, &mut ram)
+        assert!(run(&mut s, second, Action::Schedule, &mut ram)
             .unwrap()
             .is_empty());
-        let launched = s.signal(first, Action::Schedule, &mut ram).unwrap();
+        let launched = run(&mut s, first, Action::Schedule, &mut ram).unwrap();
         let addresses: Vec<u64> = launched.iter().map(|l| l.address).collect();
         assert_eq!(addresses, [first, second]);
         assert_eq!(ram.word(target), 3);

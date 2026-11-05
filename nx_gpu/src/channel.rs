@@ -180,6 +180,13 @@ impl Channel {
     fn semaphore_op(&mut self, cx: &mut Cx<'_>) -> Result<(), String> {
         let [a, b, payload, d] = self.semaphore;
         let va = (u64::from(a & 0xFF) << 32) | u64::from(b & !3);
+        // A release says the work before it is done; an acquire reads a word that a launch not
+        // waited for, or one of its releases, may write.
+        if d & 0x1F == 2 {
+            cx.settle()?;
+        } else {
+            cx.settle_range(va, 4)?;
+        }
         match d & 0x1F {
             2 => {
                 if d >> 24 & 1 != 0 {

@@ -236,3 +236,118 @@ fn a_vertex_program_sees_the_instance_counter_of_its_draw() {
     assert!(w.mem.read(w.cpu(OUT) + 8, &mut word));
     assert_eq!(u32::from_le_bytes(word), 0, "instance 2 was never drawn");
 }
+
+/// The word of guest memory at GPU address `va`.
+fn word_at(w: &World, va: u64) -> u32 {
+    let mut word = [0u8; 4];
+    assert!(w.mem.read(w.cpu(va), &mut word));
+    u32::from_le_bytes(word)
+}
+
+/// A launch of `code` (Maxwell code at `at`, one invocation) whose constant buffer 0 is the 16
+/// bytes at `cbuf`.
+fn launch(w: &mut World, at: u64, code: &[u64], cbuf: u64) -> nx_gpu::compute::Dispatch {
+    w.put(at, &nx_shader::asm::assemble(code));
+    let mut cbufs = [None; 8];
+    cbufs[0] = Some(nx_gpu::compute::CbufBinding {
+        address: cbuf,
+        size: 16,
+    });
+    nx_gpu::compute::Dispatch {
+        qmd: 0,
+        program: at,
+        grid: [1, 1, 1],
+        block: [1, 1, 1],
+        shared_bytes: 0,
+        cbufs,
+        sm86: false,
+    }
+}
+
+#[test]
+fn a_launch_is_waited_for_when_the_gpu_front_needs_what_it_wrote() {
+    let Some(vk) = vulkan() else { return };
+    if !vk.caps.external_memory_host || !vk.caps.buffer_device_address {
+        eprintln!("SKIPPED: the device cannot import host memory");
+        return;
+    }
+    let mut w = World::new();
+    bind_base(&mut w, OUT);
+    // The program stores a word at the address in c[0][0].
+    let code = [
+        ldc64(8, 0),
+        mov32i(12, 0x1234_5678),
+        stg(12, 8, 0, 4),
+        exit(Guard::ALWAYS),
+    ];
+    let d = launch(&mut w, GPU_BASE + 0x33_0000, &code, CBUF);
+    let mut r = Renderer::new(RenderConfig::default());
+    r.dispatch(&w.scene(), &d).unwrap();
+    // The release that follows the launch is made once the launch is waited for (A-274).
+    let flag = OUT + 0x100;
+    let release = nx_gpu::qmd3::Release {
+        va: flag,
+        op: nx_gpu::qmd3::ReleaseOp::Set,
+        payload: 7,
+    };
+    r.release(&w.space, &w.mem, release).unwrap();
+    assert_eq!(word_at(&w, flag), 0, "released before the launch had run");
+    assert_eq!(
+        r.launch_waits(),
+        [0; 4],
+        "the launch was waited for at once"
+    );
+    r.settle(&w.space, &w.mem, None).unwrap();
+    assert_eq!(
+        r.launch_waits(),
+        [1, 0, 0, 0],
+        "one wait, for the GPU front"
+    );
+    assert_eq!(word_at(&w, flag), 7);
+    assert_eq!(word_at(&w, OUT), 0x1234_5678);
+}
+
+#[test]
+fn a_launch_that_reads_what_the_one_before_it_wrote_waits_for_it() {
+    let Some(vk) = vulkan() else { return };
+    if !vk.caps.external_memory_host || !vk.caps.buffer_device_address {
+        eprintln!("SKIPPED: the device cannot import host memory");
+        return;
+    }
+    let mut w = World::new();
+    bind_base(&mut w, OUT);
+    let first = [
+        ldc64(8, 0),
+        mov32i(12, 0xCAFE_F00D),
+        stg(12, 8, 0, 4),
+        exit(Guard::ALWAYS),
+    ];
+    // The second reads its constant buffer 0, which is that word, and stores it 8 bytes on.
+    let to = OUT + 8;
+    let second = [
+        ldc64(12, 0),
+        mov32i(8, to as u32),
+        mov32i(9, (to >> 32) as u32),
+        stg(12, 8, 0, 4),
+        exit(Guard::ALWAYS),
+    ];
+    let a = launch(&mut w, GPU_BASE + 0x33_0000, &first, CBUF);
+    let b = launch(&mut w, GPU_BASE + 0x34_0000, &second, OUT);
+    let mut r = Renderer::new(RenderConfig::default());
+    r.dispatch(&w.scene(), &a).unwrap();
+    r.dispatch(&w.scene(), &b).unwrap();
+    // The device may have run the first launch before the second was recorded; the wait is
+    // what makes sure it has.
+    assert_eq!(
+        r.launch_waits()[2],
+        1,
+        "the second launch did not wait for the first"
+    );
+    r.settle(&w.space, &w.mem, None).unwrap();
+    assert_eq!(word_at(&w, OUT), 0xCAFE_F00D);
+    assert_eq!(
+        word_at(&w, to),
+        0xCAFE_F00D,
+        "the second launch's constant buffer was copied before the first had run"
+    );
+}

@@ -104,6 +104,7 @@ impl I2m {
                 }
             }
         }
+        cx.settle_range(upload.destination, upload.pitch * upload.lines as u64)?;
         for line in 0..upload.lines {
             let from = line * upload.line_length;
             cx.write(

@@ -568,9 +568,14 @@ impl Gpu {
             job.word = 0;
             return Ok(Advance::More);
         }
-        // What was recorded for the renderer is finished before any fence says it is.
+        // What was recorded for the renderer is finished before any fence says it is, and what it
+        // writes in place is in memory with the releases that follow it (A-274).
         if let Some(backend) = self.backend.as_deref_mut() {
-            if let Err(why) = backend.finish() {
+            let settled = match self.spaces.get(&job.space) {
+                Some(space) => backend.settle(space, &*self.mem, None),
+                None => Ok(()),
+            };
+            if let Err(why) = settled.and_then(|()| backend.finish()) {
                 if self.lenient {
                     eprintln!("[gpu] the renderer could not finish a submission: {why}");
                 } else {

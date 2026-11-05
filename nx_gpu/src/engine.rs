@@ -230,38 +230,45 @@ pub struct Cx<'a> {
     pub blocked: Option<String>,
 }
 
-/// GPU memory as the QMD scheduler reads and writes it.
-struct QmdMemory<'a> {
-    mem: &'a dyn GuestMemory,
-    space: &'a AddressSpace,
-}
-
-impl qmd3::Memory for QmdMemory<'_> {
-    fn read(&mut self, va: u64, out: &mut [u32]) -> Result<(), String> {
-        let mut bytes = vec![0u8; out.len() * 4];
-        if !self.space.read(self.mem, va, &mut bytes) {
-            return Err(format!(
-                "a QMD read of GPU address {va:#x}, which is not mapped"
-            ));
-        }
-        for (w, b) in out.iter_mut().zip(bytes.as_chunks::<4>().0) {
-            *w = u32::from_le_bytes(*b);
-        }
-        Ok(())
-    }
-
-    fn write(&mut self, va: u64, words: &[u32]) -> Result<(), String> {
-        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        if !self.space.write(self.mem, va, &bytes) {
-            return Err(format!(
-                "a QMD release to GPU address {va:#x}, which is not mapped"
-            ));
-        }
-        Ok(())
-    }
-}
-
 impl Cx<'_> {
+    /// What the renderer recorded that changes memory in place is there before the GPU front
+    /// reads or writes memory that says work is done (a semaphore; A-274).
+    pub fn settle(&mut self) -> Result<(), String> {
+        self.settle_in(None)
+    }
+
+    /// As [`Cx::settle`], for `len` bytes at GPU address `va` that the front is about to read or
+    /// write: only work that reaches them is waited for.
+    pub fn settle_range(&mut self, va: u64, len: u64) -> Result<(), String> {
+        self.settle_in(Some((va, len)))
+    }
+
+    fn settle_in(&mut self, range: Option<(u64, u64)>) -> Result<(), String> {
+        let done = match self.backend.as_deref_mut() {
+            Some(backend) => backend.settle(self.space, self.mem, range),
+            None => return Ok(()),
+        };
+        match done {
+            Ok(()) => Ok(()),
+            Err(why) => self.renderer_failed("waiting for compute launches", why),
+        }
+    }
+
+    /// Make a QMD's release once the launches before it are done (A-210, A-274).
+    pub fn release(&mut self, release: qmd3::Release) -> Result<(), String> {
+        let done = match self.backend.as_deref_mut() {
+            Some(backend) => backend.release(self.space, self.mem, release),
+            None => release.apply(&mut qmd3::GpuMemory {
+                mem: self.mem,
+                space: self.space,
+            }),
+        };
+        match done {
+            Ok(()) => Ok(()),
+            Err(why) => self.renderer_failed("a QMD release", why),
+        }
+    }
+
     pub fn read_u32(&self, va: u64) -> Result<u32, String> {
         // The Switch 2's syncpoint shim reads as the syncpoints (A-200).
         if let Some(id) = self.space.shim_syncpoint(va) {
@@ -714,6 +721,9 @@ impl Engine {
             // MME_DMA_READ(count): words of memory into the data RAM, from the address the data
             // RAM address register names.
             m::DMA_READ => {
+                let va = (u64::from(self.reg(m::MEM_ADDRESS_A) & 0x1FF_FFFF) << 32)
+                    | u64::from(self.reg(m::MEM_ADDRESS_B));
+                cx.settle_range(va, u64::from(data) * 4)?;
                 let words = self.dma_words(cx, data)?;
                 let at = self.reg(m::DATA_RAM_ADDRESS) as usize;
                 let ram = cx.macros.data_ram(cx.channel);
@@ -805,12 +815,23 @@ impl Engine {
         address: u64,
         action: qmd3::Action,
     ) -> Result<(), String> {
-        let mut mem = QmdMemory {
+        let mut mem = qmd3::GpuMemory {
             mem: cx.mem,
             space: cx.space,
         };
         let launches = cx.qmds.signal(address, action, &mut mem)?;
         for launch in launches {
+            self.launch_v3(cx, &launch)?;
+            for release in &launch.releases {
+                cx.release(*release)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one launch of a QMD of version 3.
+    fn launch_v3(&mut self, cx: &mut Cx<'_>, launch: &qmd3::Launch) -> Result<(), String> {
+        {
             cx.stats.compute_launches += 1;
             if cx.level >= 1 || trace_compute() {
                 eprintln!(
@@ -824,18 +845,15 @@ impl Engine {
                 );
             }
             if !launch.has_work() {
-                continue;
+                return Ok(());
             }
             dump_compute_program(cx, launch.program());
             if cx.backend.is_none() {
-                continue;
+                return Ok(());
             }
             let dispatch = match compute::Dispatch::decode_v3(launch.address, &launch.qmd) {
                 Ok(d) => d,
-                Err(why) => {
-                    cx.renderer_failed("a compute launch", why)?;
-                    continue;
-                }
+                Err(why) => return cx.renderer_failed("a compute launch", why),
             };
             let scene = Scene {
                 regs: Regs(&self.regs),
@@ -846,7 +864,7 @@ impl Engine {
             };
             let _phase = crate::progress::enter(crate::progress::DISPATCHING);
             let Some(backend) = cx.backend.as_mut() else {
-                continue;
+                return Ok(());
             };
             if let Err(why) = backend.dispatch(&scene, &dispatch) {
                 cx.renderer_failed("a compute launch", why)?;
@@ -995,6 +1013,7 @@ impl Engine {
             }
         }
         if let Some((va, payload, four_words)) = launch.semaphore {
+            cx.settle()?;
             if four_words {
                 let mut out = [0u8; 16];
                 out[..4].copy_from_slice(&payload.to_le_bytes());
@@ -1108,6 +1127,7 @@ impl Engine {
             m3d::LOAD_CONSTANT_BUFFER_FIRST..=m3d::LOAD_CONSTANT_BUFFER_LAST => {
                 let (address, _) = self.regs().selected_constant_buffer();
                 let offset = self.reg(m3d::LOAD_CONSTANT_BUFFER_OFFSET) & 0xFFFF;
+                cx.settle_range(address + u64::from(offset), 4)?;
                 cx.write(address + u64::from(offset), &data.to_le_bytes())?;
                 self.regs[m3d::LOAD_CONSTANT_BUFFER_OFFSET as usize] = (offset + 4) & 0xFFFF;
             }
@@ -1388,6 +1408,7 @@ impl Engine {
                     cx.stats.releases_to_zero += 1;
                     return Ok(());
                 }
+                cx.settle()?;
                 if one_word {
                     cx.write(va, &value.to_le_bytes())?;
                 } else {
@@ -1401,6 +1422,8 @@ impl Engine {
             }
             // ACQUIRE: continue when the memory has the value (>= with bit 16 set).
             1 => {
+                // The word may be what a launch not waited for writes, or one of its releases.
+                cx.settle_range(va, 4)?;
                 let have = cx.read_u32(va)?;
                 let ge = d >> 16 & 1 != 0;
                 if (ge && have >= payload) || (!ge && have == payload) {

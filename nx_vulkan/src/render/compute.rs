@@ -1,9 +1,11 @@
 //! Compute launches: the program translated for its workgroup, the constant buffers the descriptor
-//! binds, and a dispatch that has finished (and so has written its memory) when it returns.
+//! binds, and a dispatch recorded after the commands before it.
 //!
-//! The commands recorded so far are run first, and the launch after them, because what later
-//! draws read of memory (their constant buffers, vertices and textures) is copied when they are
-//! recorded, so it has to be in memory by then (docs/ASSUMPTIONS.md A-110).
+//! What later commands read of memory (constant buffers, vertices, textures) is copied when they
+//! are recorded, so what a launch writes has to be in memory by then (docs/ASSUMPTIONS.md A-110).
+//! A run of launches is not waited for launch by launch: it is waited for, and the surfaces it
+//! wrote put into memory, when something needs that: a draw, a clear or a copy, a launch that
+//! reads what one before it writes, or the GPU front reading or writing memory itself (A-274).
 
 use super::shaders::{bindings_of, Binding, Program};
 use super::Core;
@@ -11,11 +13,31 @@ use crate::fast::FastMap;
 use ash::vk;
 use nx_gpu::compute::Dispatch;
 use nx_gpu::render::Scene;
+use nx_gpu::vm::AddressSpace;
+use nx_gpu::GuestMemory;
 use std::time::Instant;
 
 /// The constant buffer slot that holds the handles of the textures a compute program names (the
 /// title puts them there for a launch as it does for a draw).
 const TEXTURE_TABLE: u32 = 2;
+
+/// Why launches were waited for (A-274), for the report.
+pub(super) mod settle {
+    /// The GPU front reads or writes memory itself, or a submission ends.
+    pub const FRONT: usize = 0;
+    /// A draw, a clear or a copy comes.
+    pub const COMMAND: usize = 1;
+    /// A launch reads on the host, or reaches in place, what one before it writes.
+    pub const HAZARD: usize = 2;
+    /// A launch waited for at once (`NX_DEBUG_COMPUTE_WAIT`, `NX_TRACE_COMPUTE`,
+    /// `NX_DEBUG_SYNC_DRAWS`).
+    pub const SYNC: usize = 3;
+}
+
+/// Whether `[from, to)` overlaps one of `ranges`.
+fn overlaps(ranges: &[(u64, u64)], from: u64, to: u64) -> bool {
+    ranges.iter().any(|&(a, b)| a < to && from < b)
+}
 
 /// Compute pipelines by the program and the layout they were made for.
 #[derive(Default)]
@@ -34,6 +56,10 @@ impl ComputePipelines {
 
 impl Core {
     pub(super) fn dispatch(&mut self, scene: &Scene<'_>, d: &Dispatch) -> Result<(), String> {
+        if self.commands_at_launch != self.commands_seen {
+            self.phases.launch_kinds[3] += 1;
+            self.commands_at_launch = self.commands_seen;
+        }
         let mut mark = super::stopwatch();
         let mut lap = |into: &mut std::time::Duration| {
             if let Some(mark) = &mut mark {
@@ -54,6 +80,9 @@ impl Core {
             self.shaders
                 .kernel(&self.vk, scene, d, self.textures.frame, classes)?
         };
+        // What the launch reads may be what a launch before it writes: those are waited for
+        // first, before anything of the batch is taken for this one (A-274).
+        self.settle_hazards(scene, d, &program)?;
         let bindings = bindings_of(&[&program]);
         let (set_layout, pipeline_layout) = self.layouts.get(&self.vk, &bindings)?;
         let set = self.frame.descriptor_set(&self.vk, set_layout)?;
@@ -111,6 +140,7 @@ impl Core {
                 }
             }
         }
+        let mut reached = None;
         if program.info.global_memory {
             // The storage buffers the program's accesses are in, read from the launch's constant
             // buffers (A-258); all of memory for a program whose accesses are not attributed.
@@ -125,10 +155,11 @@ impl Core {
                     .try_into()
                     .ok()
             };
-            let (buffer, offset, size) = match super::global::storage_buffers(&program.info, read) {
+            reached = super::global::storage_buffers(&program.info, read);
+            let (buffer, offset, size) = match &reached {
                 Some(buffers) => {
                     self.global
-                        .table_for(&self.vk, &mut self.frame, scene, &buffers, now)?
+                        .table_for(&self.vk, &mut self.frame, scene, buffers, now)?
                 }
                 None => {
                     let (b, s) = self.global.table(&self.vk, &mut self.frame, scene, now)?;
@@ -337,11 +368,40 @@ impl Core {
             );
         }
         lap(&mut self.phases.compute[4]);
-        let flushed = if self.debug.no_compute_wait && surfaces.is_empty() {
+        // What the launch writes reaches memory when something needs it there (A-274): its
+        // surfaces are copied out for the host after it, and what it reaches of global memory is
+        // noted for the commands after it to wait for when they read it.
+        let staged = self.stage_surfaces(surfaces.into_iter().map(|(_, s)| s).collect())?;
+        if program.info.global_memory {
+            self.phases.launch_kinds[2] += 1;
             self.global_pending = true;
-            self.send_batch()
+            match &reached {
+                Some(buffers) => {
+                    let ranges: Vec<(u64, u64)> = buffers
+                        .iter()
+                        .map(|&(at, len)| (at, at.saturating_add(len)))
+                        .collect();
+                    if program.info.global_writes {
+                        self.pending_writes.extend_from_slice(&ranges);
+                    }
+                    self.pending_reach.extend(ranges);
+                }
+                None => {
+                    self.reach_everywhere = true;
+                    self.writes_everywhere |= program.info.global_writes;
+                }
+            }
+        }
+        if !staged.is_empty() {
+            self.phases.launch_kinds[0] += 1;
+            self.phases.launch_kinds[1] += staged.len() as u64;
+        }
+        self.deferred.extend(staged);
+        // A launch that is timed, or that a switch asks to wait for, is waited for at once.
+        let sent = if self.debug.compute_wait || self.debug.trace_compute || self.sync_on {
+            self.settle(scene.space, scene.mem, settle::SYNC)
         } else {
-            self.flush()
+            self.send_batch()
         };
         if let Some(pool) = timestamps {
             let mut ticks = [0u64; 2];
@@ -367,11 +427,165 @@ impl Core {
             unsafe { self.vk.device.destroy_query_pool(pool, None) };
         }
         lap(&mut self.phases.compute[5]);
-        if surfaces.is_empty() {
-            return flushed;
+        sent
+    }
+
+    /// Compute launches were recorded whose effects are not all in memory yet.
+    pub(super) fn launches_pending(&self) -> bool {
+        self.reach_everywhere
+            || !self.pending_reach.is_empty()
+            || !self.deferred.is_empty()
+            || !self.releases.is_empty()
+    }
+
+    /// Wait for what was recorded, put what the launches' surfaces hold into memory and make the
+    /// releases that follow them (A-274).
+    pub(super) fn settle(
+        &mut self,
+        space: &AddressSpace,
+        mem: &dyn GuestMemory,
+        cause: usize,
+    ) -> Result<(), String> {
+        if !self.launches_pending() {
+            return Ok(());
         }
-        flushed?;
-        self.put_back(scene, surfaces.into_iter().map(|(_, s)| s).collect())
+        let mut mark = super::stopwatch();
+        self.phases.settles[cause] += 1;
+        let waited = self.flush();
+        let deferred = std::mem::take(&mut self.deferred);
+        let written = waited.and_then(|()| self.write_staged(space, mem, deferred));
+        self.pending_writes.clear();
+        self.pending_reach.clear();
+        self.writes_everywhere = false;
+        self.reach_everywhere = false;
+        let mut memory = nx_gpu::qmd3::GpuMemory { mem, space };
+        let mut released = Ok(());
+        for r in std::mem::take(&mut self.releases) {
+            released = released.and(r.apply(&mut memory));
+        }
+        if let Some(mark) = mark.take() {
+            self.phases.compute[6] += mark.elapsed();
+        }
+        written.and(released)
+    }
+
+    /// As [`Core::settle`], for the GPU front: `range` (a GPU address and a length) asks it only
+    /// when a launch reaches those bytes, writes a surface over them or releases into them.
+    pub(super) fn settle_for_front(
+        &mut self,
+        space: &AddressSpace,
+        mem: &dyn GuestMemory,
+        range: Option<(u64, u64)>,
+    ) -> Result<(), String> {
+        if let Some((at, len)) = range {
+            let to = at.saturating_add(len);
+            if !self.reach_everywhere
+                && !overlaps(&self.pending_reach, at, to)
+                && !self.deferred.iter().any(|s| s.overlaps(at, to))
+                && !self.releases.iter().any(|r| r.va < to && at < r.va + 4)
+            {
+                return Ok(());
+            }
+        }
+        self.settle(space, mem, settle::FRONT)
+    }
+
+    /// Whether a launch recorded and not waited for may write `[from, to)` (GPU addresses).
+    fn pending_write(&self, from: u64, to: u64) -> bool {
+        self.writes_everywhere
+            || overlaps(&self.pending_writes, from, to)
+            || self.deferred.iter().any(|s| s.overlaps(from, to))
+    }
+
+    /// Wait for the launches before this one when it reads what they write: its constant buffers,
+    /// textures and surfaces are copied on the host from memory, and what it reaches of global
+    /// memory in place must not be where a surface is still to be put (A-274).
+    fn settle_hazards(
+        &mut self,
+        scene: &Scene<'_>,
+        d: &Dispatch,
+        program: &Program,
+    ) -> Result<(), String> {
+        if !self.launches_pending() {
+            return Ok(());
+        }
+        let hazard = |core: &mut Core| core.settle(scene.space, scene.mem, settle::HAZARD);
+        for (cb, bound) in d.cbufs.iter().enumerate().take(18) {
+            let used = program.info.cbuf_extent[cb] != 0 || program.info.cbuf_dynamic[cb];
+            if let (true, Some(c)) = (used, bound) {
+                if self.pending_write(c.address, c.address + u64::from(c.size)) {
+                    return hazard(self);
+                }
+            }
+        }
+        let pools = scene.regs.texture_pools();
+        let handle = |slot: u32, index: u32| -> Option<u32> {
+            let buffer = d.cbufs.get(slot as usize).copied().flatten()?;
+            let mut word = [0u8; 4];
+            scene
+                .read(buffer.address + 4 * u64::from(index), &mut word)
+                .then(|| u32::from_le_bytes(word) & 0xF_FFFF)
+        };
+        let header = |tic_id: u32| -> Option<super::textures::Tic> {
+            if tic_id >= pools.header_count {
+                return None;
+            }
+            let mut bytes = [0u8; 32];
+            scene
+                .read(pools.header_address + 32 * u64::from(tic_id), &mut bytes)
+                .then(|| {
+                    super::textures::Tic(std::array::from_fn(|i| {
+                        u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap())
+                    }))
+                })
+        };
+        let mut spans = Vec::new();
+        for used in &program.info.textures {
+            let slot = used.source.unwrap_or(TEXTURE_TABLE);
+            if let Some(tic) = handle(slot, used.index).and_then(header) {
+                let span = self.textures.span(&tic, used).unwrap_or(1);
+                spans.push((tic.address(), span));
+            }
+        }
+        for used in &program.info.images {
+            let slot = used.source.unwrap_or(TEXTURE_TABLE);
+            if let Some(tic) = handle(slot, used.index).and_then(header) {
+                spans.push((
+                    tic.address(),
+                    super::surfaces::span(&tic, used).unwrap_or(1),
+                ));
+            }
+        }
+        if spans
+            .iter()
+            .any(|&(at, len)| self.pending_write(at, at.saturating_add(len)))
+        {
+            return hazard(self);
+        }
+        if program.info.global_memory && !self.deferred.is_empty() {
+            let read = |slot: u32, at: u32| -> Option<[u8; 12]> {
+                let c = d.cbufs.get(slot as usize).copied().flatten()?;
+                if u64::from(at) + 12 > u64::from(c.size) {
+                    return None;
+                }
+                scene
+                    .read_vec(c.address + u64::from(at), 12)?
+                    .try_into()
+                    .ok()
+            };
+            let clear = match super::global::storage_buffers(&program.info, read) {
+                Some(buffers) => !buffers.iter().any(|&(at, len)| {
+                    self.deferred
+                        .iter()
+                        .any(|s| s.overlaps(at, at.saturating_add(len)))
+                }),
+                None => false,
+            };
+            if !clear {
+                return hazard(self);
+            }
+        }
+        Ok(())
     }
 
     /// The compute pipeline of `program` in `layout`, made on first use.

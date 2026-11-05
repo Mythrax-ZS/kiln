@@ -815,7 +815,7 @@ pub(super) struct Plan {
     /// The distance between layers in bytes.
     pub(super) layer_stride: u64,
     /// The bytes of the whole texture in memory.
-    total: u64,
+    pub(super) total: u64,
 }
 
 /// The image `tic` makes for a shader that samples it with `shape`, in `format`, and where its

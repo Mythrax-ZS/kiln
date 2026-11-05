@@ -190,6 +190,32 @@ pub trait Backend: Send {
     fn dma_copy(&mut self, scene: &Scene<'_>, copy: &crate::dma::Copy) -> Result<(), String> {
         copy.run(scene.mem, scene.space)
     }
+
+    /// The GPU front is about to read or write guest memory itself: what the renderer recorded
+    /// that changes memory in place (compute launches it has not waited for) has run and is in
+    /// memory first, with the releases that follow it (docs/ASSUMPTIONS.md A-274). `range` (a GPU
+    /// address and a length) asks that only of the work that reaches those bytes or releases into
+    /// them, for an access that says nothing of what is done (an inline upload, a semaphore
+    /// acquire); `None` asks it of everything (a semaphore release, the end of a submission).
+    fn settle(
+        &mut self,
+        _space: &AddressSpace,
+        _mem: &dyn GuestMemory,
+        _range: Option<(u64, u64)>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// A QMD's release (A-210), made once the work recorded before it has run: at once, unless
+    /// the renderer still has launches to wait for (A-274).
+    fn release(
+        &mut self,
+        space: &AddressSpace,
+        mem: &dyn GuestMemory,
+        release: crate::qmd3::Release,
+    ) -> Result<(), String> {
+        release.apply(&mut crate::qmd3::GpuMemory { mem, space })
+    }
 }
 
 #[cfg(test)]

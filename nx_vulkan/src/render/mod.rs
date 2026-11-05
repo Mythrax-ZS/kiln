@@ -153,6 +153,20 @@ struct Core {
     /// last waited for: the guest may take a submission as over when its fence is reached, so
     /// the end of the submission waits (A-123).
     global_pending: bool,
+    /// Draws and clears so far, and how many there were at the last compute launch: the launches
+    /// that come with none between them are a run (for the report).
+    commands_seen: u64,
+    commands_at_launch: u64,
+    /// Compute launches recorded and not waited for (A-274): the GPU address ranges their
+    /// programs write in place and the ranges they reach at all (`*_everywhere` when the program's
+    /// accesses are not attributed to buffers), the surfaces they wrote (copied out for the host,
+    /// put into memory once they have run), and the QMD releases that follow them.
+    pending_writes: Vec<(u64, u64)>,
+    pending_reach: Vec<(u64, u64)>,
+    writes_everywhere: bool,
+    reach_everywhere: bool,
+    deferred: Vec<surfaces::Staged>,
+    releases: Vec<nx_gpu::qmd3::Release>,
     /// Textures let go to keep to the device memory budget (A-260), for the report.
     textures_trimmed: u64,
     /// 2D copies made in guest memory (A-249), for the report of every 100 frames.
@@ -213,8 +227,14 @@ struct Phases {
     /// The dynamic state and the draw command.
     record: std::time::Duration,
     /// The steps of compute launches: the program, the constant buffers, the textures, the
-    /// pipeline, the recording and sending the work and waiting for it.
-    compute: [std::time::Duration; 6],
+    /// pipeline, the recording, sending the work and waiting for it, and putting what the
+    /// surfaces hold back into memory.
+    compute: [std::time::Duration; 7],
+    /// Of the launches: how many wrote surfaces, how many surfaces they wrote, how many reached
+    /// global memory, and in how many runs they came (a draw or a clear ends a run).
+    launch_kinds: [u64; 4],
+    /// Why launches were waited for (A-274), by [`compute::settle`] cause.
+    settles: [u64; 4],
 }
 
 /// Calls of one kind and the time they took.
@@ -342,6 +362,14 @@ impl Renderer {
                     scratch: Scratch::default(),
                     sync_on: false,
                     global_pending: false,
+                    commands_seen: 0,
+                    commands_at_launch: u64::MAX,
+                    pending_writes: Vec::new(),
+                    pending_reach: Vec::new(),
+                    writes_everywhere: false,
+                    reach_everywhere: false,
+                    deferred: Vec::new(),
+                    releases: Vec::new(),
                     textures_trimmed: 0,
                     memory_copies: 0,
                     batch_draws: 0,
@@ -364,6 +392,15 @@ impl Renderer {
     /// How many textures the renderer holds images for. For tests and tools.
     pub fn textures_held(&mut self) -> usize {
         self.core().map_or(0, |core| core.textures.device_bytes().1)
+    }
+
+    /// How often compute launches were waited for since the last report, by cause: the GPU front,
+    /// another command, a launch reading what one before it wrote, at once (A-274). For tests.
+    pub fn launch_waits(&self) -> [u64; 4] {
+        match &self.core {
+            Some(Ok(core)) => core.phases.settles,
+            _ => [0; 4],
+        }
     }
 
     /// The color target at a guest address as a picture (RGBA bytes, width, height), as of the
@@ -995,8 +1032,10 @@ impl Core {
 impl Renderer {
     fn draw_command(&mut self, scene: &Scene<'_>, draw: &Draw) -> Result<(), String> {
         let core = self.core()?;
+        core.settle(scene.space, scene.mem, compute::settle::COMMAND)?;
         let mut result = core.draw(scene, draw);
         core.batch_draws += 1;
+        core.commands_seen += 1;
         if core.sync_on && result.is_ok() {
             if let Err(e) = core.flush() {
                 // What was submitted up to this draw failed, and this was the last to join it.
@@ -1075,7 +1114,9 @@ impl Renderer {
 
     fn clear_command(&mut self, scene: &Scene<'_>, clear: &Clear) -> Result<(), String> {
         let core = self.core()?;
+        core.settle(scene.space, scene.mem, compute::settle::COMMAND)?;
         let result = core.clear(scene, clear);
+        core.commands_seen += 1;
         if let Some(frame) = core.traced() {
             let v = scene.regs.clear_values();
             let said = format!(
@@ -1220,9 +1261,17 @@ impl Renderer {
                         .map(|d| format!("{:.0}", d.as_secs_f64() * 1000.0))
                         .collect();
                     eprintln!(
-                        "[vulkan] frame {}: the compute launches spent {} ms (program, constant buffers, textures, pipeline, recording, sending and waiting)",
+                        "[vulkan] frame {}: the compute launches spent {} ms (program, constant buffers, textures, pipeline, recording, sending and waiting, putting surfaces back); {} wrote {} surfaces, {} reached global memory, in {} runs; waited for at the GPU front {}, at another command {}, at a launch reading what one before it wrote {}, at once {}",
                         p.frame,
-                        ms.join(", ")
+                        ms.join(", "),
+                        ph.launch_kinds[0],
+                        ph.launch_kinds[1],
+                        ph.launch_kinds[2],
+                        ph.launch_kinds[3],
+                        ph.settles[0],
+                        ph.settles[1],
+                        ph.settles[2],
+                        ph.settles[3]
                     );
                 }
                 let s = std::mem::take(&mut self.spent);
@@ -1488,11 +1537,42 @@ impl Backend for Renderer {
     }
 
     fn blit(&mut self, scene: &Scene<'_>, blit: &Blit) -> Result<(), String> {
-        self.core().and_then(|core| core.copy_surface(scene, blit))
+        let core = self.core()?;
+        core.settle(scene.space, scene.mem, compute::settle::COMMAND)?;
+        core.copy_surface(scene, blit)
     }
 
     fn dma_copy(&mut self, scene: &Scene<'_>, copy: &nx_gpu::dma::Copy) -> Result<(), String> {
-        self.core().and_then(|core| core.copy_engine(scene, copy))
+        let core = self.core()?;
+        core.settle(scene.space, scene.mem, compute::settle::COMMAND)?;
+        core.copy_engine(scene, copy)
+    }
+
+    fn settle(
+        &mut self,
+        space: &nx_gpu::vm::AddressSpace,
+        mem: &dyn nx_gpu::GuestMemory,
+        range: Option<(u64, u64)>,
+    ) -> Result<(), String> {
+        match self.core.as_mut() {
+            Some(Ok(core)) => core.settle_for_front(space, mem, range),
+            _ => Ok(()),
+        }
+    }
+
+    fn release(
+        &mut self,
+        space: &nx_gpu::vm::AddressSpace,
+        mem: &dyn nx_gpu::GuestMemory,
+        release: nx_gpu::qmd3::Release,
+    ) -> Result<(), String> {
+        match self.core.as_mut() {
+            Some(Ok(core)) if core.launches_pending() => {
+                core.releases.push(release);
+                Ok(())
+            }
+            _ => release.apply(&mut nx_gpu::qmd3::GpuMemory { mem, space }),
+        }
     }
 
     fn dispatch(&mut self, scene: &Scene<'_>, dispatch: &Dispatch) -> Result<(), String> {

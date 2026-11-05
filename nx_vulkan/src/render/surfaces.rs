@@ -3,9 +3,9 @@
 //! A surface is made from its memory for the launch that uses it: a storage image of level 0 of
 //! the texture its header describes (the handle's low 20 bits are the header's number in the
 //! texture pool, as for a texture: NVN registers image descriptors in the texture pool). What
-//! the launch stores is put back into that memory after it (the launch waits for the device in
-//! any case, A-110), so that whatever reads the memory later finds it there. The images are not
-//! kept from one launch to the next (docs/ASSUMPTIONS.md A-252).
+//! the launch stores is copied out for the host after it, and put into that memory once the
+//! launch has run (A-274), so that whatever reads the memory later finds it there. The images
+//! are not kept from one launch to the next (docs/ASSUMPTIONS.md A-252).
 
 use super::textures::{plan, texture_format, Kind, Shape, Tic};
 use super::Core;
@@ -13,11 +13,13 @@ use crate::blocklinear::{deswizzle, swizzle, Geometry};
 use crate::image::{aspect_of, Image, ImageInfo};
 use ash::vk;
 use nx_gpu::render::Scene;
+use nx_gpu::vm::AddressSpace;
+use nx_gpu::GuestMemory;
 use nx_shader::translate::{Dim, ImageUse};
 
-/// A surface made for a launch.
-pub struct Surface {
-    image: Image,
+/// Where a surface's texels lie in memory.
+#[derive(Clone, Copy)]
+struct Place {
     /// The GPU address of the texture's memory and the bytes from one layer to the next.
     address: u64,
     layer_stride: u64,
@@ -25,20 +27,85 @@ pub struct Surface {
     /// Level 0 of a layer as it lies in memory (block linear), or its rows (pitch linear).
     geometry: Geometry,
     pitch: Option<u32>,
-    written: bool,
 }
 
-impl Surface {
-    pub fn view(&self) -> vk::ImageView {
-        self.image.view
-    }
-
+impl Place {
     /// The bytes of a layer's level 0 in memory.
     fn layer_bytes(&self) -> u64 {
         match self.pitch {
             Some(pitch) => u64::from(pitch) * u64::from(self.geometry.height),
             None => self.geometry.tiled_size(),
         }
+    }
+
+    /// One past the last byte of its memory (a GPU address).
+    fn end(&self) -> u64 {
+        self.address
+            + self.layer_stride * u64::from(self.layers.saturating_sub(1))
+            + self.layer_bytes()
+    }
+
+    /// Lay the packed rows of a layer out as memory has them, over what memory held (`tiled`):
+    /// the bytes that are not the texels' stay as they were.
+    fn lay_out(&self, linear: &[u8], tiled: &mut [u8]) {
+        match self.pitch {
+            Some(pitch) => {
+                let row = (self.geometry.width * self.geometry.bytes_per_element) as usize;
+                for y in 0..self.geometry.height as usize {
+                    let at = y * pitch as usize;
+                    if at + row <= tiled.len() {
+                        tiled[at..at + row].copy_from_slice(&linear[y * row..(y + 1) * row]);
+                    }
+                }
+            }
+            None => swizzle(&self.geometry, linear, tiled),
+        }
+    }
+}
+
+/// A surface made for a launch.
+pub struct Surface {
+    image: Image,
+    place: Place,
+    written: bool,
+}
+
+/// What a launch stored in a surface, copied out for the host, to be put into the surface's
+/// memory once the launch has run (A-274).
+pub struct Staged {
+    staging: crate::compute::HostBuffer,
+    place: Place,
+}
+
+impl Staged {
+    /// Whether the surface's memory overlaps `[from, to)` (GPU addresses).
+    pub fn overlaps(&self, from: u64, to: u64) -> bool {
+        self.place.address < to && from < self.place.end()
+    }
+}
+
+/// How many bytes of memory the surface of header `tic` that a program uses as `used` takes, as
+/// [`Core::surface`] lays it out.
+pub fn span(tic: &Tic, used: &ImageUse) -> Option<u64> {
+    let format = texture_format(tic.components(), tic.types()[0], false)?;
+    let (kind, layers, depth) = match (used.dim, used.arrayed) {
+        (Dim::D1, false) => (Kind::D1, 1, 1),
+        (Dim::D2, false) => (Kind::D2, 1, 1),
+        (Dim::D2, true) => (Kind::D2Array, tic.depth(), 1),
+        (Dim::D3, false) => (Kind::D3, 1, tic.depth()),
+        _ => return None,
+    };
+    let shape = Shape {
+        kind,
+        layers,
+        depth,
+    };
+    plan(tic, shape, format).ok().map(|p| p.total)
+}
+
+impl Surface {
+    pub fn view(&self) -> vk::ImageView {
+        self.image.view
     }
 
     fn region(&self, layer: u32, offset: u64) -> vk::BufferImageCopy {
@@ -63,24 +130,7 @@ impl Surface {
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
-            layer_count: self.layers,
-        }
-    }
-
-    /// Lay the packed rows of a layer out as memory has them, over what memory held (`tiled`):
-    /// the bytes that are not the texels' stay as they were.
-    fn lay_out(&self, linear: &[u8], tiled: &mut [u8]) {
-        match self.pitch {
-            Some(pitch) => {
-                let row = (self.geometry.width * self.geometry.bytes_per_element) as usize;
-                for y in 0..self.geometry.height as usize {
-                    let at = y * pitch as usize;
-                    if at + row <= tiled.len() {
-                        tiled[at..at + row].copy_from_slice(&linear[y * row..(y + 1) * row]);
-                    }
-                }
-            }
-            None => swizzle(&self.geometry, linear, tiled),
+            layer_count: self.place.layers,
         }
     }
 }
@@ -192,24 +242,27 @@ impl Core {
         })?;
         let surface = Surface {
             image,
-            address: tic.address(),
-            layer_stride: p.layer_stride,
-            layers,
-            geometry: p.level_geometry[0],
-            pitch: tic.is_pitch().then(|| tic.pitch()),
+            place: Place {
+                address: tic.address(),
+                layer_stride: p.layer_stride,
+                layers,
+                geometry: p.level_geometry[0],
+                pitch: tic.is_pitch().then(|| tic.pitch()),
+            },
             written: used.written,
         };
         // What memory holds, layer by layer.
         let mut packed = Vec::new();
         let mut regions = Vec::new();
         for layer in 0..layers {
-            let at = surface.address + u64::from(layer) * surface.layer_stride;
-            let mut held = vec![0u8; surface.layer_bytes() as usize];
+            let place = surface.place;
+            let at = place.address + u64::from(layer) * place.layer_stride;
+            let mut held = vec![0u8; place.layer_bytes() as usize];
             let n = super::textures::read_partial(scene, at, &mut held);
             held.truncate(n);
-            let g = surface.geometry;
+            let g = place.geometry;
             let mut linear = vec![0u8; g.linear_size() as usize];
-            match surface.pitch {
+            match place.pitch {
                 Some(pitch) => {
                     let row = (g.width * g.bytes_per_element) as usize;
                     for y in 0..g.height as usize {
@@ -284,24 +337,19 @@ impl Core {
         Ok(surface)
     }
 
-    /// After a launch has run: put what it stored in its surfaces into their memory, let go the
-    /// textures and render targets that memory was taken into, and let the images go.
-    pub(super) fn put_back(
-        &mut self,
-        scene: &Scene<'_>,
-        surfaces: Vec<Surface>,
-    ) -> Result<(), String> {
-        let written: Vec<&Surface> = surfaces.iter().filter(|s| s.written).collect();
+    /// After a launch is recorded: copy what it stored in its surfaces out for the host (after
+    /// it, in the same batch), and let the images go once the batch is over (A-274).
+    pub(super) fn stage_surfaces(&mut self, surfaces: Vec<Surface>) -> Result<Vec<Staged>, String> {
         let mut staged = Vec::new();
-        if !written.is_empty() {
+        if surfaces.iter().any(|s| s.written) {
             let cmd = self.frame.cmd(&self.vk)?;
-            for s in &written {
-                let size = s.geometry.linear_size() * u64::from(s.layers);
-                let staging = self
-                    .vk
-                    .create_host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST)?;
-                let per_layer = s.geometry.linear_size();
-                let regions: Vec<vk::BufferImageCopy> = (0..s.layers)
+            for s in surfaces.iter().filter(|s| s.written) {
+                let per_layer = s.place.geometry.linear_size();
+                let staging = self.vk.create_host_buffer(
+                    per_layer * u64::from(s.place.layers),
+                    vk::BufferUsageFlags::TRANSFER_DST,
+                )?;
+                let regions: Vec<vk::BufferImageCopy> = (0..s.place.layers)
                     .map(|layer| s.region(layer, u64::from(layer) * per_layer))
                     .collect();
                 // SAFETY: the command buffer is recording outside a rendering; the image is in
@@ -336,7 +384,10 @@ impl Core {
                         &regions,
                     );
                 }
-                staged.push(staging);
+                staged.push(Staged {
+                    staging,
+                    place: s.place,
+                });
             }
             let to_host = [vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -354,29 +405,45 @@ impl Core {
                 );
             }
         }
-        let submitted = if staged.is_empty() {
-            Ok(())
-        } else {
-            self.frame.submit(&self.vk)
-        };
-        for (s, staging) in written.iter().zip(&staged) {
-            if submitted.is_err() {
-                break;
-            }
-            let per_layer = s.geometry.linear_size() as usize;
-            for layer in 0..s.layers as usize {
-                let linear = &staging.as_slice()[layer * per_layer..(layer + 1) * per_layer];
-                let at = s.address + layer as u64 * s.layer_stride;
-                let mut tiled = vec![0u8; s.layer_bytes() as usize];
-                let n = super::textures::read_partial(scene, at, &mut tiled);
+        // Nothing uses the images once the batch is over.
+        for s in surfaces {
+            self.frame
+                .garbage
+                .push(super::frame::Garbage::Image(s.image));
+        }
+        Ok(staged)
+    }
+
+    /// Once the launches have run: put what they stored in their surfaces into memory, in the
+    /// order they were made, and let go the textures and render targets that memory was taken
+    /// into.
+    pub(super) fn write_staged(
+        &mut self,
+        space: &AddressSpace,
+        mem: &dyn GuestMemory,
+        staged: Vec<Staged>,
+    ) -> Result<(), String> {
+        let mut result = Ok(());
+        for s in staged {
+            let place = s.place;
+            let per_layer = place.geometry.linear_size() as usize;
+            for layer in 0..place.layers as usize {
+                if result.is_err() {
+                    break;
+                }
+                let linear = &s.staging.as_slice()[layer * per_layer..(layer + 1) * per_layer];
+                let at = place.address + layer as u64 * place.layer_stride;
+                let mut tiled = vec![0u8; place.layer_bytes() as usize];
+                let n = space.read_prefix(mem, at, &mut tiled);
                 tiled.truncate(n);
-                s.lay_out(linear, &mut tiled);
-                if !scene.space.write(scene.mem, at, &tiled) {
-                    return Err(format!(
+                place.lay_out(linear, &mut tiled);
+                if !space.write(mem, at, &tiled) {
+                    result = Err(format!(
                         "a surface's memory at GPU address {at:#x} is not mapped"
                     ));
+                    break;
                 }
-                if let Some((cpu, _)) = scene.host_address(at) {
+                if let Some((cpu, _)) = space.translate(at) {
                     let end = cpu + tiled.len() as u64;
                     self.textures.memory_written(cpu, end);
                     let stale: Vec<_> = self
@@ -390,16 +457,8 @@ impl Core {
                     }
                 }
             }
+            self.vk.destroy_host_buffer(s.staging);
         }
-        for staging in staged {
-            self.vk.destroy_host_buffer(staging);
-        }
-        // The launch has run: nothing uses the images any more once the batch is over.
-        for s in surfaces {
-            self.frame
-                .garbage
-                .push(super::frame::Garbage::Image(s.image));
-        }
-        submitted
+        result
     }
 }
