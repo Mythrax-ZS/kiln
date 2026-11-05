@@ -254,6 +254,37 @@ impl Cx<'_> {
         }
     }
 
+    /// The word a semaphore acquire at `va` compares: as the releases still to be made will leave
+    /// it, or as memory holds it once the launches that may write it are waited for (A-274).
+    pub fn acquire_value(&mut self, va: u64) -> Result<u32, String> {
+        if self.space.shim_syncpoint(va).is_none() {
+            if let Some(backend) = self.backend.as_deref_mut() {
+                if let Some(v) = backend.released_value(self.space, self.mem, va) {
+                    return Ok(v);
+                }
+            }
+            self.settle_range(va, 4)?;
+        }
+        self.read_u32(va)
+    }
+
+    /// Make a semaphore release once the launches before it are done (A-274).
+    pub fn write_after(&mut self, va: u64, data: &[u8]) -> Result<(), String> {
+        if self.space.shim_syncpoint(va).is_some() {
+            return Err(format!(
+                "a write to GPU address {va:#x}, in the read-only syncpoint shim"
+            ));
+        }
+        let done = match self.backend.as_deref_mut() {
+            Some(backend) => backend.write_after(self.space, self.mem, va, data),
+            None => return self.write(va, data),
+        };
+        match done {
+            Ok(()) => Ok(()),
+            Err(why) => self.renderer_failed("a semaphore release", why),
+        }
+    }
+
     /// Make a QMD's release once the launches before it are done (A-210, A-274).
     pub fn release(&mut self, release: qmd3::Release) -> Result<(), String> {
         let done = match self.backend.as_deref_mut() {
@@ -1013,14 +1044,13 @@ impl Engine {
             }
         }
         if let Some((va, payload, four_words)) = launch.semaphore {
-            cx.settle()?;
             if four_words {
                 let mut out = [0u8; 16];
                 out[..4].copy_from_slice(&payload.to_le_bytes());
                 out[8..].copy_from_slice(&cx.timestamp().to_le_bytes());
-                cx.write(va, &out)?;
+                cx.write_after(va, &out)?;
             } else {
-                cx.write(va, &payload.to_le_bytes())?;
+                cx.write_after(va, &payload.to_le_bytes())?;
             }
             cx.stats.semaphore_releases += 1;
         }
@@ -1412,14 +1442,14 @@ impl Engine {
                     cx.stats.releases_to_zero += 1;
                     return Ok(());
                 }
-                cx.settle()?;
+                // Made once the launches before it are done (A-274).
                 if one_word {
-                    cx.write(va, &value.to_le_bytes())?;
+                    cx.write_after(va, &value.to_le_bytes())?;
                 } else {
                     let mut out = [0u8; 16];
                     out[..4].copy_from_slice(&value.to_le_bytes());
                     out[8..].copy_from_slice(&cx.timestamp().to_le_bytes());
-                    cx.write(va, &out)?;
+                    cx.write_after(va, &out)?;
                 }
                 cx.stats.semaphore_releases += 1;
                 Ok(())
@@ -1427,10 +1457,15 @@ impl Engine {
             // ACQUIRE: continue when the memory has the value (>= with bit 16 set).
             1 => {
                 // The word may be what a launch not waited for writes, or one of its releases.
-                cx.settle_range(va, 4)?;
-                let have = cx.read_u32(va)?;
                 let ge = d >> 16 & 1 != 0;
-                if (ge && have >= payload) || (!ge && have == payload) {
+                let met = |have: u32| (ge && have >= payload) || (!ge && have == payload);
+                let mut have = cx.acquire_value(va)?;
+                if !met(have) {
+                    // What is still to be released may be what it waits for (A-274).
+                    cx.settle()?;
+                    have = cx.read_u32(va)?;
+                }
+                if met(have) {
                     Ok(())
                 } else {
                     Err(format!(

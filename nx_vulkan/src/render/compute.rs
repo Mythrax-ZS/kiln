@@ -32,6 +32,64 @@ pub(super) mod settle {
     /// A launch waited for at once (`NX_DEBUG_COMPUTE_WAIT`, `NX_TRACE_COMPUTE`,
     /// `NX_DEBUG_SYNC_DRAWS`).
     pub const SYNC: usize = 3;
+    /// The GPU front reads or writes bytes that a launch reaches, a surface or a release covers.
+    pub const FRONT_RANGE: usize = 4;
+}
+
+/// What is made in memory once the launches before it have run (A-274): a QMD's release, or a
+/// semaphore release of the GPU front (its bytes).
+pub enum Completion {
+    Qmd(nx_gpu::qmd3::Release),
+    Bytes(u64, Vec<u8>),
+}
+
+impl Completion {
+    pub fn apply(&self, space: &AddressSpace, mem: &dyn GuestMemory) -> Result<(), String> {
+        match self {
+            Completion::Qmd(r) => r.apply(&mut nx_gpu::qmd3::GpuMemory { mem, space }),
+            Completion::Bytes(va, data) => {
+                if space.write(mem, *va, data) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "a release of {} bytes to GPU address {va:#x}, which is not mapped",
+                        data.len()
+                    ))
+                }
+            }
+        }
+    }
+
+    /// The word at `va` after this release, from what it was (`word`).
+    fn applied_to(&self, va: u64, word: u32) -> u32 {
+        match self {
+            Completion::Qmd(r) if r.va == va => match r.op {
+                nx_gpu::qmd3::ReleaseOp::Set => r.payload,
+                nx_gpu::qmd3::ReleaseOp::Add => word.wrapping_add(r.payload),
+                nx_gpu::qmd3::ReleaseOp::Max => word.max(r.payload),
+            },
+            Completion::Qmd(_) => word,
+            Completion::Bytes(at, data) => {
+                let mut bytes = word.to_le_bytes();
+                for (k, b) in bytes.iter_mut().enumerate() {
+                    let address = va + k as u64;
+                    if address >= *at && address < at + data.len() as u64 {
+                        *b = data[(address - at) as usize];
+                    }
+                }
+                u32::from_le_bytes(bytes)
+            }
+        }
+    }
+
+    /// Whether it writes into `[from, to)`.
+    fn overlaps(&self, from: u64, to: u64) -> bool {
+        let (at, len) = match self {
+            Completion::Qmd(r) => (r.va, 4),
+            Completion::Bytes(va, data) => (*va, data.len() as u64),
+        };
+        at < to && from < at + len
+    }
 }
 
 /// Whether `[from, to)` overlaps one of `ranges`.
@@ -458,10 +516,9 @@ impl Core {
         self.pending_reach.clear();
         self.writes_everywhere = false;
         self.reach_everywhere = false;
-        let mut memory = nx_gpu::qmd3::GpuMemory { mem, space };
         let mut released = Ok(());
         for r in std::mem::take(&mut self.releases) {
-            released = released.and(r.apply(&mut memory));
+            released = released.and(r.apply(space, mem));
         }
         if let Some(mark) = mark.take() {
             self.phases.compute[6] += mark.elapsed();
@@ -482,12 +539,52 @@ impl Core {
             if !self.reach_everywhere
                 && !overlaps(&self.pending_reach, at, to)
                 && !self.deferred.iter().any(|s| s.overlaps(at, to))
-                && !self.releases.iter().any(|r| r.va < to && at < r.va + 4)
+                && !self.releases.iter().any(|r| r.overlaps(at, to))
             {
                 return Ok(());
             }
+            // `NX_TRACE_PERF`: the first of these waits, with what they overlapped.
+            if self.debug.trace_gpu && self.phases.settles[settle::FRONT_RANGE] < 3 {
+                let hit: Vec<String> = self
+                    .pending_reach
+                    .iter()
+                    .filter(|&&(a, b)| a < to && at < b)
+                    .map(|(a, b)| format!("{a:#x}..{b:#x}"))
+                    .collect();
+                eprintln!(
+                    "[vulkan] the GPU front's access of {len:#x} bytes at {at:#x} waits for launches: everywhere {}, reached {hit:?}, surfaces {}, releases {}",
+                    self.reach_everywhere,
+                    self.deferred.iter().any(|s| s.overlaps(at, to)),
+                    self.releases.iter().any(|r| r.overlaps(at, to))
+                );
+            }
+            return self.settle(space, mem, settle::FRONT_RANGE);
         }
         self.settle(space, mem, settle::FRONT)
+    }
+
+    /// The word at `va` as the releases still to be made will leave it, when they alone are still
+    /// to change it: no launch reaches it and no surface is to be put over it (A-274).
+    pub(super) fn released_value(
+        &self,
+        space: &AddressSpace,
+        mem: &dyn GuestMemory,
+        va: u64,
+    ) -> Option<u32> {
+        let to = va + 4;
+        if !self.releases.iter().any(|r| r.overlaps(va, to))
+            || self.reach_everywhere
+            || overlaps(&self.pending_reach, va, to)
+            || self.deferred.iter().any(|s| s.overlaps(va, to))
+        {
+            return None;
+        }
+        let mut bytes = [0u8; 4];
+        if !space.read(mem, va, &mut bytes) {
+            return None;
+        }
+        let word = u32::from_le_bytes(bytes);
+        Some(self.releases.iter().fold(word, |w, r| r.applied_to(va, w)))
     }
 
     /// Whether a launch recorded and not waited for may write `[from, to)` (GPU addresses).
@@ -659,5 +756,37 @@ impl Core {
             }
         }
         Ok((uint, sint))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nx_gpu::qmd3::{Release, ReleaseOp};
+
+    #[test]
+    fn releases_still_to_be_made_leave_a_word_as_they_say() {
+        let qmd = |op, payload| {
+            Completion::Qmd(Release {
+                va: 0x100,
+                op,
+                payload,
+            })
+        };
+        assert_eq!(qmd(ReleaseOp::Set, 7).applied_to(0x100, 3), 7);
+        assert_eq!(qmd(ReleaseOp::Add, 7).applied_to(0x100, 3), 10);
+        assert_eq!(qmd(ReleaseOp::Max, 2).applied_to(0x100, 3), 3);
+        assert_eq!(
+            qmd(ReleaseOp::Set, 7).applied_to(0x104, 3),
+            3,
+            "another word"
+        );
+        // A semaphore release of 16 bytes (payload, then a timestamp) puts its first word there.
+        let mut bytes = 9u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[0xAA; 12]);
+        assert_eq!(Completion::Bytes(0x100, bytes).applied_to(0x100, 3), 9);
+        // One that covers part of the word changes those bytes only.
+        let part = Completion::Bytes(0x102, vec![0x11, 0x22]);
+        assert_eq!(part.applied_to(0x100, 0x4433_0201), 0x2211_0201);
     }
 }

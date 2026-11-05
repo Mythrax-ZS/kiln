@@ -206,6 +206,38 @@ pub trait Backend: Send {
         Ok(())
     }
 
+    /// A semaphore release of the GPU front: `data` written at `va` once the work recorded before
+    /// it has run (at once, unless the renderer still has launches to wait for, A-274).
+    fn write_after(
+        &mut self,
+        space: &AddressSpace,
+        mem: &dyn GuestMemory,
+        va: u64,
+        data: &[u8],
+    ) -> Result<(), String> {
+        if space.write(mem, va, data) {
+            Ok(())
+        } else {
+            Err(format!(
+                "a release of {} bytes to GPU address {va:#x}, which is not mapped",
+                data.len()
+            ))
+        }
+    }
+
+    /// The word at `va` as it will be once the releases still to be made are made, when only
+    /// releases are still to change it (no launch not waited for reaches it): what a semaphore
+    /// acquire compares, since the commands after the acquire run after those launches anyway
+    /// (A-274). `None` when nothing is still to be released there, or a launch may write it.
+    fn released_value(
+        &mut self,
+        _space: &AddressSpace,
+        _mem: &dyn GuestMemory,
+        _va: u64,
+    ) -> Option<u32> {
+        None
+    }
+
     /// A QMD's release (A-210), made once the work recorded before it has run: at once, unless
     /// the renderer still has launches to wait for (A-274).
     fn release(

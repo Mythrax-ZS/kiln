@@ -166,7 +166,7 @@ struct Core {
     writes_everywhere: bool,
     reach_everywhere: bool,
     deferred: Vec<surfaces::Staged>,
-    releases: Vec<nx_gpu::qmd3::Release>,
+    releases: Vec<compute::Completion>,
     /// Surface images and staging buffers of launches that have run, for the next launches of
     /// the same shapes (A-278).
     surface_images: crate::fast::FastMap<surfaces::ImageShape, Vec<crate::image::Image>>,
@@ -238,7 +238,7 @@ struct Phases {
     /// global memory, and in how many runs they came (a draw or a clear ends a run).
     launch_kinds: [u64; 4],
     /// Why launches were waited for (A-274), by [`compute::settle`] cause.
-    settles: [u64; 4],
+    settles: [u64; 5],
 }
 
 /// Calls of one kind and the time they took.
@@ -402,10 +402,10 @@ impl Renderer {
 
     /// How often compute launches were waited for since the last report, by cause: the GPU front,
     /// another command, a launch reading what one before it wrote, at once (A-274). For tests.
-    pub fn launch_waits(&self) -> [u64; 4] {
+    pub fn launch_waits(&self) -> [u64; 5] {
         match &self.core {
             Some(Ok(core)) => core.phases.settles,
-            _ => [0; 4],
+            _ => [0; 5],
         }
     }
 
@@ -1267,7 +1267,7 @@ impl Renderer {
                         .map(|d| format!("{:.0}", d.as_secs_f64() * 1000.0))
                         .collect();
                     eprintln!(
-                        "[vulkan] frame {}: the compute launches spent {} ms (program, constant buffers, textures, pipeline, recording, sending and waiting, putting surfaces back); {} wrote {} surfaces, {} reached global memory, in {} runs; waited for at the GPU front {}, at another command {}, at a launch reading what one before it wrote {}, at once {}",
+                        "[vulkan] frame {}: the compute launches spent {} ms (program, constant buffers, textures, pipeline, recording, sending and waiting, putting surfaces back); {} wrote {} surfaces, {} reached global memory, in {} runs; waited for at the GPU front {} (for bytes it reaches {}), at another command {}, at a launch reading what one before it wrote {}, at once {}",
                         p.frame,
                         ms.join(", "),
                         ph.launch_kinds[0],
@@ -1275,6 +1275,7 @@ impl Renderer {
                         ph.launch_kinds[2],
                         ph.launch_kinds[3],
                         ph.settles[0],
+                        ph.settles[4],
                         ph.settles[1],
                         ph.settles[2],
                         ph.settles[3]
@@ -1574,10 +1575,39 @@ impl Backend for Renderer {
     ) -> Result<(), String> {
         match self.core.as_mut() {
             Some(Ok(core)) if core.launches_pending() => {
-                core.releases.push(release);
+                core.releases.push(compute::Completion::Qmd(release));
                 Ok(())
             }
             _ => release.apply(&mut nx_gpu::qmd3::GpuMemory { mem, space }),
+        }
+    }
+
+    fn released_value(
+        &mut self,
+        space: &nx_gpu::vm::AddressSpace,
+        mem: &dyn nx_gpu::GuestMemory,
+        va: u64,
+    ) -> Option<u32> {
+        match self.core.as_mut() {
+            Some(Ok(core)) => core.released_value(space, mem, va),
+            _ => None,
+        }
+    }
+
+    fn write_after(
+        &mut self,
+        space: &nx_gpu::vm::AddressSpace,
+        mem: &dyn nx_gpu::GuestMemory,
+        va: u64,
+        data: &[u8],
+    ) -> Result<(), String> {
+        let completion = compute::Completion::Bytes(va, data.to_vec());
+        match self.core.as_mut() {
+            Some(Ok(core)) if core.launches_pending() => {
+                core.releases.push(completion);
+                Ok(())
+            }
+            _ => completion.apply(space, mem),
         }
     }
 

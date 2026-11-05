@@ -292,18 +292,27 @@ fn a_launch_is_waited_for_when_the_gpu_front_needs_what_it_wrote() {
     };
     r.release(&w.space, &w.mem, release).unwrap();
     assert_eq!(word_at(&w, flag), 0, "released before the launch had run");
+    // So is a semaphore release of the GPU front.
+    let semaphore = OUT + 0x200;
+    r.write_after(&w.space, &w.mem, semaphore, &9u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(word_at(&w, semaphore), 0, "a semaphore released too early");
+    // An acquire may not compare the word as the releases will leave it: this launch's accesses
+    // are not attributed to buffers, so it may write any word (A-274).
+    assert_eq!(r.released_value(&w.space, &w.mem, flag), None);
     assert_eq!(
         r.launch_waits(),
-        [0; 4],
+        [0; 5],
         "the launch was waited for at once"
     );
     r.settle(&w.space, &w.mem, None).unwrap();
     assert_eq!(
         r.launch_waits(),
-        [1, 0, 0, 0],
+        [1, 0, 0, 0, 0],
         "one wait, for the GPU front"
     );
     assert_eq!(word_at(&w, flag), 7);
+    assert_eq!(word_at(&w, semaphore), 9);
     assert_eq!(word_at(&w, OUT), 0x1234_5678);
 }
 

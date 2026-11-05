@@ -180,34 +180,36 @@ impl Channel {
     fn semaphore_op(&mut self, cx: &mut Cx<'_>) -> Result<(), String> {
         let [a, b, payload, d] = self.semaphore;
         let va = (u64::from(a & 0xFF) << 32) | u64::from(b & !3);
-        // A release says the work before it is done; an acquire reads a word that a launch not
-        // waited for, or one of its releases, may write.
-        if d & 0x1F == 2 {
-            cx.settle()?;
-        } else {
-            cx.settle_range(va, 4)?;
-        }
+        // A release is made once the launches before it are done; an acquire compares the word as
+        // the releases still to be made leave it (A-274).
         match d & 0x1F {
             2 => {
                 if d >> 24 & 1 != 0 {
-                    cx.write(va, &payload.to_le_bytes())?;
+                    cx.write_after(va, &payload.to_le_bytes())?;
                 } else {
                     let mut out = [0u8; 16];
                     out[..4].copy_from_slice(&payload.to_le_bytes());
                     out[8..].copy_from_slice(&cx.timestamp().to_le_bytes());
-                    cx.write(va, &out)?;
+                    cx.write_after(va, &out)?;
                 }
                 cx.stats.semaphore_releases += 1;
                 Ok(())
             }
             op @ (1 | 4 | 8) => {
-                let have = cx.read_u32(va)?;
-                let ok = match op {
+                let met = |have: u32| match op {
                     1 => have == payload,
                     4 if d >> 31 != 0 => have >= payload,
                     4 => (have as i32) >= (payload as i32),
                     _ => have & payload != 0,
                 };
+                let mut have = cx.acquire_value(va)?;
+                if !met(have) {
+                    // Before the channel stops, what is still to be released is made: it may be
+                    // what it waits for (A-274).
+                    cx.settle()?;
+                    have = cx.read_u32(va)?;
+                }
+                let ok = met(have);
                 // Not yet: the channel stops here until another channel's commands (or the
                 // program) put the value there, and this write is made again then (A-238).
                 if !ok {
@@ -449,6 +451,205 @@ mod tests {
         assert!(r.iter().all(|x| x.is_ok()), "{r:?}");
         let (r, _, _) = run(&mut ch, &[write(0, 0x1c, 4, false)]);
         assert!(r[0].is_ok());
+    }
+
+    /// A backend that holds semaphore releases until it is asked to settle everything, as the
+    /// renderer does while it has compute launches not waited for (A-274).
+    #[derive(Default)]
+    struct Holding {
+        held: Vec<(u64, Vec<u8>)>,
+        settles: usize,
+    }
+
+    impl crate::render::Backend for Holding {
+        fn draw(
+            &mut self,
+            _: &crate::render::Scene<'_>,
+            _: &crate::render::Draw,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn clear(
+            &mut self,
+            _: &crate::render::Scene<'_>,
+            _: &crate::render::Clear,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn present(&mut self, _: &crate::render::Present) -> Result<(), String> {
+            Ok(())
+        }
+        fn write_after(
+            &mut self,
+            _: &AddressSpace,
+            _: &dyn GuestMemory,
+            va: u64,
+            data: &[u8],
+        ) -> Result<(), String> {
+            self.held.push((va, data.to_vec()));
+            Ok(())
+        }
+        fn settle(
+            &mut self,
+            space: &AddressSpace,
+            mem: &dyn GuestMemory,
+            range: Option<(u64, u64)>,
+        ) -> Result<(), String> {
+            if range.is_none() {
+                self.settles += 1;
+                for (va, data) in self.held.drain(..) {
+                    assert!(space.write(mem, va, &data));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_acquire_of_a_word_still_to_be_released_waits_for_the_release() {
+        let mut ch = channel_with(&[]);
+        let (mem, space) = env();
+        let mut sp = Syncpoints::new();
+        let (mut woken, mut stats) = (Vec::new(), Stats::default());
+        let mut macros = crate::mme64::Store::default();
+        let mut qmds = crate::qmd3::Scheduler::default();
+        let mut holding = Holding::default();
+        let word = |mem: &TestMemory| {
+            let mut b = [0u8; 4];
+            assert!(space.read(mem, 0x500_0000, &mut b));
+            u32::from_le_bytes(b)
+        };
+        {
+            let mut cx = Cx {
+                mem: &mem,
+                space: &space,
+                syncpoints: &mut sp,
+                woken: &mut woken,
+                stats: &mut stats,
+                backend: Some(&mut holding),
+                lenient: false,
+                channel: 1,
+                syncpt: 1,
+                level: 0,
+                macros: &mut macros,
+                qmds: &mut qmds,
+                blocked: None,
+            };
+            // Release 7 (one word): the backend holds it.
+            for w in [
+                write(0, 0x14, 0x500_0000, false),
+                write(0, 0x18, 7, false),
+                write(0, 0x1c, 2 | 1 << 24, false),
+            ] {
+                ch.execute(&mut cx, w).unwrap();
+            }
+            assert_eq!(word(&mem), 0, "the release is held");
+            // An acquire of 7 finds it: the release is made before the channel would stop.
+            ch.execute(&mut cx, write(0, 0x1c, 1, false)).unwrap();
+            assert_eq!(cx.blocked, None);
+        }
+        assert_eq!(word(&mem), 7);
+        assert_eq!(holding.settles, 1);
+    }
+
+    /// [`Holding`], which also says what the word will be once the held releases are made.
+    #[derive(Default)]
+    struct Foreseeing(Holding);
+
+    impl crate::render::Backend for Foreseeing {
+        fn draw(
+            &mut self,
+            s: &crate::render::Scene<'_>,
+            d: &crate::render::Draw,
+        ) -> Result<(), String> {
+            self.0.draw(s, d)
+        }
+        fn clear(
+            &mut self,
+            s: &crate::render::Scene<'_>,
+            c: &crate::render::Clear,
+        ) -> Result<(), String> {
+            self.0.clear(s, c)
+        }
+        fn finish(&mut self) -> Result<(), String> {
+            self.0.finish()
+        }
+        fn present(&mut self, p: &crate::render::Present) -> Result<(), String> {
+            self.0.present(p)
+        }
+        fn write_after(
+            &mut self,
+            space: &AddressSpace,
+            mem: &dyn GuestMemory,
+            va: u64,
+            data: &[u8],
+        ) -> Result<(), String> {
+            self.0.write_after(space, mem, va, data)
+        }
+        fn settle(
+            &mut self,
+            space: &AddressSpace,
+            mem: &dyn GuestMemory,
+            range: Option<(u64, u64)>,
+        ) -> Result<(), String> {
+            self.0.settle(space, mem, range)
+        }
+        fn released_value(
+            &mut self,
+            _: &AddressSpace,
+            _: &dyn GuestMemory,
+            va: u64,
+        ) -> Option<u32> {
+            self.0
+                .held
+                .iter()
+                .rev()
+                .find(|(at, data)| *at == va && data.len() >= 4)
+                .map(|(_, data)| u32::from_le_bytes(data[..4].try_into().unwrap()))
+        }
+    }
+
+    #[test]
+    fn an_acquire_compares_the_word_as_the_held_releases_will_leave_it() {
+        let mut ch = channel_with(&[]);
+        let (mem, space) = env();
+        let mut sp = Syncpoints::new();
+        let (mut woken, mut stats) = (Vec::new(), Stats::default());
+        let mut macros = crate::mme64::Store::default();
+        let mut qmds = crate::qmd3::Scheduler::default();
+        let mut backend = Foreseeing::default();
+        {
+            let mut cx = Cx {
+                mem: &mem,
+                space: &space,
+                syncpoints: &mut sp,
+                woken: &mut woken,
+                stats: &mut stats,
+                backend: Some(&mut backend),
+                lenient: false,
+                channel: 1,
+                syncpt: 1,
+                level: 0,
+                macros: &mut macros,
+                qmds: &mut qmds,
+                blocked: None,
+            };
+            for w in [
+                write(0, 0x14, 0x500_0000, false),
+                write(0, 0x18, 7, false),
+                write(0, 0x1c, 2 | 1 << 24, false),
+                write(0, 0x1c, 1, false),
+            ] {
+                ch.execute(&mut cx, w).unwrap();
+            }
+            assert_eq!(cx.blocked, None);
+        }
+        // Nothing waited: the release is still held.
+        assert_eq!(backend.0.settles, 0);
+        assert_eq!(backend.0.held.len(), 1);
     }
 
     #[test]
