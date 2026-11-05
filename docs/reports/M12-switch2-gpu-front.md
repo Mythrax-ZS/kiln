@@ -1,6 +1,8 @@
 # M12: the Switch 2 GPU front
 
-Status: open. Started 2026-11-04.
+Status: complete. Started 2026-11-04, passed 2026-11-05: the title submits its frames, and they
+are traced and presented (900 in a run stopped by `NX_MAX_FRAMES`). Nothing is drawn yet: the
+renderer refuses every draw at its programs, which are sm_86 (M13).
 
 The task (part of the owner's request of 2026-11-04): what a Switch 2 program's graphics need below
 NVN2, at the driver level, until the title submits its first frames and they are traced. The plan
@@ -12,8 +14,8 @@ docs/ASSUMPTIONS.md with its source.
 
 ## Where the title is
 
-The title now sets up its graphics system, its display and its GPU driver, and makes its first GPU
-submission. In order:
+The title sets up its graphics system, its display and its GPU driver, submits its commands on four
+channels and presents its frames. In order:
 
 1. `ISelfController` 2000 hands over the supervisor, `nx2:gsv`, a TIPC session (A-194).
 2. `nn::gsv::BootWithRemoteMemory`: commands 4, 11 (`RegisterClientHandle`), 101, and the
@@ -39,8 +41,29 @@ submission. In order:
 10. A channel: a timeslice group (A-202, A-207), the channel's runlist (A-203), its binding to the
     group, its object context of the Ampere 3D class (A-204), its event 7 (A-205), its preemption
     modes (A-206), the address space, its GPFIFO, and the zcull binding.
-11. **The first submission** (`SUBMIT_GPFIFO2`) reaches the command processor, which stops at
-    `SET_OBJECT` of the Ampere 3D class, 0xC797: it has no engine for the Ampere classes yet.
+11. The first submission (`SUBMIT_GPFIFO2`) reaches the command processor. The Ampere classes
+    run on the Maxwell engines, whose methods they keep, with MME64 for their macros (A-208) and
+    QMD version 3 for compute launches (A-210).
+12. Native memory and images (A-212), GPU-only regions backed by the graphics server (214 and
+    215, A-215), GameChat and the camera (A-220 to A-222, A-234).
+13. The macros. NVN2's macros fall through into the next and read more parameters than a call
+    has; a missing one reads 0 (A-237). The macro code is each channel's: the title's two compute
+    channels load their own code at instruction 0 after the 3D channel has loaded its macros there,
+    and with one store for the process the 3D macros were replaced and drew nothing. With a store
+    per channel the same start makes 1,141 draws and 290 clears in its first 644 submissions.
+14. Synchronisation across channels: the compute channel acquires counters that the 3D channel
+    releases in commands it submits later. A channel now waits at such an acquire, and goes on once
+    another channel's commands have released it (A-238): about 2,000 waits in a run of 300 s, none
+    of them for good.
+15. The shared memory the title maps at an address it picks at random could fall where the
+    graphics server later backs GPU-only memory; that range is now "in use" for a Switch 2 program
+    (A-164). Before, most runs stopped there, each at a different point.
+16. **Presenting**: `vi2` 351, 352 (A-235) and 229, `PresentClientBuffer` (A-236), which shows a
+    native image from its memory, paced by the swap interval. The title presents with swap interval
+    1, and with 2 from about frame 345.
+17. The programs of a draw: the Ampere 3D class gives each program's whole address
+    (`SET_PIPELINE_PROGRAM_ADDRESS_A/B`, A-239). Each draw's programs then start with a program
+    header of type 1, version 4, which the translator does not read: the end of this milestone.
 
 Two findings changed what other emulators do:
 
@@ -52,17 +75,40 @@ Two findings changed what other emulators do:
   are set; without them it asked for an object context of class 0, which the other emulators map
   onto a class of their own choosing (A-199).
 
-## What is left in this milestone
+## Measured
 
-- The command processor for the Ampere classes (3D 0xC797, compute 0xC7C0 with QMD version 3,
-  copy 0xC7B5, GPFIFO 0xC56F), MME64 macros, methods split across GPFIFO entries.
-- `nx2:gpu`'s private regions (214, 215) and sparse mappings, when the title asks.
-- The rest of `vi2` (228 and 229, presenting a layer's buffer) and the supervisor's native memory
-  and image commands (111 to 114, 423 to 435, 1510), when the title asks.
+One run with the Vulkan renderer (`NX_RENDERER=vulkan NX_GPU_LENIENT=1 NX_MAX_FRAMES=900`), on one
+RTX 5070 Ti:
 
-## Tests so far
+- 900 frames presented, then the run ended by itself (exit 0).
+- From frame 400 on, about 1,200 draws and 30 clears a frame. Every draw is refused at its programs
+  (header version 4); the clears are made. 100 frames took about 20 s, almost all of it in refusing
+  draws, so the rate says nothing of what the title will run at.
+- The presented image is 3840x2160. No render target is drawn at its address, as the draws that
+  would make it are refused, so there is no frame to dump and look at yet.
+- What else the renderer cannot do yet, said once each: compute launches of QMD version 3 (sm_86
+  programs), 2D copies from memory that no render target stands for, a clear of a color target
+  of format 0, and draws with a tessellation program.
+
+Without a renderer the run went 300 s without a stop.
+
+## What M13 and M14 take on
+
+- M13: the version 4 program header and the sm_86 instruction set, for the draws' and the compute
+  launches' programs.
+- M14: what the renderer then refuses: the 2D copies above, the formats, tessellation, the
+  presented image (a render target at its address, or the pass that makes it), and frames dumped
+  and looked at.
+- `vi2` 353 (when its three values are turned off) and 228, and the 3D class's report-semaphore
+  acquire across channels, when the title asks.
+
+## Tests
 
 The supervisor's, `nx2:gpu`'s and `vi2`'s answers, the TIPC reply layout, the Switch 2's
 characteristics, TPC masks, SM mapping, engine list, unified address space, syncpoint shim (read
 by a semaphore acquire), timeslice groups, channel runlists and preemption modes are unit tested,
-as are the kernel's Switch 2 values and the CPU forms.
+as are the kernel's Switch 2 values and the CPU forms. New with this part: a macro's short read
+(0, and counted); the macro code of two channels kept apart; a channel that waits at an acquire,
+a later submission of it waiting behind, and both going on when another channel releases (each
+word run once, the fences reached); the Ampere program address and the Maxwell region plus
+offset; shared memory refused in the graphics server's range for a Switch 2 program only.
