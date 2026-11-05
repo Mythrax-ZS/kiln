@@ -1298,15 +1298,10 @@ impl Textures {
             self.epoch = scene.begin_write_epoch();
             self.epoch_frame = current;
         }
-        if let Some(t) = self.map.get_mut(&key) {
-            if !self.always_compare
-                && t.epoch != 0
-                && scene.untouched_since(tic.address(), total, t.epoch) == Some(true)
-            {
-                t.checked = current;
-                return Ok(t.image.view);
-            }
-        }
+        // The tracking is asked about each layer's levels the image holds (below), not about the
+        // whole texture: a large array's memory is gigabytes of levels the image leaves out
+        // (A-250), whose pages the question walks, and a layer the renderer wrote into this epoch
+        // is read again whatever the tracking says (A-279).
         // What the device holds of each element: an ASTC block becomes its texels.
         let device_bytes = if format.astc { 4 } else { format.bytes };
         let device_block = if format.astc { (1, 1) } else { format.block };
