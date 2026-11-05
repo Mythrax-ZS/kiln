@@ -19,6 +19,9 @@ use std::collections::VecDeque;
 /// Size of the chunks the upload memory is carved from.
 const CHUNK: u64 = 16 << 20;
 
+/// The upload memory a slot keeps from one batch to the next.
+const KEPT_UPLOAD: u64 = 64 << 20;
+
 /// How many batches there are: one is recorded while the others run.
 const SLOTS: usize = 3;
 
@@ -193,7 +196,9 @@ impl Frame {
                 return Ok((chunk.buffer.buffer, at, chunk.buffer.ptr_at(at)));
             }
         }
-        // A free chunk of an earlier batch that is big enough, or a new one.
+        // A free chunk of an earlier batch that is big enough, or a new one in the place of one
+        // that is too small (which no batch uses: this one has not used it, the earlier ones of
+        // the slot are over).
         let reusable = slot
             .chunks
             .get(slot.in_use)
@@ -207,7 +212,13 @@ impl Frame {
                     | vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::UNIFORM_BUFFER,
             )?;
-            slot.chunks.insert(slot.in_use, Chunk { buffer, used: 0 });
+            let fresh = Chunk { buffer, used: 0 };
+            if slot.in_use < slot.chunks.len() {
+                let small = std::mem::replace(&mut slot.chunks[slot.in_use], fresh);
+                vk.destroy_host_buffer(small.buffer);
+            } else {
+                slot.chunks.push(fresh);
+            }
         }
         let chunk = &mut slot.chunks[slot.in_use];
         chunk.used = size;
@@ -431,6 +442,20 @@ impl Frame {
             chunk.used = 0;
         }
         slot.in_use = 0;
+        // The upload memory a busy batch took (large textures) is not kept for ever: past
+        // `KEPT_UPLOAD` bytes, the chunks go.
+        let mut kept = 0;
+        let mut keep = 0;
+        for chunk in &slot.chunks {
+            if kept + chunk.buffer.size > KEPT_UPLOAD && keep > 0 {
+                break;
+            }
+            kept += chunk.buffer.size;
+            keep += 1;
+        }
+        for chunk in slot.chunks.drain(keep..) {
+            vk.destroy_host_buffer(chunk.buffer);
+        }
         for g in slot.garbage.drain(..) {
             match g {
                 Garbage::Image(i) => vk.destroy_image(i),
