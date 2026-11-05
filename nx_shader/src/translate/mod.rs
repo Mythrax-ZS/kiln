@@ -27,6 +27,7 @@ mod half;
 mod int;
 mod io;
 mod local;
+mod mesh;
 mod sm86;
 mod tex;
 
@@ -44,12 +45,19 @@ pub enum Stage {
     /// A compute program as a title launches it: a grid of workgroups of [`Config::block`]
     /// invocations; the thread and block numbers come from `S2R`, memory is reached by GPU address.
     Kernel,
+    /// The task program of a task and mesh pipeline (docs/ASSUMPTIONS.md A-270): workgroups that
+    /// hand the mesh workgroups their payload ([`Config::mesh`]).
+    Task,
+    /// The mesh program of a task and mesh pipeline: workgroups that make vertices and primitives.
+    Mesh,
 }
 
 impl Stage {
     pub fn index(self) -> u32 {
         match self {
             Stage::Vertex => 0,
+            Stage::Task => 1,
+            Stage::Mesh => 2,
             Stage::Pixel => 4,
             Stage::Compute | Stage::Kernel => 5,
         }
@@ -118,6 +126,11 @@ pub struct Config {
     /// The byte offsets of the fixed reads `zero_cbufs` makes 0.
     pub zero_cbuf_range: (u32, u32),
     pub zero_inputs: bool,
+    /// For a task or mesh program, its pipeline (A-270).
+    pub mesh: Option<MeshConfig>,
+    /// For a pixel program drawn by a mesh pipeline: the input attribute words (byte address / 4)
+    /// that are a primitive's rather than interpolated between its vertices.
+    pub per_primitive: Vec<u32>,
 }
 
 impl Config {
@@ -143,8 +156,30 @@ impl Config {
             zero_cbuf_kind: 0,
             zero_cbuf_range: (0, u32::MAX),
             zero_inputs: false,
+            mesh: None,
+            per_primitive: Vec::new(),
         }
     }
+}
+
+/// What a task or a mesh program needs to know of its pipeline (A-270).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MeshConfig {
+    /// The invocations of a workgroup of the stage.
+    pub threads: u32,
+    /// The most vertices and primitives a mesh workgroup makes, and what they are (4 triangles,
+    /// 1 lines, 0 points).
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    pub topology: u32,
+    /// The words of the region a task workgroup hands its mesh workgroups (lines of 32 words):
+    /// their number at byte 4, the payload from byte 16.
+    pub payload_words: u32,
+    /// Whether a task program runs before the mesh program.
+    pub task: bool,
+    /// The attribute words written of each primitive (the output map of the pipeline's
+    /// pass-through geometry header), in the order of their lines.
+    pub primitive_words: Vec<u32>,
 }
 
 /// A texture a program samples.

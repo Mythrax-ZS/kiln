@@ -21,16 +21,49 @@ pub struct Variation {
     pub attribute_classes: [Class; 32],
     pub target_classes: [Class; 8],
     pub depth_minus_one_to_one: bool,
+    /// For the programs of a mesh pipeline (A-270): its settings.
+    pub mesh: Option<MeshVariation>,
+    /// The generic attribute words (bit `w - 0x20`) that are a primitive's: the output map of a
+    /// mesh pipeline's pass-through header, for its mesh and pixel programs.
+    pub per_primitive: u128,
+}
+
+/// What a task or mesh program's translation depends on of its pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MeshVariation {
+    pub threads: u32,
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    pub topology: u32,
+    pub payload_words: u32,
+    pub task: bool,
 }
 
 impl Variation {
     pub fn config(&self) -> Config {
-        let stage = if self.stage_index == Stage::Vertex.index() {
-            Stage::Vertex
-        } else {
-            Stage::Pixel
-        };
+        let stage = [Stage::Vertex, Stage::Task, Stage::Mesh]
+            .into_iter()
+            .find(|s| s.index() == self.stage_index)
+            .unwrap_or(Stage::Pixel);
         let mut c = Config::new(stage);
+        let words: Vec<u32> = (0..128u32)
+            .filter(|b| self.per_primitive >> b & 1 != 0)
+            .map(|b| 0x20 + b)
+            .collect();
+        if let Some(m) = self.mesh {
+            c.mesh = Some(nx_shader::translate::MeshConfig {
+                threads: m.threads,
+                max_vertices: m.max_vertices,
+                max_primitives: m.max_primitives,
+                topology: m.topology,
+                payload_words: m.payload_words,
+                task: m.task,
+                primitive_words: words.clone(),
+            });
+        }
+        if stage == Stage::Pixel {
+            c.per_primitive = words;
+        }
         c.attribute_classes = self.attribute_classes;
         c.target_classes = self.target_classes;
         c.depth_minus_one_to_one = self.depth_minus_one_to_one;
@@ -537,6 +570,8 @@ pub enum Visible {
     Vertex,
     Fragment,
     Compute,
+    Task,
+    Mesh,
 }
 
 /// One descriptor the programs of a draw or a launch need.
@@ -567,6 +602,8 @@ pub fn bindings_of(programs: &[&Program]) -> Vec<Binding> {
             Stage::Vertex => Visible::Vertex,
             Stage::Pixel => Visible::Fragment,
             Stage::Compute | Stage::Kernel => Visible::Compute,
+            Stage::Task => Visible::Task,
+            Stage::Mesh => Visible::Mesh,
         };
         for slot in 0..18 {
             if p.info.cbuf_extent[slot] > 0 || p.info.cbuf_dynamic[slot] {
@@ -633,6 +670,8 @@ impl Layouts {
                         Visible::Vertex => vk::ShaderStageFlags::VERTEX,
                         Visible::Fragment => vk::ShaderStageFlags::FRAGMENT,
                         Visible::Compute => vk::ShaderStageFlags::COMPUTE,
+                        Visible::Task => vk::ShaderStageFlags::TASK_EXT,
+                        Visible::Mesh => vk::ShaderStageFlags::MESH_EXT,
                     })
             })
             .collect();

@@ -150,6 +150,8 @@ pub(super) fn epilogue(tx: &mut Tx<'_>) -> R<()> {
     match tx.cfg.stage {
         Stage::Compute => epilogue_test(tx),
         Stage::Kernel => Ok(()),
+        Stage::Task => super::mesh::epilogue_task(tx),
+        Stage::Mesh => super::mesh::epilogue_mesh(tx),
         Stage::Vertex => epilogue_vertex(tx),
         Stage::Pixel => epilogue_pixel(tx),
     }
@@ -649,6 +651,7 @@ fn ipa(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
         Stage::Pixel => interpolated(tx, addr)?,
         Stage::Vertex => return tx.fail("IPA in a vertex shader"),
         Stage::Kernel => return tx.fail("IPA in a compute program"),
+        Stage::Task | Stage::Mesh => return tx.fail("IPA in a task or mesh program"),
     };
     if mode == 1 {
         let m = tx.read_f(inst.rb());
@@ -692,6 +695,11 @@ pub(super) fn interpolated(tx: &mut Tx<'_>, addr: u32) -> R<Id> {
                     let v = tx.m.global_variable(ptr, storage::INPUT);
                     tx.m.decorate(v, deco::LOCATION, &[loc]);
                     tx.m.decorate(v, deco::COMPONENT, &[comp]);
+                    // An attribute of the primitive, in a mesh pipeline (A-270).
+                    if tx.cfg.per_primitive.contains(&(addr / 4)) {
+                        super::mesh::declare(tx);
+                        tx.m.decorate(v, super::mesh::DECO_PER_PRIMITIVE, &[]);
+                    }
                     match imap {
                         PixelImap::Constant => tx.m.decorate(v, deco::FLAT, &[]),
                         PixelImap::ScreenLinear => tx.m.decorate(v, deco::NO_PERSPECTIVE, &[]),

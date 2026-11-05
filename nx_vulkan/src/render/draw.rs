@@ -2,7 +2,7 @@
 
 use super::convert;
 use super::convert::Topology;
-use super::shaders::{bindings_of, Program, Variation};
+use super::shaders::{bindings_of, MeshVariation, Program, Variation};
 use super::textures::{texture_format, Copy, Overlay, Tic, Tsc};
 use super::Core;
 use crate::fast::FastMap;
@@ -35,6 +35,9 @@ fn lap(mark: &mut Option<Instant>, into: &mut Duration, _step: &'static str) {
 pub struct PipelineKey {
     vertex: u64,
     pixel: Option<u64>,
+    /// A task and mesh pipeline (A-270): `vertex` is its mesh program, this its task program.
+    task: Option<u64>,
+    mesh: bool,
     /// `(location, binding, format, offset)`.
     attributes: Vec<(u32, u32, i32, u32)>,
     /// `(binding, stride, per instance)`.
@@ -170,18 +173,37 @@ impl Core {
         if count == 0 {
             return Ok(());
         }
-        // The programs of the draw.
+        // The programs of the draw: a vertex and a pixel program, or those of a task and mesh
+        // pipeline (A-270): the vertex slot holds the task program (the mesh program when there
+        // is no task), the tessellation slot the mesh program, and the geometry slot a header
+        // whose output map is what each primitive carries.
         let stages = scene.stages();
+        let mesh = regs.mesh();
+        if mesh.is_some() && self.vk.mesh_shader.is_none() {
+            return Err("a draw of a task and mesh pipeline, which the device cannot make".into());
+        }
         for s in &stages {
             match s.kind {
                 StageKind::Vertex | StageKind::Pixel => {}
+                StageKind::Tessellation | StageKind::Geometry if mesh.is_some() => {}
                 other => return Err(format!("a draw with a {} program", other.name())),
             }
         }
-        let vs_slot: &StageSlot = stages
+        let vertex_slot: &StageSlot = stages
             .iter()
             .find(|s| s.kind == StageKind::Vertex)
             .ok_or("a draw without a vertex program")?;
+        let (vs_slot, task_slot) = match (
+            mesh,
+            stages.iter().find(|s| s.kind == StageKind::Tessellation),
+        ) {
+            (Some(_), Some(m)) => (m, Some(vertex_slot)),
+            _ => (vertex_slot, None),
+        };
+        let per_primitive = match (mesh, stages.iter().find(|s| s.kind == StageKind::Geometry)) {
+            (Some(_), Some(g)) => primitive_words(scene, g.address),
+            _ => 0,
+        };
         let ps_slot = stages.iter().find(|s| s.kind == StageKind::Pixel);
         if stages
             .iter()
@@ -222,15 +244,44 @@ impl Core {
                 [Class::Float; 8]
             },
             depth_minus_one_to_one: !window.z_zero_to_one,
+            mesh: mesh
+                .filter(|_| matches!(stage, Stage::Task | Stage::Mesh))
+                .map(|m| MeshVariation {
+                    threads: if stage == Stage::Task {
+                        m.task_threads
+                    } else {
+                        m.mesh_threads
+                    },
+                    max_vertices: m.max_vertices,
+                    max_primitives: m.max_primitives,
+                    topology: m.topology,
+                    payload_words: m.task_output_lines * 32,
+                    task: task_slot.is_some(),
+                }),
+            per_primitive,
         };
         let mut mark = super::stopwatch();
         let vs = self.shaders.program(
             &self.vk,
             scene,
             vs_slot,
-            variation(Stage::Vertex),
+            variation(if mesh.is_some() {
+                Stage::Mesh
+            } else {
+                Stage::Vertex
+            }),
             self.textures.frame,
         )?;
+        let task = match task_slot {
+            Some(slot) => Some(self.shaders.program(
+                &self.vk,
+                scene,
+                slot,
+                variation(Stage::Task),
+                self.textures.frame,
+            )?),
+            None => None,
+        };
         let ps = match ps_slot {
             Some(slot) => Some(self.shaders.program(
                 &self.vk,
@@ -269,7 +320,10 @@ impl Core {
         let mut image_infos = std::mem::take(&mut self.scratch.image_infos);
         image_infos.clear();
         let mut handles = std::mem::take(&mut self.scratch.handles);
-        for (p, slot) in std::iter::once((&vs, vs_slot)).chain(ps.iter().zip(ps_slot)) {
+        for (p, slot) in std::iter::once((&vs, vs_slot))
+            .chain(ps.iter().zip(ps_slot))
+            .chain(task.iter().zip(task_slot))
+        {
             // The handle is in the program's table, or (a bindless access) in a word of another
             // constant buffer the program names.
             handles.clear();
@@ -397,15 +451,20 @@ impl Core {
         lap(&mut mark, &mut self.phases.vertices, "vertices");
 
         // Descriptors: the constant buffers the programs read.
-        let layout_bindings = match ps.as_deref() {
-            Some(p) => bindings_of(&[&*vs, p]),
-            None => bindings_of(&[&*vs]),
+        let layout_bindings = {
+            let mut programs: Vec<&Program> = vec![&*vs];
+            programs.extend(ps.as_deref());
+            programs.extend(task.as_deref());
+            bindings_of(&programs)
         };
         let (set_layout, pipeline_layout) = self.layouts.get(&self.vk, &layout_bindings)?;
         let set = self.frame.descriptor_set(&self.vk, set_layout)?;
         let mut buffer_infos = std::mem::take(&mut self.scratch.buffer_infos);
         buffer_infos.clear();
-        for (p, slot) in std::iter::once((&vs, vs_slot)).chain(ps.iter().zip(ps_slot)) {
+        for (p, slot) in std::iter::once((&vs, vs_slot))
+            .chain(ps.iter().zip(ps_slot))
+            .chain(task.iter().zip(task_slot))
+        {
             let base = 64 * p.stage.index();
             for cb in 0..18u32 {
                 if p.info.cbuf_extent[cb as usize] == 0 && !p.info.cbuf_dynamic[cb as usize] {
@@ -527,8 +586,20 @@ impl Core {
             self.debug.discard_programs.contains(&vs_slot.address),
         );
         let optimize = !self.debug.no_optimize.contains(&vs_slot.address);
-        let pipeline =
-            self.pipeline(&key, &vs, ps.as_deref(), pipeline_layout, &blend, optimize)?;
+        let key = PipelineKey {
+            task: task.as_ref().map(|t| t.id),
+            mesh: mesh.is_some(),
+            ..key
+        };
+        let pipeline = self.pipeline(
+            &key,
+            &vs,
+            ps.as_deref(),
+            task.as_deref(),
+            pipeline_layout,
+            &blend,
+            optimize,
+        )?;
         self.scratch.attributes = attributes;
         self.scratch.streams = streams;
         self.scratch.binding_state = binding_state;
@@ -578,12 +649,14 @@ impl Core {
         let d = &self.vk.device;
         // SAFETY: as above.
         unsafe {
-            match geometry.indices {
-                Some((buffer, offset, ty, n)) => {
+            match (&self.vk.mesh_shader, mesh, geometry.indices) {
+                // A task and mesh pipeline: as many workgroups as the draw has vertices (A-270).
+                (Some(m), Some(_), _) => m.cmd_draw_mesh_tasks(cmd, count, 1, 1),
+                (_, _, Some((buffer, offset, ty, n))) => {
                     d.cmd_bind_index_buffer(cmd, buffer, offset, ty);
                     d.cmd_draw_indexed(cmd, n, 1, 0, geometry.vertex_offset, 0);
                 }
-                None => d.cmd_draw(cmd, geometry.vertices.1, 1, geometry.vertices.0, 0),
+                _ => d.cmd_draw(cmd, geometry.vertices.1, 1, geometry.vertices.0, 0),
             }
         }
         let _ = geometry.restart;
@@ -1523,6 +1596,8 @@ impl Core {
         PipelineKey {
             vertex: vs.id,
             pixel: ps.map(|p| p.id),
+            task: None,
+            mesh: false,
             attributes: attributes
                 .iter()
                 .map(|(l, b, f, o)| (*l, *b, f.as_raw(), *o))
@@ -1542,11 +1617,13 @@ impl Core {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pipeline(
         &mut self,
         key: &PipelineKey,
         vs: &Program,
         ps: Option<&Program>,
+        task: Option<&Program>,
         layout: vk::PipelineLayout,
         _blend: &Blend,
         optimize: bool,
@@ -1620,7 +1697,7 @@ impl Core {
                 .logic_op_enable(true)
                 .logic_op(vk::LogicOp::from_raw(op));
         }
-        let dynamic_states = [
+        let mut dynamic_states = vec![
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
             vk::DynamicState::LINE_WIDTH,
@@ -1641,11 +1718,33 @@ impl Core {
             vk::DynamicState::DEPTH_BIAS_ENABLE,
             vk::DynamicState::PRIMITIVE_RESTART_ENABLE,
         ];
+        let mut stages = Vec::new();
+        if key.mesh {
+            // A mesh pipeline has no vertex input and no input assembly (A-270).
+            dynamic_states.retain(|s| *s != vk::DynamicState::PRIMITIVE_RESTART_ENABLE);
+            if let Some(t) = task {
+                stages.push(
+                    vk::PipelineShaderStageCreateInfo::default()
+                        .stage(vk::ShaderStageFlags::TASK_EXT)
+                        .module(t.module)
+                        .name(c"main"),
+                );
+            }
+            stages.push(
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::MESH_EXT)
+                    .module(vs.module)
+                    .name(c"main"),
+            );
+        } else {
+            stages.push(
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .module(vs.module)
+                    .name(c"main"),
+            );
+        }
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-        let mut stages = vec![vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(vs.module)
-            .name(c"main")];
         if let Some(p) = ps {
             stages.push(
                 vk::PipelineShaderStageCreateInfo::default()
@@ -1675,11 +1774,15 @@ impl Core {
         } else {
             vk::PipelineCreateFlags::DISABLE_OPTIMIZATION
         };
-        let info = [vk::GraphicsPipelineCreateInfo::default()
+        let mut info = vk::GraphicsPipelineCreateInfo::default()
             .flags(flags)
-            .stages(&stages)
-            .vertex_input_state(&vertex_input)
-            .input_assembly_state(&assembly)
+            .stages(&stages);
+        if !key.mesh {
+            info = info
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&assembly);
+        }
+        let info = [info
             .viewport_state(&viewport)
             .rasterization_state(&rasterization)
             .multisample_state(&multisample)
@@ -1894,6 +1997,23 @@ fn rewrite(topology: Topology, seq: &[u32]) -> Result<(vk::PrimitiveTopology, Ve
         }
         Topology::Polygon => (T::TRIANGLE_FAN, seq.to_vec()),
     })
+}
+
+/// The generic attribute words a mesh pipeline's pass-through geometry header maps (bit `w -
+/// 0x20` for word `w`): what each primitive carries (A-270). The output map's bits from 432 are
+/// the words from 0x20.
+fn primitive_words(scene: &Scene<'_>, address: u64) -> u128 {
+    let Some(header) = scene.read_vec(address, 0x80) else {
+        return 0;
+    };
+    let mut mask = 0u128;
+    for b in 0..128usize {
+        let bit = 432 + b;
+        if header[bit / 8] >> (bit % 8) & 1 != 0 {
+            mask |= 1 << b;
+        }
+    }
+    mask
 }
 
 #[cfg(test)]

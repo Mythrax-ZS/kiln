@@ -29,8 +29,7 @@ pub(super) fn build(tx: &mut Tx<'_>, code: Program<'_>, graph: &Cfg) -> R<()> {
         && matches!(entry.term, Term::Exit { guard, cc, .. } if guard.is_always() && cc == CC_ALWAYS);
     if straight {
         body(tx, code, graph, entry)?;
-        io::epilogue(tx)?;
-        tx.f.ret();
+        end(tx)?;
         return Ok(());
     }
     if !tx.cfg.force_loop && forward_only(graph) {
@@ -71,9 +70,7 @@ pub(super) fn build(tx: &mut Tx<'_>, code: Program<'_>, graph: &Cfg) -> R<()> {
     tx.f.branch(header);
     // The loop's merge block is where every exit goes: the outputs are written once, here.
     tx.f.label(exit);
-    io::epilogue(tx)?;
-    tx.f.ret();
-    Ok(())
+    end(tx)
 }
 
 /// The blocks a block can go on to.
@@ -140,8 +137,7 @@ fn build_predicated(tx: &mut Tx<'_>, code: Program<'_>, graph: &Cfg) -> R<()> {
             return Ok(());
         }
     }
-    io::epilogue(tx)?;
-    tx.f.ret();
+    end(tx)?;
     Ok(())
 }
 
@@ -482,4 +478,14 @@ fn instruction(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
             tx.fail(format!("{} ({:?}) is not translated", row.name, row.op))
         }
     }
+}
+
+/// The end of the program: its epilogue, then the return, unless the epilogue ended it (a task
+/// program's launch of its mesh workgroups).
+fn end(tx: &mut Tx<'_>) -> R<()> {
+    io::epilogue(tx)?;
+    if tx.cfg.stage != super::Stage::Task {
+        tx.f.ret();
+    }
+    Ok(())
 }

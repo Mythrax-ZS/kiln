@@ -229,6 +229,7 @@ pub mod builtin {
     pub const WORKGROUP_ID: u32 = 26;
     pub const LOCAL_INVOCATION_ID: u32 = 27;
     pub const GLOBAL_INVOCATION_ID: u32 = 28;
+    pub const LOCAL_INVOCATION_INDEX: u32 = 29;
     pub const VERTEX_INDEX: u32 = 42;
     pub const INSTANCE_INDEX: u32 = 43;
     pub const BASE_VERTEX: u32 = 4424;

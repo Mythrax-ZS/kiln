@@ -134,6 +134,8 @@ pub(super) struct Tx<'a> {
     pub local_min_words: u32,
     /// The shared memory variable and its length in words, made on first use.
     pub shared: Option<(Id, u32)>,
+    /// The stage buffer and the outputs of a task or mesh program (A-270).
+    pub mesh: super::mesh::Vars,
     /// The words of shared memory the constant-offset accesses of the program reach.
     pub shared_min_words: u32,
     /// The offset of the instruction being translated, for messages.
@@ -201,6 +203,7 @@ impl<'a> Tx<'a> {
             local: None,
             local_min_words: 0,
             shared: None,
+            mesh: Default::default(),
             shared_min_words: 0,
             pc: 0,
             bad: None,
@@ -968,6 +971,8 @@ fn finish(tx: Tx<'_>, cfg: &Config) -> Translation {
         Stage::Vertex => exec::VERTEX,
         Stage::Pixel => exec::FRAGMENT,
         Stage::Compute | Stage::Kernel => exec::GL_COMPUTE,
+        Stage::Task => super::mesh::EXEC_TASK,
+        Stage::Mesh => super::mesh::EXEC_MESH,
     };
     m.entry_point(model, id, "main", &interface);
     match cfg.stage {
@@ -975,6 +980,21 @@ fn finish(tx: Tx<'_>, cfg: &Config) -> Translation {
         Stage::Compute => m.execution_mode(id, exec::LOCAL_SIZE, &[1, 1, 1]),
         Stage::Kernel => m.execution_mode(id, exec::LOCAL_SIZE, &cfg.block),
         Stage::Vertex => {}
+        Stage::Task | Stage::Mesh => {
+            let mesh = cfg.mesh.clone().unwrap_or_default();
+            m.extension("SPV_EXT_mesh_shader");
+            m.capability(super::mesh::CAP_MESH_SHADING);
+            m.execution_mode(id, exec::LOCAL_SIZE, &[mesh.threads.max(1), 1, 1]);
+            if cfg.stage == Stage::Mesh {
+                m.execution_mode(id, super::mesh::MODE_OUTPUT_VERTICES, &[mesh.max_vertices]);
+                m.execution_mode(
+                    id,
+                    super::mesh::MODE_OUTPUT_PRIMITIVES,
+                    &[mesh.max_primitives],
+                );
+                m.execution_mode(id, super::mesh::MODE_OUTPUT_TRIANGLES, &[]);
+            }
+        }
     }
     Translation {
         spirv: m.finish(),

@@ -13,6 +13,7 @@
 mod float;
 mod int;
 mod mem;
+pub(in crate::translate) use mem::builtin_value;
 mod surface;
 mod tex;
 mod warp;
@@ -97,6 +98,7 @@ fn dispatch(tx: &mut Tx<'_>, i: &I) -> R<()> {
         op::LDC => return mem::ldc(tx, i),
         op::ULDC | op::ULDC_INDEXED => return mem::uldc(tx, i),
         op::ALD => return mem::ald(tx, i),
+        op::ISBERD | op::ISBEWR => return mem::stage_buffer(tx, i),
         op::AST => return mem::ast(tx, i),
         op::IPA => return mem::ipa(tx, i),
         op::LDG | op::LDG_U => return mem::ldg(tx, i),
@@ -616,6 +618,111 @@ mod tests {
             .chain([&exit, &end])
             .flat_map(|i| i.0.to_le_bytes())
             .collect()
+    }
+
+    /// `ISBEWR` (`ISBERD` with `write` false) of the stage buffer: `[Ra + offset]`, the data or
+    /// destination register, 32 bits or a byte, the region (3 the attributes, 0 the map), the
+    /// output buffer.
+    fn stage_buffer(write: bool, ra: u8, reg: u8, offset: u64, wide: bool, region: u64) -> Inst {
+        let reg_at = if write { 32 } else { 16 };
+        word(&[
+            (0, 12, if write { 0x927 } else { 0x923 }),
+            (12, 4, 7),
+            (24, 8, u64::from(ra)),
+            (reg_at, 8, u64::from(reg)),
+            (40, 24, offset),
+            (75, 1, u64::from(wide)),
+            (76, 2, region),
+            (78, 1, u64::from(!write)),
+            (79, 1, u64::from(write)),
+        ])
+    }
+
+    /// `MOV Rd, imm32`.
+    fn mov(rd: u8, imm: u32) -> Inst {
+        word(&[
+            (0, 12, 0x802),
+            (12, 4, 7),
+            (16, 8, u64::from(rd)),
+            (32, 32, u64::from(imm)),
+            (72, 4, 0xF),
+        ])
+    }
+
+    fn mesh_config(task: bool) -> crate::translate::MeshConfig {
+        crate::translate::MeshConfig {
+            threads: 32,
+            max_vertices: 32,
+            max_primitives: 16,
+            topology: 4,
+            payload_words: 64,
+            task,
+            primitive_words: vec![0x20],
+        }
+    }
+
+    fn validated(t: &crate::translate::Translation) {
+        match crate::validate::validate(&t.spirv) {
+            Ok(Some(())) => {}
+            Ok(None) => {
+                eprintln!("SKIPPED: spirv-val is not installed, the SPIR-V is not validated")
+            }
+            Err(e) => panic!("invalid SPIR-V: {e}"),
+        }
+    }
+
+    #[test]
+    fn a_mesh_program_writes_its_vertices_and_primitives_through_the_stage_buffer() {
+        // The header of a mesh program as the title has them (it reads as a domain shader), its
+        // output map the position (bits 428..431).
+        let mut header = vec![0u8; 0x80];
+        header[..4].copy_from_slice(&0x020c_0c81u32.to_le_bytes());
+        header[428 / 8] |= 0xF << (428 % 8);
+        let sph = crate::sph::Sph::parse(&header).expect("a header");
+        let insts = [
+            // The payload word after its own number, then a vertex's x and w, one primitive
+            // of vertices 0, 0, 0, and the count.
+            stage_buffer(false, RZ, 3, 0x10, true, 3),
+            mov(1, 0x3f80_0000),
+            stage_buffer(true, RZ, 3, 0, true, 3),
+            stage_buffer(true, RZ, 1, 0x180, true, 3),
+            stage_buffer(true, RZ, RZ, 4, false, 0),
+            stage_buffer(true, RZ, RZ, 5, false, 0),
+            stage_buffer(true, RZ, RZ, 6, false, 0),
+            mov(0, 1),
+            stage_buffer(true, RZ, 0, 3, true, 0),
+        ];
+        let mut cfg = Config::new(Stage::Mesh);
+        cfg.mesh = Some(mesh_config(true));
+        let t = translate_sm86(&program(&insts), Some(&sph), &cfg).expect("translates");
+        validated(&t);
+        // Without a task, the program reads no payload.
+        cfg.mesh = Some(mesh_config(false));
+        let t = translate_sm86(&program(&insts), Some(&sph), &cfg).expect("translates");
+        validated(&t);
+        // A byte to the attributes is not something the hardware has.
+        let bad = [stage_buffer(true, RZ, 1, 0, false, 3)];
+        assert!(translate_sm86(&program(&bad), Some(&sph), &cfg).is_err());
+    }
+
+    #[test]
+    fn a_task_program_hands_its_mesh_workgroups_their_number_and_payload() {
+        let mut header = vec![0u8; 0x80];
+        header[..4].copy_from_slice(&0x020c_0461u32.to_le_bytes());
+        let sph = crate::sph::Sph::parse(&header).expect("a header");
+        let insts = [
+            // Its own number; that many mesh workgroups (byte 4) and the number as payload.
+            stage_buffer(false, RZ, 2, 0, true, 3),
+            stage_buffer(true, RZ, 2, 4, true, 3),
+            stage_buffer(true, RZ, 2, 0x10, true, 3),
+        ];
+        let mut cfg = Config::new(Stage::Task);
+        cfg.mesh = Some(mesh_config(true));
+        let t = translate_sm86(&program(&insts), Some(&sph), &cfg).expect("translates");
+        validated(&t);
+        // The map is a mesh program's.
+        let bad = [stage_buffer(true, RZ, 2, 3, true, 0)];
+        assert!(translate_sm86(&program(&bad), Some(&sph), &cfg).is_err());
     }
 
     fn kernel(insts: &[Inst]) -> crate::translate::Translation {

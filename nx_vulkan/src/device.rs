@@ -30,6 +30,9 @@ pub struct Capabilities {
     pub checkpoints: bool,
     /// `VK_EXT_memory_budget`: the driver says how much of each heap is used and may be.
     pub memory_budget: bool,
+    /// `VK_EXT_mesh_shader` with task and mesh shaders: the task and mesh pipelines of the Switch
+    /// 2 (docs/ASSUMPTIONS.md A-270).
+    pub mesh_shader: bool,
     /// `VK_EXT_device_fault` is enabled (with the checkpoints): a lost device says what it knows of
     /// the fault (addresses, the vendor's codes).
     pub device_fault: bool,
@@ -71,6 +74,8 @@ pub struct Vk {
     pub external_memory_host: Option<ash::ext::external_memory_host::Device>,
     checkpoints: Option<ash::nv::device_diagnostic_checkpoints::Device>,
     device_fault: Option<ash::ext::device_fault::Device>,
+    /// `vkCmdDrawMeshTasksEXT` and the rest of `VK_EXT_mesh_shader`.
+    pub mesh_shader: Option<ash::ext::mesh_shader::Device>,
     /// The bytes of device memory the images and device buffers made here hold.
     pub allocated: std::sync::atomic::AtomicU64,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
@@ -293,6 +298,7 @@ impl Vk {
         );
         want(khr::index_type_uint8::NAME, &mut caps.index_type_uint8);
         want(ash::ext::memory_budget::NAME, &mut caps.memory_budget);
+        want(ash::ext::mesh_shader::NAME, &mut caps.mesh_shader);
         want(
             ash::ext::vertex_input_dynamic_state::NAME,
             &mut caps.vertex_input_dynamic_state,
@@ -330,6 +336,7 @@ impl Vk {
         let mut uint8 = vk::PhysicalDeviceIndexTypeUint8FeaturesKHR::default();
         let mut vertex_input = vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT::default();
         let mut fault = vk::PhysicalDeviceFaultFeaturesEXT::default();
+        let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
         let mut features2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut f11)
             .push_next(&mut f12)
@@ -352,9 +359,13 @@ impl Vk {
         if caps.device_fault {
             features2 = features2.push_next(&mut fault);
         }
+        if caps.mesh_shader {
+            features2 = features2.push_next(&mut mesh);
+        }
         // SAFETY: the chain is valid for the call.
         unsafe { instance.get_physical_device_features2(physical, &mut features2) };
         let supported = features2.features;
+        caps.mesh_shader = caps.mesh_shader && mesh.mesh_shader != 0 && mesh.task_shader != 0;
         caps.shader_int64 = supported.shader_int64 != 0;
         caps.shader_float64 = supported.shader_float64 != 0;
         caps.shader_int16 = supported.shader_int16 != 0;
@@ -446,6 +457,9 @@ impl Vk {
             .vertex_input_dynamic_state(caps.vertex_input_dynamic_state);
         let mut e_fault =
             vk::PhysicalDeviceFaultFeaturesEXT::default().device_fault(caps.device_fault);
+        let mut e_mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default()
+            .mesh_shader(caps.mesh_shader)
+            .task_shader(caps.mesh_shader);
 
         let priorities = [1.0f32];
         let queues = [vk::DeviceQueueCreateInfo::default()
@@ -476,6 +490,9 @@ impl Vk {
         if caps.device_fault {
             create = create.push_next(&mut e_fault);
         }
+        if caps.mesh_shader {
+            create = create.push_next(&mut e_mesh);
+        }
         // SAFETY: the create info chain and the arrays it points to live through the call.
         let device = unsafe { instance.create_device(physical, &create, None) }
             .map_err(|e| format!("creating the Vulkan device on {}: {e}", caps.name))?;
@@ -494,6 +511,9 @@ impl Vk {
         let device_fault = caps
             .device_fault
             .then(|| ash::ext::device_fault::Device::new(&instance, &device));
+        let mesh_shader = caps
+            .mesh_shader
+            .then(|| ash::ext::mesh_shader::Device::new(&instance, &device));
         Ok(Vk {
             entry,
             instance,
@@ -507,6 +527,7 @@ impl Vk {
             external_memory_host,
             checkpoints,
             device_fault,
+            mesh_shader,
             allocated: std::sync::atomic::AtomicU64::new(0),
             debug,
         })

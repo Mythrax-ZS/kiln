@@ -17,7 +17,7 @@ use crate::sm86::{op, Inst, RZ, URZ};
 use crate::spirv::{builtin, cap, deco, op as sop, storage, Id};
 
 /// The value of a built-in input (made on first use) of type `ty`.
-pub(super) fn builtin_value(tx: &mut Tx<'_>, which: u32, ty: Id) -> Id {
+pub(in crate::translate) fn builtin_value(tx: &mut Tx<'_>, which: u32, ty: Id) -> Id {
     let var = match tx.builtins.get(&which) {
         Some(v) => *v,
         None => {
@@ -63,7 +63,9 @@ fn system_register(tx: &mut Tx<'_>, sr: u64) -> R<Id> {
                 .emit_result(&mut tx.m, sop::COMPOSITE_EXTRACT, u, &[mask, 0]))
         }
         // SR_TID.X..Z, SR_CTAID.X..Z
-        0x21..=0x23 | 0x25..=0x27 if matches!(tx.cfg.stage, Stage::Kernel) => {
+        0x21..=0x23 | 0x25..=0x27
+            if matches!(tx.cfg.stage, Stage::Kernel | Stage::Task | Stage::Mesh) =>
+        {
             let which = if sr < 0x25 {
                 builtin::LOCAL_INVOCATION_ID
             } else {
@@ -77,6 +79,29 @@ fn system_register(tx: &mut Tx<'_>, sr: u64) -> R<Id> {
                 .emit_result(&mut tx.m, sop::COMPOSITE_EXTRACT, u, &[all, component]))
         }
         _ => tx.fail(format!("S2R of system register {sr:#x}")),
+    }
+}
+
+/// `ISBERD Rd, [Ra + imm]` and `ISBEWR [Ra + imm], Rb`: the stage buffer of a task or mesh
+/// program (A-270). Bit 75 says 32 bits (a byte otherwise), bits 76..77 the region (3 the
+/// attributes, 0 the map), bit 79 the output buffer.
+pub(super) fn stage_buffer(tx: &mut Tx<'_>, i: &I) -> R<()> {
+    let inst = i.inst;
+    let base = tx.read(inst.reg(24));
+    let offset = tx.c32(inst.field(40, 24) as u32);
+    let addr = tx.iadd(base, offset);
+    let mode = super::super::mesh::Mode {
+        wide: inst.bit(75),
+        region: inst.field(76, 2) as u32,
+        output: inst.bit(79),
+    };
+    if inst.opcode() == op::ISBERD {
+        let v = super::super::mesh::read(tx, addr, mode)?;
+        write(tx, i, inst.reg(16), v);
+        Ok(())
+    } else {
+        let value = tx.read(inst.reg(32));
+        super::super::mesh::write(tx, addr, value, mode)
     }
 }
 

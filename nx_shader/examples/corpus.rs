@@ -6,7 +6,7 @@
 
 use nx_shader::cfg::Code;
 use nx_shader::sph::{Sph, Stage as HeaderStage, SPH_BYTES};
-use nx_shader::translate::{translate, translate_sm86, Config, Stage};
+use nx_shader::translate::{translate, translate_sm86, Config, MeshConfig, Stage};
 use nx_shader::validate;
 use std::collections::BTreeMap;
 
@@ -43,9 +43,21 @@ fn main() {
                     continue;
                 }
             };
+            // The largest pipeline the title sets up (A-270), for the programs of mesh pipelines.
+            let mesh = MeshConfig {
+                threads: 32,
+                max_vertices: 256,
+                max_primitives: 192,
+                topology: 4,
+                payload_words: 11 * 32,
+                task: true,
+                primitive_words: vec![0x20],
+            };
             let stage = match sph.stage() {
                 Some(HeaderStage::Vertex) => Stage::Vertex,
                 Some(HeaderStage::Pixel) => Stage::Pixel,
+                // A program in the tessellation slot of a mesh pipeline is its mesh program.
+                _ if name.starts_with("TESSELLATION") => Stage::Mesh,
                 other => {
                     reasons
                         .entry(format!("the stage {other:?}"))
@@ -54,11 +66,36 @@ fn main() {
                     continue;
                 }
             };
-            let cfg = Config::new(stage);
-            if sph.version() == 4 {
+            let mut cfg = Config::new(stage);
+            if stage == Stage::Mesh {
+                cfg.mesh = Some(mesh.clone());
+            }
+            let first = if sph.version() == 4 {
                 translate_sm86(&bytes[sph.code_offset()..], Some(&sph), &cfg)
             } else {
                 translate(Code(&bytes[SPH_BYTES..]), Some(&sph), &cfg)
+            };
+            match first {
+                // A vertex program that reads the stage buffer is the task program of a mesh
+                // pipeline.
+                Err(e) if stage == Stage::Vertex && e.message.contains("ISBE") => {
+                    cfg.stage = Stage::Task;
+                    cfg.mesh = Some(mesh.clone());
+                    match translate_sm86(&bytes[sph.code_offset()..], Some(&sph), &cfg) {
+                        // One that writes the map is the mesh program of a pipeline without a
+                        // task, which the vertex slot holds then.
+                        Err(e) if e.message.contains("region 0") => {
+                            cfg.stage = Stage::Mesh;
+                            cfg.mesh = Some(MeshConfig {
+                                task: false,
+                                ..mesh
+                            });
+                            translate_sm86(&bytes[sph.code_offset()..], Some(&sph), &cfg)
+                        }
+                        other => other,
+                    }
+                }
+                other => other,
             }
         };
         match result {
