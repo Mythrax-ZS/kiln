@@ -18,6 +18,7 @@ pub mod draw_state;
 pub mod engine;
 pub mod error;
 pub mod event;
+pub mod gob;
 pub mod gpu;
 pub mod i2m;
 pub mod media;

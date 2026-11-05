@@ -70,9 +70,10 @@ impl Geometry {
     }
 }
 
-/// Where byte `x` (0..64) of row `y` (0..8) is inside a GOB.
-pub const fn gob_offset(x: u32, y: u32) -> u32 {
-    (x / 32) * 256 + (y / 2) * 64 + ((x % 32) / 16) * 32 + (y % 2) * 16 + x % 16
+/// Where byte `x` (0..64) of row `y` (0..8) is inside a GOB, in the order of the process's GPU
+/// (the Switch's or the Switch 2's, [`nx_gpu::gob`]).
+pub fn gob_offset(x: u32, y: u32) -> u32 {
+    nx_gpu::gob::offset(x, y)
 }
 
 /// Copy a block-linear surface into packed rows. `tiled` must hold [`Geometry::tiled_size`]
@@ -103,20 +104,28 @@ pub fn swizzle(g: &Geometry, linear: &[u8], tiled: &mut [u8]) {
 }
 
 /// Where each 16-byte chunk of a row of a GOB lies inside it: the chunk across (0..4) in each of
-/// the 8 rows.
-const CHUNK: [[u16; 4]; 8] = {
+/// the 8 rows, in the Switch's order and in the Switch 2's.
+const fn chunks(switch_2: bool) -> [[u16; 4]; 8] {
     let mut table = [[0u16; 4]; 8];
     let mut y = 0;
     while y < 8 {
         let mut c = 0;
         while c < 4 {
-            table[y][c] = gob_offset(16 * c as u32, y as u32) as u16;
+            let (x, row) = (16 * c as u32, y as u32);
+            table[y][c] = if switch_2 {
+                nx_gpu::gob::offset_switch_2(x, row)
+            } else {
+                nx_gpu::gob::offset_x1(x, row)
+            } as u16;
             c += 1;
         }
         y += 1;
     }
     table
-};
+}
+
+const CHUNK_X1: [[u16; 4]; 8] = chunks(false);
+const CHUNK_SWITCH_2: [[u16; 4]; 8] = chunks(true);
 
 /// Visit the surface in runs of up to 16 bytes that are contiguous in both layouts, calling
 /// `f(tiled offset, linear offset, length)`: GOB by GOB, so that the position of a GOB is worked
@@ -128,6 +137,11 @@ fn walk(g: &Geometry, mut f: impl FnMut(usize, usize, usize)) {
     let block_depth = 1usize << g.block_depth_log2;
     let block_bytes = g.block_bytes() as usize;
     let height = g.height as usize;
+    let chunk = if nx_gpu::gob::is_switch_2() {
+        &CHUNK_SWITCH_2
+    } else {
+        &CHUNK_X1
+    };
     for z in 0..g.depth as usize {
         let (block_z, z_in_block) = (z / block_depth, z % block_depth);
         for gob_row in 0..height.div_ceil(8) {
@@ -138,7 +152,7 @@ fn walk(g: &Geometry, mut f: impl FnMut(usize, usize, usize)) {
                 let gob = (first_block + gob_x) * block_bytes + gob_in_block * 512;
                 let x0 = gob_x * 64;
                 let width = (row - x0).min(64);
-                for (y_in_gob, chunks) in CHUNK.iter().enumerate() {
+                for (y_in_gob, chunks) in chunk.iter().enumerate() {
                     let y = gob_row * 8 + y_in_gob;
                     if y >= height {
                         break;

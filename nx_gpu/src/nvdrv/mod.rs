@@ -133,6 +133,8 @@ impl Nvdrv {
     /// Make the driver the Switch 2's (see `switch_2`).
     pub fn set_switch_2(&mut self, on: bool) {
         self.switch_2 = on;
+        // Its surfaces have the Switch 2's GOBs (A-248).
+        crate::gob::set_switch_2(on);
     }
 
     /// Whether the driver is the Switch 2's.

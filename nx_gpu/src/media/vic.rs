@@ -203,10 +203,10 @@ impl Config {
     }
 }
 
-/// Where byte `x` (0..64) of row `y` (0..8) is inside a GOB (the pattern of the GPU's
-/// block-linear layout, as `nx_vulkan::blocklinear` uses it).
-const fn gob_offset(x: usize, y: usize) -> usize {
-    (x / 32) * 256 + (y / 2) * 64 + ((x % 32) / 16) * 32 + (y % 2) * 16 + x % 16
+/// Where byte `x` (0..64) of row `y` (0..8) is inside a GOB, in the process's order
+/// ([`crate::gob`]).
+fn gob_offset(x: usize, y: usize) -> usize {
+    crate::gob::offset(x as u32, y as u32) as usize
 }
 
 /// Put packed rows of `row_bytes` bytes into the block-linear layout with blocks of
