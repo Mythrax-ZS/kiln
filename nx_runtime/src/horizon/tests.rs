@@ -470,6 +470,13 @@ fn a_switch_2_process_gets_the_switch_2_answers() {
     assert_eq!(e.r(), 0);
     e.svc(0x08, &[0, 0x0900_0000, 0, SCRATCH, 0x2C, 6]);
     assert_eq!(e.r(), err::INVALID_CORE_ID.0);
+    // The Switch 2's own services are there (A-219).
+    super::services::register_defaults(&e.kernel);
+    assert!(e
+        .kernel
+        .implemented_services()
+        .iter()
+        .any(|s| s == "chat:u"));
     drop(e); // one process at a time: `Env` holds the runtime
 
     let mut e = nx2(crate::npdm::Platform::Nx);
@@ -480,6 +487,12 @@ fn a_switch_2_process_gets_the_switch_2_answers() {
     e.svc(0x08, &[0, 0x0900_0000, 0, SCRATCH, 0x2C, 4]);
     assert_eq!(e.r(), err::INVALID_CORE_ID.0);
     assert_eq!(e.svc(0x80, &[HEAP_BASE, 0x2000, 0x20, 0x20]), Flow::Stop);
+    super::services::register_defaults(&e.kernel);
+    assert!(!e
+        .kernel
+        .implemented_services()
+        .iter()
+        .any(|s| s == "chat:u"));
 }
 
 #[test]

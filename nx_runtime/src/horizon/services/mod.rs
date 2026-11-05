@@ -11,6 +11,7 @@ mod applet;
 mod audout;
 mod audren;
 mod bsd;
+mod chat;
 mod ectx;
 mod friend;
 mod fsp;
@@ -109,6 +110,10 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     register(kernel, "time:u", move |k| {
         time::StaticService::new(k, clocks.clone())
     });
+    if kernel.process.platform() == crate::npdm::Platform::Nx2 {
+        // GameChat, which nn::chat::Initialize opens at start-up (A-219).
+        register(kernel, "chat:u", chat::ChatService::new);
+    }
 }
 
 /// An interface object with no command implemented: handing it out is right, using it stops the

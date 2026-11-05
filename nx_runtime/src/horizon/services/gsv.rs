@@ -9,6 +9,7 @@
 use super::super::kernel::Kernel;
 use super::super::layout;
 use super::super::object::KObject;
+use super::super::result::ResultCode;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
 use super::{nvdrv, vi};
 use std::sync::{Arc, Weak};
@@ -73,6 +74,23 @@ impl ImageLayout {
     }
 }
 
+impl ImageLayout {
+    /// A GameChat image (1291, A-220): `nn::chat::gsv::MakeImagePreference` gives only the size
+    /// and leaves the block height, the pitch and the format to the graphics server (zero); taken
+    /// as four bytes a pixel in blocks of 128 rows. A preference that gives them is read as any.
+    pub fn from_chat_preference(words: &[u32]) -> Result<ImageLayout, String> {
+        let word = |n: usize| words.get(n).copied().unwrap_or(0);
+        if word(1) == 1 && word(4) == 0 && word(5) == 0 && word(6) == 0 {
+            let mut w = words.to_vec();
+            w.resize(16, 0);
+            w[4] = 7;
+            w[5] = ((word(2) & 0xFFFF) + 1).saturating_mul(4).div_ceil(64);
+            return Self::from_preference(&w);
+        }
+        Self::from_preference(words)
+    }
+}
+
 /// Native memory: its size and, once bound (114, 423), its address.
 #[derive(Clone, Copy, Debug, Default)]
 struct NativeMemory {
@@ -83,7 +101,6 @@ struct NativeMemory {
 /// A pool of native images made with 429: `count` images of one layout, one after the other in
 /// a native memory.
 #[derive(Clone, Copy, Debug)]
-#[expect(dead_code, reason = "read by NativeObjects::image, which vi2's present will call")]
 struct NativePool {
     memory: u32,
     count: u32,
@@ -100,19 +117,14 @@ pub struct NativeObjects {
 }
 
 impl NativeObjects {
-    /// The address and layout of the image `handle` (the first image of its pool and those after
-    /// it), once its memory is bound.
-    #[expect(dead_code, reason = "vi2's present (229) is not modelled yet")]
-    pub fn image(&self, handle: u32) -> Option<(u64, ImageLayout)> {
+    /// Where the image `handle` (the first image of its pool, or one after it) lies in its pool's
+    /// native memory, bound or not, and its layout; None once that memory is gone (112).
+    pub fn image_in_memory(&self, handle: u32) -> Option<(u64, ImageLayout)> {
         let (&first, pool) = self.pools.range(..=handle).next_back()?;
-        if handle - first >= pool.count {
+        if handle - first >= pool.count || !self.memories.contains_key(&pool.memory) {
             return None;
         }
-        let address = self.memories.get(&pool.memory)?.address?;
-        Some((
-            address + u64::from(handle - first) * pool.layout.size,
-            pool.layout,
-        ))
+        Some((u64::from(handle - first) * pool.layout.size, pool.layout))
     }
 }
 
@@ -144,6 +156,61 @@ impl Supervisor {
             1510 => preference()
                 .map(|l| Response::ok().with_u64(l.size).with_u64(l.alignment))
                 .map_err(|e| Stop(format!("nx2:gsv 1510: {e}"))),
+            // nn::chat::gsv::CalculateRequiredBufferMemory(preference, u32 count) -> (u64 size,
+            // u64 alignment): the memory of a pool of `count` GameChat images (A-220).
+            1291 => ImageLayout::from_chat_preference(&words_of(req, 16))
+                .map(|l| {
+                    Response::ok()
+                        .with_u64(l.size * u64::from(count))
+                        .with_u64(l.alignment)
+                })
+                .map_err(|e| Stop(format!("nx2:gsv 1291: {e}"))),
+            // nn::gpu::sdk::QueryNativeImage(u32 image) -> (8 bytes the SDK does not read, u64
+            // offset of the image in its native memory, a GpuOunceUserImageDescriptor of 32
+            // words, u32 flags), which NVN reads to use an image another part of the system made
+            // (GameChat's camera images, 1211; A-221).
+            428 => match st.image_in_memory(req.u32_at(0)) {
+                Some((offset, layout)) => Ok(native_image_reply(0, offset, &layout)),
+                None => Err(Stop(format!(
+                    "nx2:gsv 428 of the native image {}, which 429 or 1211 did not make",
+                    req.u32_at(0)
+                ))),
+            },
+            // nn::gpu::sdk::MapNativeImage(u32 image, u32 1, u32 address space, u8 permission)
+            // -> 428's reply with the image's GPU address in its first two words: the image is
+            // mapped at its own CPU address, as GPU-accessible memory is (A-201, A-221).
+            426 => {
+                let (handle, space) = (req.u32_at(0), req.u32_at(8));
+                let known = self
+                    .gpu_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .spaces
+                    .contains(&space);
+                if !known || req.u32_at(4) != 1 {
+                    return Some(Err(Stop(format!(
+                        "nx2:gsv 426 of the image {handle} into the address space {space} (second \
+                         word {})",
+                        req.u32_at(4)
+                    ))));
+                }
+                let found = st.image_in_memory(handle).and_then(|(offset, layout)| {
+                    let (&first, pool) = st.pools.range(..=handle).next_back()?;
+                    debug_assert!(handle >= first);
+                    let base = st.memories.get(&pool.memory)?.address?;
+                    Some((base + offset, offset, layout))
+                });
+                let Some((address, offset, layout)) = found else {
+                    return Some(Err(Stop(format!(
+                        "nx2:gsv 426 of the native image {handle}, which is not made or whose \
+                         memory is not bound"
+                    ))));
+                };
+                if let Err(e) = self.gpu.switch_2_map(address, layout.size, address, 0) {
+                    return Some(Err(Stop(format!("nx2:gsv 426 of the image {handle}: {e}"))));
+                }
+                Ok(native_image_reply(address, offset, &layout))
+            }
             // CalculateNativeImageSize(preference, u32 count) -> u64 size
             435 => preference()
                 .map(|l| Response::ok().with_u64(l.size * u64::from(count)))
@@ -192,15 +259,22 @@ impl Supervisor {
                 Ok(Response::ok())
             }
             // CreateNativeImage(preference, u32 count, u32 memory) -> u32 first image: the pool
-            // takes as many handles as it has images.
-            429 => {
+            // takes as many handles as it has images. 1211 is nn::chat::gsv::CreateImagePool, the
+            // same for GameChat's images (A-220).
+            429 | 1211 => {
                 let memory = req.u32_at(68);
                 if !st.memories.contains_key(&memory) {
                     return Some(Err(Stop(format!(
-                        "nx2:gsv 429 in the native memory {memory}, which 111 did not make"
+                        "nx2:gsv {} in the native memory {memory}, which 111 did not make",
+                        req.command
                     ))));
                 }
-                match preference() {
+                let layout = if req.command == 1211 {
+                    ImageLayout::from_chat_preference(&words_of(req, 16))
+                } else {
+                    preference()
+                };
+                match layout {
                     Ok(layout) => {
                         let first = st.next_image + 1;
                         st.next_image += count;
@@ -214,7 +288,7 @@ impl Supervisor {
                         );
                         Ok(Response::ok().with_u32(first))
                     }
-                    Err(e) => Err(Stop(format!("nx2:gsv 429: {e}"))),
+                    Err(e) => Err(Stop(format!("nx2:gsv {}: {e}", req.command))),
                 }
             }
             // DestroyNativeImage(u32 first image)
@@ -239,6 +313,179 @@ impl Supervisor {
             _ => return None,
         })
     }
+}
+
+/// GameChat's graphics session (`nn::chat::gsv`, supervisor command 1202, A-219): event ids and
+/// their events, which nothing sets, since GameChat is never in a call here.
+#[derive(Debug)]
+struct ChatGsv {
+    kernel: Weak<Kernel>,
+    /// The (writable, readable) ends of each event, by the id 1 handed out.
+    events: Vec<(KObject, KObject)>,
+    /// What 103 and 121 opened, by the id the program gave it (one space of ids, which the
+    /// program allocates itself): a description.
+    opened: std::collections::BTreeMap<u32, String>,
+}
+
+/// The highest event id the SDK accepts from command 1.
+const CHAT_EVENT_IDS: usize = 0x400;
+
+impl ChatGsv {
+    /// Record what the program opened under id, unless something is open under it already.
+    fn open(&mut self, req: &Request, id: u32, what: String) -> ServiceResult {
+        if let Some(open) = self.opened.get(&id) {
+            return Err(Stop(format!(
+                "nx2:chat:gsv {} opens {what} as {id}, which {open} is already",
+                req.command
+            )));
+        }
+        self.opened.insert(id, what);
+        Ok(Response::ok())
+    }
+}
+
+impl Service for ChatGsv {
+    fn name(&self) -> &str {
+        "nx2:chat:gsv"
+    }
+
+    fn request(&mut self, req: &Request) -> ServiceResult {
+        Err(Stop(format!(
+            "nx2:chat:gsv was sent a CMIF message (command {}); it speaks TIPC",
+            req.command
+        )))
+    }
+
+    fn request_tipc(&mut self, req: &Request) -> ServiceResult {
+        match req.command {
+            // () -> u32 id: a new event, from 0 (the SDK stops above 0x3FF).
+            1 => {
+                if self.events.len() >= CHAT_EVENT_IDS {
+                    return Err(Stop(
+                        "nx2:chat:gsv 1: all 0x400 event ids are handed out".into(),
+                    ));
+                }
+                let kernel = self
+                    .kernel
+                    .upgrade()
+                    .ok_or_else(|| Stop("the process is gone".into()))?;
+                self.events.push(kernel.new_event());
+                Ok(Response::ok().with_u32(self.events.len() as u32 - 1))
+            }
+            // (u32 id) -> event: the event of an id 1 handed out, which the SDK attaches as a
+            // system event that clears itself.
+            11 => {
+                let id = req.u32_at(0) as usize;
+                match self.events.get(id) {
+                    Some(event) => Ok(Response::ok().with_copy_handle(event.1.clone())),
+                    None => Err(Stop(format!(
+                        "nx2:chat:gsv 11 of the event {id}, which 1 did not hand out"
+                    ))),
+                }
+            }
+            // (8 bytes of name, u32 id), from nn::chat::gsv::OpenVirtualDisplay: a named virtual
+            // display ("chat2", ...) under an id the program chose. Nothing is ever shown on it.
+            103 => {
+                let raw = &req.data[..req.data.len().min(8)];
+                let name: String = raw
+                    .iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|&b| b as char)
+                    .collect();
+                let id = req.u32_at(8);
+                if name.is_empty() || !name.bytes().all(|b| b.is_ascii_graphic()) {
+                    return Err(Stop(format!("nx2:chat:gsv 103 with the name {raw:x?}")));
+                }
+                self.open(req, id, format!("the virtual display `{name}`"))
+            }
+            // (u64 address, u64 count, u32 id), from nn::chat::gsv::CreateMetadataPool: a pool of
+            // that many metadata entries in the program's memory. Nothing is ever written to it.
+            121 => {
+                let (address, count) = (req.u64_at(0), req.u64_at(8));
+                if address == 0 || count == 0 {
+                    return Err(Stop(format!(
+                        "nx2:chat:gsv 121 of {count} entries at {address:#x}"
+                    )));
+                }
+                let id = req.u32_at(16);
+                self.open(
+                    req,
+                    id,
+                    format!("the metadata pool of {count} at {address:#x}"),
+                )
+            }
+            other => Err(Stop::unknown_command(self.name(), other)),
+        }
+    }
+}
+
+/// What the camera's session answers when the camera asked for is not attached: 2452-0006, the
+/// result the Switch 2 title takes to mean "no camera" (A-222).
+const NO_CAMERA: ResultCode = ResultCode::new(452, 6);
+
+/// The camera's session (supervisor command 602, A-222), which speaks CMIF. No camera is attached.
+#[derive(Debug)]
+struct Camera {
+    kernel: Weak<Kernel>,
+    /// The event 21 hands out, made on first use; nothing sets it, since no camera comes.
+    event: Option<(KObject, KObject)>,
+}
+
+impl Service for Camera {
+    fn name(&self) -> &str {
+        "nx2:camera"
+    }
+
+    fn request(&mut self, req: &Request) -> ServiceResult {
+        match req.command {
+            // (16 bytes of camera name: "Default"): the camera of that name is not attached.
+            3 => {
+                let name = &req.data[..req.data.len().min(16)];
+                if !name.first().is_some_and(|b| b.is_ascii_graphic()) {
+                    return Err(Stop(format!("nx2:camera 3 with the name {name:x?}")));
+                }
+                Ok(Response::error(NO_CAMERA))
+            }
+            // (16 bytes) -> event, which the title attaches as a system event: a camera being
+            // attached, which never happens here.
+            21 => {
+                let kernel = self
+                    .kernel
+                    .upgrade()
+                    .ok_or_else(|| Stop("the process is gone".into()))?;
+                let event = self.event.get_or_insert_with(|| kernel.new_event());
+                Ok(Response::ok().with_copy_handle(event.1.clone()))
+            }
+            other => Err(Stop::unknown_command(self.name(), other)),
+        }
+    }
+
+    fn request_tipc(&mut self, req: &Request) -> ServiceResult {
+        Err(Stop(format!(
+            "nx2:camera was sent a TIPC message (command {}); it speaks CMIF",
+            req.command
+        )))
+    }
+}
+
+/// The reply of 428 and 426 (A-221): the image's GPU address (426) or 0, its offset in its native
+/// memory, a `GpuOunceUserImageDescriptor` of 32 words and the flags.
+fn native_image_reply(gpu_address: u64, offset: u64, layout: &ImageLayout) -> Response {
+    let mut descriptor = [0u32; 32];
+    descriptor[0] = 1; // checked by the SDK
+    descriptor[1] = layout.kind;
+    descriptor[2] = (layout.width - 1) | (layout.height - 1) << 16;
+    descriptor[4] = layout.block_rows.trailing_zeros();
+    descriptor[5] = (layout.pitch / 64) as u32;
+    descriptor[8] = 1; // checked by the SDK
+    descriptor[9] = 1;
+    descriptor[10] = 0; // the image starts at the address and offset before
+    descriptor[11] = layout.size as u32; // checked: not zero
+    let mut r = Response::ok().with_u64(gpu_address).with_u64(offset);
+    for w in descriptor {
+        r = r.with_u32(w);
+    }
+    r.with_u32(0)
 }
 
 /// The first `n` u32s of a request's data.
@@ -1220,7 +1467,7 @@ impl Service for Supervisor {
             }
             // Permission checks: each tests a bit of what the session was opened with and fails
             // when it is clear; a program asks only for what it was granted, so all pass.
-            201 | 301 | 401..=403 | 494 | 801 | 1101 | 1102 | 1501..=1503 | 1601 => {
+            201 | 301 | 401..=403 | 494 | 601 | 801 | 1101 | 1102 | 1201 | 1501..=1503 | 1601 => {
                 Ok(Response::ok())
             }
             // QueryGrantedFeatures(u64 requested) -> u64 granted: everything asked for (a zero
@@ -1272,6 +1519,30 @@ impl Service for Supervisor {
                     self.native.clone(),
                 ),
             )))),
+            // CreateCameraContext(u64 1), from nn::camera::sdk::CreateCameraContext after the check
+            // 601: the camera's session (A-222).
+            602 => {
+                if req.u64_at(0) != 1 {
+                    return Err(Stop(format!(
+                        "nx2:gsv 602 with {:#x}; only 1 is known",
+                        req.u64_at(0)
+                    )));
+                }
+                Ok(
+                    Response::ok().with_copy_handle(KObject::session(Box::new(Camera {
+                        kernel: self.kernel.clone(),
+                        event: None,
+                    }))),
+                )
+            }
+            // nn::chat::gsv::Initialize, after the check 1201: GameChat's graphics session (A-219).
+            1202 => Ok(
+                Response::ok().with_copy_handle(KObject::session(Box::new(ChatGsv {
+                    kernel: self.kernel.clone(),
+                    events: Vec::new(),
+                    opened: Default::default(),
+                }))),
+            ),
             // nn::nvsrv::BootWithRemoteMemory: a session of the GPU driver (A-194).
             1402 => Ok(
                 Response::ok().with_copy_handle(KObject::session(Box::new(NvSrv(
@@ -1309,6 +1580,25 @@ mod tests {
             "the client is registered once"
         );
         assert!(s.request_tipc(&req(1101)).is_ok(), "a permission check");
+        assert!(s.request_tipc(&req(1201)).is_ok(), "GameChat's");
+        assert!(s.request_tipc(&req(601)).is_ok(), "the camera's");
+        let mut camera = req(602);
+        camera.data[..8].copy_from_slice(&1u64.to_le_bytes());
+        assert_eq!(s.request_tipc(&camera).unwrap().copy_handles.len(), 1);
+        // The camera session: "Default" is not attached, the result the title reads as no camera.
+        let mut open = req(3);
+        open.data[..8].copy_from_slice(b"Default\0");
+        let mut camera = Camera {
+            kernel: Weak::new(),
+            event: None,
+        };
+        assert_eq!(camera.request(&open).unwrap().result, NO_CAMERA);
+        assert!(
+            camera.request(&req(21)).unwrap_err().0.contains("gone"),
+            "needs a kernel"
+        );
+        assert!(camera.request(&req(22)).is_err() && camera.request_tipc(&req(3)).is_err());
+        assert_eq!(s.request_tipc(&req(1202)).unwrap().copy_handles.len(), 1);
         let mut asked = req(115);
         asked.data = 6u64.to_le_bytes().to_vec();
         assert_eq!(
@@ -1322,6 +1612,126 @@ mod tests {
             s.request(&req(4)).is_err(),
             "a CMIF message is not the supervisor's"
         );
+    }
+
+    #[test]
+    fn image_layouts_from_preferences() {
+        // A 3840x2160 window image as the title asks for one: kind 2, blocks of 2^7 rows, a pitch
+        // of 240 units of 64 bytes, format 1.
+        let mut window = [0u32; 16];
+        window[1] = 2;
+        window[2] = 3839 | 2159 << 16;
+        window[4] = 7;
+        window[5] = 240;
+        window[6] = 1;
+        let l = ImageLayout::from_preference(&window).unwrap();
+        assert_eq!(
+            (l.width, l.height, l.pitch, l.block_rows),
+            (3840, 2160, 15360, 128)
+        );
+        assert_eq!((l.size, l.format), (15360 * 2176, 1));
+        // A GameChat camera image gives only its size: four bytes a pixel, blocks of 128 rows.
+        let mut chat = [0u32; 16];
+        chat[1] = 1;
+        chat[2] = 383 | 215 << 16;
+        assert!(ImageLayout::from_preference(&chat).is_err(), "no pitch");
+        let c = ImageLayout::from_chat_preference(&chat).unwrap();
+        assert_eq!(
+            (c.pitch, c.block_rows, c.size, c.alignment),
+            (1536, 128, 1536 * 256, 0x2000)
+        );
+        let mut s = Supervisor::new(
+            Weak::new(),
+            nvdrv::Shared::new(),
+            Arc::new(vi::Shared::new()),
+        );
+        let mut size = req(1291);
+        size.data = chat
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .chain(3u32.to_le_bytes())
+            .collect();
+        let r = s.request_tipc(&size).unwrap();
+        assert_eq!(r.data[..8], (3u64 * 1536 * 256).to_le_bytes());
+        assert_eq!(r.data[8..16], 0x2000u64.to_le_bytes());
+        // 111 and 1211: three GameChat images in native memory; 428 describes the second.
+        let mut made = req(111);
+        made.data[4..12].copy_from_slice(&0x12_0000u64.to_le_bytes());
+        let memory = s.request_tipc(&made).unwrap().data;
+        let mut pool = size;
+        pool.command = 1211;
+        pool.data.extend_from_slice(&memory);
+        let first =
+            u32::from_le_bytes(s.request_tipc(&pool).unwrap().data[..4].try_into().unwrap());
+        let mut query = req(428);
+        query.data[..4].copy_from_slice(&(first + 1).to_le_bytes());
+        let d = s.request_tipc(&query).unwrap().data;
+        assert_eq!(d.len(), 37 * 4);
+        let word = |n: usize| u32::from_le_bytes(d[4 * n..4 * n + 4].try_into().unwrap());
+        assert_eq!(
+            d[8..16],
+            (1536u64 * 256).to_le_bytes(),
+            "the second image's offset"
+        );
+        // The fields the SDK checks: byte 0 and byte 0x20 of the descriptor are 1, its size not 0.
+        assert_eq!((word(4), word(4 + 8), word(4 + 11)), (1, 1, 1536 * 256));
+        assert_eq!(word(4 + 2), 383 | 215 << 16);
+        query.data[..4].copy_from_slice(&(first + 3).to_le_bytes());
+        assert!(s.request_tipc(&query).is_err(), "the pool has three");
+        // 426 maps an image at its own address once its memory is bound (114).
+        let mut map = req(426);
+        map.data[..16].copy_from_slice(&[first + 1, 1, 1, 3].map(u32::to_le_bytes).concat());
+        assert!(s.request_tipc(&map).is_err(), "no address space 1 yet");
+        s.gpu.set_switch_2(true);
+        s.gpu_state.lock().unwrap().spaces.insert(1);
+        assert!(s.request_tipc(&map).is_err(), "the memory is not bound");
+        let mut bind = req(114);
+        bind.data[..4].copy_from_slice(&memory);
+        bind.data[4..12].copy_from_slice(&0x30_0040_0000u64.to_le_bytes());
+        bind.data[12..20].copy_from_slice(&0x12_0000u64.to_le_bytes());
+        s.request_tipc(&bind).unwrap();
+        let d = s.request_tipc(&map).unwrap().data;
+        let image: u64 = 0x30_0040_0000 + 1536 * 256;
+        assert_eq!(d[..8], image.to_le_bytes(), "the image's GPU address");
+        assert_eq!(s.gpu.switch_2_translate(image + 0x10), Some(image + 0x10));
+    }
+
+    #[test]
+    fn gamechat_events_are_handed_out_by_id_and_never_set() {
+        use super::super::super::kernel::{ProcessInfo, ProcessKind};
+        let kernel = Kernel::new(ProcessInfo::new("chat", ProcessKind::Nso, None));
+        let mut c = ChatGsv {
+            kernel: Arc::downgrade(&kernel),
+            events: Vec::new(),
+            opened: Default::default(),
+        };
+        assert_eq!(c.request_tipc(&req(1)).unwrap().data, 0u32.to_le_bytes());
+        assert_eq!(c.request_tipc(&req(1)).unwrap().data, 1u32.to_le_bytes());
+        let mut get = req(11);
+        get.data[..4].copy_from_slice(&1u32.to_le_bytes());
+        let event = c.request_tipc(&get).unwrap();
+        assert_eq!(event.copy_handles.len(), 1);
+        assert!(!kernel.event_signaled(&event.copy_handles[0]));
+        get.data[..4].copy_from_slice(&5u32.to_le_bytes());
+        assert!(c.request_tipc(&get).is_err(), "an id 1 did not hand out");
+        assert!(c.request_tipc(&req(2)).is_err());
+        // 103: a virtual display by name and id, once per id.
+        let mut open = req(103);
+        open.data[..8].copy_from_slice(b"chat2\0\0\0");
+        open.data[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(c.request_tipc(&open).is_ok());
+        assert!(c.request_tipc(&open).is_err(), "the id is taken");
+        open.data[..8].copy_from_slice(&[0; 8]);
+        open.data[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert!(c.request_tipc(&open).is_err(), "no name");
+        // 121: a metadata pool, in the same space of ids.
+        let mut pool = req(121);
+        pool.data[..8].copy_from_slice(&0x30_0000_1000u64.to_le_bytes());
+        pool.data[8..16].copy_from_slice(&3u64.to_le_bytes());
+        pool.data[16..20].copy_from_slice(&6u32.to_le_bytes());
+        assert!(c.request_tipc(&pool).is_ok());
+        pool.data[16..20].copy_from_slice(&1u32.to_le_bytes());
+        assert!(c.request_tipc(&pool).is_err(), "1 is the display's");
     }
 
     #[test]
