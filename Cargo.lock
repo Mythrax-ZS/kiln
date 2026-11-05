@@ -2007,6 +2007,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nx_opus"
+version = "0.1.0"
+
+[[package]]
 name = "nx_runtime"
 version = "0.1.0"
 dependencies = [

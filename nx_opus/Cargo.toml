@@ -1,0 +1,10 @@
+[package]
+name = "nx_opus"
+version = "0.1.0"
+edition = "2021"
+description = "An Opus decoder (RFC 6716, with the updates of RFC 8251), written from the specification"
+publish = false
+
+[lib]
+name = "nx_opus"
+path = "src/lib.rs"
