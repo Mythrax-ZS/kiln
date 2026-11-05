@@ -77,7 +77,9 @@ Small chunks. Title at most 50 characters. No body. No attribution lines of any 
   supervisor, `docs/reports/M11-switch2-boot.md`). The owner's request covers what follows, the
   NX2 GPU front, sm_86 shaders and the renderer's NX2 path (M12 to M14, laid out in that report).
   M12 passed 2026-11-05: the title submits and presents its frames, and every draw then stops at
-  its sm_86 programs (`docs/reports/M12-switch2-gpu-front.md`).
+  its sm_86 programs (`docs/reports/M12-switch2-gpu-front.md`). M13 passed 2026-11-06: the draws
+  and launches run their sm_86 programs translated as they are, and the title reaches its title
+  screen, drawn, without a lost device (`docs/reports/M13-switch2-shaders.md`); M14 is next.
   Every NX2 difference is gated on `Npdm::platform` (A-188), never on a title. M8 passed (2026-10-12): the owner approved the GPU front, the `nx_gpu` crate
   (`nvdrv` and its device nodes, the display and buffer-queue path, a tracing command processor
   with a macro engine). The owner approved shader translation (Maxwell SASS to SPIR-V, crate
