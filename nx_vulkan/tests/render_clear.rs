@@ -66,6 +66,22 @@ fn a_color_target_of_format_zero_is_off() {
     r.finish().unwrap();
     let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
     assert_eq!(&rgba[..4], &[0, 255, 0, 255]);
+    // Two targets, the first off: the second is still the second, and a clear of it clears it.
+    let second = GPU_BASE + 0x80000;
+    w.color_target(0, target, 64, 32, 0);
+    w.color_target(1, second, 64, 32, 0xD5);
+    w.set(0x121c, 2 | 1 << 7);
+    r.clear(
+        &w.scene(),
+        &Clear {
+            target: 1,
+            ..clear_all()
+        },
+    )
+    .unwrap();
+    r.finish().unwrap();
+    let (rgba, _, _) = r.picture_at(w.cpu(second)).unwrap().expect("a target");
+    assert_eq!(&rgba[..4], &[0, 255, 0, 255]);
 }
 
 #[test]

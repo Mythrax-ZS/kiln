@@ -489,6 +489,43 @@ fn blending_mixes_with_what_is_there() {
 }
 
 #[test]
+fn a_draw_whose_first_target_is_off_draws_to_the_second() {
+    if vulkan().is_none() {
+        return;
+    }
+    // Two targets, the first of format 0 (off, A-273): the rendering has a hole where it would be.
+    let (off, on) = (GPU_BASE + 0x20_0000, GPU_BASE + 0x28_0000);
+    let mut w = scene(&pass_through_vertex(), &flat_color_pixel(), 16, off);
+    w.color_target(0, off, 16, 16, 0);
+    w.color_target(1, on, 16, 16, 0xD5);
+    w.set(0x121c, 2 | 1 << 7);
+    let green = [0.0, 1.0, 0.0, 1.0];
+    vertices(
+        &mut w,
+        GPU_BASE + 0x30_0000,
+        &[
+            ([-1.0, -1.0, 0.5, 1.0], green),
+            ([3.0, -1.0, 0.5, 1.0], green),
+            ([-1.0, 3.0, 0.5, 1.0], green),
+        ],
+    );
+    let mut r = Renderer::new(RenderConfig::default());
+    r.draw(
+        &w.scene(),
+        &Draw {
+            source: Source::Arrays { first: 0, count: 3 },
+            topology: 4,
+            instance: 0,
+        },
+    )
+    .unwrap();
+    r.finish().unwrap();
+    assert!(r.picture_at(w.cpu(off)).unwrap().is_none());
+    let (_, width, height) = r.picture_at(w.cpu(on)).unwrap().expect("the second target");
+    assert_eq!((width, height), (16, 16));
+}
+
+#[test]
 fn a_program_that_cannot_be_translated_stops_the_draw_with_its_address() {
     if vulkan().is_none() {
         return;

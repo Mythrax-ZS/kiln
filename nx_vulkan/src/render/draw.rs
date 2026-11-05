@@ -747,7 +747,8 @@ impl Core {
         // cannot be read while it is written, and its memory is read instead.
         let mut layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         // A draw that writes the depth it samples samples a copy of it (A-163).
-        if depth == Some(key) && !self.leaves_depth_alone(scene) && !colors.contains(&key) {
+        let drawn_to = colors.contains(&Some(key));
+        if depth == Some(key) && !self.leaves_depth_alone(scene) && !drawn_to {
             self.end_pass();
             let cmd = self.frame.cmd(&self.vk)?;
             let view = self
@@ -755,11 +756,11 @@ impl Core {
                 .depth_copy(&self.vk, cmd, &key, tic.view_mapping())?;
             return Ok(view.map(|v| (v, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)));
         }
-        if colors.contains(&key) || (depth == Some(key) && !self.leaves_depth_alone(scene)) {
+        if drawn_to || (depth == Some(key) && !self.leaves_depth_alone(scene)) {
             if trace {
                 self.say_once(format!(
                     "[vulkan] a depth texture at {cpu:#x} is the target the draw writes to (color {}, depth write {}, stencil test {})",
-                    colors.contains(&key),
+                    drawn_to,
                     scene.regs.depth_stencil().depth_write,
                     scene.regs.depth_stencil().stencil_test
                 ));
@@ -1568,7 +1569,12 @@ impl Core {
         layout: Vec<super::shaders::Binding>,
         discard: bool,
     ) -> PipelineKey {
-        let color_formats: Vec<i32> = pass.colors.iter().map(|k| k.format.as_raw()).collect();
+        // A target that is off has no format, and nothing to blend with (A-273).
+        let color_formats: Vec<i32> = pass
+            .colors
+            .iter()
+            .map(|k| k.map_or(vk::Format::UNDEFINED, |k| k.format).as_raw())
+            .collect();
         let blend_keys = (0..pass.colors.len())
             .map(|i| {
                 let e = blend.equation[i];
@@ -1578,7 +1584,7 @@ impl Core {
                     (e.color_op, e.color_src, e.color_dst)
                 };
                 BlendKey {
-                    enable: blend.enabled[i],
+                    enable: blend.enabled[i] && pass.colors[i].is_some(),
                     color: (
                         convert::blend_op(e.color_op).as_raw(),
                         convert::blend_factor(e.color_src).as_raw(),

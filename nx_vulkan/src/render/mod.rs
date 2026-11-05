@@ -110,7 +110,8 @@ impl Config {
 /// The attachments of the rendering in progress.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Pass {
-    colors: Vec<Key>,
+    /// The color targets by output; `None` for one that is off between two that are on (A-273).
+    colors: Vec<Option<Key>>,
     depth: Option<Key>,
     /// The depth target is attached to be read: a draw that samples it as a texture while it tests
     /// against it (it writes neither depth nor stencil).
@@ -594,6 +595,11 @@ impl Core {
         let cmd = self.frame.cmd(&self.vk)?;
         let mut color_infos = Vec::new();
         for key in &wanted.colors {
+            let Some(key) = key else {
+                // A target that is off: what the draws write to it goes nowhere (A-273).
+                color_infos.push(vk::RenderingAttachmentInfo::default());
+                continue;
+            };
             self.targets.get(&self.vk, &mut self.frame, *key)?;
             self.targets.note_memory(scene.mem, key);
             let t = self.targets.existing(key).expect("just made");
@@ -654,16 +660,24 @@ impl Core {
     }
 
     /// The keys of the color and depth targets the registers name.
-    fn attachments(&mut self, scene: &Scene<'_>) -> Result<(Vec<Key>, Option<Key>), String> {
+    #[allow(clippy::type_complexity)]
+    fn attachments(
+        &mut self,
+        scene: &Scene<'_>,
+    ) -> Result<(Vec<Option<Key>>, Option<Key>), String> {
         let mut colors = Vec::new();
         // A target of format 0 is off: nothing is drawn to it. Those that no target after them is
-        // on are left out (A-273).
+        // on are left out, the others are holes in the list (A-273).
         let targets = scene.regs.color_targets_in_use();
         let on = targets
             .iter()
             .rposition(|(_, t)| t.format != 0)
             .map_or(0, |last| last + 1);
         for (output, t) in targets.into_iter().take(on) {
+            if t.format == 0 {
+                colors.push(None);
+                continue;
+            }
             let Some(format) = color_format(t.format) else {
                 return Err(format!(
                     "color target {output} has format {:#x}, which is not a color format",
@@ -700,7 +714,7 @@ impl Core {
                 Layout::Pitch => t.width / format.bytes,
                 Layout::BlockLinear { .. } => t.width,
             };
-            colors.push(Key {
+            colors.push(Some(Key {
                 address,
                 format: format.vk,
                 width,
@@ -714,7 +728,7 @@ impl Core {
                     Layout::Pitch => 0,
                     Layout::BlockLinear { block } => block[2],
                 },
-            });
+            }));
         }
         let depth = match scene.regs.depth_target() {
             None => None,
@@ -748,8 +762,12 @@ impl Core {
         Ok((colors, depth))
     }
 
-    fn extent_of(&self, colors: &[Key], depth: Option<&Key>) -> Result<(u32, u32), String> {
-        let mut sizes = colors.iter().chain(depth).map(|k| (k.width, k.height));
+    fn extent_of(&self, colors: &[Option<Key>], depth: Option<&Key>) -> Result<(u32, u32), String> {
+        let mut sizes = colors
+            .iter()
+            .flatten()
+            .chain(depth)
+            .map(|k| (k.width, k.height));
         let Some(first) = sizes.next() else {
             return Err("a draw or clear with no render target".to_string());
         };
