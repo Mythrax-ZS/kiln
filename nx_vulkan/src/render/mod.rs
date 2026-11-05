@@ -57,6 +57,10 @@ pub struct Config {
     pub window_title: String,
     /// Told what the person does in the window: keys and the keyboard focus.
     pub input: Option<crate::InputSink>,
+    /// The most device memory the textures' images may hold, in bytes (`NX_TEXTURE_BUDGET`, in
+    /// MiB); by default 40 % of the budget the driver gives the device heap, at least 1 GiB
+    /// (docs/ASSUMPTIONS.md A-260).
+    pub texture_budget: Option<u64>,
 }
 
 impl Config {
@@ -80,6 +84,7 @@ impl Config {
             window,
             window_title: std::env::var("NX_WINDOW_TITLE").unwrap_or_else(|_| "kiln".to_string()),
             input: None,
+            texture_budget: number("NX_TEXTURE_BUDGET").map(|mib| mib << 20),
         }
     }
 
@@ -143,6 +148,8 @@ struct Core {
     /// last waited for: the guest may take a submission as over when its fence is reached, so
     /// the end of the submission waits (A-123).
     global_pending: bool,
+    /// Textures let go to keep to the device memory budget (A-260), for the report.
+    textures_trimmed: u64,
     /// 2D copies made in guest memory (A-249), for the report of every 100 frames.
     memory_copies: u64,
     /// Draws recorded since the last batch was sent to the device.
@@ -330,6 +337,7 @@ impl Renderer {
                     scratch: Scratch::default(),
                     sync_on: false,
                     global_pending: false,
+                    textures_trimmed: 0,
                     memory_copies: 0,
                     batch_draws: 0,
                     retired_at: 0,
@@ -346,6 +354,11 @@ impl Renderer {
             Ok(core) => Ok(core),
             Err(e) => Err(format!("no Vulkan device to render with: {e}")),
         }
+    }
+
+    /// How many textures the renderer holds images for. For tests and tools.
+    pub fn textures_held(&mut self) -> usize {
+        self.core().map_or(0, |core| core.textures.device_bytes().1)
     }
 
     /// The color target at a guest address as a picture (RGBA bytes, width, height), as of the
@@ -1140,13 +1153,18 @@ impl Renderer {
                         )
                     })
                     .collect();
+                let (texture_bytes, textures) = core.textures.device_bytes();
+                let trimmed = std::mem::take(&mut core.textures_trimmed);
+                let (target_bytes, targets) = core.targets.device_bytes();
                 eprintln!(
-                    "[vulkan] frame {}: device memory: {} MiB in images and buffers, {} MiB of guest memory imported in {} runs ({} MiB of it distinct); heaps used/budget (MiB): {}",
+                    "[vulkan] frame {}: device memory: {} MiB in images and buffers ({} MiB in {textures} textures, {trimmed} let go, {} MiB in {targets} render targets), {} MiB of guest memory imported in {} runs ({} MiB of it distinct); heaps used/budget (MiB): {}",
                     p.frame,
                     mib(core
                         .vk
                         .allocated
                         .load(std::sync::atomic::Ordering::Relaxed)),
+                    mib(texture_bytes),
+                    mib(target_bytes),
                     mib(core.global.bytes()),
                     core.global.runs(),
                     mib(core.global.union_bytes()),
@@ -1206,6 +1224,21 @@ impl Renderer {
         }
         // A displayed buffer ends a frame: textures are compared with memory again in the next.
         core.textures.frame += 1;
+        // The textures keep to a share of the device memory the driver lets the process use
+        // (A-260): 40 % of the device heap's budget, at least 1 GiB.
+        let budget = core
+            .vk
+            .heaps()
+            .iter()
+            .filter(|(_, _, local)| *local)
+            .map(|(_, budget, _)| *budget)
+            .max()
+            .unwrap_or(8 << 30);
+        let limit = config
+            .texture_budget
+            .unwrap_or_else(|| (budget / 10 * 4).max(1 << 30));
+        let gone = core.textures.trim(&mut core.frame, limit);
+        core.textures_trimmed += gone as u64;
         if busy && core.debug.trace_after_busy {
             core.debug.trace_frame = Some(core.textures.frame);
             core.traced_commands = 0;

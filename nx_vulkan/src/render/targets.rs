@@ -696,6 +696,14 @@ impl Targets {
         }
     }
 
+    /// How many bytes of device memory the targets and their depth copies hold, and how many
+    /// targets there are.
+    pub fn device_bytes(&self) -> (u64, usize) {
+        let targets: u64 = self.map.values().map(|t| t.image.bytes).sum();
+        let copies: u64 = self.snapshots.values().map(|s| s.image.bytes).sum();
+        (targets + copies, self.map.len())
+    }
+
     pub fn destroy(&mut self, vk: &Vk) {
         for (_, t) in self.map.drain() {
             vk.destroy_image(t.image);

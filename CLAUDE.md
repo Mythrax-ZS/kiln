@@ -184,7 +184,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   the allocations of the draws' steps and the guest's calls too, and says how often memory was
   hashed; the report also says how much device memory the images and buffers hold, how much guest
   memory is imported for global memory, and what the driver says each heap holds against its
-  budget, which a lost device repeats); `NX_DUMP_FRAMES=<dir>` writes each displayed frame as a PNG (opaque, cropped
+  budget, which a lost device repeats; `NX_TEXTURE_BUDGET=<MiB>` caps what the textures hold, 40 %
+  of the device heap's budget by default, A-260); `NX_DUMP_FRAMES=<dir>` writes each displayed frame as a PNG (opaque, cropped
   to what is shown; `NX_DUMP_EVERY=<n>`, `NX_DUMP_COUNT=<n>`, `NX_DUMP_START=<frame>` to begin late, `NX_DUMP_TARGETS=1` for every render
   target too: a PNG is uncompressed, so dump every n-th frame; `NX_DUMP_HASH=1` prints a hash of each
   frame that would be dumped, whether it is the same picture as the frame before, when it reached the

@@ -1071,3 +1071,30 @@ fn work_sent_to_the_device_in_batches_sees_what_the_batches_before_it_made() {
         }
     }
 }
+
+#[test]
+fn textures_used_longest_ago_go_when_they_hold_more_than_their_budget() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    let w = textured(8, target, header(0x08, 2, 4, 4, TEXELS), nearest_sampler());
+    put_rgba_texture(&w, |_, _| [10, 20, 30, 255]);
+    let mut r = Renderer::new(RenderConfig {
+        texture_budget: Some(1),
+        ..RenderConfig::default()
+    });
+    r.draw(&w.scene(), &DRAW).unwrap();
+    assert_eq!(r.textures_held(), 1);
+    // The frame it was used in, and the next: it stays.
+    next_frame(&mut r, &w, target, 1);
+    assert_eq!(r.textures_held(), 1);
+    // A frame without it: over its budget, it goes.
+    next_frame(&mut r, &w, target, 2);
+    assert_eq!(r.textures_held(), 0);
+    // Used again, it is made again from memory.
+    r.draw(&w.scene(), &DRAW).unwrap();
+    assert_eq!(r.textures_held(), 1);
+    let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    assert_eq!(&rgba[..4], [10, 20, 30, 255]);
+}

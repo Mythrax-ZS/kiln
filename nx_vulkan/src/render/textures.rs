@@ -1670,6 +1670,51 @@ impl Textures {
     pub fn bytes(&self) -> u64 {
         self.map.values().map(|t| t.bytes).sum()
     }
+
+    /// Let go of the textures used longest ago, once no batch can use them, until their images
+    /// hold at most nine tenths of `limit` bytes of device memory (when they hold more than it):
+    /// a texture is made again from memory when it is next used (docs/ASSUMPTIONS.md A-260). The
+    /// textures of the frame that just ended stay. Says how many went.
+    pub fn trim(&mut self, frame: &mut Frame, limit: u64) -> usize {
+        let (held, _) = self.device_bytes();
+        if held <= limit {
+            return 0;
+        }
+        let mut by_age: Vec<(u64, (Tic, Shape), u64)> = self
+            .map
+            .iter()
+            .filter(|(_, t)| t.checked == UNCHECKED || t.checked + 1 < self.frame)
+            .map(|(k, t)| {
+                (
+                    if t.checked == UNCHECKED { 0 } else { t.checked },
+                    *k,
+                    t.image.bytes,
+                )
+            })
+            .collect();
+        by_age.sort_unstable_by_key(|(checked, _, _)| *checked);
+        let goal = limit / 10 * 9;
+        let mut left = held;
+        let mut gone = 0;
+        for (_, key, bytes) in by_age {
+            if left <= goal {
+                break;
+            }
+            if let Some(t) = self.map.remove(&key) {
+                frame.garbage.push(Garbage::Image(t.image));
+                left -= bytes;
+                gone += 1;
+            }
+        }
+        gone
+    }
+
+    /// How many bytes of device memory the textures' images hold, and how many textures there are.
+    pub fn device_bytes(&self) -> (u64, usize) {
+        let images: u64 = self.map.values().map(|t| t.image.bytes).sum();
+        let nulls: u64 = self.nulls.values().map(|i| i.bytes).sum();
+        (images + nulls, self.map.len())
+    }
 }
 
 /// Read as much of `out.len()` bytes at GPU address `va` as is mapped, in order; the number of
