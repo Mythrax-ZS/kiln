@@ -1286,10 +1286,29 @@ impl Textures {
         } else {
             (0, layer_stride)
         };
+        // The hashes of the layers whose memory was not written since the texture last looked at
+        // it stay: a write into one layer of a large array (a target written back into it) does
+        // not make every layer be read again.
+        let known: Option<(u32, Vec<u64>)> = self
+            .map
+            .get(&key)
+            .filter(|t| {
+                !self.always_compare
+                    && t.epoch != 0
+                    && t.skip == skip
+                    && t.layer_hashes.len() == layers as usize
+            })
+            .map(|t| (t.epoch, t.layer_hashes.clone()));
         let mut readable = 0;
         let layer_hashes: Vec<u64> = (0..layers)
             .map(|l| {
                 let at = tic.address() + u64::from(l) * layer_stride + held_from;
+                if let Some((epoch, hashes)) = &known {
+                    if scene.untouched_since(at, held_len, *epoch) == Some(true) {
+                        readable += held_len;
+                        return hashes[l as usize];
+                    }
+                }
                 let (h, n) = scene.hash(at, held_len);
                 readable += n;
                 h

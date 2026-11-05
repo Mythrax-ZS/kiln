@@ -349,6 +349,71 @@ fn a_layer_that_changes_is_uploaded_again_and_the_others_are_kept() {
 }
 
 #[test]
+fn with_writes_tracked_a_layer_written_since_is_read_again_and_the_others_kept() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    // Three layers of 32x32 texels, a page each, in memory whose writes are tracked: the layers
+    // not written since the texture last looked keep their hashes without being read.
+    let mut tic = header(0x08, 2, 32, 32, TEXELS);
+    set_bits(&mut tic, 151, 4, 5);
+    set_bits(&mut tic, 176, 14, 2);
+    let w = textured(8, target, tic, nearest_sampler());
+    w.mem.track_writes();
+    let put_layer = |w: &World, layer: u64, rgba: [u8; 4]| {
+        let g = Geometry {
+            width: 32,
+            height: 32,
+            depth: 1,
+            bytes_per_element: 4,
+            block_height_log2: 0,
+            block_depth_log2: 0,
+        };
+        let linear: Vec<u8> = (0..32 * 32).flat_map(|_| rgba).collect();
+        let mut tiled = vec![0u8; g.tiled_size() as usize];
+        swizzle(&g, &linear, &mut tiled);
+        assert_eq!(tiled.len(), 4096);
+        w.put(TEXELS + layer * 4096, &tiled);
+    };
+    w.put(REGION + PIXEL_PROGRAM, &array_pixel(1));
+    let colors = [[200, 0, 0, 255], [0, 200, 0, 255], [0, 0, 200, 255]];
+    for (l, c) in colors.iter().enumerate() {
+        put_layer(&w, l as u64, *c);
+    }
+    let mut r = Renderer::new(RenderConfig::default());
+    let sampled = |r: &mut Renderer| {
+        r.draw(&w.scene(), &DRAW).unwrap();
+        let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+        [rgba[0], rgba[1], rgba[2], rgba[3]]
+    };
+    assert_eq!(sampled(&mut r), colors[1]);
+    for frame in 1..4 {
+        next_frame(&mut r, &w, target, frame);
+        put_layer(&w, 1, [frame as u8, 255, 255, 255]);
+        assert_eq!(
+            sampled(&mut r),
+            [frame as u8, 255, 255, 255],
+            "frame {frame}"
+        );
+    }
+    for (frame, layer) in [(4, 2), (5, 0)] {
+        next_frame(&mut r, &w, target, frame);
+        w.put(REGION + PIXEL_PROGRAM, &array_pixel(layer));
+        assert_eq!(sampled(&mut r), colors[layer as usize], "layer {layer}");
+    }
+    // A write the tracking does not see (through the host's pointer, as the device's writes into
+    // guest memory are made) leaves the layer as the texture last read it: it is not read again.
+    next_frame(&mut r, &w, target, 6);
+    w.put(REGION + PIXEL_PROGRAM, &array_pixel(2));
+    let (ptr, run) = w.mem.host_run(w.cpu(TEXELS) + 2 * 4096, 4096).unwrap();
+    assert_eq!(run, 4096);
+    // SAFETY: the run is inside the test memory, which nothing else uses meanwhile.
+    unsafe { std::ptr::write_bytes(ptr, 0xFF, 4096) };
+    assert_eq!(sampled(&mut r), colors[2], "an unseen write is not read");
+}
+
+#[test]
 fn a_handle_that_names_no_header_stops_the_draw_with_what_it_named() {
     if vulkan().is_none() {
         return;

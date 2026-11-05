@@ -34,6 +34,10 @@ pub fn vulkan() -> Option<Vk> {
 /// Guest memory for tests: one page-aligned block, so a device can be given its address.
 pub struct Memory {
     ptr: *mut u8,
+    /// Write tracking, once [`Memory::track_writes`] turned it on: the epoch running and, for each
+    /// page, the number of the epoch after the one it was last written in through
+    /// [`GuestMemory::write`], as the runtime's tracking stamps them.
+    tracking: std::sync::Mutex<Option<(u32, Vec<u32>)>>,
 }
 
 // SAFETY: the block is owned by this value and only reached through its methods or the device.
@@ -46,7 +50,15 @@ impl Memory {
         // SAFETY: the layout has a non-zero size.
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!ptr.is_null());
-        Memory { ptr }
+        Memory {
+            ptr,
+            tracking: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// From now on the writes through [`GuestMemory::write`] are tracked by page and epoch.
+    pub fn track_writes(&self) {
+        *self.tracking.lock().unwrap() = Some((0, vec![0; (SIZE / 4096) as usize]));
     }
 }
 
@@ -84,7 +96,36 @@ impl GuestMemory for Memory {
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(off as usize), data.len())
         };
+        if let Some((epoch, stamps)) = self.tracking.lock().unwrap().as_mut() {
+            if !data.is_empty() {
+                let pages = (off / 4096) as usize..=((off + data.len() as u64 - 1) / 4096) as usize;
+                for page in pages {
+                    stamps[page] = *epoch + 1;
+                }
+            }
+        }
         true
+    }
+
+    fn begin_write_epoch(&self) -> u32 {
+        match self.tracking.lock().unwrap().as_mut() {
+            Some((epoch, _)) => {
+                *epoch += 1;
+                *epoch
+            }
+            None => 0,
+        }
+    }
+
+    fn untouched_since(&self, addr: u64, len: u64, epoch: u32) -> Option<bool> {
+        let guard = self.tracking.lock().unwrap();
+        let (_, stamps) = guard.as_ref()?;
+        let off = addr.checked_sub(CPU_BASE)?;
+        if len == 0 || off + len > SIZE || epoch == 0 {
+            return None;
+        }
+        let pages = (off / 4096) as usize..=((off + len - 1) / 4096) as usize;
+        Some(stamps[pages].iter().all(|&s| s <= epoch))
     }
 
     fn host_run(&self, addr: u64, max: u64) -> Option<(*mut u8, u64)> {
