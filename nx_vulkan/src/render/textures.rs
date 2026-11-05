@@ -732,6 +732,10 @@ struct Texture {
     skip: u32,
     /// The hash of each layer's memory, of the levels the image holds.
     layer_hashes: Vec<u64>,
+    /// The bytes from one layer to the next in memory, and the layers the renderer wrote into
+    /// since they were last compared (A-279).
+    layer_stride: u64,
+    stale_layers: Vec<bool>,
 }
 
 /// How a shader sees a texture: the type of image view the descriptor needs.
@@ -1306,7 +1310,7 @@ impl Textures {
         // The hashes of the layers whose memory was not written since the texture last looked at
         // it stay: a write into one layer of a large array (a target written back into it) does
         // not make every layer be read again.
-        let known: Option<(u32, Vec<u64>)> = self
+        let known: Option<(u32, Vec<u64>, Vec<bool>)> = self
             .map
             .get(&key)
             .filter(|t| {
@@ -1315,13 +1319,17 @@ impl Textures {
                     && t.skip == skip
                     && t.layer_hashes.len() == layers as usize
             })
-            .map(|t| (t.epoch, t.layer_hashes.clone()));
+            .map(|t| (t.epoch, t.layer_hashes.clone(), t.stale_layers.clone()));
         let mut readable = 0;
         let layer_hashes: Vec<u64> = (0..layers)
             .map(|l| {
                 let at = tic.address() + u64::from(l) * layer_stride + held_from;
-                if let Some((epoch, hashes)) = &known {
-                    if scene.untouched_since(at, held_len, *epoch) == Some(true) {
+                if let Some((epoch, hashes, stale)) = &known {
+                    // A layer the renderer wrote into is read again: the tracking of writes says
+                    // what this epoch wrote only from the next one on.
+                    if !stale.get(l as usize).copied().unwrap_or(true)
+                        && scene.untouched_since(at, held_len, *epoch) == Some(true)
+                    {
                         readable += held_len;
                         return hashes[l as usize];
                     }
@@ -1342,6 +1350,7 @@ impl Textures {
             .fold(layers as u64, |a, h| a.rotate_left(7) ^ h);
         let mut update: Option<(vk::Image, vk::ImageView, Vec<u32>)> = None;
         if let Some(t) = self.map.get_mut(&key) {
+            t.stale_layers.fill(false);
             if t.layer_hashes == layer_hashes {
                 t.checked = current;
                 t.epoch = self.epoch;
@@ -1679,6 +1688,8 @@ impl Textures {
                         layers,
                         skip,
                         layer_hashes,
+                        layer_stride,
+                        stale_layers: vec![false; layers as usize],
                     },
                 );
             }
@@ -1693,7 +1704,18 @@ impl Textures {
         for t in self.map.values_mut() {
             if t.cpu == 0 || (t.cpu < end && t.cpu + t.bytes > start) {
                 t.checked = UNCHECKED;
-                t.epoch = 0;
+                // The layers the write reaches are hashed again; the others keep what the
+                // tracking of writes says of them (A-279). Without a layout to go by, all are.
+                let layers = t.stale_layers.len() as u64;
+                if t.cpu == 0 || t.layer_stride == 0 || layers == 0 {
+                    t.epoch = 0;
+                    continue;
+                }
+                let first = start.saturating_sub(t.cpu) / t.layer_stride;
+                let last = (end - 1).saturating_sub(t.cpu) / t.layer_stride;
+                for l in first..=last.min(layers - 1) {
+                    t.stale_layers[l as usize] = true;
+                }
             }
         }
     }
