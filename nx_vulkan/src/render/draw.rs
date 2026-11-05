@@ -287,6 +287,7 @@ impl Core {
             self.bind_textures(
                 scene,
                 p,
+                slot.address,
                 slot.kind.name(),
                 &pools,
                 &handles,
@@ -772,10 +773,12 @@ impl Core {
     /// The descriptors (binding and image info) of the textures program `p` samples: for each,
     /// from its handle (with a description of where the handle came from, for messages), the
     /// headers of the pools, the image and the sampler.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn bind_textures(
         &mut self,
         scene: &Scene<'_>,
         p: &Program,
+        address: u64,
         kind_name: &str,
         pools: &nx_gpu::draw_state::TexturePools,
         handles: &[(u32, HandleFrom)],

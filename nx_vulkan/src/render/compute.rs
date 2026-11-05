@@ -42,14 +42,9 @@ impl Core {
                 *mark = now;
             }
         };
-        let program = self.shaders.kernel(
-            &self.vk,
-            scene,
-            d.program,
-            d.block,
-            d.shared_bytes,
-            self.textures.frame,
-        )?;
+        let program = self
+            .shaders
+            .kernel(&self.vk, scene, d, self.textures.frame)?;
         let bindings = bindings_of(&[&program]);
         let (set_layout, pipeline_layout) = self.layouts.get(&self.vk, &bindings)?;
         let set = self.frame.descriptor_set(&self.vk, set_layout)?;
@@ -148,7 +143,50 @@ impl Core {
             ));
         }
         let mut images = Vec::new();
-        self.bind_textures(scene, &program, "compute", &pools, &handles, &mut images)?;
+        self.bind_textures(
+            scene,
+            &program,
+            d.program,
+            "compute",
+            &pools,
+            &handles,
+            &mut images,
+        )?;
+        // The surfaces: their handles are words of constant buffers too, and their headers are in
+        // the texture pool (A-252).
+        let mut surfaces = Vec::new();
+        for used in &program.info.images {
+            let slot = used.source.unwrap_or(TEXTURE_TABLE);
+            let Some(Some(buffer)) = d.cbufs.get(slot as usize) else {
+                return Err(format!(
+                    "surface {} is named by a handle in constant buffer {slot}, which the launch does not bind",
+                    used.index
+                ));
+            };
+            let mut word = [0u8; 4];
+            self.read_exact(scene, buffer.address + 4 * u64::from(used.index), &mut word)?;
+            let tic_id = u32::from_le_bytes(word) & 0xF_FFFF;
+            if tic_id >= pools.header_count {
+                return Err(format!(
+                    "surface {}: header {tic_id} of {}",
+                    used.index, pools.header_count
+                ));
+            }
+            let mut tic_bytes = [0u8; 32];
+            self.read_exact(
+                scene,
+                pools.header_address + 32 * u64::from(tic_id),
+                &mut tic_bytes,
+            )?;
+            let tic = super::textures::Tic(std::array::from_fn(|i| {
+                u32::from_le_bytes(tic_bytes[4 * i..4 * i + 4].try_into().unwrap())
+            }));
+            let surface = self.surface(scene, tic, used)?;
+            surfaces.push((
+                nx_shader::translate::ImageUse::binding(program.stage, used.slot),
+                surface,
+            ));
+        }
         lap(&mut self.phases.compute[2]);
 
         let infos: Vec<[vk::DescriptorBufferInfo; 1]> =
@@ -175,6 +213,26 @@ impl Core {
                         .dst_set(set)
                         .dst_binding(*binding)
                         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(info)
+                }),
+        );
+        let surface_arrays: Vec<[vk::DescriptorImageInfo; 1]> = surfaces
+            .iter()
+            .map(|(_, s)| {
+                [vk::DescriptorImageInfo::default()
+                    .image_view(s.view())
+                    .image_layout(vk::ImageLayout::GENERAL)]
+            })
+            .collect();
+        writes.extend(
+            surfaces
+                .iter()
+                .zip(&surface_arrays)
+                .map(|((binding, _), info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(*binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                         .image_info(info)
                 }),
         );
@@ -273,7 +331,11 @@ impl Core {
             unsafe { self.vk.device.destroy_query_pool(pool, None) };
         }
         lap(&mut self.phases.compute[5]);
-        flushed
+        if surfaces.is_empty() {
+            return flushed;
+        }
+        flushed?;
+        self.put_back(scene, surfaces.into_iter().map(|(_, s)| s).collect())
     }
 
     /// The compute pipeline of `program` in `layout`, made on first use.

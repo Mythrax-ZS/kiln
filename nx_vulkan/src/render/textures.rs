@@ -771,7 +771,7 @@ fn texels_that_are_not_numbers(format: vk::Format, data: &[u8]) -> usize {
 }
 
 /// Where the bytes of a texture are in memory and what image they make.
-struct Plan {
+pub(super) struct Plan {
     width: u32,
     height: u32,
     depth: u32,
@@ -779,16 +779,16 @@ struct Plan {
     levels: u32,
     aspect: vk::ImageAspectFlags,
     /// The geometry of each mip level of one layer.
-    level_geometry: Vec<Geometry>,
+    pub(super) level_geometry: Vec<Geometry>,
     /// The distance between layers in bytes.
-    layer_stride: u64,
+    pub(super) layer_stride: u64,
     /// The bytes of the whole texture in memory.
     total: u64,
 }
 
 /// The image `tic` makes for a shader that samples it with `shape`, in `format`, and where its
 /// bytes are.
-fn plan(tic: &Tic, shape: Shape, format: TexFormat) -> Result<Plan, String> {
+pub(super) fn plan(tic: &Tic, shape: Shape, format: TexFormat) -> Result<Plan, String> {
     let (width, height) = (tic.width(), tic.height());
     let volume = shape.kind == Kind::D3;
     let layers = shape.layers;

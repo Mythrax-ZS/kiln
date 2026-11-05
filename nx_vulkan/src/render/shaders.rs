@@ -7,8 +7,8 @@ use ash::vk;
 use nx_gpu::render::Scene;
 use nx_gpu::state::{StageKind, StageSlot};
 use nx_shader::cfg::{Cfg, Code, Constants, TableWord};
-use nx_shader::sph::{Sph, SPH_BYTES};
-use nx_shader::translate::{translate, Class, Config, Info, Stage};
+use nx_shader::sph::Sph;
+use nx_shader::translate::{translate, translate_sm86, Class, Config, Info, Stage};
 use std::sync::Arc;
 
 /// How much of GPU memory after a program's start is read to find its end.
@@ -87,12 +87,34 @@ impl Constants for BoundConstants<'_, '_> {
     }
 }
 
+/// The words of the constant buffers a compute launch binds, read from GPU memory.
+struct LaunchConstants<'a, 'b> {
+    scene: &'a Scene<'b>,
+    cbufs: &'a [Option<nx_gpu::compute::CbufBinding>; 8],
+}
+
+impl Constants for LaunchConstants<'_, '_> {
+    fn word(&self, slot: u32, offset: u32) -> Option<u32> {
+        let bound = self.cbufs.get(slot as usize)?.as_ref()?;
+        if u64::from(offset) + 4 > u64::from(bound.size) {
+            return None;
+        }
+        let mut word = [0u8; 4];
+        self.scene
+            .read(bound.address + u64::from(offset), &mut word)
+            .then(|| u32::from_le_bytes(word))
+    }
+}
+
 /// A compute program found in GPU memory (it has no header), translated for a workgroup size.
 struct KernelEntry {
     /// Bytes from the start to the end of the last reachable instruction.
     size: usize,
     hash: u64,
     checked: u64,
+    /// The words of the launch's constant buffers its indirect jumps were resolved with; the
+    /// entry is good while the buffers still hold them.
+    constants: Vec<TableWord>,
     program: Arc<Program>,
 }
 
@@ -235,21 +257,29 @@ impl Shaders {
                 }
                 let sph = Sph::parse(&bytes)
                     .map_err(|e| format!("the {name} program at {:#x}: {e}", slot.address))?;
-                let code = &bytes[SPH_BYTES..];
+                // A version 4 header is in front of the Switch 2's sm_86 code (0x80 bytes).
+                let sm86 = sph.version() == 4;
+                let start = sph.code_offset();
+                let code = &bytes[start..];
                 let bound = BoundConstants {
                     scene,
                     group: slot.group,
                 };
-                let cfg = Cfg::discover_with(Code(code), &bound);
+                let cfg = if sm86 {
+                    nx_shader::sm86::cfg::discover(code, &bound)
+                } else {
+                    Cfg::discover_with(Code(code), &bound)
+                };
                 if let Some(issue) = cfg.issues.first() {
                     return Err(format!(
                         "the control flow of the {name} program at {:#x}: {issue}",
                         slot.address
                     ));
                 }
-                let size = SPH_BYTES + cfg.extent as usize;
+                let size = start + cfg.extent as usize;
                 let mut code = code[..cfg.extent as usize].to_vec();
-                if slot.kind == StageKind::Pixel
+                if !sm86
+                    && slot.kind == StageKind::Pixel
                     && ((self.solid_pixel && !self.solid_keep.contains(&slot.address))
                         || self.solid_only.contains(&slot.address))
                 {
@@ -297,6 +327,53 @@ impl Shaders {
                     .then(|| (at, [regs[0], regs[1], regs[2]]))
             });
         }
+        // `NX_DEBUG_FINITE_POSITION=1`: see `Config::finite_position`.
+        config.finite_position = std::env::var_os("NX_DEBUG_FINITE_POSITION").is_some();
+        // `NX_DEBUG_ZERO_CBUFS`, `NX_DEBUG_ZERO_INPUTS=<hex address>[,...]`: see `Config::zero_cbufs`.
+        config.zero_cbufs = super::debug::addresses("NX_DEBUG_ZERO_CBUFS").contains(&slot.address);
+        if let Ok(slots) = std::env::var("NX_DEBUG_ZERO_CBUF_SLOTS") {
+            config.zero_cbuf_slots = slots
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .fold(0, |m, s| m | 1 << s);
+        }
+        if let Some((from, to)) = std::env::var("NX_DEBUG_ZERO_CBUF_RANGE")
+            .ok()
+            .and_then(|v| {
+                let (a, b) = v.split_once(':')?;
+                let hex = |s: &str| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok();
+                Some((hex(a)?, hex(b)?))
+            })
+        {
+            config.zero_cbuf_range = (from, to);
+        }
+        config.zero_cbuf_kind = match std::env::var("NX_DEBUG_ZERO_CBUF_KIND").as_deref() {
+            Ok("static") => 1,
+            Ok("dynamic") => 2,
+            _ => 0,
+        };
+        config.zero_inputs =
+            super::debug::addresses("NX_DEBUG_ZERO_INPUTS").contains(&slot.address);
+        // `NX_DEBUG_SKIP_FROM=<program address>:<offset>[:<end>][,<offset>[:<end>]...]`
+        // (hexadecimal): see `Config::skip`.
+        config.skip = std::env::var("NX_DEBUG_SKIP_FROM")
+            .ok()
+            .and_then(|v| {
+                let hex = |s: &str| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok();
+                let (address, ranges) = v.split_once(':')?;
+                (hex(address)? == slot.address).then(|| {
+                    ranges
+                        .split(',')
+                        .filter_map(|r| {
+                            let mut ends = r.split(':');
+                            let from = hex(ends.next()?)? as u32;
+                            let to = ends.next().and_then(hex).map_or(u32::MAX, |t| t as u32);
+                            Some((from, to))
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
         if config.probe_bad.is_some() {
             eprintln!(
                 "[vulkan] probe tag {}: the {name} program at {:#x}",
@@ -304,8 +381,12 @@ impl Shaders {
             );
         }
         let _phase = nx_gpu::progress::enter(nx_gpu::progress::TRANSLATING);
-        let translation = translate(Code(&entry.code), Some(&entry.sph), &config)
-            .map_err(|e| format!("the {name} program at {:#x}: {e}", slot.address))?;
+        let translation = if entry.sph.version() == 4 {
+            translate_sm86(&entry.code, Some(&entry.sph), &config)
+        } else {
+            translate(Code(&entry.code), Some(&entry.sph), &config)
+        }
+        .map_err(|e| format!("the {name} program at {:#x}: {e}", slot.address))?;
         if self.spirv_check {
             if let Err(e) = nx_shader::validate::validate(&translation.spirv) {
                 return Err(format!(
@@ -341,24 +422,32 @@ impl Shaders {
         Ok(program)
     }
 
-    /// The compute program at `address`, translated for workgroups of `block` invocations with
-    /// `shared_bytes` bytes of shared memory.
+    /// The compute program of launch `d`, translated for its workgroups and shared memory (Maxwell
+    /// or sm_86 code, as the descriptor's version says).
     pub fn kernel(
         &mut self,
         vk: &Vk,
         scene: &Scene<'_>,
-        address: u64,
-        block: [u32; 3],
-        shared_bytes: u32,
+        d: &nx_gpu::compute::Dispatch,
         frame: u64,
     ) -> Result<Arc<Program>, String> {
-        // The same program: unchanged if the bytes still hash the same (looked at once a frame).
+        let (address, block, shared_bytes, sm86) = (d.program, d.block, d.shared_bytes, d.sm86);
+        let launch = LaunchConstants {
+            scene,
+            cbufs: &d.cbufs,
+        };
+        // The same program: unchanged if the bytes still hash the same (looked at once a frame)
+        // and the launch's buffers hold its jump tables' words.
         if let Some(e) = self.kernels.get_mut(&(address, block, shared_bytes)) {
-            if e.checked == frame {
+            let tables_hold = e
+                .constants
+                .iter()
+                .all(|w| launch.word(w.slot, w.offset) == Some(w.value));
+            if e.checked == frame && tables_hold {
                 return Ok(Arc::clone(&e.program));
             }
             let (hash, mapped) = scene.hash(address, e.size as u64);
-            if mapped == e.size as u64 && hash == e.hash {
+            if mapped == e.size as u64 && hash == e.hash && tables_hold {
                 e.checked = frame;
                 return Ok(Arc::clone(&e.program));
             }
@@ -371,7 +460,11 @@ impl Shaders {
                 unreadable(scene, address)
             ));
         }
-        let cfg = Cfg::discover(Code(&bytes));
+        let cfg = if sm86 {
+            nx_shader::sm86::cfg::discover(&bytes, &launch)
+        } else {
+            Cfg::discover_with(Code(&bytes), &launch)
+        };
         if let Some(issue) = cfg.issues.first() {
             return Err(format!(
                 "the control flow of the compute program at {address:#x}: {issue}"
@@ -381,9 +474,14 @@ impl Shaders {
         let mut config = Config::new(Stage::Kernel);
         config.block = block;
         config.shared_bytes = shared_bytes;
+        config.constants = cfg.tables.clone();
         let _phase = nx_gpu::progress::enter(nx_gpu::progress::TRANSLATING);
-        let translation = translate(Code(&bytes[..size]), None, &config)
-            .map_err(|e| format!("the compute program at {address:#x}: {e}"))?;
+        let translation = if sm86 {
+            translate_sm86(&bytes[..size], None, &config)
+        } else {
+            translate(Code(&bytes[..size]), None, &config)
+        }
+        .map_err(|e| format!("the compute program at {address:#x}: {e}"))?;
         if self.spirv_check {
             if let Err(e) = nx_shader::validate::validate(&translation.spirv) {
                 return Err(format!(
@@ -412,6 +510,7 @@ impl Shaders {
                 size,
                 hash: scene.hash(address, size as u64).0,
                 checked: frame,
+                constants: config.constants,
                 program: Arc::clone(&program),
             },
         );
@@ -444,8 +543,19 @@ pub enum Visible {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Binding {
     pub binding: u32,
-    pub storage: bool,
+    pub kind: Descriptor,
     pub visible: Visible,
+}
+
+/// The kind of a descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Descriptor {
+    /// A storage buffer (a constant buffer, the table of global memory).
+    Buffer,
+    /// A combined image sampler (a texture).
+    Texture,
+    /// A storage image (a surface).
+    Image,
 }
 
 /// The descriptors the programs of a draw need, in binding order.
@@ -462,7 +572,7 @@ pub fn bindings_of(programs: &[&Program]) -> Vec<Binding> {
             if p.info.cbuf_extent[slot] > 0 || p.info.cbuf_dynamic[slot] {
                 out.push(Binding {
                     binding: base + slot as u32,
-                    storage: true,
+                    kind: Descriptor::Buffer,
                     visible,
                 });
             }
@@ -470,14 +580,21 @@ pub fn bindings_of(programs: &[&Program]) -> Vec<Binding> {
         if p.info.global_memory {
             out.push(Binding {
                 binding: base + 20,
-                storage: true,
+                kind: Descriptor::Buffer,
                 visible,
             });
         }
         for t in &p.info.textures {
             out.push(Binding {
                 binding: base + 24 + t.slot,
-                storage: false,
+                kind: Descriptor::Texture,
+                visible,
+            });
+        }
+        for i in &p.info.images {
+            out.push(Binding {
+                binding: nx_shader::translate::ImageUse::binding(p.stage, i.slot),
+                kind: Descriptor::Image,
                 visible,
             });
         }
@@ -506,10 +623,10 @@ impl Layouts {
             .map(|b| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(b.binding)
-                    .descriptor_type(if b.storage {
-                        vk::DescriptorType::STORAGE_BUFFER
-                    } else {
-                        vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                    .descriptor_type(match b.kind {
+                        Descriptor::Buffer => vk::DescriptorType::STORAGE_BUFFER,
+                        Descriptor::Texture => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                        Descriptor::Image => vk::DescriptorType::STORAGE_IMAGE,
                     })
                     .descriptor_count(1)
                     .stage_flags(match b.visible {

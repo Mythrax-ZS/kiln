@@ -17,6 +17,7 @@ mod draw;
 mod frame;
 mod global;
 mod shaders;
+mod surfaces;
 mod targets;
 mod textures;
 
