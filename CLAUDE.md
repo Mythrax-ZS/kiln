@@ -168,7 +168,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   with its surfaces and rectangles (A-165); `NX_TRACE_MEDIA=1` prints every frame the video decoder
   decodes and every conversion the video image compositor makes, with its output surface, format and
   how many of its pixels are not black (A-182, A-183; `NX_TRACE_MEDIA=2` adds every method write and
-  every mapping of the engines); `NX_MAX_FRAMES=<n>` ends the run after `n` presented
+  every mapping of the engines); `NX_TRACE_VDEC=1` prints every request of the Switch 2's video decoder
+  sessions (`nx2:vdec`, `nx2:vdecsvc`) and every frame it decodes and writes into an image (A-261); `NX_MAX_FRAMES=<n>` ends the run after `n` presented
   frames; `NX_SAVE_DIR=<dir>` is where save data goes (default `./nx_save`). `kiln symbols --exefs <dir> [--match <text>]
   [<address>...]` names the function around an address, for reading the return addresses a stop
   report ends with. `NX_TRACE_AS=1` says every mapping the program makes in the GPU's address space
@@ -219,6 +220,9 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   program with the loop around a `switch` (A-114), `NX_SPIRV_OPT=<arguments>` passes every graphics
   program through `spirv-opt` first),
   `NX_DEBUG_EQUAL_AS_LEQUAL=1`, `NX_DEBUG_NO_DEPTH_TEST=1`, `NX_DEBUG_FLIP_FRONT=1`,
+  `NX_DEBUG_ALWAYS_COMPARE=1` (every texture is compared with memory once a frame even where the
+  tracking of writes says its memory is unchanged: that tracking does not see what the device writes
+  into guest memory in place),
   `NX_TRACE_TARGETS=1` (each render target configuration, the first time it is drawn to) and
   `NX_GPU_SYNC=1` runs the commands of a submission in the call that makes it (with a renderer they
   otherwise run on a thread of their own, A-124, and so do the media engines' jobs, A-184); `NX_GPU_LENIENT=1` skips a draw the renderer

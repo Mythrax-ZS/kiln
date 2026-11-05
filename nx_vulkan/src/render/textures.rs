@@ -928,6 +928,10 @@ pub struct Textures {
     nulls: FastMap<(Kind, bool), Image>,
     /// The textures made from a smaller level so far (A-250), said once each.
     reduced: Vec<u64>,
+    /// `NX_DEBUG_ALWAYS_COMPARE=1`: every texture is compared with memory once a frame, even
+    /// where the tracking of writes says its memory is unchanged (it does not see what the device
+    /// writes into guest memory in place: a texture's fault, or the tracking's?).
+    always_compare: bool,
 }
 
 /// A texture's `checked` that matches no frame: it is compared with memory again.
@@ -954,6 +958,7 @@ impl Textures {
     pub fn new(trace: bool) -> Textures {
         Textures {
             trace,
+            always_compare: std::env::var_os("NX_DEBUG_ALWAYS_COMPARE").is_some(),
             ..Textures::default()
         }
     }
@@ -1251,7 +1256,10 @@ impl Textures {
             self.epoch_frame = current;
         }
         if let Some(t) = self.map.get_mut(&key) {
-            if t.epoch != 0 && scene.untouched_since(tic.address(), total, t.epoch) == Some(true) {
+            if !self.always_compare
+                && t.epoch != 0
+                && scene.untouched_since(tic.address(), total, t.epoch) == Some(true)
+            {
                 t.checked = current;
                 return Ok(t.image.view);
             }
