@@ -21,6 +21,8 @@ const MAX_IMPORT: u64 = 1 << 30;
 const KEPT_FRAMES: u64 = 600;
 /// What is made reachable of a storage buffer whose size word is not one (A-258).
 const UNSIZED_WINDOW: u64 = 64 << 20;
+/// How far past the start of a storage buffer an import of its memory reaches.
+const IMPORT_WINDOW: u64 = 16 << 20;
 /// The largest size word taken as a storage buffer's size.
 const LARGEST_BUFFER: u64 = 1 << 30;
 
@@ -147,16 +149,8 @@ impl GlobalMemory {
     /// The device address of the host bytes `[ptr, ptr + len)`, importing the pages they are in
     /// unless an import covers them already.
     fn import(&mut self, vk: &Vk, ptr: *mut u8, len: u64, now: u64) -> Result<u64, String> {
-        let start = ptr as usize;
-        let end = start + len as usize;
-        // The imports that start at or below the bytes, nearest first: one of the first few that
-        // reaches past them serves.
-        for ((base, size), (m, used)) in self.imports.range_mut(..=(start, u64::MAX)).rev().take(8)
-        {
-            if *base + *size as usize >= end {
-                *used = now;
-                return Ok(m.address + (start - *base) as u64);
-            }
+        if let Some(device) = self.covering(ptr, len, now) {
+            return Ok(device);
         }
         let page_offset = ptr as u64 % PAGE;
         let base = ptr as u64 - page_offset;
@@ -165,6 +159,22 @@ impl GlobalMemory {
         let address = m.address;
         self.imports.insert((base as usize, size), (m, now));
         Ok(address + page_offset)
+    }
+
+    /// The device address of the host bytes `[ptr, ptr + len)` in an import that covers them.
+    fn covering(&mut self, ptr: *mut u8, len: u64, now: u64) -> Option<u64> {
+        let start = ptr as usize;
+        let end = start + len as usize;
+        // The imports that start at or below the bytes, nearest first: one of the first few that
+        // reaches past them serves.
+        for ((base, size), (m, used)) in self.imports.range_mut(..=(start, u64::MAX)).rev().take(8)
+        {
+            if *base + *size as usize >= end {
+                *used = now;
+                return Some(m.address + (start - *base) as u64);
+            }
+        }
+        None
     }
 
     /// Let go of the imports nothing has used for `KEPT_FRAMES` frames, once no batch can use
@@ -230,12 +240,24 @@ impl GlobalMemory {
                 let Some((cpu, left)) = scene.space.translate(at) else {
                     break;
                 };
-                let want = (end - at).min(left).min(MAX_IMPORT);
-                let Some((ptr, run)) = scene.mem.host_run(cpu, want) else {
+                let need = (end - at).min(left).min(MAX_IMPORT);
+                let Some((ptr, run)) = scene.mem.host_run(cpu, need) else {
                     at += PAGE - (cpu % PAGE);
                     continue;
                 };
-                match self.import(vk, ptr, run, now) {
+                // An import that covers the bytes serves; else what is imported reaches
+                // `IMPORT_WINDOW` past them where the mapping goes on: the buffers of a ring move
+                // along the same memory from one launch to the next, and find it imported (each
+                // import costs milliseconds).
+                let device = match self.covering(ptr, run, now) {
+                    Some(device) => Ok(device),
+                    None => {
+                        let want = need.max(IMPORT_WINDOW).min(left).min(MAX_IMPORT);
+                        let (window, size) = scene.mem.host_run(cpu, want).unwrap_or((ptr, run));
+                        self.import(vk, window, size.max(run), now)
+                    }
+                };
+                match device {
                     Ok(device) => entries.push((at, at + run, device)),
                     Err(why) => *self.failures.entry(why).or_default() += 1,
                 }
