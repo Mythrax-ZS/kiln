@@ -73,6 +73,33 @@ impl Plane {
     }
 }
 
+// Color spaces (section 7.2, `color_space`).
+pub const CS_UNKNOWN: u8 = 0;
+pub const CS_BT_601: u8 = 1;
+pub const CS_BT_709: u8 = 2;
+pub const CS_SMPTE_170: u8 = 3;
+pub const CS_SMPTE_240: u8 = 4;
+pub const CS_BT_2020: u8 = 5;
+pub const CS_RGB: u8 = 7;
+
+/// What the samples of a stream mean: its `color_space` and `color_range` (section 7.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Color {
+    pub space: u8,
+    /// `color_range`: the samples use 0 to 255 rather than studio swing (16 to 235, 240 for
+    /// chroma).
+    pub full_range: bool,
+}
+
+impl Default for Color {
+    fn default() -> Color {
+        Color {
+            space: CS_BT_601,
+            full_range: false,
+        }
+    }
+}
+
 /// A decoded picture: Y, U and V, the chroma planes half the size of the luma plane.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
@@ -270,6 +297,8 @@ pub struct Decoder {
     last_size: Option<(usize, usize)>,
     last_show_frame: bool,
     last_was_key: bool,
+    /// The color space and range of the stream (section 7.2), as its last key frame said.
+    color: Color,
     /// The headers of the frames decoded, for inspection (`take_headers`).
     headers: Vec<(FrameHeader, Probs)>,
 }
@@ -292,6 +321,7 @@ impl Decoder {
             last_size: None,
             last_show_frame: false,
             last_was_key: false,
+            color: Color::default(),
             headers: Vec::new(),
         }
     }
@@ -406,6 +436,12 @@ impl Decoder {
         Ok(hdr.show_frame.then_some(frame))
     }
 
+    /// The color space and range of the samples, as the last key frame (or, in profile 0, intra-only
+    /// frame) said; BT.601 in the limited range before any.
+    pub fn color(&self) -> Color {
+        self.color
+    }
+
     /// The headers (and the probabilities after the forward updates) of the frames decoded since
     /// the last call, in decoding order.
     pub fn take_headers(&mut self) -> Vec<(FrameHeader, Probs)> {
@@ -452,7 +488,7 @@ impl Decoder {
         h.error_resilient = r.bit()?;
         if h.key_frame {
             frame_sync(r)?;
-            color_config(r)?;
+            self.color = color_config(r)?;
             self.frame_size(r, &mut h)?;
             render_size(r)?;
             h.refresh_frame_flags = 0xFF;
@@ -461,7 +497,11 @@ impl Decoder {
             h.reset_frame_context = if h.error_resilient { 0 } else { r.f(2)? as u8 };
             if h.intra_only {
                 frame_sync(r)?;
-                // Profile 0: 8-bit 4:2:0, no color config.
+                // Profile 0: 8-bit 4:2:0, no color config: the samples are BT.601's.
+                self.color = Color {
+                    space: CS_BT_601,
+                    full_range: false,
+                };
                 h.refresh_frame_flags = r.f(8)? as u8;
                 self.frame_size(r, &mut h)?;
                 render_size(r)?;
@@ -615,14 +655,16 @@ fn frame_sync(r: &mut BitReader) -> Result<(), Error> {
     Ok(())
 }
 
-/// `color_config` of profile 0: the color space and range are read and not used.
-fn color_config(r: &mut BitReader) -> Result<(), Error> {
-    let color_space = r.f(3)?;
-    if color_space == 7 {
+/// `color_config` of profile 0: the color space and range.
+fn color_config(r: &mut BitReader) -> Result<Color, Error> {
+    let space = r.f(3)? as u8;
+    if space == CS_RGB {
         return Err(Error::Unsupported("the RGB color space".into()));
     }
-    r.f(1)?; // color_range
-    Ok(())
+    Ok(Color {
+        space,
+        full_range: r.bit()?,
+    })
 }
 
 fn render_size(r: &mut BitReader) -> Result<(), Error> {
