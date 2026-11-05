@@ -131,6 +131,7 @@ impl World {
     pub fn scene(&self) -> Scene<'_> {
         Scene {
             regs: Regs(&self.regs),
+            class: nx_gpu::gpu::class::THREED,
             cbufs: &self.cbufs,
             mem: &self.mem,
             space: &self.space,

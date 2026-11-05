@@ -47,6 +47,9 @@ pub mod reg {
     pub const PIPELINE_SLOTS: u32 = 6;
     /// The slot of the vertex shader proper, which is always enabled.
     pub const VERTEX_SLOT: u32 = 1;
+    /// Where a pipeline slot of the Turing and later classes gives its program's address: the
+    /// upper word, then the lower (`SET_PIPELINE_PROGRAM_ADDRESS_A/B`, A-239).
+    pub const PIPELINE_PROGRAM_ADDRESS: u32 = 0x14;
     pub const CONSTANT_BUFFER_SELECTOR: u32 = 0x2380;
     pub const LOAD_CONSTANT_BUFFER_OFFSET: u32 = 0x238C;
     pub const LOAD_CONSTANT_BUFFER: u32 = 0x2390;
@@ -104,7 +107,8 @@ pub struct StageSlot {
     /// The index of the slot (0..6).
     pub slot: u32,
     pub kind: StageKind,
-    /// The program's offset from the program region, and its address in the GPU's space.
+    /// The program's offset from the program region (that word of a Maxwell class), and its
+    /// address in the GPU's space.
     pub offset: u32,
     pub address: u64,
     /// The register count the driver declared.
@@ -123,6 +127,14 @@ impl Regs<'_> {
     /// enabled (docs/ASSUMPTIONS.md): a title never writes its enable bit. A slot whose type is not
     /// one of the six is left out.
     pub fn stages(&self) -> Vec<StageSlot> {
+        self.stages_of(crate::gpu::class::THREED)
+    }
+
+    /// [`Regs::stages`] of an engine of class `class`: the Switch 2's Ampere class gives each
+    /// program's whole address (`SET_PIPELINE_PROGRAM_ADDRESS_A/B`, A-239) where the Maxwell class
+    /// gives an offset from the program region.
+    pub fn stages_of(&self, class: u32) -> Vec<StageSlot> {
+        let wide = crate::gpu::class::is_ampere(class);
         (0..reg::PIPELINE_SLOTS)
             .filter_map(|slot| {
                 let base = reg::PIPELINE_SHADER + slot * reg::PIPELINE_STRIDE;
@@ -133,19 +145,25 @@ impl Regs<'_> {
                 } else {
                     return None;
                 };
-                Some(self.slot(slot, kind))
+                Some(self.slot(slot, kind, wide))
             })
             .collect()
     }
 
-    fn slot(&self, slot: u32, kind: StageKind) -> StageSlot {
+    fn slot(&self, slot: u32, kind: StageKind, wide: bool) -> StageSlot {
         let base = reg::PIPELINE_SHADER + slot * reg::PIPELINE_STRIDE;
         let offset = self.word(base + 4);
+        let address = if wide {
+            u64::from(self.word(base + reg::PIPELINE_PROGRAM_ADDRESS)) << 32
+                | u64::from(self.word(base + reg::PIPELINE_PROGRAM_ADDRESS + 4))
+        } else {
+            self.program_region() + u64::from(offset)
+        };
         StageSlot {
             slot,
             kind,
             offset,
-            address: self.program_region() + u64::from(offset),
+            address,
             registers: self.field(base + 0xC, 0, 8),
             group: self.field(base + 0x10, 0, 3),
         }
@@ -229,6 +247,25 @@ mod tests {
         assert_eq!(stages[1].kind, StageKind::Pixel);
         assert_eq!(stages[1].address, 0x1_8000_2000);
         assert_eq!(stages[1].group, 4);
+    }
+
+    #[test]
+    fn the_ampere_class_gives_each_program_its_whole_address() {
+        let mut r = file();
+        r[0x1608 / 4] = 0x1;
+        r[0x2044 / 4] = 0x100;
+        // Slot 1's SET_PIPELINE_PROGRAM_ADDRESS_A/B, as NVN2's macro 4 writes them, and its
+        // prefetch word.
+        r[0x2054 / 4] = 0x20;
+        r[0x2058 / 4] = 0x46A6_3000;
+        r[0x205C / 4] = 2;
+        let ampere = Regs(&r).stages_of(crate::gpu::class::AMPERE_THREED);
+        assert_eq!(ampere[0].address, 0x20_46A6_3000);
+        let maxwell = Regs(&r).stages_of(crate::gpu::class::THREED);
+        assert_eq!(
+            maxwell[0].address, 0x1_0000_0100,
+            "the region and the offset"
+        );
     }
 
     #[test]

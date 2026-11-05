@@ -17,12 +17,19 @@ use crate::vm::AddressSpace;
 /// engine has bound, and the GPU address space with the memory behind it.
 pub struct Scene<'a> {
     pub regs: Regs<'a>,
+    /// The class of the engine the registers are of.
+    pub class: u32,
     pub cbufs: &'a CbufBindings,
     pub mem: &'a dyn GuestMemory,
     pub space: &'a AddressSpace,
 }
 
 impl Scene<'_> {
+    /// The programs of the draw, as the engine's class gives them.
+    pub fn stages(&self) -> Vec<crate::state::StageSlot> {
+        self.regs.stages_of(self.class)
+    }
+
     /// Read `out.len()` bytes of GPU memory at `va`. `false` when any of it is not mapped.
     pub fn read(&self, va: u64, out: &mut [u8]) -> bool {
         self.space.read(self.mem, va, out)

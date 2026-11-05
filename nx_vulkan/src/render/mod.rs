@@ -940,7 +940,6 @@ impl Renderer {
                 // What was submitted up to this draw failed, and this was the last to join it.
                 eprintln!("[vulkan] the commands up to this draw failed: {e}");
                 let stages: Vec<String> = scene
-                    .regs
                     .stages()
                     .iter()
                     .map(|s| format!("{} {:#x}", s.kind.name(), s.address))
@@ -985,8 +984,7 @@ impl Renderer {
             }
         }
         if let Some(frame) = core.traced() {
-            let regs = scene.regs;
-            let stages: Vec<String> = regs
+            let stages: Vec<String> = scene
                 .stages()
                 .iter()
                 .map(|s| format!("{} {:#x}", s.kind.name(), s.address))

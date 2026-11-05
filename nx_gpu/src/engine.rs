@@ -897,6 +897,7 @@ impl Engine {
         };
         let scene = Scene {
             regs: Regs(&self.regs),
+            class: self.class,
             cbufs: &self.cbufs,
             mem: cx.mem,
             space: cx.space,
@@ -940,6 +941,7 @@ impl Engine {
         };
         let scene = Scene {
             regs: Regs(&self.regs),
+            class: self.class,
             cbufs: &self.cbufs,
             mem: cx.mem,
             space: cx.space,
@@ -1131,7 +1133,7 @@ impl Engine {
             }
             Source::Inline { count } | Source::Unsupported { count } => (0, count),
         };
-        let stages = self.regs().stages();
+        let stages = self.regs().stages_of(self.class);
         let mut shaders = std::mem::take(&mut cx.stats.shaders);
         shaders.observe(cx, &stages);
         cx.stats.shaders = shaders;
@@ -1168,6 +1170,7 @@ impl Engine {
         };
         let scene = Scene {
             regs: Regs(&self.regs),
+            class: self.class,
             cbufs: &self.cbufs,
             mem: cx.mem,
             space: cx.space,
@@ -1188,6 +1191,7 @@ impl Engine {
         };
         let scene = Scene {
             regs: Regs(&self.regs),
+            class: self.class,
             cbufs: &self.cbufs,
             mem: cx.mem,
             space: cx.space,

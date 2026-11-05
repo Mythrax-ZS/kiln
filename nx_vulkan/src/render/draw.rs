@@ -171,7 +171,7 @@ impl Core {
             return Ok(());
         }
         // The programs of the draw.
-        let stages = regs.stages();
+        let stages = scene.stages();
         for s in &stages {
             match s.kind {
                 StageKind::Vertex | StageKind::Pixel => {}
