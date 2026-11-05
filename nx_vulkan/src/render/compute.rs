@@ -456,10 +456,15 @@ impl Core {
         }
         self.deferred.extend(staged);
         // A launch that is timed, or that a switch asks to wait for, is waited for at once.
+        // Else it joins the batch as a draw does: a batch of one launch would have the next one
+        // wait for the device's slots almost every time.
+        self.batch_draws += 1;
         let sent = if self.debug.compute_wait || self.debug.trace_compute || self.sync_on {
             self.settle(scene.space, scene.mem, settle::SYNC)
-        } else {
+        } else if self.batch_draws >= super::BATCH_DRAWS {
             self.send_batch()
+        } else {
+            Ok(())
         };
         if let Some(pool) = timestamps {
             let mut ticks = [0u64; 2];
