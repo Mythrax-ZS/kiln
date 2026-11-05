@@ -100,6 +100,9 @@ pub struct Nvdrv {
     /// The driver is the Switch 2's: its ioctls have their Switch 2 forms (an Ampere GPU, A-199).
     /// Set for a program built for the Switch 2 (A-188), never by what a program asks.
     switch_2: bool,
+    /// The Switch 2's one GPU address space: every `/dev/nvhost-as-gpu` of its driver is this
+    /// one, `nx2:gpu` maps GPU memory into it, and it lasts as long as the process (A-201).
+    switch_2_space: Option<u32>,
 }
 
 impl Nvdrv {
@@ -116,6 +119,7 @@ impl Nvdrv {
             media: crate::media::Media::new(),
             pending_wait: None,
             switch_2: false,
+            switch_2_space: None,
         }
     }
 
@@ -127,6 +131,39 @@ impl Nvdrv {
     /// Whether the driver is the Switch 2's.
     pub fn is_switch_2(&self) -> bool {
         self.switch_2
+    }
+
+    /// The Switch 2's GPU address space (see `switch_2_space`), made the first time.
+    fn switch_2_space(&mut self) -> u32 {
+        match self.switch_2_space {
+            Some(id) => id,
+            None => {
+                let id = self.gpu.new_space();
+                self.switch_2_space = Some(id);
+                id
+            }
+        }
+    }
+
+    /// `nx2:gpu`: make `len` bytes of the Switch 2's GPU address space at `gpu_va` a window onto
+    /// the CPU memory at `cpu` (A-201).
+    pub fn switch_2_map(&mut self, gpu_va: u64, len: u64, cpu: u64, kind: u32) -> IoResult {
+        let id = self.switch_2_space();
+        let space = self.gpu.spaces.get_mut(&id).ok_or(NvError::INVALID_STATE)?;
+        Ok(space.map_range(gpu_va, len, cpu, kind)?)
+    }
+
+    /// The CPU address that GPU address `va` of the Switch 2's address space is a window onto.
+    pub fn switch_2_translate(&mut self, va: u64) -> Option<u64> {
+        let id = self.switch_2_space();
+        Some(self.gpu.spaces.get(&id)?.translate(va)?.0)
+    }
+
+    /// `nx2:gpu`: unmap `len` bytes of the Switch 2's GPU address space at `gpu_va` (A-201).
+    pub fn switch_2_unmap(&mut self, gpu_va: u64, len: u64) -> IoResult {
+        let id = self.switch_2_space();
+        let space = self.gpu.spaces.get_mut(&id).ok_or(NvError::INVALID_STATE)?;
+        Ok(space.unmap_range(gpu_va, len)?)
     }
 
     /// Whether threads of the runtime run work for the driver (the renderer's commands, the
@@ -143,6 +180,7 @@ impl Nvdrv {
             },
             "/dev/nvhost-ctrl-gpu" => Node::CtrlGpu,
             "/dev/nvmap" => Node::Nvmap,
+            "/dev/nvhost-as-gpu" if self.switch_2 => Node::AsGpu(self.switch_2_space()),
             "/dev/nvhost-as-gpu" => Node::AsGpu(self.gpu.new_space()),
             "/dev/nvhost-gpu" => Node::Gpu(self.gpu.new_channel()),
             // The media engines: nodes that accept their work and decode nothing (A-119).
@@ -173,6 +211,8 @@ impl Nvdrv {
             eprintln!("[nvdrv] close fd {fd} ({})", node.path());
         }
         match node {
+            // The Switch 2's one address space stays (A-201).
+            Node::AsGpu(id) if Some(id) == self.switch_2_space => {}
             Node::AsGpu(id) => {
                 self.gpu.spaces.remove(&id);
             }

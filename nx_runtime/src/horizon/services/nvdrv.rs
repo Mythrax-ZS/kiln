@@ -350,6 +350,27 @@ impl Shared {
         self.lock().set_switch_2(on);
     }
 
+    /// `nx2:gpu`: make `len` bytes of the Switch 2's GPU address space at `gpu_va` a window onto
+    /// the CPU memory at `cpu` (A-201); the error says why not.
+    pub fn switch_2_map(&self, gpu_va: u64, len: u64, cpu: u64, kind: u32) -> Result<(), String> {
+        self.lock()
+            .switch_2_map(gpu_va, len, cpu, kind)
+            .map_err(|f| format!("{f:?}"))
+    }
+
+    /// The CPU address that GPU address `va` of the Switch 2's address space is a window onto.
+    #[cfg(test)]
+    pub fn switch_2_translate(&self, va: u64) -> Option<u64> {
+        self.lock().switch_2_translate(va)
+    }
+
+    /// `nx2:gpu`: unmap `len` bytes of the Switch 2's GPU address space at `gpu_va` (A-201).
+    pub fn switch_2_unmap(&self, gpu_va: u64, len: u64) -> Result<(), String> {
+        self.lock()
+            .switch_2_unmap(gpu_va, len)
+            .map_err(|f| format!("{f:?}"))
+    }
+
     /// The readable end of the event of slot `slot` of the Switch 2's syncpoint service.
     pub fn nx2_slot_event(&self, kernel: &Kernel, slot: u32) -> KObject {
         let token = self.lock().nx2_slot_token(slot);

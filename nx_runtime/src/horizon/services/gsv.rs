@@ -20,6 +20,10 @@ pub struct Supervisor {
     display: Arc<vi::Shared>,
     /// Command 11 was sent.
     client_registered: bool,
+    /// What the `nx2:gpu` sessions handed out (497) know: the address spaces 434 attaches.
+    gpu_state: Arc<std::sync::Mutex<GpuState>>,
+    /// The GPU address spaces attached with 434, by id.
+    attached: std::collections::BTreeSet<u32>,
 }
 
 impl Supervisor {
@@ -33,6 +37,8 @@ impl Supervisor {
             gpu,
             display,
             client_registered: false,
+            gpu_state: Arc::default(),
+            attached: Default::default(),
         }
     }
 }
@@ -226,6 +232,260 @@ impl Service for Syncpt {
 
     fn request_tipc(&mut self, req: &Request) -> ServiceResult {
         self.handle(req)
+    }
+}
+
+/// The events `nx2:gpu` jobs complete on, by id modulo this.
+const GPU_EVENT_IDS: u32 = 32;
+/// The GPU addresses NVN2 uses: its address space's user partition (A-197).
+const GPU_VA_START: u64 = 0x800_0000;
+const GPU_VA_END: u64 = 0xC0_0000_0000;
+
+/// What `nx2:gpu` and its sub-sessions share (A-197).
+#[derive(Debug, Default)]
+pub struct GpuState {
+    /// The (writable, readable) ends of the event of each id, made on first use.
+    events: std::collections::HashMap<u32, (KObject, KObject)>,
+    /// The graphics devices made with 41, by id.
+    devices: std::collections::BTreeSet<u8>,
+    /// The GPU address spaces made with 33, by id.
+    spaces: std::collections::BTreeSet<u32>,
+    /// The GPU memory made with 101, by handle: its CPU address and size.
+    memories: std::collections::BTreeMap<u32, (u64, u64)>,
+    /// The handle the next memory gets.
+    next_memory: u32,
+}
+
+/// The graphics devices there may be at once: ids 1 to 63 (A-197).
+const GPU_DEVICE_IDS: u8 = 64;
+
+/// `nx2:gpu`: GPU memory, mapped into the GPU's address space, and the events its jobs complete
+/// on (A-197).
+#[derive(Debug)]
+pub struct GpuSession {
+    kernel: Weak<Kernel>,
+    #[allow(dead_code)]
+    gpu: Arc<nvdrv::Shared>,
+    state: Arc<std::sync::Mutex<GpuState>>,
+}
+
+impl GpuSession {
+    /// Set the event of a job's slot: nothing runs elsewhere, so a job is done once it is asked
+    /// for (an unmap does not wait for the work queued before it; A-201).
+    fn complete(&self, kernel: &Kernel, slot: u32) {
+        kernel.set_event(&self.event(kernel, slot).0, true);
+    }
+
+    /// The memory 101 made under the handle: its CPU address and size.
+    fn memory(&self, req: &Request, handle: u32) -> Result<(u64, u64), Stop> {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.memories.get(&handle).copied().ok_or_else(|| {
+            Stop(format!(
+                "nx2:gpu {} of the GPU memory {handle}, which 101 did not make",
+                req.command
+            ))
+        })
+    }
+
+    /// The bytes of `[first, last]` from a request, or a stop when the range is empty.
+    fn span(req: &Request, first: u64, last: u64) -> Result<u64, Stop> {
+        match last.checked_sub(first) {
+            Some(d) if d < u64::MAX => Ok(d + 1),
+            _ => Err(Stop(format!(
+                "nx2:gpu {} of the range [{first:#x}, {last:#x}]",
+                req.command
+            ))),
+        }
+    }
+
+    /// Stop unless the request's u32 at 0 names an address space made with 33.
+    fn space(&self, req: &Request) -> Result<u32, Stop> {
+        let id = req.u32_at(0);
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !st.spaces.contains(&id) {
+            return Err(Stop(format!(
+                "nx2:gpu {} of the address space {id}, which 33 did not make",
+                req.command
+            )));
+        }
+        Ok(id)
+    }
+
+    fn event(&self, kernel: &Kernel, id: u32) -> (KObject, KObject) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.events
+            .entry(id % GPU_EVENT_IDS)
+            .or_insert_with(|| kernel.new_event())
+            .clone()
+    }
+}
+
+impl Service for GpuSession {
+    fn name(&self) -> &str {
+        "nx2:gpu"
+    }
+
+    fn request(&mut self, req: &Request) -> ServiceResult {
+        Err(Stop(format!(
+            "nx2:gpu was sent a CMIF message (command {}); it speaks TIPC",
+            req.command
+        )))
+    }
+
+    fn request_tipc(&mut self, req: &Request) -> ServiceResult {
+        let kernel = self
+            .kernel
+            .upgrade()
+            .ok_or_else(|| Stop("the process is gone".into()))?;
+        match req.command {
+            // GetIdRange -> (u32 first, u32 last): the ids whose events jobs complete on.
+            11 => Ok(Response::ok().with_u32(0).with_u32(GPU_EVENT_IDS - 1)),
+            // GetIdEvent(u32 id) -> event
+            12 => Ok(Response::ok().with_copy_handle(self.event(&kernel, req.u32_at(0)).1)),
+            // Start(u32 id): nothing runs elsewhere, so the id's event is set at once.
+            21 => {
+                kernel.set_event(&self.event(&kernel, req.u32_at(0)).0, true);
+                Ok(Response::ok())
+            }
+            // OpenSubSession: another session on the same state, whose jobs set the same events.
+            22 => Ok(
+                Response::ok().with_copy_handle(KObject::session(Box::new(GpuSession {
+                    kernel: self.kernel.clone(),
+                    gpu: self.gpu.clone(),
+                    state: self.state.clone(),
+                }))),
+            ),
+            // CreateGpuAddressSpace(u32 flags) -> u32 id, from nn::gpu::sdk::CreateGpuAddressSpace
+            // (the SDK keeps eight): an address space of the GPU, which 202, 203 and the
+            // supervisor's 434 name by its id, the lowest free one from 1. Only flags 0 is known.
+            33 => {
+                if req.u32_at(0) != 0 {
+                    return Err(Stop(format!(
+                        "nx2:gpu 33 makes an address space with the flags {:#x}; only 0 is known",
+                        req.u32_at(0)
+                    )));
+                }
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let id = (1..).find(|id| !st.spaces.contains(id)).unwrap_or(u32::MAX);
+                st.spaces.insert(id);
+                Ok(Response::ok().with_u32(id))
+            }
+            // CreateGraphicsDevice(u64 name, u64 flags, u64 debug label) -> u8 id, from
+            // nn::gpu::sdk::CreateGraphicsDevice (NvRm's `NvRmGpu`): the lowest free id from 1,
+            // which the SDK keeps as a byte; 0 names no device.
+            41 => {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(id) = (1..GPU_DEVICE_IDS).find(|id| !st.devices.contains(id)) else {
+                    return Err(Stop(format!(
+                        "nx2:gpu 41: all {} graphics devices are made",
+                        GPU_DEVICE_IDS - 1
+                    )));
+                };
+                st.devices.insert(id);
+                Ok(Response::ok().with_u32(u32::from(id)))
+            }
+            // CreateGpuAccessibleMemory(u64 start, u64 last, u32, u32) -> u32 handle, after the
+            // SVC 0x80 that lets the GPU at the memory: the CPU memory from start to last becomes
+            // GPU memory, mapped at its own address, which 102 and 211 name by the handle (from
+            // 1). The two u32s are not known and not used (A-201).
+            101 => {
+                let (start, last) = (req.u64_at(0), req.u64_at(8));
+                let len = Self::span(req, start, last)?;
+                self.gpu
+                    .switch_2_map(start, len, start, 0)
+                    .map_err(|e| Stop(format!("nx2:gpu 101 of [{start:#x}, {last:#x}]: {e}")))?;
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.next_memory += 1;
+                let handle = st.next_memory;
+                st.memories.insert(handle, (start, len));
+                Ok(Response::ok().with_u32(handle))
+            }
+            // DestroyGpuAccessibleMemory(u32 handle, u32 slot): the memory is GPU memory no more
+            // (the program reuses it at once) and its mapping at its own address goes.
+            102 => {
+                let (handle, slot) = (req.u32_at(0), req.u32_at(4));
+                let (start, len) = self.memory(req, handle)?;
+                self.gpu
+                    .switch_2_unmap(start, len)
+                    .map_err(|e| Stop(format!("nx2:gpu 102 of the memory {handle}: {e}")))?;
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.memories.remove(&handle);
+                drop(st);
+                self.complete(&kernel, slot);
+                Ok(Response::ok())
+            }
+            // NormalMapGpuMemory4K(u32 address space, u64 first, u64 last, u32 handle, u64 offset,
+            // ..., u32 slot at 60): from first to last, the address space becomes a window onto
+            // the handle's memory from the offset on.
+            211 => {
+                self.space(req)?;
+                let (first, last) = (req.u64_at(4), req.u64_at(12));
+                let (handle, offset, slot) = (req.u32_at(20), req.u64_at(24), req.u32_at(60));
+                let len = Self::span(req, first, last)?;
+                let (start, size) = self.memory(req, handle)?;
+                if offset.checked_add(len).is_none_or(|end| end > size) {
+                    return Err(Stop(format!(
+                        "nx2:gpu 211 maps {len:#x} bytes from {offset:#x} into the memory \
+                         {handle} of {size:#x} bytes"
+                    )));
+                }
+                self.gpu
+                    .switch_2_map(first, len, start + offset, 0)
+                    .map_err(|e| Stop(format!("nx2:gpu 211 of [{first:#x}, {last:#x}]: {e}")))?;
+                self.complete(&kernel, slot);
+                Ok(Response::ok())
+            }
+            // NormalModifyMemoryKind4K(u32 address space, u64 first, u64 last, u32 kind, u32
+            // fallback kind, u32 sync, u32 slot) -> u32 kind applied: a mapping's kind changes
+            // nothing in the GPU front here (A-177), so the kind asked for is applied.
+            212 => {
+                self.space(req)?;
+                Self::span(req, req.u64_at(4), req.u64_at(12))?;
+                self.complete(&kernel, req.u32_at(32));
+                Ok(Response::ok().with_u32(req.u32_at(20) & 0xFF))
+            }
+            // NormalUnmapGpuMemory4K(u32 address space, u64 first, u64 last, ..., u32 slot at 24)
+            213 => {
+                self.space(req)?;
+                let (first, last) = (req.u64_at(4), req.u64_at(12));
+                let len = Self::span(req, first, last)?;
+                self.gpu
+                    .switch_2_unmap(first, len)
+                    .map_err(|e| Stop(format!("nx2:gpu 213 of [{first:#x}, {last:#x}]: {e}")))?;
+                self.complete(&kernel, req.u32_at(24));
+                Ok(Response::ok())
+            }
+            // DestroyGraphicsDevice(u8 id)
+            42 => {
+                let id = req.u32_at(0) as u8;
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if !st.devices.remove(&id) {
+                    return Err(Stop(format!(
+                        "nx2:gpu 42 of the graphics device {id}, which is not made"
+                    )));
+                }
+                Ok(Response::ok())
+            }
+            // GetUserPartition -> (u64 start, u64 size)
+            201 => Ok(Response::ok()
+                .with_u64(GPU_VA_START)
+                .with_u64(GPU_VA_END - GPU_VA_START)),
+            // GetGsvPartition(u32 address space) -> empty, minimum above maximum.
+            202 => {
+                self.space(req)?;
+                Ok(Response::ok().with_u64(u64::MAX).with_u64(0))
+            }
+            // GetVaRange(u32 address space) -> (u64 kind, u64 start, u64 size): the SDK takes a
+            // kind of 0 for no range and stops at 5 or more.
+            203 => {
+                self.space(req)?;
+                Ok(Response::ok()
+                    .with_u64(1)
+                    .with_u64(GPU_VA_START)
+                    .with_u64(GPU_VA_END - GPU_VA_START))
+            }
+            other => Err(Stop::unknown_command(self.name(), other)),
+        }
     }
 }
 
@@ -536,6 +796,26 @@ impl Service for Supervisor {
             // QueryGrantedFeatures(u64 requested) -> u64 granted: everything asked for (a zero
             // answer would deny every feature), from nn::gs::sdk::BootNativeMemoryManagement.
             115 => Ok(Response::ok().with_u64(req.u64_at(0))),
+            // AttachGpuAddressSpace(u32 id), from nn::gpu::sdk::CreateGpuAddressSpace: the
+            // graphics system takes the address space nx2:gpu 33 made; only the result is read.
+            434 => {
+                let id = req.u32_at(0);
+                let made = {
+                    let st = self.gpu_state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.spaces.contains(&id)
+                };
+                if !made || !self.attached.insert(id) {
+                    return Err(Stop(format!(
+                        "nx2:gsv 434 of the GPU address space {id}, {}",
+                        if made {
+                            "attached before"
+                        } else {
+                            "which nx2:gpu did not make"
+                        }
+                    )));
+                }
+                Ok(Response::ok())
+            }
             // AttachSyncpointPage(u32 version, u32 count, u64 rw size, u64 ro size, rw transfer
             // memory, ro transfer memory) -> (request event, reply event) (A-196).
             204 => self.attach_page(req),
@@ -544,6 +824,14 @@ impl Service for Supervisor {
                 Response::ok().with_copy_handle(KObject::session(Box::new(Syncpt {
                     kernel: self.kernel.clone(),
                     gpu: self.gpu.clone(),
+                }))),
+            ),
+            // OpenGpuSession(u64): the GPU memory session (A-197).
+            497 => Ok(
+                Response::ok().with_copy_handle(KObject::session(Box::new(GpuSession {
+                    kernel: self.kernel.clone(),
+                    gpu: self.gpu.clone(),
+                    state: self.gpu_state.clone(),
                 }))),
             ),
             // OpenViSession(u64): presentation (A-198).
@@ -599,6 +887,151 @@ mod tests {
         assert!(
             s.request(&req(4)).is_err(),
             "a CMIF message is not the supervisor's"
+        );
+    }
+
+    #[test]
+    fn graphics_devices_take_the_lowest_free_id_from_1() {
+        use super::super::super::kernel::{ProcessInfo, ProcessKind};
+        let kernel = Kernel::new(ProcessInfo::new("gpu", ProcessKind::Nso, None));
+        let mut g = GpuSession {
+            kernel: Arc::downgrade(&kernel),
+            gpu: nvdrv::Shared::new(),
+            state: Arc::default(),
+        };
+        let make = |g: &mut GpuSession| g.request_tipc(&req(41)).unwrap().data;
+        assert_eq!(make(&mut g), 1u32.to_le_bytes());
+        assert_eq!(make(&mut g), 2u32.to_le_bytes());
+        let mut destroy = req(42);
+        destroy.data = 1u32.to_le_bytes().to_vec();
+        assert!(g.request_tipc(&destroy).is_ok());
+        assert!(
+            g.request_tipc(&destroy).is_err(),
+            "a device is destroyed once"
+        );
+        assert_eq!(make(&mut g), 1u32.to_le_bytes(), "the lowest free id");
+    }
+
+    #[test]
+    fn a_gpu_address_space_is_made_then_attached_to_the_graphics_system() {
+        use super::super::super::kernel::{ProcessInfo, ProcessKind};
+        let kernel = Kernel::new(ProcessInfo::new("gpu", ProcessKind::Nso, None));
+        let mut s = Supervisor::new(
+            Arc::downgrade(&kernel),
+            nvdrv::Shared::new(),
+            Arc::new(vi::Shared::new()),
+        );
+        let mut g = GpuSession {
+            kernel: Arc::downgrade(&kernel),
+            gpu: s.gpu.clone(),
+            state: s.gpu_state.clone(),
+        };
+        let with = |command, v: u32| Request {
+            command,
+            data: v.to_le_bytes().to_vec(),
+            ..Request::default()
+        };
+        assert!(s.request_tipc(&with(434, 1)).is_err(), "not made yet");
+        assert_eq!(
+            g.request_tipc(&with(33, 0)).unwrap().data,
+            1u32.to_le_bytes()
+        );
+        assert!(g.request_tipc(&with(203, 1)).is_ok() && g.request_tipc(&with(202, 1)).is_ok());
+        assert!(g.request_tipc(&with(203, 2)).is_err(), "no address space 2");
+        assert!(
+            g.request_tipc(&with(33, 4)).is_err(),
+            "flags that are not known"
+        );
+        assert!(s.request_tipc(&with(434, 1)).is_ok());
+        assert!(s.request_tipc(&with(434, 1)).is_err(), "attached once");
+    }
+
+    #[test]
+    fn gpu_memory_is_mapped_at_its_own_address_and_where_211_puts_it() {
+        use super::super::super::kernel::{ProcessInfo, ProcessKind};
+        let kernel = Kernel::new(ProcessInfo::new("gpu", ProcessKind::Nso, None));
+        let gpu = nvdrv::Shared::new();
+        gpu.set_switch_2(true);
+        let mut g = GpuSession {
+            kernel: Arc::downgrade(&kernel),
+            gpu: gpu.clone(),
+            state: Arc::default(),
+        };
+        let data = |command: u32, fields: &[(usize, u64, usize)]| {
+            let mut data = vec![0u8; 64];
+            for &(at, value, width) in fields {
+                data[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+            }
+            Request {
+                command,
+                data,
+                ..Request::default()
+            }
+        };
+        let space = g.request_tipc(&data(33, &[])).unwrap().data;
+        assert_eq!(space, 1u32.to_le_bytes());
+        // 101: two pages of CPU memory at 0x30_0003_5000, which become GPU memory there too.
+        let made = data(
+            101,
+            &[(0, 0x30_0003_5000, 8), (8, 0x30_0003_6FFF, 8), (20, 1, 4)],
+        );
+        let handle = g.request_tipc(&made).unwrap().data;
+        assert_eq!(handle, 1u32.to_le_bytes());
+        assert_eq!(gpu.switch_2_translate(0x30_0003_6004), Some(0x30_0003_6004));
+        // 211: the second page at GPU address 0x1000_0000, its event set.
+        let map = data(
+            211,
+            &[
+                (0, 1, 4),
+                (4, 0x1000_0000, 8),
+                (12, 0x1000_0FFF, 8),
+                (20, 1, 4),
+                (24, 0x1000, 8),
+                (60, 3, 4),
+            ],
+        );
+        g.request_tipc(&map).unwrap();
+        assert_eq!(gpu.switch_2_translate(0x1000_0010), Some(0x30_0003_6010));
+        assert!(kernel.event_signaled(&g.event(&kernel, 3).0));
+        // Past the memory's end, of an address space or a memory that was not made: stops.
+        let past = data(
+            211,
+            &[
+                (0, 1, 4),
+                (4, 0x1000_0000, 8),
+                (12, 0x1000_1FFF, 8),
+                (20, 1, 4),
+                (24, 0x1000, 8),
+            ],
+        );
+        assert!(g.request_tipc(&past).is_err());
+        let other = data(
+            211,
+            &[
+                (0, 2, 4),
+                (4, 0x1000_0000, 8),
+                (12, 0x1000_0FFF, 8),
+                (20, 1, 4),
+            ],
+        );
+        assert!(g.request_tipc(&other).is_err());
+        // 213 unmaps; 102 destroys the memory and its mapping at its own address.
+        g.request_tipc(&data(
+            213,
+            &[
+                (0, 1, 4),
+                (4, 0x1000_0000, 8),
+                (12, 0x1000_0FFF, 8),
+                (24, 4, 4),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(gpu.switch_2_translate(0x1000_0010), None);
+        g.request_tipc(&data(102, &[(0, 1, 4), (4, 5, 4)])).unwrap();
+        assert_eq!(gpu.switch_2_translate(0x30_0003_5000), None);
+        assert!(
+            g.request_tipc(&data(102, &[(0, 1, 4)])).is_err(),
+            "destroyed once"
         );
     }
 
