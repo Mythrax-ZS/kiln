@@ -78,6 +78,44 @@ pub struct Stats {
 }
 
 impl Stats {
+    /// What the renderer could not do, by kind: the reasons with their numbers (addresses, words
+    /// of headers) left out, so that one kind of failure is one line, and how often each came.
+    pub fn failures(&self, top: usize) -> String {
+        let mut kinds: BTreeMap<String, u64> = BTreeMap::new();
+        for (why, count) in &self.failed {
+            let mut kind = String::with_capacity(why.len());
+            let mut chars = why.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '0' && chars.peek() == Some(&'x') {
+                    chars.next();
+                    while chars.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+                        chars.next();
+                    }
+                    kind.push('#');
+                } else if c == '[' {
+                    // A header's words, a list of numbers: one mark for all.
+                    for c in chars.by_ref() {
+                        if c == ']' {
+                            break;
+                        }
+                    }
+                    kind.push_str("[..]");
+                } else {
+                    kind.push(c);
+                }
+            }
+            *kinds.entry(kind).or_default() += count;
+        }
+        let total: u64 = kinds.values().sum();
+        let mut s = format!("[gpu] the renderer could not make {total} commands; by kind:\n");
+        let mut by_count: Vec<_> = kinds.into_iter().collect();
+        by_count.sort_by_key(|(kind, count)| (std::cmp::Reverse(*count), kind.clone()));
+        for (kind, count) in by_count.into_iter().take(top) {
+            s.push_str(&format!("[gpu]   {count:>8} x {kind}\n"));
+        }
+        s
+    }
+
     /// A report of the counts: totals, then the most written methods.
     pub fn report(&self, top: usize) -> String {
         let mut s = format!(

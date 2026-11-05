@@ -504,6 +504,9 @@ impl Shared {
                 None => 25,
             };
             eprint!("{}", core.gpu.stats.report(top));
+        } else if !core.gpu.stats.failed.is_empty() {
+            // Past a failure (`NX_GPU_LENIENT`): what was skipped, by kind.
+            eprint!("{}", core.gpu.stats.failures(25));
         }
     }
 
