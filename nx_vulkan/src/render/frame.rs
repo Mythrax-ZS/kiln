@@ -62,6 +62,8 @@ pub struct Frame {
     flying: VecDeque<usize>,
     /// Resources to destroy once the commands recorded so far (and those before them) have run.
     pub garbage: Vec<Garbage>,
+    /// The surface images of batches that have run, to be used again (A-278).
+    pub returned: Vec<crate::image::Image>,
     /// The device was lost: nothing more is asked of it.
     lost: bool,
 }
@@ -69,6 +71,8 @@ pub struct Frame {
 /// Something a submission needed that can be destroyed after it ran.
 pub enum Garbage {
     Image(crate::image::Image),
+    /// A surface's image, handed back for another launch once the batch has run (A-278).
+    Surface(crate::image::Image),
     Device(DeviceBuffer),
     /// Guest memory imported for global memory (released once no batch can use it).
     Imported(crate::compute::ImportedMemory),
@@ -123,6 +127,7 @@ impl Frame {
                 current: 0,
                 flying: VecDeque::new(),
                 garbage: Vec::new(),
+                returned: Vec::new(),
                 lost: false,
             })
         }
@@ -478,6 +483,7 @@ impl Frame {
         for g in slot.garbage.drain(..) {
             match g {
                 Garbage::Image(i) => vk.destroy_image(i),
+                Garbage::Surface(i) => self.returned.push(i),
                 Garbage::Device(b) => vk.destroy_device_buffer(b),
                 Garbage::Imported(m) => vk.destroy_imported(m),
             }
@@ -520,10 +526,13 @@ impl Frame {
         // What was left to destroy after the last batch.
         for g in self.garbage.drain(..) {
             match g {
-                Garbage::Image(i) => vk.destroy_image(i),
+                Garbage::Image(i) | Garbage::Surface(i) => vk.destroy_image(i),
                 Garbage::Device(b) => vk.destroy_device_buffer(b),
                 Garbage::Imported(m) => vk.destroy_imported(m),
             }
+        }
+        for i in self.returned.drain(..) {
+            vk.destroy_image(i);
         }
     }
 }

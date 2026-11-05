@@ -167,6 +167,10 @@ struct Core {
     reach_everywhere: bool,
     deferred: Vec<surfaces::Staged>,
     releases: Vec<nx_gpu::qmd3::Release>,
+    /// Surface images and staging buffers of launches that have run, for the next launches of
+    /// the same shapes (A-278).
+    surface_images: crate::fast::FastMap<surfaces::ImageShape, Vec<crate::image::Image>>,
+    staging_buffers: crate::fast::FastMap<u64, Vec<crate::compute::HostBuffer>>,
     /// Textures let go to keep to the device memory budget (A-260), for the report.
     textures_trimmed: u64,
     /// 2D copies made in guest memory (A-249), for the report of every 100 frames.
@@ -370,6 +374,8 @@ impl Renderer {
                     reach_everywhere: false,
                     deferred: Vec::new(),
                     releases: Vec::new(),
+                    surface_images: crate::fast::FastMap::default(),
+                    staging_buffers: crate::fast::FastMap::default(),
                     textures_trimmed: 0,
                     memory_copies: 0,
                     batch_draws: 0,
@@ -1617,6 +1623,16 @@ impl Drop for Renderer {
             }
             core.pipelines.destroy(&core.vk);
             core.compute_pipelines.destroy(&core.vk);
+            for (_, images) in core.surface_images.drain() {
+                for image in images {
+                    core.vk.destroy_image(image);
+                }
+            }
+            for (_, buffers) in core.staging_buffers.drain() {
+                for buffer in buffers {
+                    core.vk.destroy_host_buffer(buffer);
+                }
+            }
             core.layouts.destroy(&core.vk);
             core.shaders.destroy(&core.vk);
             core.textures.destroy(&core.vk);

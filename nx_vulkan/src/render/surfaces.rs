@@ -63,6 +63,23 @@ impl Place {
     }
 }
 
+/// What an image made for a surface is: its format, size, layers and view (A-278).
+pub type ImageShape = (i32, u32, u32, u32, u32, i32);
+
+fn shape_of_image(info: &ImageInfo) -> ImageShape {
+    (
+        info.format.as_raw(),
+        info.width,
+        info.height,
+        info.depth,
+        info.layers,
+        info.view_type.as_raw(),
+    )
+}
+
+/// The images and staging buffers of each shape kept for later launches.
+const POOLED: usize = 8;
+
 /// A surface made for a launch.
 pub struct Surface {
     image: Image,
@@ -227,7 +244,7 @@ impl Core {
             },
             format,
         )?;
-        let image = self.vk.create_image(ImageInfo {
+        let image = self.surface_image(ImageInfo {
             format: format.vk,
             width: tic.width(),
             height: tic.height(),
@@ -345,10 +362,7 @@ impl Core {
             let cmd = self.frame.cmd(&self.vk)?;
             for s in surfaces.iter().filter(|s| s.written) {
                 let per_layer = s.place.geometry.linear_size();
-                let staging = self.vk.create_host_buffer(
-                    per_layer * u64::from(s.place.layers),
-                    vk::BufferUsageFlags::TRANSFER_DST,
-                )?;
+                let staging = self.staging_buffer(per_layer * u64::from(s.place.layers))?;
                 let regions: Vec<vk::BufferImageCopy> = (0..s.place.layers)
                     .map(|layer| s.region(layer, u64::from(layer) * per_layer))
                     .collect();
@@ -405,13 +419,47 @@ impl Core {
                 );
             }
         }
-        // Nothing uses the images once the batch is over.
+        // The images serve later launches once the batch is over.
         for s in surfaces {
             self.frame
                 .garbage
-                .push(super::frame::Garbage::Image(s.image));
+                .push(super::frame::Garbage::Surface(s.image));
         }
         Ok(staged)
+    }
+
+    /// An image of `info` for a surface: one a launch before used, once its batch has run, else
+    /// a new one (A-278).
+    fn surface_image(&mut self, info: ImageInfo) -> Result<Image, String> {
+        for image in std::mem::take(&mut self.frame.returned) {
+            let list = self
+                .surface_images
+                .entry(shape_of_image(&image.info))
+                .or_default();
+            if list.len() < POOLED {
+                list.push(image);
+            } else {
+                self.vk.destroy_image(image);
+            }
+        }
+        match self
+            .surface_images
+            .get_mut(&shape_of_image(&info))
+            .and_then(Vec::pop)
+        {
+            Some(image) => Ok(image),
+            None => self.vk.create_image(info),
+        }
+    }
+
+    /// A host buffer of `size` bytes for a surface's texels: one used before, else a new one.
+    fn staging_buffer(&mut self, size: u64) -> Result<crate::compute::HostBuffer, String> {
+        match self.staging_buffers.get_mut(&size).and_then(Vec::pop) {
+            Some(buffer) => Ok(buffer),
+            None => self
+                .vk
+                .create_host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST),
+        }
     }
 
     /// Once the launches have run: put what they stored in their surfaces into memory, in the
@@ -457,7 +505,12 @@ impl Core {
                     }
                 }
             }
-            self.vk.destroy_host_buffer(s.staging);
+            let list = self.staging_buffers.entry(s.staging.size).or_default();
+            if list.len() < POOLED {
+                list.push(s.staging);
+            } else {
+                self.vk.destroy_host_buffer(s.staging);
+            }
         }
         result
     }
