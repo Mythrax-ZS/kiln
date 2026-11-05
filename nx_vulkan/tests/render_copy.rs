@@ -105,27 +105,64 @@ fn a_copy_that_scales_down_makes_a_smaller_picture() {
     }
 }
 
+/// How many pixels of the surface's memory hold `rgba`.
+fn pixels_holding(w: &World, s: &Surface, rgba: [u8; 4]) -> usize {
+    use nx_gpu::GuestMemory;
+    let mut bytes = vec![0u8; s.memory_bytes(4) as usize];
+    assert!(w.mem.read(w.cpu(s.address), &mut bytes));
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| **p == rgba)
+        .count()
+}
+
 #[test]
-fn what_the_copy_cannot_do_stops_with_its_parameters() {
+fn what_the_device_cannot_copy_is_copied_in_memory() {
     if vulkan().is_none() {
         return;
     }
     let (from, to) = (GPU_BASE + 0x20_0000, GPU_BASE + 0x50_0000);
     let mut w = World::new();
     let mut r = green_target(&mut w, from, 16);
-    // From memory no render target stands for.
-    let e = r
-        .blit(&w.scene(), &copy(GPU_BASE + 0x70_0000, 16, to, 16))
-        .unwrap_err();
-    assert!(e.contains("no render target"), "{e}");
-    // Into a part of a surface.
-    let mut part = copy(from, 16, to, 16);
+    // From memory no render target stands for (A-249): its pixels, wherever they are in the
+    // layout, are the destination's.
+    let plain = GPU_BASE + 0x70_0000;
+    let src = surface(plain, 16);
+    let pattern: Vec<u8> = (0..src.memory_bytes(4) / 4)
+        .flat_map(|_| [1u8, 2, 3, 4])
+        .collect();
+    w.put(plain, &pattern);
+    r.blit(&w.scene(), &copy(plain, 16, to, 16)).unwrap();
+    assert_eq!(pixels_holding(&w, &surface(to, 16), [1, 2, 3, 4]), 16 * 16);
+    // Into a part of a surface: the render target's pixels are put into its memory first.
+    let elsewhere = GPU_BASE + 0x60_0000;
+    let mut part = copy(from, 16, elsewhere, 16);
     part.dst_width = 8;
-    let e = r.blit(&w.scene(), &part).unwrap_err();
-    assert!(e.contains("part of a surface"), "{e}");
-    // With an operation that is not a copy.
+    r.blit(&w.scene(), &part).unwrap();
+    assert_eq!(
+        pixels_holding(&w, &surface(elsewhere, 16), [0, 255, 0, 255]),
+        8 * 16
+    );
+}
+
+#[test]
+fn what_no_copy_can_make_stops_with_its_parameters() {
+    if vulkan().is_none() {
+        return;
+    }
+    let (from, to) = (GPU_BASE + 0x20_0000, GPU_BASE + 0x50_0000);
+    let mut w = World::new();
+    let mut r = green_target(&mut w, from, 16);
+    // An operation that is not a copy.
     let mut blend = copy(from, 16, to, 16);
     blend.operation = 2;
     let e = r.blit(&w.scene(), &blend).unwrap_err();
     assert!(e.contains("operation 2"), "{e}");
+    // From memory into another format.
+    let mut convert = copy(GPU_BASE + 0x70_0000, 16, to, 16);
+    convert.dst.format = 0xE9;
+    let e = r.blit(&w.scene(), &convert).unwrap_err();
+    assert!(e.contains("into format 0xe9"), "{e}");
 }

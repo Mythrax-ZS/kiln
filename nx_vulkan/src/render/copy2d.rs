@@ -46,13 +46,11 @@ impl Core {
             ));
         }
         if b.clip.is_some() || b.src.depth > 1 || b.dst.depth > 1 || b.dst.layer != 0 {
-            return Err(format!(
-                "a 2D copy with a clip rectangle or a layered surface: {}",
-                describe()
-            ));
+            return self.copy_in_memory(scene, b, "a clip rectangle or a layered surface");
         }
-        // The rectangle of the destination must be all of it: a part of a surface would leave the
-        // rest to what its memory holds, which the target made for it does not know.
+        // The rectangle of the destination must be all of it for a copy on the device: a part of
+        // a surface would leave the rest to what its memory holds, which the target made for it
+        // does not know.
         if b.dst_x != 0
             || b.dst_y != 0
             || b.dst_width != b.dst.width
@@ -60,10 +58,7 @@ impl Core {
             || b.dst_width == 0
             || b.dst_height == 0
         {
-            return Err(format!(
-                "a 2D copy into a part of a surface is not implemented: {}",
-                describe()
-            ));
+            return self.copy_in_memory(scene, b, "a part of a surface as the destination");
         }
         let Some((src_cpu, _)) = scene.host_address(b.src.address) else {
             return Err(format!(
@@ -78,10 +73,7 @@ impl Core {
             ));
         };
         let Some(src_key) = self.targets.at_address(src_cpu).map(|t| t.key) else {
-            return Err(format!(
-                "a 2D copy from memory that no render target stands for is not implemented: {}",
-                describe()
-            ));
+            return self.copy_in_memory(scene, b, "a source that no render target stands for");
         };
         if src_key.format != src_format.vk || src_key.layers != 1 {
             return Err(format!(
@@ -192,6 +184,69 @@ impl Core {
         if let Some(bytes) = dst_key.memory_bytes() {
             self.textures.memory_written(dst_cpu, dst_cpu + bytes);
         }
+        Ok(())
+    }
+
+    /// Make a 2D copy in guest memory (`nx_gpu::twod::copy_in_memory`), for one the device does
+    /// not make (`why`). Memory is brought up to date first: what the device writes into it in
+    /// place, and the pixels of the render targets drawn over what the copy reads or writes. The
+    /// targets over what it writes are let go afterwards, since memory is newer there, and so
+    /// are the textures made from it (docs/ASSUMPTIONS.md A-249).
+    fn copy_in_memory(&mut self, scene: &Scene<'_>, b: &Blit, why: &str) -> Result<(), String> {
+        let Some(bytes) = nx_gpu::twod::pixel_bytes(b.src.format) else {
+            return Err(format!(
+                "a 2D copy with {why}, from a surface of format {:#x}: {b:?}",
+                b.src.format
+            ));
+        };
+        let range = |s: &nx_gpu::twod::Surface| {
+            scene
+                .host_address(s.address)
+                .map(|(cpu, _)| (cpu, cpu + s.memory_bytes(bytes)))
+        };
+        let (Some(src), Some(dst)) = (range(&b.src), range(&b.dst)) else {
+            return Err(format!(
+                "a 2D copy with {why}, of a surface that is not mapped: {b:?}"
+            ));
+        };
+        if self.global_pending {
+            self.flush()?;
+        }
+        let mut dirty: Vec<Key> = Vec::new();
+        for (start, end) in [src, dst] {
+            for c in self.targets.covering(start, end) {
+                if c.dirty
+                    && !dirty.contains(&c.key)
+                    && self.targets.memory_unchanged(scene.mem, &c.key)
+                {
+                    dirty.push(c.key);
+                }
+            }
+        }
+        if !dirty.is_empty() {
+            self.end_pass();
+            let _phase = nx_gpu::progress::enter(nx_gpu::progress::WRITING_BACK);
+            self.targets
+                .write_back(&self.vk, &mut self.frame, scene.mem, &dirty)?;
+        }
+        let (lo, hi) = nx_gpu::twod::copy_in_memory(scene.space, scene.mem, b)
+            .map_err(|e| format!("a 2D copy with {why}: {e}: {b:?}"))?;
+        if lo == hi {
+            return Ok(());
+        }
+        let written = (dst.0 + lo, dst.0 + hi);
+        let stale: Vec<Key> = self
+            .targets
+            .covering(written.0, written.1)
+            .into_iter()
+            .map(|c| c.key)
+            .collect();
+        if !stale.is_empty() {
+            self.end_pass();
+            self.targets.release(&stale, &mut self.frame);
+        }
+        self.textures.memory_written(written.0, written.1);
+        self.memory_copies += 1;
         Ok(())
     }
 }

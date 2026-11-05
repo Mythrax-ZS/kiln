@@ -142,6 +142,8 @@ struct Core {
     /// last waited for: the guest may take a submission as over when its fence is reached, so
     /// the end of the submission waits (A-123).
     global_pending: bool,
+    /// 2D copies made in guest memory (A-249), for the report of every 100 frames.
+    memory_copies: u64,
     /// Draws recorded since the last batch was sent to the device.
     batch_draws: u32,
     /// The submission counter when the targets nothing draws to were last looked at.
@@ -325,6 +327,7 @@ impl Renderer {
                     scratch: Scratch::default(),
                     sync_on: false,
                     global_pending: false,
+                    memory_copies: 0,
                     batch_draws: 0,
                     retired_at: 0,
                     last_textures: Vec::new(),
@@ -1110,6 +1113,13 @@ impl Renderer {
                             "[vulkan]   the texture at GPU address {address:#x}: {times} times, \n                             {targets} targets at the last; {what}"
                         );
                     }
+                }
+                let copies = std::mem::take(&mut core.memory_copies);
+                if copies > 0 {
+                    eprintln!(
+                        "[vulkan] frame {}: {copies} 2D copies were made in guest memory",
+                        p.frame
+                    );
                 }
                 if ph.compute.iter().any(|d| !d.is_zero()) {
                     let ms: Vec<String> = ph
