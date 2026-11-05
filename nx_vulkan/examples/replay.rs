@@ -4,11 +4,13 @@
 //! cannot make, a draw that loses the device).
 //!
 //! usage: replay [--zero <slot>:<hex from>:<hex to>] [--skip <hex from>:<hex to>] [--no-draw]
-//!               [--spv <file>] [--write <file>] <VERTEX_*.bin>
+//!               [--spv <file>] [--write <file>] [--attr <location>=<x>,<y>,<z>,<w>]...
+//!               <VERTEX_*.bin>
 //!
 //! `--zero` makes the program's fixed reads of that constant buffer range 0 in the translation
 //! (`NX_DEBUG_ZERO_CBUFS`), `--skip` leaves out instructions (`NX_DEBUG_SKIP_FROM`), `--spv` takes
-//! that SPIR-V instead of translating and `--write` writes the SPIR-V used to a file.
+//! that SPIR-V instead of translating and `--write` writes the SPIR-V used to a file; `--attr` gives
+//! an input location those values for every vertex (the others read zeros).
 
 use ash::vk;
 use nx_shader::sph::Sph;
@@ -124,21 +126,38 @@ fn main() {
     let mut draw = true;
     let mut spv: Option<String> = None;
     let mut write: Option<String> = None;
+    let mut attrs: HashMap<u32, [f32; 4]> = HashMap::new();
     let mut file = None;
     let mut args = std::env::args().skip(1);
     let hex = |s: &str| u32::from_str_radix(s.trim_start_matches("0x"), 16).expect("hex");
     // `--crash-test <dump> <file.spv>`: an interestingness test for `spirv-reduce`, which succeeds
-    // when the driver crashes making the pipeline of that SPIR-V (in a process of its own).
+    // when the driver crashes making the pipeline of that SPIR-V (in a process of its own). A
+    // compilation that goes on for 20 s is stopped and does not count (a driver's compiler can run
+    // away with the memory on a reduced module).
     let all: Vec<String> = std::env::args().collect();
     if all.get(1).map(String::as_str) == Some("--crash-test") {
-        let status = std::process::Command::new(std::env::current_exe().expect("this program"))
+        let mut child = std::process::Command::new(std::env::current_exe().expect("this program"))
             .args(["--no-draw", "--spv", &all[3], &all[2]])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
+            .spawn()
             .expect("a child process");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("the child's state") {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
         // STATUS_ACCESS_VIOLATION
-        let crashed = status.code() == Some(0xC000_0005u32 as i32) || status.code() == Some(139);
+        let crashed = status
+            .and_then(|s| s.code())
+            .is_some_and(|c| c == 0xC000_0005u32 as i32 || c == 139);
         std::process::exit(if crashed { 0 } else { 1 });
     }
     while let Some(a) = args.next() {
@@ -156,6 +175,15 @@ fn main() {
             "--no-draw" => draw = false,
             "--spv" => spv = args.next(),
             "--write" => write = args.next(),
+            "--attr" => {
+                let v = args.next().expect("--attr <location>=<x>,<y>,<z>,<w>");
+                let (l, xs) = v.split_once('=').expect("location=values");
+                let mut values = [0f32; 4];
+                for (k, x) in xs.split(',').enumerate().take(4) {
+                    values[k] = x.parse().expect("a number");
+                }
+                attrs.insert(l.parse().expect("a location"), values);
+            }
             _ => file = Some(a),
         }
     }
@@ -321,12 +349,21 @@ fn main() {
         }
 
         // Zeros everywhere: one buffer serves every binding and every vertex stream.
-        let buffer = vk
+        let mut buffer = vk
             .create_host_buffer(
                 1 << 20,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::VERTEX_BUFFER,
             )
             .expect("buffer");
+        // The buffers read zeros; the inputs from 64 KiB on, 16 bytes each.
+        let bytes = buffer.as_mut_slice();
+        bytes.fill(0);
+        for (&l, values) in &attrs {
+            let at = (1 << 16) + 16 * l as usize;
+            for (k, v) in values.iter().enumerate() {
+                bytes[at + 4 * k..at + 4 * k + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
         let mut images = Vec::new();
         let compare = vk.create_compare_sampler().expect("sampler");
         let nearest = vk.create_nearest_sampler().expect("sampler");
@@ -474,7 +511,7 @@ fn main() {
         d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[set], &[]);
         d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::VERTEX, 0, &[0u8; 16]);
         for &(l, _) in &iface.inputs {
-            d.cmd_bind_vertex_buffers(cmd, l, &[buffer.buffer], &[0]);
+            d.cmd_bind_vertex_buffers(cmd, l, &[buffer.buffer], &[(1 << 16) + 16 * u64::from(l)]);
         }
         d.cmd_draw(cmd, 4, 1, 0, 0);
         d.cmd_end_rendering(cmd);
