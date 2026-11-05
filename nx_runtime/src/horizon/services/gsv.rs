@@ -1729,6 +1729,10 @@ impl Service for Supervisor {
                     },
                 ),
             )))),
+            // nn::codec::video::detail::FinalizeServerContext: the ends of what 906 and 1002
+            // began (no data, a result only). The program closed the sessions those handed out,
+            // and nothing else was taken (A-269).
+            903 | 1003 => Ok(Response::ok()),
             // nn::nvsrv::BootWithRemoteMemory: a session of the GPU driver (A-194).
             1402 => Ok(
                 Response::ok().with_copy_handle(KObject::session(Box::new(NvSrv(
@@ -2370,6 +2374,7 @@ mod tests {
             Arc::new(vi::Shared::new()),
         );
         assert!(s.request_tipc(&req(901)).is_ok(), "the decoder's check");
+        assert!(s.request_tipc(&req(903)).is_ok() && s.request_tipc(&req(1003)).is_ok());
         let session = s.request_tipc(&req(906)).unwrap();
         assert!(matches!(session.copy_handles[..], [KObject::Session(_)]));
         // A pool of two NV12 images of 8x8 in the memory bound at heap + 1 MiB.
