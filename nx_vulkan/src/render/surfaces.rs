@@ -120,9 +120,9 @@ impl Core {
         {
             return Err(format!("{} in the format {:?}", describe(), format.vk));
         }
-        // The program reads and writes floats (A-252): an integer format is not given to it. An
-        // atomic operation (`SURED`) is on 32-bit words, which an image of unsigned integers has
-        // the bits of whatever the header calls them.
+        // The program reads and writes floats (A-252), or integers when it was made knowing the
+        // surface holds them (A-272). An atomic operation (`SURED`) is on 32-bit words, which an
+        // image of unsigned integers has the bits of whatever the header calls them.
         let format = if used.atomic {
             if format.bytes != 4 || format.block != (1, 1) {
                 return Err(format!(
@@ -135,8 +135,6 @@ impl Core {
                 vk: vk::Format::R32_UINT,
                 ..format
             }
-        } else if matches!(tic.types()[0], 3 | 4) {
-            return Err(format!("{} of an integer format", describe()));
         } else {
             format
         };

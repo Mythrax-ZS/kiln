@@ -128,6 +128,10 @@ pub struct Config {
     pub zero_inputs: bool,
     /// For a task or mesh program, its pipeline (A-270).
     pub mesh: Option<MeshConfig>,
+    /// The surfaces (by their slot, the order of first use) whose texels are unsigned or signed
+    /// integers: the program reads and writes their bits as they are (A-272).
+    pub uint_images: u16,
+    pub sint_images: u16,
     /// For a pixel program drawn by a mesh pipeline: the input attribute words (byte address / 4)
     /// that are a primitive's rather than interpolated between its vertices.
     pub per_primitive: Vec<u32>,
@@ -157,6 +161,8 @@ impl Config {
             zero_cbuf_range: (0, u32::MAX),
             zero_inputs: false,
             mesh: None,
+            uint_images: 0,
+            sint_images: 0,
             per_primitive: Vec::new(),
         }
     }

@@ -773,6 +773,15 @@ mod tests {
             (9, Dim::D2, false)
         );
         assert!(images[1].written && !images[1].read);
+        // The same with the first surface of unsigned and the second of signed integers (A-272):
+        // their bits move as they are, and the module is valid.
+        let mut cfg = Config::new(Stage::Kernel);
+        cfg.block = [64, 1, 1];
+        cfg.uint_images = 1;
+        cfg.sint_images = 2;
+        let t = translate_sm86(&program(&[suld, sust]), None, &cfg).expect("translates");
+        validated(&t);
+        assert_eq!(t.info.images.len(), 2);
         // A 2D array: the layer is the third coordinate.
         let array = word(&[
             (0, 12, 0xb97),

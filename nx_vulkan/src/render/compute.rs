@@ -44,7 +44,16 @@ impl Core {
         };
         let program = self
             .shaders
-            .kernel(&self.vk, scene, d, self.textures.frame)?;
+            .kernel(&self.vk, scene, d, self.textures.frame, (0, 0))?;
+        // A program whose surfaces hold integers reads and writes their bits (A-272): it is made
+        // again knowing which they are.
+        let classes = self.integer_surfaces(scene, d, &program)?;
+        let program = if classes == (0, 0) {
+            program
+        } else {
+            self.shaders
+                .kernel(&self.vk, scene, d, self.textures.frame, classes)?
+        };
         let bindings = bindings_of(&[&program]);
         let (set_layout, pipeline_layout) = self.layouts.get(&self.vk, &bindings)?;
         let set = self.frame.descriptor_set(&self.vk, set_layout)?;
@@ -392,5 +401,49 @@ impl Core {
         .map_err(|(_, e)| format!("creating the compute pipeline: {e}"))?;
         self.compute_pipelines.map.insert(key, made[0]);
         Ok(made[0])
+    }
+}
+
+impl Core {
+    /// Which surfaces of a launch's program (by slot) hold unsigned and signed integers, as
+    /// their headers say (the types 4 and 3; A-272). The atomic ones are words of bits already.
+    fn integer_surfaces(
+        &mut self,
+        scene: &Scene<'_>,
+        d: &Dispatch,
+        program: &super::shaders::Program,
+    ) -> Result<(u16, u16), String> {
+        let pools = scene.regs.texture_pools();
+        let (mut uint, mut sint) = (0u16, 0u16);
+        for used in &program.info.images {
+            if used.atomic || used.slot >= 16 {
+                continue;
+            }
+            let slot = used.source.unwrap_or(TEXTURE_TABLE);
+            let Some(Some(buffer)) = d.cbufs.get(slot as usize) else {
+                continue;
+            };
+            let mut word = [0u8; 4];
+            self.read_exact(scene, buffer.address + 4 * u64::from(used.index), &mut word)?;
+            let tic_id = u32::from_le_bytes(word) & 0xF_FFFF;
+            if tic_id >= pools.header_count {
+                continue;
+            }
+            let mut tic_bytes = [0u8; 32];
+            self.read_exact(
+                scene,
+                pools.header_address + 32 * u64::from(tic_id),
+                &mut tic_bytes,
+            )?;
+            let tic = super::textures::Tic(std::array::from_fn(|i| {
+                u32::from_le_bytes(tic_bytes[4 * i..4 * i + 4].try_into().unwrap())
+            }));
+            match tic.types()[0] {
+                4 => uint |= 1 << used.slot,
+                3 => sint |= 1 << used.slot,
+                _ => {}
+            }
+        }
+        Ok((uint, sint))
     }
 }

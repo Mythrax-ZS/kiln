@@ -14,6 +14,10 @@ use std::sync::Arc;
 /// How much of GPU memory after a program's start is read to find its end.
 const WINDOW: usize = 1 << 20;
 
+/// A compute program in the cache: its address, its workgroup, its shared memory, and the
+/// surfaces (by slot) of unsigned and of signed integers it was made for (A-272).
+type KernelKey = (u64, [u32; 3], u32, (u16, u16));
+
 /// What a translation depends on besides the program itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Variation {
@@ -154,7 +158,7 @@ struct KernelEntry {
 pub struct Shaders {
     entries: FastMap<u64, Entry>,
     /// Compute programs by (address, workgroup size).
-    kernels: FastMap<(u64, [u32; 3], u32), KernelEntry>,
+    kernels: FastMap<KernelKey, KernelEntry>,
     next_id: u64,
     /// `NX_SPIRV_CHECK`: validate each translation.
     spirv_check: bool,
@@ -463,15 +467,17 @@ impl Shaders {
         scene: &Scene<'_>,
         d: &nx_gpu::compute::Dispatch,
         frame: u64,
+        integer_images: (u16, u16),
     ) -> Result<Arc<Program>, String> {
         let (address, block, shared_bytes, sm86) = (d.program, d.block, d.shared_bytes, d.sm86);
+        let key = (address, block, shared_bytes, integer_images);
         let launch = LaunchConstants {
             scene,
             cbufs: &d.cbufs,
         };
         // The same program: unchanged if the bytes still hash the same (looked at once a frame)
         // and the launch's buffers hold its jump tables' words.
-        if let Some(e) = self.kernels.get_mut(&(address, block, shared_bytes)) {
+        if let Some(e) = self.kernels.get_mut(&key) {
             let tables_hold = e
                 .constants
                 .iter()
@@ -484,7 +490,7 @@ impl Shaders {
                 e.checked = frame;
                 return Ok(Arc::clone(&e.program));
             }
-            self.kernels.remove(&(address, block, shared_bytes));
+            self.kernels.remove(&key);
         }
         let bytes = read_window(scene, address, WINDOW);
         if bytes.is_empty() {
@@ -508,6 +514,7 @@ impl Shaders {
         config.block = block;
         config.shared_bytes = shared_bytes;
         config.constants = cfg.tables.clone();
+        (config.uint_images, config.sint_images) = integer_images;
         let _phase = nx_gpu::progress::enter(nx_gpu::progress::TRANSLATING);
         let translation = if sm86 {
             translate_sm86(&bytes[..size], None, &config)
@@ -538,7 +545,7 @@ impl Shaders {
             id: self.next_id,
         });
         self.kernels.insert(
-            (address, block, shared_bytes),
+            key,
             KernelEntry {
                 size,
                 hash: scene.hash(address, size as u64).0,

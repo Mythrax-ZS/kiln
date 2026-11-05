@@ -52,7 +52,15 @@ enum Access {
 
 /// The storage image variable of the image a handle names, made on first use: its type and the
 /// variable.
-fn image(tx: &mut Tx<'_>, i: &I, access: Access) -> R<(Id, Id, Dim, bool)> {
+/// The numbers a surface's texels are: floats, or (A-272) unsigned or signed integers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Numbers {
+    Float,
+    Unsigned,
+    Signed,
+}
+
+fn image(tx: &mut Tx<'_>, i: &I, access: Access) -> R<(Id, Id, Dim, bool, Numbers)> {
     let inst = i.inst;
     if !matches!(inst.opcode(), op::SULD_BOUND | op::SUST_BOUND | op::SURED) {
         return tx.fail("a bindless surface instruction");
@@ -73,6 +81,19 @@ fn image(tx: &mut Tx<'_>, i: &I, access: Access) -> R<(Id, Id, Dim, bool)> {
         Dim::D3 => 2,
         Dim::Cube => 3,
     };
+    let known = tx
+        .info
+        .images
+        .iter()
+        .position(|u| (u.index, u.source) == (index, source));
+    let slot = known.map_or(tx.info.images.len(), |k| tx.info.images[k].slot as usize);
+    let numbers = if slot < 16 && tx.cfg.uint_images >> slot & 1 != 0 {
+        Numbers::Unsigned
+    } else if slot < 16 && tx.cfg.sint_images >> slot & 1 != 0 {
+        Numbers::Signed
+    } else {
+        Numbers::Float
+    };
     // An atomic operation needs the image's format, R32ui (33); the loads and stores have none.
     let (sampled, format) = if atomic {
         (tx.t.u32, 33)
@@ -82,16 +103,16 @@ fn image(tx: &mut Tx<'_>, i: &I, access: Access) -> R<(Id, Id, Dim, bool)> {
         } else {
             cap::STORAGE_IMAGE_WRITE_WITHOUT_FORMAT
         });
-        (tx.t.f32, 0)
+        let sampled = match numbers {
+            Numbers::Float => tx.t.f32,
+            Numbers::Unsigned => tx.t.u32,
+            Numbers::Signed => tx.t.i32,
+        };
+        (sampled, 0)
     };
     let ty =
         tx.m.ty_image(sampled, dim_code, 0, u32::from(arrayed), 0, 2, format);
-    if let Some(k) = tx
-        .info
-        .images
-        .iter()
-        .position(|u| (u.index, u.source) == (index, source))
-    {
+    if let Some(k) = known {
         let used = &mut tx.info.images[k];
         if (used.dim, used.arrayed, used.atomic) != (dim, arrayed, atomic) {
             return tx.fail(format!(
@@ -104,7 +125,7 @@ fn image(tx: &mut Tx<'_>, i: &I, access: Access) -> R<(Id, Id, Dim, bool)> {
             used.written = true;
         }
         let var = tx.images[&(index, source)];
-        return Ok((ty, var, dim, arrayed));
+        return Ok((ty, var, dim, arrayed, numbers));
     }
     let slot = tx.info.images.len() as u32;
     if slot >= 16 {
@@ -126,7 +147,16 @@ fn image(tx: &mut Tx<'_>, i: &I, access: Access) -> R<(Id, Id, Dim, bool)> {
         written: !read,
         atomic,
     });
-    Ok((ty, var, dim, arrayed))
+    Ok((ty, var, dim, arrayed, numbers))
+}
+
+/// The vector type of a texel of `numbers`.
+fn texel_type(tx: &mut Tx<'_>, numbers: Numbers) -> Id {
+    match numbers {
+        Numbers::Float => tx.t.v4f32,
+        Numbers::Unsigned => tx.m.ty_vector(tx.t.u32, 4),
+        Numbers::Signed => tx.m.ty_vector(tx.t.i32, 4),
+    }
 }
 
 /// The coordinates: the integers of the register run from bits 24..31, the layer last.
@@ -149,19 +179,27 @@ fn coordinates(tx: &mut Tx<'_>, i: &I, dim: Dim, arrayed: bool) -> Id {
 /// `SULD.P.dim.components Rd, [Ra], c[slot][word]`: load a texel's components.
 pub(super) fn suld(tx: &mut Tx<'_>, i: &I) -> R<()> {
     let n = components(tx, i.inst.field(72, 4))?;
-    let (ty, var, dim, arrayed) = image(tx, i, Access::Load)?;
+    let (ty, var, dim, arrayed, numbers) = image(tx, i, Access::Load)?;
     let coord = coordinates(tx, i, dim, arrayed);
     let handle = tx.f.load(&mut tx.m, ty, var);
-    let v4 = tx.t.v4f32;
+    let v4 = texel_type(tx, numbers);
     let texel =
         tx.f.emit_result(&mut tx.m, sop::IMAGE_READ, v4, &[handle, coord]);
-    let f = tx.t.f32;
+    let scalar = match numbers {
+        Numbers::Float => tx.t.f32,
+        Numbers::Unsigned => tx.t.u32,
+        Numbers::Signed => tx.t.i32,
+    };
     let u = tx.t.u32;
     let d = i.inst.dst();
     for c in 0..n {
         let v =
-            tx.f.emit_result(&mut tx.m, sop::COMPOSITE_EXTRACT, f, &[texel, c]);
-        let bits = tx.op1(sop::BITCAST, u, v);
+            tx.f.emit_result(&mut tx.m, sop::COMPOSITE_EXTRACT, scalar, &[texel, c]);
+        let bits = if numbers == Numbers::Unsigned {
+            v
+        } else {
+            tx.op1(sop::BITCAST, u, v)
+        };
         if d != RZ {
             write(tx, i, reg_at(i, d, c), bits);
         }
@@ -179,22 +217,35 @@ pub(super) fn suld(tx: &mut Tx<'_>, i: &I) -> R<()> {
 /// are zero).
 pub(super) fn sust(tx: &mut Tx<'_>, i: &I) -> R<()> {
     let n = components(tx, i.inst.field(72, 4))?;
-    let (ty, var, dim, arrayed) = image(tx, i, Access::Store)?;
+    let (ty, var, dim, arrayed, numbers) = image(tx, i, Access::Store)?;
     let coord = coordinates(tx, i, dim, arrayed);
     let data = i.inst.reg(32);
-    let f = tx.t.f32;
-    let zero = tx.cf32(0.0);
+    let scalar = match numbers {
+        Numbers::Float => tx.t.f32,
+        Numbers::Unsigned => tx.t.u32,
+        Numbers::Signed => tx.t.i32,
+    };
+    let zero_bits = tx.c32(0);
+    let zero = if numbers == Numbers::Unsigned {
+        zero_bits
+    } else {
+        tx.op1(sop::BITCAST, scalar, zero_bits)
+    };
     let parts: Vec<Id> = (0..4)
         .map(|c| {
             if c < n {
                 let v = tx.read(reg_at(i, data, c));
-                tx.op1(sop::BITCAST, f, v)
+                if numbers == Numbers::Unsigned {
+                    v
+                } else {
+                    tx.op1(sop::BITCAST, scalar, v)
+                }
             } else {
                 zero
             }
         })
         .collect();
-    let v4 = tx.t.v4f32;
+    let v4 = texel_type(tx, numbers);
     let texel =
         tx.f.emit_result(&mut tx.m, sop::COMPOSITE_CONSTRUCT, v4, &parts);
     super::mem::guarded(tx, i.cond, |tx| {
@@ -216,7 +267,7 @@ pub(super) fn sured(tx: &mut Tx<'_>, i: &I) -> R<()> {
             inst.field(73, 3)
         ));
     }
-    let (_, var, dim, arrayed) = image(tx, i, Access::Atomic)?;
+    let (_, var, dim, arrayed, _) = image(tx, i, Access::Atomic)?;
     let coord = coordinates(tx, i, dim, arrayed);
     let value = tx.read(inst.reg(32));
     super::mem::guarded(tx, i.cond, |tx| {
