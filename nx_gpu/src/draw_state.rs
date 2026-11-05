@@ -12,6 +12,10 @@ use crate::state::Regs;
 mod r {
     pub const COLOR_TARGET: u32 = 0x0800;
     pub const COLOR_TARGET_STRIDE: u32 = 64;
+    pub const MESH_CONTROL: u32 = 0x114c;
+    pub const MESH_SHADER_A: u32 = 0x1150;
+    pub const MESH_SHADER_B: u32 = 0x1154;
+    pub const MESH_INIT_SHADER: u32 = 0x1158;
     pub const CT_SELECT: u32 = 0x121c;
     pub const SURFACE_CLIP_HORIZONTAL: u32 = 0x0ff4;
     pub const SURFACE_CLIP_VERTICAL: u32 = 0x0ff8;
@@ -141,6 +145,25 @@ pub struct ColorTarget {
     pub depth_is_size: bool,
     pub array_pitch: u32,
     pub layer: u32,
+}
+
+/// A task and mesh pipeline (`SET_MESH_CONTROL`, `SET_MESH_SHADER_A` and `_B`,
+/// `SET_MESH_INIT_SHADER`; docs/ASSUMPTIONS.md A-270): while it is on, a draw launches as many
+/// workgroups of the task program as it has vertices, the vertex slot holding the task program
+/// (or the mesh program, when there is no task) and the tessellation slot the mesh program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Mesh {
+    /// The primitives the mesh program makes (4 triangles, as the draw topologies).
+    pub topology: u32,
+    /// The most vertices and primitives a mesh workgroup makes.
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    /// The invocations of a mesh workgroup.
+    pub mesh_threads: u32,
+    /// The invocations of a task workgroup, and the lines of 128 bytes it hands to the mesh
+    /// workgroups (the count of them at byte 4, the payload from byte 16).
+    pub task_threads: u32,
+    pub task_output_lines: u32,
 }
 
 /// The depth/stencil target.
@@ -339,6 +362,27 @@ pub struct ClearValues {
 }
 
 impl Regs<'_> {
+    /// The task and mesh pipeline the registers set up, while `SET_MESH_CONTROL` has it on
+    /// (A-270).
+    pub fn mesh(&self) -> Option<Mesh> {
+        if self.word(r::MESH_CONTROL) & 1 == 0 {
+            return None;
+        }
+        let (a, b, init) = (
+            self.word(r::MESH_SHADER_A),
+            self.word(r::MESH_SHADER_B),
+            self.word(r::MESH_INIT_SHADER),
+        );
+        Some(Mesh {
+            topology: a & 0xF,
+            max_vertices: a >> 4 & 0x1FF,
+            max_primitives: a >> 13 & 0x3FF,
+            mesh_threads: b >> 20 & 0x3F,
+            task_threads: init & 0x3F,
+            task_output_lines: init >> 22 & 0x1FF,
+        })
+    }
+
     pub fn color_target(&self, j: usize) -> ColorTarget {
         let base = r::COLOR_TARGET + j as u32 * r::COLOR_TARGET_STRIDE;
         let memory = self.word(base + 0x14);
@@ -969,5 +1013,27 @@ mod tests {
         assert_eq!((c.depth, c.stencil), (0.25, 0x7F));
         assert!(c.use_clear_rect && c.use_scissor0);
         assert_eq!(c.rect, [1, 640, 2, 480]);
+    }
+
+    #[test]
+    fn the_mesh_registers_read_as_the_title_sets_them() {
+        let mut words = vec![0u32; 0x2000];
+        let mut set = |offset: u32, v: u32| words[offset as usize / 4] = v;
+        set(super::r::MESH_SHADER_A, 0x0018_1004);
+        set(super::r::MESH_SHADER_B, 0x0200_0000);
+        set(super::r::MESH_INIT_SHADER, 0x02c0_b020);
+        assert_eq!(Regs(&words).mesh(), None, "off");
+        words[super::r::MESH_CONTROL as usize / 4] = 1;
+        assert_eq!(
+            Regs(&words).mesh(),
+            Some(Mesh {
+                topology: 4,
+                max_vertices: 256,
+                max_primitives: 192,
+                mesh_threads: 32,
+                task_threads: 32,
+                task_output_lines: 11,
+            })
+        );
     }
 }
