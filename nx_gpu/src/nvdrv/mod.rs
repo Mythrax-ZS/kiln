@@ -411,6 +411,24 @@ impl Nvdrv {
         self.signal([token]);
     }
 
+    /// A syncpoint for an engine of the host to count its work on (the Switch 2's video decoder,
+    /// A-261); `None` when none is free.
+    pub fn host_syncpoint(&mut self) -> Option<u32> {
+        self.gpu.syncpoints.allocate()
+    }
+
+    /// Give back a syncpoint [`Nvdrv::host_syncpoint`] handed out.
+    pub fn host_release(&mut self, id: u32) {
+        self.gpu.syncpoints.release(id);
+    }
+
+    /// The host finished a piece of work counted on syncpoint `id`: it counts up by one, and
+    /// what waits for that value is woken.
+    pub fn host_increment(&mut self, id: u32) {
+        let woken = self.gpu.syncpoints.increment(id, 1);
+        self.signal(woken);
+    }
+
     /// The events a submission that ran elsewhere has set (the renderer's thread, A-124).
     pub fn wake(&mut self, tokens: impl IntoIterator<Item = EventToken>) {
         self.signal(tokens);

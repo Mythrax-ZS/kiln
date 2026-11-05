@@ -21,7 +21,9 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-static LOCK: Mutex<()> = Mutex::new(());
+/// Held by every test whose kernel maps guest memory at the fixed places (the heap, the main
+/// stack): one such kernel at a time.
+pub(super) static LOCK: Mutex<()> = Mutex::new(());
 
 /// Wait until nothing but `kernel` refers to the kernel. The threads a test starts (guest
 /// threads, the audio renderer's frame clock) hold it for a moment after the test is over, and

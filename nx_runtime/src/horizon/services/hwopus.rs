@@ -273,6 +273,9 @@ mod tests {
 
     #[test]
     fn a_packet_decodes_into_the_output_buffer() {
+        let _one_heap = super::super::super::tests::LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let kernel = Kernel::new(ProcessInfo::new("hwopus", ProcessKind::Nso, None));
         let heap = kernel.set_heap_size(0x20_0000).unwrap();
         let mut d = OpusDecoder::new(

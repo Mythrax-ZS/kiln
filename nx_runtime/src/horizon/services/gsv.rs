@@ -11,6 +11,7 @@ use super::super::layout;
 use super::super::object::KObject;
 use super::super::result::ResultCode;
 use super::super::service::{Request, Response, Service, ServiceResult, Stop};
+use super::vdec::{self, DecoderLayout};
 use super::{nvdrv, vi};
 use std::sync::{Arc, Weak};
 
@@ -107,16 +108,49 @@ struct NativePool {
     layout: ImageLayout,
 }
 
-/// The native memory and image pools of the graphics system (A-212).
+/// A pool of decoder output images made with 911 (A-262): `count` images of one layout, one
+/// after the other in a native memory.
+#[derive(Clone, Copy, Debug)]
+struct DecoderPool {
+    memory: u32,
+    count: u32,
+    layout: DecoderLayout,
+}
+
+/// The native memory and image pools of the graphics system (A-212), and the pools of the video
+/// decoder's output images (A-262), whose handles are taken from the same numbers.
 #[derive(Debug, Default)]
 pub struct NativeObjects {
     memories: std::collections::BTreeMap<u32, NativeMemory>,
     pools: std::collections::BTreeMap<u32, NativePool>,
+    decoder_pools: std::collections::BTreeMap<u32, DecoderPool>,
     next_memory: u32,
     next_image: u32,
 }
 
 impl NativeObjects {
+    /// The offset of the decoder output image `handle` in its pool's memory, that memory's
+    /// address once bound, and the image's layout; None once the memory is gone.
+    fn decoder_image(&self, handle: u32) -> Option<(u64, Option<u64>, DecoderLayout)> {
+        let (&first, pool) = self.decoder_pools.range(..=handle).next_back()?;
+        if handle - first >= pool.count {
+            return None;
+        }
+        let memory = self.memories.get(&pool.memory)?;
+        Some((
+            u64::from(handle - first) * pool.layout.size,
+            memory.address,
+            pool.layout,
+        ))
+    }
+
+    /// The address in the process of the decoder output image `handle` and its layout; None
+    /// unless its memory is bound.
+    pub fn decoder_image_address(&self, handle: u32) -> Option<(u64, DecoderLayout)> {
+        let (offset, address, layout) = self.decoder_image(handle)?;
+        Some((address? + offset, layout))
+    }
+
     /// Where the image `handle` (the first image of its pool, or one after it) lies in its pool's
     /// native memory, bound or not, and its layout; None once that memory is gone (112).
     pub fn image_in_memory(&self, handle: u32) -> Option<(u64, ImageLayout)> {
@@ -300,6 +334,68 @@ impl Supervisor {
                     Err(e) => Err(Stop(format!("nx2:gsv {}: {e}", req.command))),
                 }
             }
+            // CalculateDecoderImagePoolBuffer(preference, u32 count) -> (u64 size, u64
+            // alignment), from nn::codec::CalculateDecoderImagePoolBuffer (A-262).
+            991 => DecoderLayout::from_preference(&words_of(req, 16))
+                .map(|l| {
+                    Response::ok()
+                        .with_u64(l.size * u64::from(count))
+                        .with_u64(vdec::DECODER_IMAGE_ALIGNMENT)
+                })
+                .map_err(|e| Stop(format!("nx2:gsv 991: {e}"))),
+            // CreateDecoderImage(preference, u32 count, u32 memory) -> u32 first image, from
+            // nn::codec::InitializeDecoderImagePool: the images lie one after the other in the
+            // memory and take as many handles (A-262).
+            911 => {
+                let memory = req.u32_at(68);
+                let Some(size) = st.memories.get(&memory).map(|m| m.size) else {
+                    return Some(Err(Stop(format!(
+                        "nx2:gsv 911 in the native memory {memory}, which 111 did not make"
+                    ))));
+                };
+                match DecoderLayout::from_preference(&words_of(req, 16)) {
+                    Ok(layout) if size != 0 && layout.size * u64::from(count) > size => {
+                        Err(Stop(format!(
+                            "nx2:gsv 911: {count} decoder images of {:#x} bytes do not fit in \
+                             the native memory {memory} of {size:#x}",
+                            layout.size
+                        )))
+                    }
+                    Ok(layout) => {
+                        let first = st.next_image + 1;
+                        st.next_image += count;
+                        st.decoder_pools.insert(
+                            first,
+                            DecoderPool {
+                                memory,
+                                count,
+                                layout,
+                            },
+                        );
+                        Ok(Response::ok().with_u32(first))
+                    }
+                    Err(e) => Err(Stop(format!("nx2:gsv 911: {e}"))),
+                }
+            }
+            // DestroyDecoderImage(u32 first image), from nn::codec::FinalizeDecoderImagePool.
+            912 => match st.decoder_pools.remove(&req.u32_at(0)) {
+                Some(_) => Ok(Response::ok()),
+                None => Err(Stop(format!(
+                    "nx2:gsv 912 of the decoder image {}, which 911 did not make",
+                    req.u32_at(0)
+                ))),
+            },
+            // GetCpuUserImageDescriptor(u32 image) -> 128 bytes, which
+            // nn::codec::ReadDecoderOutputImage* copy a decoder output image out with (A-263).
+            961 => match st.decoder_image(req.u32_at(0)) {
+                Some((offset, _, layout)) => {
+                    Ok(Response::ok().with_bytes(&layout.cpu_descriptor(offset)))
+                }
+                None => Err(Stop(format!(
+                    "nx2:gsv 961 of the image {}, which is not a decoder image 911 made",
+                    req.u32_at(0)
+                ))),
+            },
             // DestroyNativeImage(u32 first image)
             430 => match st.pools.remove(&req.u32_at(0)) {
                 Some(_) => Ok(Response::ok()),
@@ -1539,6 +1635,9 @@ impl Service for Supervisor {
             201 | 301 | 401..=403 | 494 | 601 | 801 | 1101 | 1102 | 1201 | 1501..=1503 | 1601 => {
                 Ok(Response::ok())
             }
+            // The video decoder's and the video encoder's, from
+            // nn::codec::video::detail::InitializeServerContext (A-261).
+            901 | 1001 => Ok(Response::ok()),
             // QueryGrantedFeatures(u64 requested) -> u64 granted: everything asked for (a zero
             // answer would deny every feature), from nn::gs::sdk::BootNativeMemoryManagement.
             115 => Ok(Response::ok().with_u64(req.u64_at(0))),
@@ -1612,6 +1711,21 @@ impl Service for Supervisor {
                     opened: Default::default(),
                 }))),
             ),
+            // The video decoder's and the video encoder's sessions, from
+            // nn::codec::video::detail::InitializeServerContext after the checks 901 and 1001
+            // (906 takes a u8 and the decoder library's version; 902 is older SDKs', A-261).
+            902 | 906 | 1002 => Ok(Response::ok().with_copy_handle(KObject::session(Box::new(
+                vdec::VideoServer::new(
+                    self.kernel.clone(),
+                    self.gpu.clone(),
+                    self.native.clone(),
+                    if req.command == 1002 {
+                        vdec::Codec::Encoder
+                    } else {
+                        vdec::Codec::Decoder
+                    },
+                ),
+            )))),
             // nn::nvsrv::BootWithRemoteMemory: a session of the GPU driver (A-194).
             1402 => Ok(
                 Response::ok().with_copy_handle(KObject::session(Box::new(NvSrv(
@@ -2227,5 +2341,159 @@ mod tests {
         assert!(v.request_tipc(&count).is_ok());
         count.data = 8u32.to_le_bytes().to_vec();
         assert!(v.request_tipc(&count).is_err());
+    }
+
+    /// A request whose data is `words`, little-endian.
+    fn words(command: u32, words: &[u32]) -> Request {
+        Request {
+            command,
+            data: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            ..Request::default()
+        }
+    }
+
+    #[test]
+    fn decoded_frames_go_into_the_images_in_the_order_they_were_handed_out() {
+        use super::super::super::kernel::{ProcessInfo, ProcessKind};
+        use super::super::super::service::Buffer;
+        let _one_heap = super::super::super::tests::LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let kernel = Kernel::new(ProcessInfo::new("vdec", ProcessKind::Nso, None));
+        let heap = kernel.set_heap_size(0x40_0000).unwrap();
+        let mut s = Supervisor::new(
+            Arc::downgrade(&kernel),
+            nvdrv::Shared::new(),
+            Arc::new(vi::Shared::new()),
+        );
+        assert!(s.request_tipc(&req(901)).is_ok(), "the decoder's check");
+        let session = s.request_tipc(&req(906)).unwrap();
+        assert!(matches!(session.copy_handles[..], [KObject::Session(_)]));
+        // A pool of two NV12 images of 8x8 in the memory bound at heap + 1 MiB.
+        let mut preference = vec![0u32; 16];
+        preference[1] = 1;
+        preference[2] = 7 | 7 << 16;
+        let layout = DecoderLayout::from_preference(&preference).unwrap();
+        let mut ask = preference.clone();
+        ask.push(2);
+        let r = s.request_tipc(&words(991, &ask)).unwrap();
+        assert_eq!(r.data[..8], (2 * layout.size).to_le_bytes());
+        let mut create = req(111);
+        create.data[4..12].copy_from_slice(&(2 * layout.size).to_le_bytes());
+        assert_eq!(s.request_tipc(&create).unwrap().data, 1u32.to_le_bytes());
+        let memory = heap + 0x10_0000;
+        let mut bind = req(114);
+        bind.data[..4].copy_from_slice(&1u32.to_le_bytes());
+        bind.data[4..12].copy_from_slice(&memory.to_le_bytes());
+        bind.data[12..20].copy_from_slice(&(2 * layout.size).to_le_bytes());
+        assert!(s.request_tipc(&bind).is_ok());
+        let mut pool = ask.clone();
+        pool.push(1);
+        let first = s.request_tipc(&words(911, &pool)).unwrap().data;
+        let first = u32::from_le_bytes(first[..4].try_into().unwrap());
+        let d = s.request_tipc(&words(961, &[first + 1])).unwrap().data;
+        assert_eq!(d.len(), vdec::CPU_DESCRIPTOR_SIZE);
+        assert_eq!(d[0], 10, "NV12");
+        assert_eq!(d[8..16], layout.size.to_le_bytes(), "the second image");
+        assert_eq!(d[0x18..0x20], (layout.size + layout.chroma).to_le_bytes());
+
+        let mut v =
+            vdec::DecoderService::new(Arc::downgrade(&kernel), s.gpu.clone(), s.native.clone());
+        kernel.create_transfer_memory(heap, 0x1000, 3).unwrap();
+        let mut init = req(201);
+        init.copy_handles.push(KObject::Memory(0));
+        assert!(v.request_tipc(&init).is_ok());
+        assert!(v.request_tipc(&req(201)).is_err(), "no work buffer");
+        // The codec's name and the frames come in send buffers in guest memory.
+        let at = heap + 0x2000;
+        assert!(kernel.write_memory(at, b"video/vp9\0"));
+        let mut configure = req(101);
+        configure.send_buffers.push(Buffer { addr: at, size: 10 });
+        assert!(v.request_tipc(&configure).is_ok());
+        let handle = |r: Response| {
+            let w = |i: usize| u32::from_le_bytes(r.data[4 * i..4 * i + 4].try_into().unwrap());
+            (
+                !w(0),
+                w(1),
+                u64::from_le_bytes(r.data[8..16].try_into().unwrap()),
+            )
+        };
+        let (syncpoint, mode, one) = handle(v.request_tipc(&words(311, &[first])).unwrap());
+        let (again, _, two) = handle(v.request_tipc(&words(311, &[first + 1])).unwrap());
+        assert_eq!((again, mode, two), (syncpoint, 0, one + 1));
+        let frame = nx_gpu::media::vp9::gray_key_frame(nx_gpu::media::vp9::Color::default());
+        let at = heap + 0x3000;
+        assert!(kernel.write_memory(at, &frame));
+        let submit = |v: &mut vdec::DecoderService, size: u64, pts: u64, end: u32| {
+            let mut r = words(109, &[pts as u32, (pts >> 32) as u32, end]);
+            r.send_buffers.push(Buffer { addr: at, size });
+            v.request_tipc(&r).unwrap().data
+        };
+        assert_eq!(
+            submit(&mut v, frame.len() as u64, 1000, 0),
+            1u64.to_le_bytes()
+        );
+        let reached = |value: u64| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !nx_gpu::syncpt::reached(s.gpu.syncpoint_value(syncpoint).unwrap(), value as u32)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the syncpoint reaches {value}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        reached(one);
+        let props = v.request_tipc(&req(213)).unwrap().data;
+        let mut expect: Vec<u8> = [first, 8, 8, 8, 8, 0]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        expect.extend_from_slice(&1_000_000u64.to_le_bytes());
+        expect.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            props, expect,
+            "the image, its size, and the time in nanoseconds"
+        );
+        let mut luma = vec![0u8; 8];
+        let mut chroma = vec![0u8; 8];
+        for row in 0..8 {
+            assert!(kernel.read_memory(memory + row * layout.pitch, &mut luma));
+            assert!(luma.iter().all(|&b| b == 128), "luma row {row}");
+        }
+        for row in 0..4 {
+            assert!(kernel.read_memory(memory + layout.chroma + row * layout.pitch, &mut chroma));
+            assert!(chroma.iter().all(|&b| b == 128), "chroma row {row}");
+        }
+        // The end of the stream, with no frame in it, still takes the next image.
+        assert_eq!(submit(&mut v, 0, 2000, 1), 2u64.to_le_bytes());
+        reached(two);
+        let props = v.request_tipc(&req(213)).unwrap().data;
+        assert_eq!(props[..4], (first + 1).to_le_bytes());
+        assert_eq!(props[32..36], 1u32.to_le_bytes(), "the end");
+        assert!(
+            v.request_tipc(&req(213)).is_err(),
+            "nothing else was written"
+        );
+        // An image given back with the fence of the program's reads is handed out again; stopping
+        // gives it back to the program at once.
+        let mut release = words(314, &[first, 0, !0, 0, 0, 0]);
+        release.data.truncate(24);
+        let (_, _, three) = handle(v.request_tipc(&release).unwrap());
+        assert_eq!(three, two + 1);
+        assert!(v.request_tipc(&req(207)).is_ok());
+        reached(three);
+        assert!(
+            v.request_tipc(&req(999)).is_err(),
+            "an unknown command stops"
+        );
+        let mut other = req(101);
+        assert!(kernel.write_memory(heap + 0x2000, b"video/avc\0"));
+        other.send_buffers.push(Buffer {
+            addr: heap + 0x2000,
+            size: 10,
+        });
+        assert!(v.request_tipc(&other).is_err(), "only VP9 is decoded");
     }
 }

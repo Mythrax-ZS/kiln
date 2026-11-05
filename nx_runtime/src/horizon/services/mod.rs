@@ -31,6 +31,7 @@ pub(super) mod savefs;
 mod set;
 mod ssl;
 mod time;
+mod vdec;
 mod vi;
 
 use super::kernel::Kernel;

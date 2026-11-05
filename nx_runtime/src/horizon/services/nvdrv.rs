@@ -403,6 +403,22 @@ impl Shared {
         self.lock().gpu.syncpoints.value(id)
     }
 
+    /// A syncpoint for an engine of the host (A-261); `None` when none is free.
+    pub fn host_syncpoint(&self) -> Option<u32> {
+        self.lock().host_syncpoint()
+    }
+
+    /// Give back a syncpoint [`Shared::host_syncpoint`] handed out.
+    pub fn host_release(&self, id: u32) {
+        self.lock().host_release(id);
+    }
+
+    /// Count syncpoint `id` up by one for work the host finished, and wake what waits for it.
+    pub fn host_increment(&self, kernel: &Kernel, id: u32) {
+        self.lock().host_increment(id);
+        self.deliver_signals(kernel);
+    }
+
     /// The (writable, readable) ends of the event behind `token`, made on first use.
     fn event(&self, kernel: &Kernel, token: EventToken) -> (KObject, KObject) {
         let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
