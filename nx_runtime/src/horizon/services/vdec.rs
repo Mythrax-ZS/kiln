@@ -207,7 +207,7 @@ fn tracing() -> bool {
     *TRACE.get_or_init(|| std::env::var_os("NX_TRACE_VDEC").is_some())
 }
 
-fn trace_request(service: &str, req: &Request) {
+pub(super) fn trace_request(service: &str, req: &Request) {
     if !tracing() {
         return;
     }
@@ -710,6 +710,7 @@ fn decode_thread(shared: Arc<Shared>) {
                 }
             };
             frames += 1;
+            dump_frame(&frame, frames);
             if tracing() {
                 eprintln!(
                     "[vdec] frame {frames} ({width}x{height}, pts {} us{}) into image {image}",
@@ -788,6 +789,42 @@ fn decode_thread(shared: Arc<Shared>) {
         shared.gpu.host_release(id);
     }
 }
+
+/// `NX_VDEC_DUMP=<dir>`: every 60th frame decoded, as the decoder made it (converted to RGB as
+/// an RGBA image would hold it), apart from what the program does with the images.
+#[cfg(feature = "vulkan")]
+fn dump_frame(frame: &Decoded, n: u64) {
+    let Some(dir) = std::env::var_os("NX_VDEC_DUMP") else {
+        return;
+    };
+    let Some(picture) = &frame.picture else {
+        return;
+    };
+    if n % 60 != 1 {
+        return;
+    }
+    let mut preference = [0u32; 16];
+    preference[1] = 3;
+    preference[2] = (picture.width as u32 - 1) | (picture.height as u32 - 1) << 16;
+    let Ok(layout) = DecoderLayout::from_preference(&preference) else {
+        return;
+    };
+    let mut bytes = Vec::new();
+    let (w, h) = layout.render(picture, frame.color, &mut bytes);
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for row in 0..h as usize {
+        let at = row * layout.pitch as usize;
+        rgba.extend_from_slice(&bytes[at..at + w as usize * 4]);
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let path = std::path::Path::new(&dir).join(format!("vdec_{n:05}.png"));
+    if let Err(e) = nx_vulkan::png::write_opaque_png(&path, w, h, &rgba) {
+        eprintln!("[vdec] writing {}: {e}", path.display());
+    }
+}
+
+#[cfg(not(feature = "vulkan"))]
+fn dump_frame(_frame: &Decoded, _n: u64) {}
 
 /// Write a decoded frame into an output image; the size it was written at.
 fn write_image(

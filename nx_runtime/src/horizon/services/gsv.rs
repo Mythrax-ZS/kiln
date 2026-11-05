@@ -337,6 +337,7 @@ impl Supervisor {
             // CalculateDecoderImagePoolBuffer(preference, u32 count) -> (u64 size, u64
             // alignment), from nn::codec::CalculateDecoderImagePoolBuffer (A-262).
             991 => DecoderLayout::from_preference(&words_of(req, 16))
+                .inspect(|_| vdec::trace_request("nx2:gsv", req))
                 .map(|l| {
                     Response::ok()
                         .with_u64(l.size * u64::from(count))
@@ -347,6 +348,7 @@ impl Supervisor {
             // nn::codec::InitializeDecoderImagePool: the images lie one after the other in the
             // memory and take as many handles (A-262).
             911 => {
+                vdec::trace_request("nx2:gsv", req);
                 let memory = req.u32_at(68);
                 let Some(size) = st.memories.get(&memory).map(|m| m.size) else {
                     return Some(Err(Stop(format!(
@@ -389,6 +391,7 @@ impl Supervisor {
             // nn::codec::ReadDecoderOutputImage* copy a decoder output image out with (A-263).
             961 => match st.decoder_image(req.u32_at(0)) {
                 Some((offset, _, layout)) => {
+                    vdec::trace_request("nx2:gsv", req);
                     Ok(Response::ok().with_bytes(&layout.cpu_descriptor(offset)))
                 }
                 None => Err(Stop(format!(

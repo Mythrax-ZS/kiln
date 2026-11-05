@@ -169,7 +169,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   decodes and every conversion the video image compositor makes, with its output surface, format and
   how many of its pixels are not black (A-182, A-183; `NX_TRACE_MEDIA=2` adds every method write and
   every mapping of the engines); `NX_TRACE_VDEC=1` prints every request of the Switch 2's video decoder
-  sessions (`nx2:vdec`, `nx2:vdecsvc`) and every frame it decodes and writes into an image (A-261); `NX_MAX_FRAMES=<n>` ends the run after `n` presented
+  sessions (`nx2:vdec`, `nx2:vdecsvc`) and every frame it decodes and writes into an image (A-261), and `NX_VDEC_DUMP=<dir>` writes every
+  60th frame it decodes as a picture; `NX_MAX_FRAMES=<n>` ends the run after `n` presented
   frames; `NX_SAVE_DIR=<dir>` is where save data goes (default `./nx_save`). `kiln symbols --exefs <dir> [--match <text>]
   [<address>...]` names the function around an address, for reading the return addresses a stop
   report ends with. `NX_TRACE_AS=1` says every mapping the program makes in the GPU's address space
