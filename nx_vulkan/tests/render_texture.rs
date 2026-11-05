@@ -1086,11 +1086,14 @@ fn textures_used_longest_ago_go_when_they_hold_more_than_their_budget() {
     });
     r.draw(&w.scene(), &DRAW).unwrap();
     assert_eq!(r.textures_held(), 1);
-    // The frame it was used in, and the next: it stays.
-    next_frame(&mut r, &w, target, 1);
+    // The frame it was used in, and those after it while it was used lately: it stays.
+    let kept = nx_vulkan::render::TEXTURE_KEPT_FRAMES;
+    for frame in 1..=kept {
+        next_frame(&mut r, &w, target, frame);
+    }
     assert_eq!(r.textures_held(), 1);
-    // A frame without it: over its budget, it goes.
-    next_frame(&mut r, &w, target, 2);
+    // A frame later: over its budget, it goes.
+    next_frame(&mut r, &w, target, kept + 1);
     assert_eq!(r.textures_held(), 0);
     // Used again, it is made again from memory.
     r.draw(&w.scene(), &DRAW).unwrap();

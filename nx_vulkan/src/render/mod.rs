@@ -5,6 +5,10 @@
 //! recorded and run when the submission ends ([`Backend::finish`]), after which the guest may
 //! rely on them having happened.
 
+/// The frames a texture stays on the device after it was last used, whatever the budget of its
+/// images (docs/ASSUMPTIONS.md A-260).
+pub const TEXTURE_KEPT_FRAMES: u64 = 60;
+
 #[cfg(feature = "window")]
 mod blit;
 mod compute;

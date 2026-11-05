@@ -8,6 +8,7 @@
 
 use super::frame::{Frame, Garbage};
 use super::targets::{Key, Tiling};
+use super::TEXTURE_KEPT_FRAMES;
 use crate::blocklinear::{deswizzle, Geometry};
 use crate::device::Vk;
 use crate::fast::FastMap;
@@ -1674,7 +1675,8 @@ impl Textures {
     /// Let go of the textures used longest ago, once no batch can use them, until their images
     /// hold at most nine tenths of `limit` bytes of device memory (when they hold more than it):
     /// a texture is made again from memory when it is next used (docs/ASSUMPTIONS.md A-260). The
-    /// textures of the frame that just ended stay. Says how many went.
+    /// textures used in the last [`TEXTURE_KEPT_FRAMES`] frames stay: making those again each
+    /// frame costs far more than the memory they hold. Says how many went.
     pub fn trim(&mut self, frame: &mut Frame, limit: u64) -> usize {
         let (held, _) = self.device_bytes();
         if held <= limit {
@@ -1683,7 +1685,7 @@ impl Textures {
         let mut by_age: Vec<(u64, (Tic, Shape), u64)> = self
             .map
             .iter()
-            .filter(|(_, t)| t.checked == UNCHECKED || t.checked + 1 < self.frame)
+            .filter(|(_, t)| t.checked == UNCHECKED || t.checked + TEXTURE_KEPT_FRAMES < self.frame)
             .map(|(k, t)| {
                 (
                     if t.checked == UNCHECKED { 0 } else { t.checked },
