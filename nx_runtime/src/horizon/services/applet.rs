@@ -158,10 +158,40 @@ impl Service for ApplicationProxy {
             20 => Box::new(ApplicationFunctions { kernel, shared }),
             // A Switch 2 program's interfaces (A-192), none of whose commands is known yet.
             40 => Box::new(Bare("nn::am::service::IPerformanceFunctions")),
-            60 => Box::new(Bare("nn::am::service::IGraphicsScalingParametersFunctions")),
+            60 => Box::new(GraphicsScaling),
             other => return Err(Stop::unknown_command("IApplicationProxy", other)),
         };
         Ok(Response::ok().with_object(object))
+    }
+}
+
+/// `nn::am::service::IGraphicsScalingParametersFunctions`, a Switch 2 program's (A-217).
+#[derive(Debug)]
+struct GraphicsScaling;
+
+impl Service for GraphicsScaling {
+    fn name(&self) -> &str {
+        "nn::am::service::IGraphicsScalingParametersFunctions"
+    }
+
+    fn request(&mut self, req: &Request) -> ServiceResult {
+        match req.command {
+            // GetGraphicsScalingParameters() -> 12 bytes, from nn::oe's: the first word is the
+            // graphics scale, 10, 20 or 30 (nn::oe::GetCurrentGraphicsScale's 0, 1 and 2; any
+            // other value aborts it). The console in handheld mode, as this runtime reports it,
+            // is taken to be at the first; the other two words are not known and are zero.
+            10 => Ok(Response::ok().with_u32(10).with_u32(0).with_u32(0)),
+            // SetGraphicsScaleChangedNotificationEnabled(bool), from nn::oe's: whether a change
+            // of the graphics scale is announced. The scale never changes here, so there is
+            // never anything to announce either way.
+            1050 => match req.data.first() {
+                Some(0 | 1) => Ok(Response::ok()),
+                other => Err(Stop(format!(
+                    "IGraphicsScalingParametersFunctions 1050 with {other:?}, not a bool"
+                ))),
+            },
+            other => Err(Stop::unknown_command(self.name(), other)),
+        }
     }
 }
 
@@ -504,6 +534,12 @@ impl Service for ApplicationFunctions {
                 let kernel = self.kernel.upgrade().ok_or_else(gone)?;
                 Ok(Response::ok().with_copy_handle(idle_event(&kernel, &self.shared, 3)))
             }
+            // A Switch 2 program's (A-218): the event on which nn::oe::GetOperationMode learns
+            // that the operation mode changed and reads it again. It never changes here.
+            210 => {
+                let kernel = self.kernel.upgrade().ok_or_else(gone)?;
+                Ok(Response::ok().with_copy_handle(idle_event(&kernel, &self.shared, 4)))
+            }
             other => Err(Stop::unknown_command("IApplicationFunctions", other)),
         }
     }
@@ -693,6 +729,19 @@ mod tests {
         // 910 (GetLaunchRequiredTick) is not implemented and says so.
         let stop = g.request(&req(910, &[])).unwrap_err();
         assert!(stop.0.contains("ICommonStateGetter") && stop.0.contains("910"));
+    }
+
+    #[test]
+    fn the_graphics_scale_notification_is_accepted_and_nothing_else_is() {
+        let mut g = GraphicsScaling;
+        let params = g.request(&req(10, &[])).unwrap().data;
+        assert_eq!(params.len(), 12);
+        assert_eq!(params[..4], 10u32.to_le_bytes(), "the first scale");
+        assert!(g.request(&req(1050, &[1])).unwrap().data.is_empty());
+        assert!(g.request(&req(1050, &[0])).is_ok());
+        assert!(g.request(&req(1050, &[7])).is_err(), "not a bool");
+        let stop = g.request(&req(1051, &[])).unwrap_err();
+        assert!(stop.0.contains("IGraphicsScalingParametersFunctions") && stop.0.contains("1051"));
     }
 
     #[test]
