@@ -4,7 +4,7 @@
 
 use nx_shader::cfg::Code;
 use nx_shader::sph::{Sph, Stage as HeaderStage, SPH_BYTES};
-use nx_shader::translate::{translate, Config, Stage};
+use nx_shader::translate::{translate, translate_sm86, Config, Stage};
 use nx_shader::validate;
 
 fn main() {
@@ -31,7 +31,13 @@ fn main() {
             let mut cfg = Config::new(Stage::Kernel);
             cfg.block = [64, 1, 1];
             cfg.debug_names = true;
-            match translate(Code(&bytes), None, &cfg) {
+            // The Switch 2's sm_86 code ends with its own end marker; Maxwell code does not.
+            let translated = if nx_shader::sm86::code_extent(&bytes).is_some() {
+                translate_sm86(&bytes, None, &cfg)
+            } else {
+                translate(Code(&bytes), None, &cfg)
+            };
+            match translated {
                 Ok(t) => {
                     let verdict = match validate::validate(&t.spirv) {
                         Ok(Some(())) => "valid".to_string(),
@@ -65,7 +71,13 @@ fn main() {
         };
         let mut cfg = Config::new(stage);
         cfg.debug_names = true;
-        match translate(Code(&bytes[SPH_BYTES..]), Some(&sph), &cfg) {
+        // A version 4 header is the Switch 2's: sm_86 code after 0x80 bytes.
+        let translated = if sph.version() == 4 {
+            translate_sm86(&bytes[sph.code_offset()..], Some(&sph), &cfg)
+        } else {
+            translate(Code(&bytes[SPH_BYTES..]), Some(&sph), &cfg)
+        };
+        match translated {
             Ok(t) => {
                 let verdict = match validate::validate(&t.spirv) {
                     Ok(Some(())) => "valid".to_string(),

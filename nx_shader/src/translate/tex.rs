@@ -27,7 +27,7 @@ use std::collections::HashMap;
 
 /// How the level of detail of a sample is chosen.
 #[derive(Clone, Copy, Debug)]
-enum Lod {
+pub(super) enum Lod {
     /// From the screen-space derivatives of the coordinates (the base level in a stage that has
     /// none).
     Implicit,
@@ -42,9 +42,9 @@ enum Lod {
 /// The texture an instruction names: its number in the table of handles, or (a bindless
 /// instruction) the constant buffer slot whose word `index` holds the handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Tex {
-    index: u32,
-    source: Option<u32>,
+pub(super) struct Tex {
+    pub(super) index: u32,
+    pub(super) source: Option<u32>,
 }
 
 impl Tex {
@@ -57,20 +57,20 @@ impl Tex {
 }
 
 /// A sample to be made.
-struct Sample {
-    tex: Tex,
-    dim: Dim,
-    arrayed: bool,
-    shadow: bool,
+pub(super) struct Sample {
+    pub(super) tex: Tex,
+    pub(super) dim: Dim,
+    pub(super) arrayed: bool,
+    pub(super) shadow: bool,
     /// The coordinates as floats, one for each dimension (a cube takes three).
-    coords: Vec<Id>,
+    pub(super) coords: Vec<Id>,
     /// The array layer, as a float.
-    layer: Option<Id>,
-    lod: Lod,
+    pub(super) layer: Option<Id>,
+    pub(super) lod: Lod,
     /// The value a shadow sample compares against.
-    dref: Option<Id>,
+    pub(super) dref: Option<Id>,
     /// The texel offsets of a sample that has them (`AOFFI`), as a constant for the image operand.
-    offset: Option<Id>,
+    pub(super) offset: Option<Id>,
 }
 
 /// The dimension of the `TEX` family: bits 28..30 (0 1D, 1 1D array, 2 2D, 3 2D array, 4 3D,
@@ -148,7 +148,13 @@ pub(super) fn scan_dims(code: Code<'_>, graph: &Cfg) -> HashMap<u32, (Dim, bool)
 }
 
 /// The combined image sampler variable of a texture, made on first use.
-fn sampler(tx: &mut Tx<'_>, tex: Tex, dim: Dim, arrayed: bool, shadow: bool) -> R<(Id, Id)> {
+pub(super) fn sampler(
+    tx: &mut Tx<'_>,
+    tex: Tex,
+    dim: Dim,
+    arrayed: bool,
+    shadow: bool,
+) -> R<(Id, Id)> {
     if dim == Dim::D3 && (arrayed || shadow) {
         return tx.fail("a 3D texture with an array or a depth comparison");
     }
@@ -208,7 +214,7 @@ fn sampler(tx: &mut Tx<'_>, tex: Tex, dim: Dim, arrayed: bool, shadow: bool) -> 
 
 /// The coordinate operand: the coordinates in one vector (or a scalar for a 1D texture), the array
 /// layer last.
-fn coordinate(tx: &mut Tx<'_>, s: &Sample) -> Id {
+pub(super) fn coordinate(tx: &mut Tx<'_>, s: &Sample) -> Id {
     let mut parts = s.coords.clone();
     parts.extend(s.layer);
     if parts.len() == 1 {
@@ -220,7 +226,7 @@ fn coordinate(tx: &mut Tx<'_>, s: &Sample) -> Id {
 }
 
 /// Sample: the four components of the texel (a depth comparison gives its one result in all four).
-fn sample(tx: &mut Tx<'_>, s: &Sample) -> R<Id> {
+pub(super) fn sample(tx: &mut Tx<'_>, s: &Sample) -> R<Id> {
     let (var, sampled_ty) = sampler(tx, s.tex, s.dim, s.arrayed, s.shadow)?;
     let coord = coordinate(tx, s);
     let image = tx.f.load(&mut tx.m, sampled_ty, var);
@@ -576,7 +582,13 @@ pub(super) fn tlds(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
 
 /// The constant texel offsets `packed` holds for `count` coordinates: a signed field of `bits` bits
 /// for each, `stride` bits apart (a scalar for one coordinate).
-fn texel_offsets(tx: &mut Tx<'_>, packed: u32, count: usize, bits: u32, stride: u32) -> Id {
+pub(super) fn texel_offsets(
+    tx: &mut Tx<'_>,
+    packed: u32,
+    count: usize,
+    bits: u32,
+    stride: u32,
+) -> Id {
     let wrap = 1i32 << (bits - 1);
     let values: Vec<Id> = (0..count as u32)
         .map(|k| {
@@ -598,7 +610,7 @@ fn texel_offsets(tx: &mut Tx<'_>, packed: u32, count: usize, bits: u32, stride: 
 
 /// Gather the component `component` of the four texels of a sample; with a reference, the results
 /// of four depth comparisons instead.
-fn gather(
+pub(super) fn gather(
     tx: &mut Tx<'_>,
     index: u32,
     coords: Vec<Id>,

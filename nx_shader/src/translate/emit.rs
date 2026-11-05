@@ -54,6 +54,30 @@ pub(super) struct Flags {
     pub o: Id,
 }
 
+/// What a write of an sm_86 instruction lands in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Dest {
+    Reg(u8),
+    UReg(u8),
+    Pred(u8),
+}
+
+/// The scoreboard of sm_86 code: an instruction that sets a write barrier (a variable-latency
+/// one: a texture, an attribute or memory load, a special function...) writes its registers when
+/// its result comes back, which the code waits for with a wait mask or a `DEPBAR` count; until then
+/// the registers hold their old values, which the code may still read (NVN2 guide 9.1,
+/// docs/ASSUMPTIONS.md A-256). Such writes are held in variables of their own here and land when
+/// the code waits for them, or at the end of the block.
+#[derive(Default)]
+pub(super) struct Scoreboard {
+    /// Per barrier, the writes of each instruction that set it, oldest first.
+    pub groups: [std::collections::VecDeque<Vec<(Dest, Id)>>; 6],
+    /// The barrier of the instruction being translated, whose writes are held.
+    pub holding: Option<u8>,
+    /// The held writes of the instruction being translated.
+    pub current: Vec<(Dest, Id)>,
+}
+
 pub(super) struct Tx<'a> {
     pub m: Module,
     pub f: Function,
@@ -63,8 +87,11 @@ pub(super) struct Tx<'a> {
     pub t: Types,
     /// A function-local variable per general register that is used.
     pub regs: [Option<Id>; 256],
-    /// A function-local boolean per predicate P0..P6.
-    pub preds: [Option<Id>; 7],
+    /// A function-local variable per uniform register UR0..UR62 an sm_86 program uses.
+    pub uregs: [Option<Id>; 64],
+    /// A function-local boolean per predicate: P0..P6, then (sm_86) the uniform predicates from
+    /// [`crate::sm86::UP_BASE`] and the translation's own from [`crate::sm86::BRANCH_PRED`].
+    pub preds: [Option<Id>; crate::sm86::PRED_SLOTS],
     /// The condition code: the flags the `.CC` operations set and `.X`, `CSETP` and the like read.
     pub flags: Option<Flags>,
     /// The global variables the entry point lists as its interface.
@@ -74,6 +101,8 @@ pub(super) struct Tx<'a> {
     pub io: super::io::Io,
     /// Texture slot variables, created on first use.
     pub textures: std::collections::HashMap<(u32, Option<u32>), Id>,
+    /// The storage image variables, by the handle's word and slot.
+    pub images: std::collections::HashMap<(u32, Option<u32>), Id>,
     /// What the texture instructions of the program say about the shape of each texture slot.
     pub texture_dims: std::collections::HashMap<u32, (super::Dim, bool)>,
     /// The constant buffer word (slot, word index) a register is known to hold in the block being
@@ -104,6 +133,10 @@ pub(super) struct Tx<'a> {
     pub bad: Option<Id>,
     /// `Config::probe_regs`: the function-local variables the registers' values are kept in.
     pub probed: Option<[Id; 3]>,
+    /// Built-in input variables made on first use, by their built-in number.
+    pub builtins: std::collections::HashMap<u32, Id>,
+    /// The writes of sm_86 instructions that have not landed yet.
+    pub scoreboard: Scoreboard,
 }
 
 impl<'a> Tx<'a> {
@@ -138,12 +171,14 @@ impl<'a> Tx<'a> {
                 v4i32,
             },
             regs: [None; 256],
-            preds: [None; 7],
+            uregs: [None; 64],
+            preds: [None; crate::sm86::PRED_SLOTS],
             flags: None,
             interface: Vec::new(),
             cbufs: [None; 18],
             io: super::io::Io::default(),
             textures: std::collections::HashMap::new(),
+            images: std::collections::HashMap::new(),
             texture_dims: std::collections::HashMap::new(),
             reg_origin: std::collections::HashMap::new(),
             reg_const: std::collections::HashMap::new(),
@@ -157,6 +192,8 @@ impl<'a> Tx<'a> {
             pc: 0,
             bad: None,
             probed: None,
+            builtins: std::collections::HashMap::new(),
+            scoreboard: Scoreboard::default(),
         }
     }
 
@@ -383,8 +420,166 @@ impl<'a> Tx<'a> {
         }
         self.reg_origin.remove(&r);
         self.reg_const.remove(&r);
+        if self.hold(Dest::Reg(r), value) {
+            return;
+        }
         let v = self.register_variable(r);
         self.f.store(v, value);
+    }
+
+    /// Hold a write of the instruction being translated when it sets a write barrier (it lands
+    /// later, [`Tx::wait_for`]); a write that lands now does so over every older one still held.
+    fn hold(&mut self, dest: Dest, value: Id) -> bool {
+        if self.scoreboard.holding.is_none() {
+            for group in self.scoreboard.groups.iter_mut() {
+                for writes in group.iter_mut() {
+                    writes.retain(|(d, _)| *d != dest);
+                }
+            }
+            return false;
+        }
+        let ty = match dest {
+            Dest::Pred(_) => self.t.bool_,
+            _ => self.t.u32,
+        };
+        let init = match dest {
+            Dest::Pred(_) => self.cfalse(),
+            _ => self.c32(0),
+        };
+        let ptr = self.m.ty_pointer(storage::FUNCTION, ty);
+        let held = self.m.id();
+        self.f.local_with_init(ptr, held, init);
+        self.f.store(held, value);
+        self.scoreboard.current.retain(|(d, _)| *d != dest);
+        self.scoreboard.current.push((dest, held));
+        true
+    }
+
+    /// The writes of the oldest instructions that set `barrier` land, until at most `keep` of
+    /// them are still out.
+    pub fn wait_for(&mut self, barrier: u8, keep: usize) {
+        let b = usize::from(barrier);
+        if b >= self.scoreboard.groups.len() {
+            return;
+        }
+        while self.scoreboard.groups[b].len() > keep {
+            let writes = self.scoreboard.groups[b].pop_front().expect("a group");
+            self.commit(writes);
+        }
+    }
+
+    /// Every held write lands, oldest first (at the end of a block, before an exit).
+    pub fn wait_for_all(&mut self) {
+        let mut all: Vec<Vec<(Dest, Id)>> = Vec::new();
+        for group in self.scoreboard.groups.iter_mut() {
+            all.extend(group.drain(..));
+        }
+        for writes in all {
+            self.commit(writes);
+        }
+    }
+
+    fn commit(&mut self, writes: Vec<(Dest, Id)>) {
+        let holding = self.scoreboard.holding.take();
+        for (dest, held) in writes {
+            match dest {
+                Dest::Reg(r) => {
+                    let u = self.t.u32;
+                    let v = self.f.load(&mut self.m, u, held);
+                    let var = self.register_variable(r);
+                    self.f.store(var, v);
+                }
+                Dest::UReg(r) => {
+                    let u = self.t.u32;
+                    let v = self.f.load(&mut self.m, u, held);
+                    let var = self.uniform_variable(r);
+                    self.f.store(var, v);
+                }
+                Dest::Pred(p) => {
+                    let b = self.t.bool_;
+                    let v = self.f.load(&mut self.m, b, held);
+                    let var = self.pred_variable(p);
+                    self.f.store(var, v);
+                }
+            }
+        }
+        self.scoreboard.holding = holding;
+    }
+
+    fn uniform_variable(&mut self, r: u8) -> Id {
+        if let Some(v) = self.uregs[usize::from(r)] {
+            return v;
+        }
+        let zero = self.c32(0);
+        let ptr = self.m.ty_pointer(storage::FUNCTION, self.t.u32);
+        let id = self.m.id();
+        self.f.local_with_init(ptr, id, zero);
+        if self.cfg.debug_names {
+            self.m.name(id, &format!("ur{r}"));
+        }
+        self.uregs[usize::from(r)] = Some(id);
+        id
+    }
+
+    /// The raw 32 bits of a uniform register (zero for `URZ`).
+    pub fn read_u(&mut self, r: u8) -> Id {
+        if r >= crate::sm86::URZ {
+            return self.c32(0);
+        }
+        let v = self.uniform_variable(r);
+        let t = self.t.u32;
+        self.f.load(&mut self.m, t, v)
+    }
+
+    /// Write a uniform register when `cond` holds (always without one); `URZ` ignores it.
+    pub fn write_u_if(&mut self, cond: Option<Id>, r: u8, value: Id) {
+        if r >= crate::sm86::URZ {
+            return;
+        }
+        let value = match cond {
+            None => value,
+            Some(c) => {
+                let old = self.read_u(r);
+                self.select_u32(c, value, old)
+            }
+        };
+        if self.hold(Dest::UReg(r), value) {
+            return;
+        }
+        let v = self.uniform_variable(r);
+        self.f.store(v, value);
+    }
+
+    /// Write a register when `cond` holds (always without one): the guard of an sm_86 instruction,
+    /// read once before the instruction writes anything.
+    pub fn write_if(&mut self, cond: Option<Id>, r: u8, value: Id) {
+        if r == RZ {
+            return;
+        }
+        match cond {
+            None => self.write_raw(r, value),
+            Some(c) => {
+                let old = self.read(r);
+                let merged = self.select_u32(c, value, old);
+                self.write_raw(r, merged);
+            }
+        }
+    }
+
+    /// Write a predicate when `cond` holds (always without one).
+    pub fn write_pred_if(&mut self, cond: Option<Id>, p: u8, value: Id) {
+        if p == PT {
+            return;
+        }
+        match cond {
+            None => self.write_pred_raw(p, value),
+            Some(c) => {
+                let old = self.read_pred(p, false);
+                let t = self.t.bool_;
+                let merged = self.select(t, c, value, old);
+                self.write_pred_raw(p, merged);
+            }
+        }
     }
 
     pub fn pred_variable(&mut self, p: u8) -> Id {
@@ -420,6 +615,9 @@ impl<'a> Tx<'a> {
 
     pub fn write_pred_raw(&mut self, p: u8, value: Id) {
         if p == PT {
+            return;
+        }
+        if self.hold(Dest::Pred(p), value) {
             return;
         }
         let v = self.pred_variable(p);
@@ -652,6 +850,13 @@ impl<'a> Tx<'a> {
         self.info.cbuf_extent[ix] = self.info.cbuf_extent[ix].max(offset + 4);
         let word = self.c32(offset / 4);
         let zero = self.c32(0);
+        if self.cfg.zero_cbufs
+            && self.cfg.zero_cbuf_slots >> slot & 1 != 0
+            && self.cfg.zero_cbuf_kind != 2
+            && (self.cfg.zero_cbuf_range.0..self.cfg.zero_cbuf_range.1).contains(&offset)
+        {
+            return Ok(zero);
+        }
         let ptr_ty = self.m.ty_pointer(storage::STORAGE_BUFFER, self.t.u32);
         let ptr = self
             .f
@@ -667,6 +872,12 @@ impl<'a> Tx<'a> {
         let two = self.c32(2);
         let word = self.shr(offset, two);
         let zero = self.c32(0);
+        if self.cfg.zero_cbufs
+            && self.cfg.zero_cbuf_slots >> slot & 1 != 0
+            && self.cfg.zero_cbuf_kind != 1
+        {
+            return Ok(zero);
+        }
         let ptr_ty = self.m.ty_pointer(storage::STORAGE_BUFFER, self.t.u32);
         let ptr = self
             .f
@@ -696,7 +907,36 @@ pub fn translate(code: Code<'_>, sph: Option<&Sph>, cfg: &Config) -> Result<Tran
     tx.texture_dims = super::tex::scan_dims(code, &graph);
     tx.local_min_words = super::local::scan(code, &graph, super::local::Space::Local);
     tx.shared_min_words = super::local::scan(code, &graph, super::local::Space::Shared);
-    super::flow::build(&mut tx, code, &graph)?;
+    super::flow::build(&mut tx, super::flow::Program::Maxwell(code), &graph)?;
+    Ok(finish(tx, cfg))
+}
+
+/// Translate an sm_86 program (the Switch 2's): `code` is everything after the header (all of it
+/// for a compute program, which has none).
+pub fn translate_sm86(code: &[u8], sph: Option<&Sph>, cfg: &Config) -> Result<Translation, Error> {
+    if !matches!(cfg.stage, Stage::Compute | Stage::Kernel) && sph.is_none() {
+        return Err(Error {
+            message: "a graphics stage needs the program header".to_string(),
+            at: None,
+        });
+    }
+    let graph = crate::sm86::cfg::discover(code, cfg.constants.as_slice());
+    if let Some(issue) = graph.issues.first() {
+        return Err(Error {
+            message: format!("the control flow of the program: {issue}"),
+            at: None,
+        });
+    }
+    let mut tx = Tx::new(cfg, sph);
+    tx.texture_dims = super::sm86::scan_dims(code, &graph);
+    tx.local_min_words = super::sm86::scan_memory(code, &graph, super::local::Space::Local);
+    tx.shared_min_words = super::sm86::scan_memory(code, &graph, super::local::Space::Shared);
+    super::flow::build(&mut tx, super::flow::Program::Sm86(code), &graph)?;
+    Ok(finish(tx, cfg))
+}
+
+/// The module of a translated program.
+fn finish(tx: Tx<'_>, cfg: &Config) -> Translation {
     let Tx {
         mut m,
         f,
@@ -720,8 +960,8 @@ pub fn translate(code: Code<'_>, sph: Option<&Sph>, cfg: &Config) -> Result<Tran
         Stage::Kernel => m.execution_mode(id, exec::LOCAL_SIZE, &cfg.block),
         Stage::Vertex => {}
     }
-    Ok(Translation {
+    Translation {
         spirv: m.finish(),
         info,
-    })
+    }
 }

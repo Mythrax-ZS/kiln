@@ -211,6 +211,16 @@ fn epilogue_vertex(tx: &mut Tx<'_>) -> R<()> {
             let half = tx.cf32(0.5);
             c[2] = tx.fmul(sum, half);
         }
+        if tx.cfg.finite_position {
+            let b = tx.t.bool_;
+            let zero = tx.cf32(0.0);
+            for v in &mut c {
+                let nan = tx.op1(op::IS_NAN, b, *v);
+                let inf = tx.op1(op::IS_INF, b, *v);
+                let bad = tx.lor(nan, inf);
+                *v = tx.select(f, bad, zero, *v);
+            }
+        }
         let v4 = tx.t.v4f32;
         let value = tx.f.emit_result(&mut tx.m, op::COMPOSITE_CONSTRUCT, v4, &c);
         let var = output_variable(tx, v4);
@@ -263,6 +273,15 @@ fn epilogue_vertex(tx: &mut Tx<'_>) -> R<()> {
                 let raw = tx.f.load(&mut tx.m, u, *v);
                 c[i] = tx.as_f32(raw);
                 mask |= 1 << i;
+            }
+        }
+        if tx.cfg.finite_position {
+            let b = tx.t.bool_;
+            for v in &mut c {
+                let nan = tx.op1(op::IS_NAN, b, *v);
+                let inf = tx.op1(op::IS_INF, b, *v);
+                let bad = tx.lor(nan, inf);
+                *v = tx.select(f, bad, zero, *v);
             }
         }
         tx.info.outputs_written[loc as usize] = mask;
@@ -416,7 +435,7 @@ fn ald(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
 }
 
 /// The 32 bits of the input attribute at byte address `addr`.
-fn attribute_in(tx: &mut Tx<'_>, addr: u32) -> R<Id> {
+pub(super) fn attribute_in(tx: &mut Tx<'_>, addr: u32) -> R<Id> {
     if tx.cfg.stage == Stage::Compute {
         let attr_in = tx.io.test.as_ref().expect("harness mode").attr_in;
         let base = invocation_base(tx, super::test_bindings::ATTRS);
@@ -447,6 +466,9 @@ fn attribute_in(tx: &mut Tx<'_>, addr: u32) -> R<Id> {
                 }
             };
             tx.info.attributes_read[loc as usize] |= 1 << comp;
+            if tx.cfg.zero_inputs {
+                return Ok(tx.c32(0));
+            }
             let ty = class_type(tx, class);
             let vec = tx.f.load(&mut tx.m, ty, var);
             let scalar = scalar_type(tx, class);
@@ -482,7 +504,7 @@ fn attribute_in(tx: &mut Tx<'_>, addr: u32) -> R<Id> {
 
 /// The instance counter of the draw: the 32-bit push constant at offset 0 (see
 /// `Info::instance_counter`).
-fn instance_counter(tx: &mut Tx<'_>) -> Id {
+pub(super) fn instance_counter(tx: &mut Tx<'_>) -> Id {
     let u = tx.t.u32;
     let var = match tx.io.instance_counter {
         Some(v) => v,
@@ -506,7 +528,7 @@ fn instance_counter(tx: &mut Tx<'_>) -> Id {
 }
 
 /// Load a scalar `int` built-in input (`which` picks the cache slot of the variable).
-fn builtin_input(tx: &mut Tx<'_>, builtin_id: u32, signed: bool, which: usize) -> Id {
+pub(super) fn builtin_input(tx: &mut Tx<'_>, builtin_id: u32, signed: bool, which: usize) -> Id {
     let slot = match which {
         0 => &mut tx.io.instance_index,
         1 => &mut tx.io.base_instance,
@@ -547,21 +569,23 @@ fn ast(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
         return tx.fail("AST of a patch attribute");
     }
     let base = inst.bits(20, 10) as u32;
+    let cond = tx.guard_condition(inst.guard());
     for i in 0..attribute_words(inst) {
         let value = tx.read(inst.rd().wrapping_add(i as u8));
-        attribute_out(tx, inst, base + 4 * i, value)?;
+        attribute_out(tx, cond, base + 4 * i, value)?;
     }
     Ok(())
 }
 
-fn attribute_out(tx: &mut Tx<'_>, inst: Inst, addr: u32, value: Id) -> R<()> {
+/// Write the output attribute at byte address `addr` when `cond` holds (always without one).
+pub(super) fn attribute_out(tx: &mut Tx<'_>, cond: Option<Id>, addr: u32, value: Id) -> R<()> {
     if tx.cfg.stage == Stage::Compute {
         let attr_out = tx.io.test.as_ref().expect("harness mode").attr_out;
         let base = invocation_base(tx, super::test_bindings::ATTRS);
         let index = tx.c32(addr / 4);
         let at = tx.iadd(base, index);
         let ptr = word_ptr(tx, attr_out, at);
-        match tx.guard_condition(inst.guard()) {
+        match cond {
             None => tx.f.store(ptr, value),
             Some(cond) => {
                 let u = tx.t.u32;
@@ -594,7 +618,7 @@ fn attribute_out(tx: &mut Tx<'_>, inst: Inst, addr: u32, value: Id) -> R<()> {
             v
         }
     };
-    match tx.guard_condition(inst.guard()) {
+    match cond {
         None => tx.f.store(var, value),
         Some(cond) => {
             let u = tx.t.u32;
@@ -641,7 +665,7 @@ fn ipa(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
 }
 
 /// The value the pixel shader's interpolation unit gives for attribute address `addr`.
-fn interpolated(tx: &mut Tx<'_>, addr: u32) -> R<Id> {
+pub(super) fn interpolated(tx: &mut Tx<'_>, addr: u32) -> R<Id> {
     match addr {
         0x70 | 0x74 | 0x78 | 0x7c => {
             let fc = frag_coord(tx);
@@ -740,7 +764,7 @@ fn interpolated(tx: &mut Tx<'_>, addr: u32) -> R<Id> {
     }
 }
 
-fn frag_coord(tx: &mut Tx<'_>) -> Id {
+pub(super) fn frag_coord(tx: &mut Tx<'_>) -> Id {
     if let Some(v) = tx.io.frag_coord {
         return v;
     }
@@ -808,7 +832,7 @@ fn ldc(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
     Ok(())
 }
 
-fn extract_small(tx: &mut Tx<'_>, word: Id, byte: u32, size: u64) -> Id {
+pub(super) fn extract_small(tx: &mut Tx<'_>, word: Id, byte: u32, size: u64) -> Id {
     let b = tx.c32(byte);
     let eight = tx.c32(8);
     let shift = tx.imul(b, eight);

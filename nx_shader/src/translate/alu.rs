@@ -157,7 +157,7 @@ pub(super) fn fcompare(tx: &mut Tx<'_>, code: u64, a: Id, b: Id) -> R<Id> {
 }
 
 /// An integer comparison by the 3-bit code of `ISETP`.
-fn icompare(tx: &mut Tx<'_>, code: u64, a: Id, b: Id, signed: bool) -> Id {
+pub(super) fn icompare(tx: &mut Tx<'_>, code: u64, a: Id, b: Id, signed: bool) -> Id {
     let opcode = match (code, signed) {
         (0, _) => return tx.cfalse(),
         (1, true) => op::S_LESS_THAN,
@@ -176,7 +176,7 @@ fn icompare(tx: &mut Tx<'_>, code: u64, a: Id, b: Id, signed: bool) -> Id {
 }
 
 /// The value a `SET` instruction stores for a true comparison: 1.0f with the `bf` flag, else all ones.
-fn set_value(tx: &mut Tx<'_>, cond: Id, bf: bool) -> Id {
+pub(super) fn set_value(tx: &mut Tx<'_>, cond: Id, bf: bool) -> Id {
     let t = if bf {
         tx.c32(1.0f32.to_bits())
     } else {
@@ -210,7 +210,7 @@ fn fadd(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
 
 /// `product == 0` zeroing for the multiply-by-zero flag: if either factor is zero the product is
 /// zero, whatever the other is (NaN and infinity included).
-fn fmz_product(tx: &mut Tx<'_>, a: Id, b: Id, product: Id) -> Id {
+pub(super) fn fmz_product(tx: &mut Tx<'_>, a: Id, b: Id, product: Id) -> Id {
     let zero = tx.cf32(0.0);
     let az = tx.cmp(op::F_ORD_EQUAL, a, zero);
     let bz = tx.cmp(op::F_ORD_EQUAL, b, zero);
@@ -390,7 +390,7 @@ fn rro(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
 
 // ---- conversions --------------------------------------------------------------------------
 
-fn round_float(tx: &mut Tx<'_>, v: Id, mode: u64) -> Id {
+pub(super) fn round_float(tx: &mut Tx<'_>, v: Id, mode: u64) -> Id {
     let f = tx.t.f32;
     match mode {
         0 => tx.ext(f, glsl::ROUND_EVEN, &[v]),
@@ -483,7 +483,7 @@ fn f2i(tx: &mut Tx<'_>, inst: Inst) -> R<()> {
 }
 
 /// The largest float below `v` (a power of two): the top of the range a conversion can take.
-fn tx_prev_float(tx: &mut Tx<'_>, v: f32) -> Id {
+pub(super) fn tx_prev_float(tx: &mut Tx<'_>, v: f32) -> Id {
     tx.cf32(f32::from_bits(v.to_bits() - 1))
 }
 
@@ -1335,7 +1335,7 @@ fn imul(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
     Ok(())
 }
 
-fn mul_high(tx: &mut Tx<'_>, a: Id, b: Id, signed: bool) -> Id {
+pub(super) fn mul_high(tx: &mut Tx<'_>, a: Id, b: Id, signed: bool) -> Id {
     let u = tx.t.u32;
     if signed {
         let i = tx.t.i32;

@@ -10,7 +10,14 @@ use crate::spirv::{op, storage, Id};
 use std::collections::BTreeMap;
 
 /// Translate the program: the prologue, every block, the epilogue.
-pub(super) fn build(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg) -> R<()> {
+/// The instructions a graph was found in: Maxwell code or sm_86 code.
+#[derive(Clone, Copy)]
+pub(super) enum Program<'a> {
+    Maxwell(Code<'a>),
+    Sm86(&'a [u8]),
+}
+
+pub(super) fn build(tx: &mut Tx<'_>, code: Program<'_>, graph: &Cfg) -> R<()> {
     io::begin(tx)?;
     for (pc, block) in &graph.blocks {
         for next in successors(block) {
@@ -100,7 +107,7 @@ fn forward_only(graph: &Cfg) -> bool {
 /// The program as a sequence of regions in address order with no loop (for a graph whose edges
 /// all go forward): a block runs when a flag of its own is set, and the blocks before it set the
 /// flags of their successors. The entry runs first, always.
-fn build_predicated(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg) -> R<()> {
+fn build_predicated(tx: &mut Tx<'_>, code: Program<'_>, graph: &Cfg) -> R<()> {
     let b = tx.t.bool_;
     let bool_ptr = tx.m.ty_pointer(storage::FUNCTION, b);
     let no = tx.cfalse();
@@ -233,27 +240,80 @@ fn indirect_address(tx: &mut Tx<'_>, reg: u8, base: u32) -> Id {
 }
 
 /// The instructions of a block, without its terminator.
-fn body(tx: &mut Tx<'_>, code: Code<'_>, graph: &Cfg, block: &Block) -> R<()> {
+fn body(tx: &mut Tx<'_>, code: Program<'_>, graph: &Cfg, block: &Block) -> R<()> {
     // What is known of the registers is what every block that leads here ends knowing.
     let known = entry_state(tx, block);
     tx.reg_origin = known.origin;
     tx.reg_const = known.constant;
-    let mut insts: Vec<(u32, Inst)> = graph.instructions(code, block).collect();
-    if !matches!(block.term, Term::Fall(_)) {
-        insts.pop();
-    }
-    for (pc, inst) in insts {
-        tx.pc = pc;
-        if inst.guard().is_never() && !matches!(inst.op(), Some(Op::Ssy | Op::Pbk | Op::Pcnt)) {
-            continue;
-        }
-        if let Some((at, regs)) = tx.cfg.probe_regs {
-            if at == pc {
-                tx.probe_registers(regs);
+    match code {
+        Program::Maxwell(code) => {
+            let mut insts: Vec<(u32, Inst)> = graph.instructions(code, block).collect();
+            if !matches!(block.term, Term::Fall(_)) {
+                insts.pop();
+            }
+            for (pc, inst) in insts {
+                tx.pc = pc;
+                if inst.guard().is_never()
+                    && !matches!(inst.op(), Some(Op::Ssy | Op::Pbk | Op::Pcnt))
+                {
+                    continue;
+                }
+                if let Some((at, regs)) = tx.cfg.probe_regs {
+                    if at == pc {
+                        tx.probe_registers(regs);
+                    }
+                }
+                instruction(tx, inst)?;
+                tx.info.instructions += 1;
             }
         }
-        instruction(tx, inst)?;
-        tx.info.instructions += 1;
+        Program::Sm86(code) => {
+            let terminator = crate::sm86::cfg::terminator(code, block);
+            for (pc, inst) in crate::sm86::cfg::instructions(code, block) {
+                if terminator.is_some_and(|(at, _)| at == pc) {
+                    break;
+                }
+                tx.pc = pc;
+                if let Some((at, regs)) = tx.cfg.probe_regs {
+                    if at == pc {
+                        tx.probe_registers(regs);
+                    }
+                }
+                if tx
+                    .cfg
+                    .skip
+                    .iter()
+                    .any(|&(from, to)| (from..to).contains(&pc))
+                {
+                    continue;
+                }
+                super::sm86::instruction(tx, inst)?;
+                tx.info.instructions += 1;
+            }
+            // What is still out lands before the block ends (A-256).
+            if let Some((_, inst)) = terminator {
+                // The terminator's own waits first: they may name what an exit needs.
+                let wait = inst.field(116, 6);
+                for b in 0..6u8 {
+                    if wait >> b & 1 != 0 {
+                        tx.wait_for(b, 0);
+                    }
+                }
+            }
+            tx.wait_for_all();
+            // A terminator with a guard and a predicate of its own takes effect when both hold.
+            if let Some((pc, inst)) = terminator {
+                tx.pc = pc;
+                if crate::sm86::cfg::needs_branch_predicate(inst) {
+                    let g = inst.guard();
+                    let p = inst.pred(87, 90, false);
+                    let a = tx.read_pred(g.index, g.negated);
+                    let b = tx.read_pred(p.index, p.negated);
+                    let both = tx.land(a, b);
+                    tx.write_pred_raw(crate::sm86::BRANCH_PRED, both);
+                }
+            }
+        }
     }
     let state = ExitState {
         origin: tx.reg_origin.clone(),

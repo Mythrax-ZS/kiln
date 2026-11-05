@@ -53,6 +53,9 @@ pub mod op {
     pub const IMAGE_SAMPLE_DREF_IMPLICIT_LOD: u16 = 89;
     pub const IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u16 = 90;
     pub const IMAGE_FETCH: u16 = 95;
+    pub const IMAGE_TEXEL_POINTER: u16 = 60;
+    pub const IMAGE_READ: u16 = 98;
+    pub const IMAGE_WRITE: u16 = 99;
     pub const IMAGE_GATHER: u16 = 96;
     pub const IMAGE_DREF_GATHER: u16 = 97;
     pub const IMAGE: u16 = 100;
@@ -139,6 +142,22 @@ pub mod op {
     pub const ATOMIC_AND: u16 = 240;
     pub const ATOMIC_OR: u16 = 241;
     pub const ATOMIC_XOR: u16 = 242;
+    pub const CONTROL_BARRIER: u16 = 224;
+    pub const MEMORY_BARRIER: u16 = 225;
+    pub const GROUP_NON_UNIFORM_ALL: u16 = 334;
+    pub const GROUP_NON_UNIFORM_ANY: u16 = 335;
+    pub const GROUP_NON_UNIFORM_ALL_EQUAL: u16 = 336;
+    pub const GROUP_NON_UNIFORM_BROADCAST_FIRST: u16 = 338;
+    pub const GROUP_NON_UNIFORM_BALLOT: u16 = 339;
+    pub const GROUP_NON_UNIFORM_SHUFFLE: u16 = 345;
+    pub const GROUP_NON_UNIFORM_I_ADD: u16 = 349;
+    pub const GROUP_NON_UNIFORM_U_MIN: u16 = 354;
+    pub const GROUP_NON_UNIFORM_S_MIN: u16 = 353;
+    pub const GROUP_NON_UNIFORM_U_MAX: u16 = 357;
+    pub const GROUP_NON_UNIFORM_S_MAX: u16 = 356;
+    pub const GROUP_NON_UNIFORM_BITWISE_AND: u16 = 359;
+    pub const GROUP_NON_UNIFORM_BITWISE_OR: u16 = 360;
+    pub const GROUP_NON_UNIFORM_BITWISE_XOR: u16 = 361;
     pub const LOOP_MERGE: u16 = 246;
     pub const SELECTION_MERGE: u16 = 247;
     pub const LABEL: u16 = 248;
@@ -165,6 +184,7 @@ pub mod storage {
     pub const PUSH_CONSTANT: u32 = 9;
     pub const STORAGE_BUFFER: u32 = 12;
     pub const PHYSICAL_STORAGE_BUFFER: u32 = 5349;
+    pub const IMAGE: u32 = 11;
 }
 
 /// Decorations.
@@ -213,6 +233,12 @@ pub mod builtin {
     pub const INSTANCE_INDEX: u32 = 43;
     pub const BASE_VERTEX: u32 = 4424;
     pub const BASE_INSTANCE: u32 = 4425;
+    pub const SUBGROUP_LOCAL_INVOCATION_ID: u32 = 41;
+    pub const SUBGROUP_EQ_MASK: u32 = 4416;
+    pub const SUBGROUP_GE_MASK: u32 = 4417;
+    pub const SUBGROUP_GT_MASK: u32 = 4418;
+    pub const SUBGROUP_LE_MASK: u32 = 4419;
+    pub const SUBGROUP_LT_MASK: u32 = 4420;
 }
 
 /// Capabilities.
@@ -229,6 +255,8 @@ pub mod cap {
     pub const SAMPLED_1D: u32 = 43;
     pub const IMAGE_1D: u32 = 44;
     pub const IMAGE_QUERY: u32 = 50;
+    pub const STORAGE_IMAGE_READ_WITHOUT_FORMAT: u32 = 55;
+    pub const STORAGE_IMAGE_WRITE_WITHOUT_FORMAT: u32 = 56;
     pub const DERIVATIVE_CONTROL: u32 = 51;
     pub const SHADER_VIEWPORT_INDEX_LAYER: u32 = 5254;
     pub const MULTI_VIEWPORT: u32 = 57;
@@ -236,6 +264,11 @@ pub mod cap {
     pub const DRAW_PARAMETERS: u32 = 4427;
     pub const PHYSICAL_STORAGE_BUFFER_ADDRESSES: u32 = 5347;
     pub const DEMOTE_TO_HELPER_INVOCATION: u32 = 5379;
+    pub const GROUP_NON_UNIFORM: u32 = 61;
+    pub const GROUP_NON_UNIFORM_VOTE: u32 = 62;
+    pub const GROUP_NON_UNIFORM_ARITHMETIC: u32 = 63;
+    pub const GROUP_NON_UNIFORM_BALLOT: u32 = 64;
+    pub const GROUP_NON_UNIFORM_SHUFFLE: u32 = 65;
 }
 
 /// Execution models and modes.
@@ -262,6 +295,7 @@ pub mod glsl {
     pub const FRACT: u32 = 10;
     pub const SIN: u32 = 13;
     pub const COS: u32 = 14;
+    pub const TANH: u32 = 21;
     pub const EXP2: u32 = 29;
     pub const LOG2: u32 = 30;
     pub const SQRT: u32 = 31;

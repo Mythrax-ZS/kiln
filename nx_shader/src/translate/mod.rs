@@ -27,9 +27,10 @@ mod half;
 mod int;
 mod io;
 mod local;
+mod sm86;
 mod tex;
 
-pub use emit::translate;
+pub use emit::{translate, translate_sm86};
 
 use crate::sph::Sph;
 
@@ -100,6 +101,23 @@ pub struct Config {
     /// Pixel stage, a bring-up switch: the program paints, in its first target, the values three
     /// registers hold before the instruction at an offset runs (zero where it does not run).
     pub probe_regs: Option<(u32, [u8; 3])>,
+    /// A bring-up switch for sm_86 programs: the instructions at offsets `from..to` of the code,
+    /// for each range, are not translated (the control flow stays), to find by halving which
+    /// instruction a fault of the device follows.
+    pub skip: Vec<(u32, u32)>,
+    /// A bring-up switch: a vertex program's position has every component that is not a number
+    /// or infinite made 0 (is a lost device a position the device cannot clip?).
+    pub finite_position: bool,
+    /// Bring-up switches: every word the program reads of a constant buffer, or of a vertex
+    /// attribute, is 0 (the bindings stay as they are). For the constant buffers, only those of
+    /// the slots of `zero_cbuf_slots` (bit n slot n), and only the reads at a fixed offset (1) or
+    /// at a computed one (2) when `zero_cbuf_kind` says so (0 both).
+    pub zero_cbufs: bool,
+    pub zero_cbuf_slots: u32,
+    pub zero_cbuf_kind: u32,
+    /// The byte offsets of the fixed reads `zero_cbufs` makes 0.
+    pub zero_cbuf_range: (u32, u32),
+    pub zero_inputs: bool,
 }
 
 impl Config {
@@ -118,6 +136,13 @@ impl Config {
             probe_bad: None,
             probe_tag: 0,
             probe_regs: None,
+            skip: Vec::new(),
+            finite_position: false,
+            zero_cbufs: false,
+            zero_cbuf_slots: u32::MAX,
+            zero_cbuf_kind: 0,
+            zero_cbuf_range: (0, u32::MAX),
+            zero_inputs: false,
         }
     }
 }
@@ -140,6 +165,32 @@ pub struct TextureUse {
     pub shadow: bool,
 }
 
+/// A surface (a storage image) a program loads or stores texels of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageUse {
+    /// The word of constant buffer `source` that holds its handle.
+    pub index: u32,
+    pub source: Option<u32>,
+    /// The program's own number for it, in the order it first names them: the binding is
+    /// [`ImageUse::binding`] of it.
+    pub slot: u32,
+    pub dim: Dim,
+    pub arrayed: bool,
+    pub read: bool,
+    pub written: bool,
+    /// Its texels are 32-bit unsigned integers that atomic operations change (`SURED`), where
+    /// the loads and stores' are floats.
+    pub atomic: bool,
+}
+
+impl ImageUse {
+    /// The binding of surface `slot` of a stage: 512 + 16 per stage, after every stage's buffers
+    /// and textures.
+    pub fn binding(stage: Stage, slot: u32) -> u32 {
+        512 + 16 * stage.index() + slot
+    }
+}
+
 /// The dimensionality of a sampled image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dim {
@@ -157,6 +208,8 @@ pub struct Info {
     pub cbuf_extent: [u32; 18],
     pub cbuf_dynamic: [bool; 18],
     pub textures: Vec<TextureUse>,
+    /// The surfaces it loads and stores texels of (storage images).
+    pub images: Vec<ImageUse>,
     /// The program reads or writes global memory. Binding `64 * stage + 20` is then a storage
     /// buffer of 32-bit words: word 0 the number of entries, word 1 reserved (zero), words 2 and
     /// 3 the device address (low, high) of a zeroed scratch page used for addresses no entry

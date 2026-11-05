@@ -63,7 +63,7 @@ fn access_bytes(inst: Inst) -> u32 {
 }
 
 /// The variable that holds the memory and its length in words, made on first use.
-fn ensure(tx: &mut Tx<'_>, space: Space) -> R<(Id, u32)> {
+pub(super) fn ensure(tx: &mut Tx<'_>, space: Space) -> R<(Id, u32)> {
     let made = match space {
         Space::Local => tx.local,
         Space::Shared => tx.shared,
@@ -109,7 +109,7 @@ fn ensure(tx: &mut Tx<'_>, space: Space) -> R<(Id, u32)> {
 
 /// A pointer to word `index`, kept inside the array (an access past its end reads and writes the
 /// last word instead of whatever is there).
-fn word_pointer(tx: &mut Tx<'_>, space: Space, var: Id, words: u32, index: Id) -> Id {
+pub(super) fn word_pointer(tx: &mut Tx<'_>, space: Space, var: Id, words: u32, index: Id) -> Id {
     let u = tx.t.u32;
     let last = tx.c32(words - 1);
     let inside = tx.ext(u, glsl::U_MIN, &[index, last]);

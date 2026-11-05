@@ -151,22 +151,22 @@ fn address(tx: &mut Tx<'_>, inst: Inst) -> R<Id> {
 }
 
 /// The device address behind a GPU address.
-fn device(tx: &mut Tx<'_>, gpu: Id) -> Id {
+pub(super) fn device(tx: &mut Tx<'_>, gpu: Id) -> Id {
     let (_, function) = ensure(tx);
     let u64t = tx.m.ty_int(64, false);
     tx.f.emit_result(&mut tx.m, op::FUNCTION_CALL, u64t, &[function, gpu])
 }
 
 /// A pointer to the 32-bit word at a device address.
-fn word_pointer(tx: &mut Tx<'_>, device: Id) -> Id {
+pub(super) fn word_pointer(tx: &mut Tx<'_>, device: Id) -> Id {
     let ptr_ty = tx.m.ty_pointer(storage::PHYSICAL_STORAGE_BUFFER, tx.t.u32);
     tx.f.emit_result(&mut tx.m, op::CONVERT_U_TO_PTR, ptr_ty, &[device])
 }
 
 /// The memory-access operands of an access aligned to 4 bytes.
-const ALIGNED_4: [u32; 2] = [0x2, 4];
+pub(super) const ALIGNED_4: [u32; 2] = [0x2, 4];
 
-fn plus(tx: &mut Tx<'_>, device: Id, bytes: u32) -> Id {
+pub(super) fn plus(tx: &mut Tx<'_>, device: Id, bytes: u32) -> Id {
     if bytes == 0 {
         return device;
     }

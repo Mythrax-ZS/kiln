@@ -227,21 +227,7 @@ fn lop3(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
         _ => src_b(tx, inst)?,
     };
     let c = tx.read(inst.rc());
-    let na = tx.not(a);
-    let nb = tx.not(b);
-    let nc = tx.not(c);
-    let mut result = tx.c32(0);
-    for k in 0..8u64 {
-        if lut >> k & 1 == 0 {
-            continue;
-        }
-        let ta = if k & 4 != 0 { a } else { na };
-        let tb = if k & 2 != 0 { b } else { nb };
-        let tc = if k & 1 != 0 { c } else { nc };
-        let ab = tx.and(ta, tb);
-        let term = tx.and(ab, tc);
-        result = tx.or(result, term);
-    }
+    let result = lop3_value(tx, lut, a, b, c);
     tx.write(inst, inst.rd(), result);
     if opc == Op::Lop3LutReg {
         let p = inst.bits(48, 3) as u8;
@@ -323,7 +309,7 @@ fn shf(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
 }
 
 /// Byte `index` (0..7, the bytes of `a` then those of `b`) as a value 0..255.
-fn permute_byte(tx: &mut Tx<'_>, a: Id, b: Id, index: Id) -> Id {
+pub(super) fn permute_byte(tx: &mut Tx<'_>, a: Id, b: Id, index: Id) -> Id {
     let four = tx.c32(4);
     let three = tx.c32(3);
     let from_a = tx.cmp(op::U_LESS_THAN, index, four);
@@ -348,6 +334,14 @@ fn prmt(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
         Op::PrmtCbuf_4bc0 | Op::PrmtImm20 => (src_b(tx, inst)?, tx.read(inst.rc())),
         _ => (tx.read(inst.rc()), src_b(tx, inst)?),
     };
+    let result = prmt_value(tx, mode, a, sel, b)?;
+    tx.write(inst, inst.rd(), result);
+    Ok(())
+}
+
+/// The bytes `PRMT` picks from the eight of `a` and `b` (`a` first) in `mode`, as `sel` says (see
+/// [`prmt`]).
+pub(super) fn prmt_value(tx: &mut Tx<'_>, mode: u64, a: Id, sel: Id, b: Id) -> R<Id> {
     if mode > 3 {
         return tx.fail(format!("PRMT in mode {mode}"));
     }
@@ -396,8 +390,7 @@ fn prmt(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
         let placed = tx.shl(byte, place);
         result = tx.or(result, placed);
     }
-    tx.write(inst, inst.rd(), result);
-    Ok(())
+    Ok(result)
 }
 
 /// A word cut to its low half (selector 1) or its high half (2), else whole.
@@ -492,4 +485,33 @@ fn iadd3(tx: &mut Tx<'_>, inst: Inst, opc: Op) -> R<()> {
         tx.write_flag(inst, flags.s, negative);
     }
     Ok(())
+}
+
+/// The three-input logic operation of `LOP3`: every result bit is bit `4a + 2b + c` of the 8-bit
+/// table `lut`.
+pub(super) fn lop3_value(tx: &mut Tx<'_>, lut: u64, a: Id, b: Id, c: Id) -> Id {
+    match lut & 0xFF {
+        0x00 => return tx.c32(0),
+        0xFF => return tx.c32(0xFFFF_FFFF),
+        0xF0 => return a,
+        0xCC => return b,
+        0xAA => return c,
+        _ => {}
+    }
+    let na = tx.not(a);
+    let nb = tx.not(b);
+    let nc = tx.not(c);
+    let mut result = tx.c32(0);
+    for k in 0..8u64 {
+        if lut >> k & 1 == 0 {
+            continue;
+        }
+        let ta = if k & 4 != 0 { a } else { na };
+        let tb = if k & 2 != 0 { b } else { nb };
+        let tc = if k & 1 != 0 { c } else { nc };
+        let ab = tx.and(ta, tb);
+        let term = tx.and(ab, tc);
+        result = tx.or(result, term);
+    }
+    result
 }
