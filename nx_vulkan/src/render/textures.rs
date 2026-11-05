@@ -629,7 +629,14 @@ pub fn overlay_of(
     }
     let plan = plan(tic, shape, format).ok()?;
     let gobs = |width: u32, bytes: u32| (u64::from(width) * u64::from(bytes)).div_ceil(64);
-    for layer in 0..plan.layers {
+    // The layer the target starts in, found from its offset: a large array has thousands of
+    // levels in all, and a texture is looked at for every target near it at every draw.
+    let offset = target.address.checked_sub(base)?;
+    let first = match offset.checked_div(plan.layer_stride) {
+        Some(layer) => u32::try_from(layer).ok()?,
+        None => 0,
+    };
+    for layer in first..plan.layers.min(first.saturating_add(1)) {
         let mut at = base + u64::from(layer) * plan.layer_stride;
         for (level, g) in plan.level_geometry.iter().enumerate() {
             let size = g.tiled_size();
