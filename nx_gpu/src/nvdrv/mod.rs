@@ -97,6 +97,9 @@ pub struct Nvdrv {
     pub media: crate::media::Media,
     /// A wait the call being served asked for, for its reply (A-185).
     pending_wait: Option<SyncptWait>,
+    /// The driver is the Switch 2's: its ioctls have their Switch 2 forms (an Ampere GPU, A-199).
+    /// Set for a program built for the Switch 2 (A-188), never by what a program asks.
+    switch_2: bool,
 }
 
 impl Nvdrv {
@@ -112,7 +115,18 @@ impl Nvdrv {
             trace: std::env::var_os("NX_TRACE_GPU").is_some(),
             media: crate::media::Media::new(),
             pending_wait: None,
+            switch_2: false,
         }
+    }
+
+    /// Make the driver the Switch 2's (see `switch_2`).
+    pub fn set_switch_2(&mut self, on: bool) {
+        self.switch_2 = on;
+    }
+
+    /// Whether the driver is the Switch 2's.
+    pub fn is_switch_2(&self) -> bool {
+        self.switch_2
     }
 
     /// Whether threads of the runtime run work for the driver (the renderer's commands, the
@@ -192,6 +206,29 @@ impl Nvdrv {
         input: &[u8],
         extra_in: &[u8],
     ) -> Result<IoctlReply, String> {
+        self.serve(fd, code, input, extra_in, 0)
+    }
+
+    /// `Ioctl3`, whose second output buffer has room for `extra_out_room` bytes: a command that
+    /// fills that buffer to its end (`VSMS_MAPPING`) needs to know where the end is.
+    pub fn ioctl3(
+        &mut self,
+        fd: u32,
+        code: u32,
+        input: &[u8],
+        extra_out_room: usize,
+    ) -> Result<IoctlReply, String> {
+        self.serve(fd, code, input, &[], extra_out_room)
+    }
+
+    fn serve(
+        &mut self,
+        fd: u32,
+        code: u32,
+        input: &[u8],
+        extra_in: &[u8],
+        extra_out_room: usize,
+    ) -> Result<IoctlReply, String> {
         let ioctl = Ioctl(code);
         let mut args = Args::new(if ioctl.has_input() { input } else { &[] }, ioctl.size());
         let mut extra_out = Vec::new();
@@ -209,7 +246,9 @@ impl Nvdrv {
         let before = self.trace.then(|| hex(&args.data));
         let outcome = match self.nodes.get(&fd) {
             Some(Node::Ctrl { .. }) => self.ctrl_ioctl(fd, ioctl, &mut args),
-            Some(Node::CtrlGpu) => self.ctrl_gpu_ioctl(ioctl, &mut args, &mut extra_out),
+            Some(Node::CtrlGpu) => {
+                self.ctrl_gpu_ioctl(ioctl, &mut args, &mut extra_out, extra_out_room)
+            }
             Some(Node::Nvmap) => self.nvmap_ioctl(ioctl, &mut args),
             Some(Node::AsGpu(space)) => {
                 let space = *space;

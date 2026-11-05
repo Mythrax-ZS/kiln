@@ -13,6 +13,13 @@ pub const ZBC_SET_TABLE: u32 = 3;
 pub const GET_CHARACTERISTICS: u32 = 5;
 pub const GET_TPC_MASKS: u32 = 6;
 pub const FLUSH_L2: u32 = 7;
+pub const VSMS_MAPPING: u32 = 0x13;
+pub const GET_ENGINE_INFO: u32 = 0x1F;
+
+/// The engines `GET_ENGINE_INFO` lists, {engine id, instance, runlist, reserved}: the graphics
+/// engine (`NVGPU_ENGINE_GR`, 0) on runlist 0 and an asynchronous copy engine (2) on runlist 1
+/// (A-199).
+pub(super) const SWITCH_2_ENGINES: [[u32; 4]; 2] = [[0, 0, 0, 0], [2, 0, 1, 0]];
 pub const ZBC_GET_ACTIVE_SLOT_MASK: u32 = 0x14;
 pub const GET_GPU_TIME: u32 = 0x1C;
 
@@ -21,6 +28,9 @@ pub const TYPE: u32 = 0x47;
 
 /// The context size `ZCULL_GET_CTX_SIZE` answers (docs/ASSUMPTIONS.md).
 pub const ZCULL_CTX_SIZE: u32 = 0x1000;
+
+/// The SMs of the Switch 2's T239: one GPC of six TPCs of two SMs each (A-199).
+const T239_SMS: usize = 12;
 
 pub fn name(code: Ioctl) -> Option<&'static str> {
     if code.ty() != TYPE {
@@ -33,6 +43,8 @@ pub fn name(code: Ioctl) -> Option<&'static str> {
         GET_CHARACTERISTICS => "NVGPU_GPU_IOCTL_GET_CHARACTERISTICS",
         GET_TPC_MASKS => "NVGPU_GPU_IOCTL_GET_TPC_MASKS",
         FLUSH_L2 => "NVGPU_GPU_IOCTL_FLUSH_L2",
+        VSMS_MAPPING => "NVGPU_GPU_IOCTL_VSMS_MAPPING",
+        GET_ENGINE_INFO => "NVGPU_GPU_IOCTL_GET_ENGINE_INFO",
         ZBC_GET_ACTIVE_SLOT_MASK => "NVGPU_GPU_IOCTL_ZBC_GET_ACTIVE_SLOT_MASK",
         GET_GPU_TIME => "NVGPU_GPU_IOCTL_GET_GPU_TIME",
         _ => return None,
@@ -76,6 +88,38 @@ pub fn characteristics() -> [u8; 160] {
     b
 }
 
+/// The Switch 2's `struct nvgpu_gpu_characteristics`, for its Ampere T239: 208 bytes, the GM20B's
+/// with the fields the Switch 2 changes (the NVN2 guide, appendix A.1, checked by NeXium against a
+/// Switch 2 title; A-199).
+pub fn characteristics_switch_2() -> [u8; 208] {
+    use super::super::gpu::class;
+    let mut b = [0u8; 208];
+    b[..160].copy_from_slice(&characteristics());
+    let mut put32 = |off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    put32(0, 0x170); // arch: Ampere
+    put32(4, 0xE); // impl: T239
+    put32(32, 6); // num_tpc_per_gpc
+    put32(60, 0x808); // sm_arch_sm_version
+    put32(64, 0x808); // sm_arch_spa_version
+    put32(92, class::AMPERE_THREED);
+    put32(96, class::AMPERE_COMPUTE);
+    put32(100, class::AMPERE_GPFIFO);
+    put32(108, class::AMPERE_DMA_COPY);
+    // The most subcontexts of a TSG.
+    put32(180, 64);
+    // The flags, 64-bit: the GM20B's, and TSG (bit 8), TSG_SUBCONTEXTS (22), SYNCPOINT_ADDRESS
+    // (26), MAPPING_MODIFY (34), REMAP (35), and SUPPORT_2D, _3D, _COMPUTE and _I2M (40 to 43),
+    // without which NvRm takes none of those classes from its table of the T239's (A-199).
+    let flags = 0x55u64 | 1 << 8 | 1 << 22 | 1 << 26 | 1 << 34 | 1 << 35 | 0xF << 40;
+    b[80..88].copy_from_slice(&flags.to_le_bytes());
+    // The interface levels of the ioctl groups, 16-bit, at 0x70 to 0x80.
+    for off in (0x70..=0x80).step_by(2) {
+        b[off..off + 2].copy_from_slice(&0x40u16.to_le_bytes());
+    }
+    b[144..152].copy_from_slice(b"ga10f\0\0\0"); // chipname
+    b
+}
+
 /// `struct nvgpu_gpu_zcull_info`: 40 bytes.
 fn zcull_info() -> [u8; 40] {
     let words: [u32; 10] = [0x20, 0x20, 0x400, 0x800, 0x20, 0x20, 0xC0, 0x20, 0x40, 0x10];
@@ -101,6 +145,7 @@ impl Nvdrv {
         code: Ioctl,
         args: &mut Args,
         extra_out: &mut Vec<u8>,
+        extra_out_room: usize,
     ) -> IoResult {
         if code.ty() != TYPE {
             return unimplemented(format!(
@@ -114,7 +159,8 @@ impl Nvdrv {
             // The compression-bit tables only matter to rendering that uses them; the entries are
             // accepted and not kept.
             (ZBC_SET_TABLE, 44) => {}
-            (GET_CHARACTERISTICS, 176) => {
+            // The Switch 2's driver is not known to answer the Switch 1's form: it stops there.
+            (GET_CHARACTERISTICS, 176) if !self.is_switch_2() => {
                 // The first word is the size of the buffer, which the driver overwrites with the
                 // size it filled. The second is the address of a buffer, which the characteristics
                 // do not use: they are returned inline, after these two words, and a title's call
@@ -128,9 +174,54 @@ impl Nvdrv {
                 extra_out.clear();
                 extra_out.extend_from_slice(&characteristics());
             }
+            // The Switch 2's form: the same two words and its larger description (A-199).
+            (GET_CHARACTERISTICS, 224) if self.is_switch_2() => {
+                if args.u64(0) == 0 {
+                    return Err(NvError::BAD_PARAMETER.into());
+                }
+                let gc = characteristics_switch_2();
+                args.set_u64(0, gc.len() as u64);
+                args.put(16, &gc);
+                extra_out.clear();
+                extra_out.extend_from_slice(&gc);
+            }
             (GET_TPC_MASKS, 24) => {
-                // One 32-bit mask per GPC: the GM20B has one GPC with two TPCs.
-                args.set_u64(16, 0b11);
+                // One 32-bit mask per GPC: the GM20B has one GPC with two TPCs, the Switch 2's T239
+                // one with six (A-199). It is in the argument at 16, and `Ioctl3` has the program
+                // give the mask buffer as its second output buffer.
+                let mask: u32 = if self.is_switch_2() { 0x3F } else { 0b11 };
+                args.set_u64(16, u64::from(mask));
+                extra_out.clear();
+                extra_out.extend_from_slice(&mask.to_le_bytes());
+            }
+            // VSMS_MAPPING(u64 buffer address): the GPC and TPC of each virtual SM, a byte pair
+            // each, into `Ioctl3`'s second output buffer, which has a pair for every SM; the T239
+            // has two SMs in each of its six TPCs (A-199).
+            (VSMS_MAPPING, 8) if self.is_switch_2() => {
+                let sms = extra_out_room / 2;
+                if sms == 0 || sms > T239_SMS {
+                    return unimplemented(format!(
+                        "VSMS_MAPPING with room for {sms} SMs; the T239 has {T239_SMS}"
+                    ));
+                }
+                extra_out.clear();
+                for sm in 0..sms {
+                    extra_out.extend_from_slice(&[0, (sm / 2) as u8]);
+                }
+            }
+            // GET_ENGINE_INFO(u32 buffer size, u32, u64 buffer address): the size becomes the size
+            // of the engines' items, which go into `Ioctl3`'s second output buffer when the size
+            // the program gave holds them.
+            (GET_ENGINE_INFO, 16) if self.is_switch_2() => {
+                let needed = (SWITCH_2_ENGINES.len() * 16) as u32;
+                let room = args.u32(0);
+                args.set_u32(0, needed);
+                if room >= needed {
+                    extra_out.clear();
+                    for word in SWITCH_2_ENGINES.iter().flatten() {
+                        extra_out.extend_from_slice(&word.to_le_bytes());
+                    }
+                }
             }
             (FLUSH_L2, 8) => {}
             (ZBC_GET_ACTIVE_SLOT_MASK, 8) => {
@@ -225,8 +316,83 @@ mod tests {
     fn other_sizes_of_a_command_are_not_guessed() {
         let (mut nv, _) = nvdrv();
         let fd = gpu_fd(&mut nv);
-        // The Switch 2 layout of GET_CHARACTERISTICS has another size.
+        // The Switch 2 layout of GET_CHARACTERISTICS has another size, which only the Switch 2's
+        // driver answers.
         let err = nv.ioctl(fd, 0xC0E0_4705, &[], &[]).unwrap_err();
         assert!(err.contains("GET_CHARACTERISTICS"), "{err}");
+    }
+
+    #[test]
+    fn the_switch_2_driver_describes_an_ampere_gpu() {
+        let (mut nv, _) = nvdrv();
+        nv.set_switch_2(true);
+        let fd = gpu_fd(&mut nv);
+        let mut input = vec![0u8; 224];
+        input[..8].copy_from_slice(&208u64.to_le_bytes());
+        let (e, out) = call(&mut nv, fd, 0xC0E0_4705, &input);
+        assert_eq!(e, NvError::SUCCESS);
+        assert_eq!(out.u64(0), 208);
+        let gc = |off: usize| out.u32(16 + off);
+        assert_eq!((gc(0), gc(4), gc(32)), (0x170, 0xE, 6));
+        assert_eq!((gc(60), gc(64)), (0x808, 0x808), "sm_86");
+        assert_eq!(
+            (gc(92), gc(96), gc(100), gc(108)),
+            (0xC797, 0xC7C0, 0xC56F, 0xC7B5)
+        );
+        assert_eq!(
+            (gc(88), gc(104)),
+            (0x902D, 0xA140),
+            "2D and inline to memory as before"
+        );
+        assert_eq!(
+            out.u64(16 + 80),
+            0x55 | 1 << 8 | 1 << 22 | 1 << 26 | 1 << 34 | 1 << 35 | 0xF << 40
+        );
+        assert_eq!(gc(180), 64);
+        assert_eq!(&out.bytes(16 + 144, 6), b"ga10f\0");
+        assert_eq!(
+            u16::from_le_bytes(out.bytes(16 + 0x80, 2).try_into().unwrap()),
+            0x40
+        );
+        // Six TPCs in the one GPC, in the argument and in Ioctl3's second output.
+        let r = nv
+            .ioctl3(fd, 0xC018_4706, &u32s(&[4, 0, 0, 0, 0, 0]), 4)
+            .unwrap();
+        assert_eq!(
+            (r.args.u64(16), r.extra_out.as_slice()),
+            (0x3F, &[0x3F, 0, 0, 0][..])
+        );
+        // Every SM's GPC and TPC, two SMs to a TPC, for as many SMs as the buffer has room for.
+        let r = nv.ioctl3(fd, 0xC008_4713, &[0; 8], 24).unwrap();
+        assert_eq!(r.error, NvError::SUCCESS);
+        let tpcs: Vec<u8> = r.extra_out.chunks(2).map(|p| p[1]).collect();
+        assert_eq!(tpcs, [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]);
+        assert!(r.extra_out.chunks(2).all(|p| p[0] == 0), "one GPC");
+        assert!(
+            nv.ioctl3(fd, 0xC008_4713, &[0; 8], 26).is_err(),
+            "a 13th SM"
+        );
+        // The engines: their size, and the items when the program's size holds them.
+        let r = nv
+            .ioctl3(fd, 0xC010_471F, &u32s(&[0, 0, 0, 0]), 0x400)
+            .unwrap();
+        assert_eq!(
+            (r.args.u32(0), r.extra_out.len()),
+            (32, 0),
+            "asked for the size"
+        );
+        let r = nv
+            .ioctl3(fd, 0xC010_471F, &u32s(&[0x400, 0, 0, 0]), 0x400)
+            .unwrap();
+        assert_eq!(r.args.u32(0), 32);
+        assert_eq!(
+            r.extra_out,
+            u32s(&[0, 0, 0, 0, 2, 0, 1, 0]),
+            "GR on 0, copy on 1"
+        );
+        // The Switch 1's form is not answered with a GM20B on the Switch 2.
+        let mut small = vec![0u8; 176];
+        small[..8].copy_from_slice(&160u64.to_le_bytes());
+        assert!(nv.ioctl(fd, CHARACTERISTICS, &small, &[]).is_err());
     }
 }

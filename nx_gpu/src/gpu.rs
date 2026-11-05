@@ -22,6 +22,12 @@ pub mod class {
     pub const INLINE_TO_MEMORY: u32 = 0xA140;
     pub const DMA_COPY: u32 = 0xB0B5;
     pub const GPFIFO: u32 = 0xB06F;
+    /// The Switch 2's Ampere classes (the NVN2 guide, appendix A.1; A-199). Its 2D and
+    /// inline-to-memory classes are the ones above.
+    pub const AMPERE_THREED: u32 = 0xC797;
+    pub const AMPERE_COMPUTE: u32 = 0xC7C0;
+    pub const AMPERE_GPFIFO: u32 = 0xC56F;
+    pub const AMPERE_DMA_COPY: u32 = 0xC7B5;
 }
 
 /// `SUBMIT_GPFIFO` flags (Switchbrew, "NV services", section 9; bit 8 is what `libnx` sets).

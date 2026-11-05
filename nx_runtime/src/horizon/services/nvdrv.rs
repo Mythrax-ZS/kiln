@@ -345,6 +345,11 @@ impl Shared {
         }
     }
 
+    /// Make the driver the Switch 2's, for a program built for the Switch 2 (A-188, A-199).
+    pub fn set_switch_2(&self, on: bool) {
+        self.lock().set_switch_2(on);
+    }
+
     /// The readable end of the event of slot `slot` of the Switch 2's syncpoint service.
     pub fn nx2_slot_event(&self, kernel: &Kernel, slot: u32) -> KObject {
         let token = self.lock().nx2_slot_token(slot);
@@ -860,10 +865,13 @@ impl NvDrv {
             Vec::new()
         };
         self.shared.wait_for_room();
-        let mut reply = self
-            .core()
-            .ioctl(fd, code, &input, &extra_in)
-            .map_err(|why| stop(format!("nvdrv: {why}")))?;
+        let served = if variant == 12 {
+            let room = req.output_buffer(1).map_or(0, |b| b.size as usize);
+            self.core().ioctl3(fd, code, &input, room)
+        } else {
+            self.core().ioctl(fd, code, &input, &extra_in)
+        };
+        let mut reply = served.map_err(|why| stop(format!("nvdrv: {why}")))?;
         self.shared.deliver_signals(&kernel);
         if let Some(wait) = reply.wait.take() {
             let (error, value) = self.wait_syncpoint(wait)?;

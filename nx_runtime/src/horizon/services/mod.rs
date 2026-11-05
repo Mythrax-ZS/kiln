@@ -58,6 +58,8 @@ pub fn implemented_names() -> Vec<String> {
 pub fn register_defaults(kernel: &Arc<Kernel>) {
     let applet = applet::Shared::default();
     let gpu = nvdrv::Shared::new();
+    // The driver of the console the program was built for (A-188, A-199).
+    gpu.set_switch_2(kernel.process.platform() == crate::npdm::Platform::Nx2);
     let display = Arc::new(vi::Shared::new());
     display.set_gpu(gpu.clone());
     {
