@@ -107,6 +107,28 @@ fn analyze(kind: StageKind, address: u64, bytes: &[u8]) -> Program {
         program.hash = hash_bytes(&bytes[..program.size]);
         return program;
     }
+    // The Switch 2's sm_86 programs: the code after a version 4 header.
+    if let Ok(sph) = &program.header {
+        if sph.version() == 4 {
+            let start = sph.code_offset();
+            let code = &bytes[start.min(bytes.len())..];
+            let cfg = nx_shader::sm86::cfg::discover(code, &());
+            program.size = start + cfg.extent as usize;
+            program.hash = hash_bytes(&bytes[..program.size.min(bytes.len())]);
+            program.blocks = cfg.blocks.len();
+            program.issues = cfg.issues.clone();
+            for block in cfg.blocks.values() {
+                for (_, inst) in nx_shader::sm86::cfg::instructions(code, block) {
+                    *program
+                        .histogram
+                        .entry(nx_shader::sm86::name(inst))
+                        .or_default() += 1;
+                    program.instructions += 1;
+                }
+            }
+            return program;
+        }
+    }
     let code = Code(&bytes[SPH_BYTES..]);
     let cfg = Cfg::discover(code);
     program.size = SPH_BYTES + cfg.extent as usize;

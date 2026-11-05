@@ -8,6 +8,9 @@
 pub const SPH_WORDS: usize = 20;
 /// Bytes in a header: the code starts this far into the program.
 pub const SPH_BYTES: usize = SPH_WORDS * 4;
+/// Bytes in a version 4 header (the Switch 2's, NVN2 guide 9.1): its first 0x50 keep version 3's
+/// layout, and the code starts after all of them.
+pub const SPH_V4_BYTES: usize = 0x80;
 
 /// What stage the program is for (`SPHV3_T1_SHADER_TYPE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -49,7 +52,7 @@ pub struct Sph {
 impl Sph {
     /// Parse the first 80 bytes of a program. Fails when they are short or are not a header of the
     /// kinds that precede graphics code (type 1 for vertex/tessellation/geometry, type 2 for pixel,
-    /// version 3).
+    /// version 3, or version 4 for the Switch 2's sm_86 code; see [`Sph::code_offset`]).
     pub fn parse(bytes: &[u8]) -> Result<Sph, String> {
         let Some(head) = bytes.get(..SPH_BYTES) else {
             return Err(format!(
@@ -66,15 +69,29 @@ impl Sph {
             .stage()
             .ok_or_else(|| format!("shader type {} in the program header", sph.field(10, 4)))?;
         let want_type = if stage == Stage::Pixel { 2 } else { 1 };
-        if sph.field(0, 5) != want_type || sph.field(5, 5) != 3 {
+        if sph.field(0, 5) != want_type || !matches!(sph.field(5, 5), 3 | 4) {
             return Err(format!(
                 "a program header of type {} version {} for a {stage:?} shader (type {want_type} \
-                 version 3 expected)",
+                 version 3 or 4 expected)",
                 sph.field(0, 5),
                 sph.field(5, 5)
             ));
         }
         Ok(sph)
+    }
+
+    /// The header's version: 3 for Maxwell code, 4 for sm_86 code.
+    pub fn version(&self) -> u32 {
+        self.field(5, 5)
+    }
+
+    /// Where the code starts: after 0x50 bytes of a version 3 header, 0x80 of a version 4 one.
+    pub fn code_offset(&self) -> usize {
+        if self.version() == 4 {
+            SPH_V4_BYTES
+        } else {
+            SPH_BYTES
+        }
     }
 
     /// `len` (at most 32) bits from bit `lo` of the header.
@@ -294,9 +311,12 @@ mod tests {
         assert!(Sph::parse(&bytes(&w))
             .unwrap_err()
             .contains("type 1 version 3"));
-        // The wrong version.
+        // The wrong version; version 4 is the Switch 2's, with the code after 0x80 bytes.
         let mut w = header(1);
-        set(&mut w, 5, 5, 4);
+        set(&mut w, 5, 5, 5);
         assert!(Sph::parse(&bytes(&w)).is_err());
+        set(&mut w, 5, 5, 4);
+        let v4 = Sph::parse(&bytes(&w)).unwrap();
+        assert_eq!((v4.version(), v4.code_offset()), (4, SPH_V4_BYTES));
     }
 }

@@ -13,6 +13,7 @@ pub mod asm;
 pub mod cfg;
 pub mod inst;
 pub mod ops;
+pub mod sm86;
 pub mod sph;
 pub mod spirv;
 pub mod translate;
