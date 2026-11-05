@@ -4,6 +4,7 @@
 
 use super::lz4;
 use super::module::{Module, ModuleKind, ModuleParts, Perm, Segment, MAX_IMAGE, PAGE};
+use super::zstd;
 use crate::{Error, Result};
 use nx_runtime::util::{align_up, array_at, u32_at};
 use sha2::{Digest, Sha256};
@@ -13,7 +14,7 @@ pub const HEADER_SIZE: usize = 0x100;
 const NAMES: [&str; 3] = ["text", "rodata", "data"];
 const FLAG_COMPRESS: [u32; 3] = [1 << 0, 1 << 1, 1 << 2];
 const FLAG_HASH: [u32; 3] = [1 << 3, 1 << 4, 1 << 5];
-/// `[22.0.0+] UseZbicCompression`: zstd-based compression instead of LZ4.
+/// `[22.0.0+] UseZbicCompression`: the compressed segments are ZBIC frames, not LZ4 (A-232).
 const FLAG_ZBIC: u32 = 1 << 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,7 +140,22 @@ fn segment_bytes(bytes: &[u8], h: &NsoHeader, i: usize) -> Result<Vec<u8>> {
             Error::format("NSO", format!("{} segment lies outside the file", NAMES[i]))
         })?;
     let raw = &bytes[start..end];
-    if h.compressed(i) {
+    if h.compressed(i) && h.flags & FLAG_ZBIC != 0 {
+        let out = zstd::decompress(raw, zstd::Variant::Zbic, seg.size as usize)
+            .map_err(|e| Error::format("NSO", format!("{} segment: {e}", NAMES[i])))?;
+        if out.len() != seg.size as usize {
+            return Err(Error::format(
+                "NSO",
+                format!(
+                    "{} segment decompresses to {} bytes, not {}",
+                    NAMES[i],
+                    out.len(),
+                    seg.size
+                ),
+            ));
+        }
+        Ok(out)
+    } else if h.compressed(i) {
         lz4::decompress(raw, seg.size as usize)
             .map_err(|e| Error::format("NSO", format!("{} segment: {e}", NAMES[i])))
     } else {
@@ -150,12 +166,6 @@ fn segment_bytes(bytes: &[u8], h: &NsoHeader, i: usize) -> Result<Vec<u8>> {
 /// Parse, decompress, verify, lay out and relocate an NSO mapped at `base`.
 pub fn load(bytes: &[u8], name: &str, base: u64, opts: &LoadOptions) -> Result<Loaded> {
     let h = NsoHeader::parse(bytes)?;
-    if h.flags & FLAG_ZBIC != 0 {
-        return Err(Error::unsupported(
-            "NSO",
-            "zstd-based (ZBIC) segment compression",
-        ));
-    }
     let mut data: Vec<Vec<u8>> = Vec::with_capacity(3);
     let mut verified = [false; 3];
     for i in 0..3 {
@@ -566,9 +576,11 @@ mod tests {
         f[0] = b'X';
         assert!(try_load(&f).unwrap_err().to_string().contains("bad magic"));
 
+        // A segment flagged ZBIC-compressed that holds no ZBIC frame.
         let mut f = good.clone();
-        put32(&mut f, 0x0C, 1 << 7);
-        assert!(matches!(try_load(&f), Err(Error::Unsupported { .. })));
+        put32(&mut f, 0x0C, (1 << 7) | 1);
+        let e = try_load(&f).unwrap_err().to_string();
+        assert!(e.contains("text segment") && e.contains("magic"), "{e}");
 
         // segment file range outside the file
         let mut f = good.clone();

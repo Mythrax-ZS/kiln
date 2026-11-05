@@ -5,8 +5,11 @@ pub mod lz4;
 pub mod module;
 pub mod nro;
 pub mod nso;
+pub mod zstd;
 
 #[cfg(test)]
 mod lz4_vectors;
 #[cfg(test)]
 pub(crate) mod testing;
+#[cfg(test)]
+mod zstd_vectors;
