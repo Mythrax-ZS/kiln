@@ -15,6 +15,9 @@ Crates:
   depends on it. It draws nothing itself: draws, clears and displayed buffers go to a `Backend`.
 - `nx_shader` (`nx_shader/`): Maxwell shader programs: header, decoder, control flow, a SPIR-V builder
   and the translation to SPIR-V. No dependencies and no knowledge of the GPU model that feeds it.
+- `nx_opus` (`nx_opus/`): an Opus decoder written from RFC 6716 with the corrections of RFC 8251
+  (range decoder, packets, SILK, CELT, hybrid, transitions, concealment). No dependencies; the
+  `hwopus` service feeds it.
 - `nx_vulkan` (`nx_vulkan/`): the Vulkan device, the compute harness the translator is tested
   with, and the renderer (a `Backend`) with the ASTC decoder (`ash`, loaded at run time).
 - `kiln_gui` (`kiln_gui/`): the desktop front end (`egui`); it runs `kiln` and the games as
@@ -261,6 +264,11 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   (`KILN_ASTCENC=<path>`, or `astcenc` on the `PATH`; the tool may be unpacked from a distribution
   package without installing it); `KILN_ASTC_BATCHES` (default 4, 4,096 blocks each) scales it and
   `KILN_ASTC_ONLY=<n>` runs one footprint.
+- Opus decoder: `nx_opus/tests/vectors.rs` decodes the official test vectors (RFC 8251 section 11;
+  `KILN_OPUS_VECTORS` = the directory of `testvector01.bit` and the rest) to stereo and mono at every
+  output rate, checks the final range of every packet, and applies the reference's quality metric
+  (`opus_compare`, re-implemented) against `testvectorNN.dec` and `NNm.dec`; `KILN_OPUS_ONLY=01,07`
+  and `KILN_OPUS_RATES=48000,8000` narrow it. Run it with `--release` (about a minute).
 - A real title through the whole pipeline (opt-in, by hand; nothing from it is stored): build with
   `kiln build --exefs <exefs> --romfs <romfs> --out <dir>`, run `<dir>/<name>` with
   `NX_TRACE_SVC=1`, and use `kiln relink` / `--reuse-objects` to iterate on the runtime.
