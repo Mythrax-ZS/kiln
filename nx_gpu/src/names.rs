@@ -6,11 +6,12 @@ use crate::methods;
 /// The generated table for an engine class.
 fn table(class_num: u32) -> &'static [(u32, u32, &'static str)] {
     match class_num {
-        class::GPFIFO => methods::HOST,
-        class::THREED => methods::THREED,
-        class::COMPUTE => methods::COMPUTE,
+        // The Ampere classes keep the Maxwell ones' methods (A-208).
+        class::GPFIFO | class::AMPERE_GPFIFO => methods::HOST,
+        class::THREED | class::AMPERE_THREED => methods::THREED,
+        class::COMPUTE | class::AMPERE_COMPUTE => methods::COMPUTE,
         class::TWOD => methods::TWOD,
-        class::DMA_COPY => methods::COPY,
+        class::DMA_COPY | class::AMPERE_DMA_COPY => methods::COPY,
         class::INLINE_TO_MEMORY => methods::INLINE_TO_MEMORY,
         _ => &[],
     }
@@ -19,11 +20,11 @@ fn table(class_num: u32) -> &'static [(u32, u32, &'static str)] {
 /// The short name of a class, for traces.
 pub fn class_name(class_num: u32) -> &'static str {
     match class_num {
-        class::GPFIFO => "HOST",
-        class::THREED => "3D",
-        class::COMPUTE => "COMPUTE",
+        class::GPFIFO | class::AMPERE_GPFIFO => "HOST",
+        class::THREED | class::AMPERE_THREED => "3D",
+        class::COMPUTE | class::AMPERE_COMPUTE => "COMPUTE",
         class::TWOD => "2D",
-        class::DMA_COPY => "COPY",
+        class::DMA_COPY | class::AMPERE_DMA_COPY => "COPY",
         class::INLINE_TO_MEMORY => "I2M",
         _ => "?",
     }

@@ -120,13 +120,17 @@ impl Channel {
                     class::TWOD,
                     class::INLINE_TO_MEMORY,
                     class::DMA_COPY,
+                    // The Switch 2's (A-208).
+                    class::AMPERE_THREED,
+                    class::AMPERE_COMPUTE,
+                    class::AMPERE_DMA_COPY,
                 ];
                 if !known.contains(&class_num) {
                     return Err(format!(
                         "SET_OBJECT of class {class_num:#x}, which is not an engine class"
                     ));
                 }
-                if class_num != class::DMA_COPY && self.objects.is_empty() {
+                if class::kind(class_num) != class::Kind::Copy && self.objects.is_empty() {
                     return Err(format!(
                         "SET_OBJECT of class {class_num:#x} on a channel with no object context"
                     ));
@@ -254,6 +258,8 @@ mod tests {
         let mut sp = Syncpoints::new();
         let mut woken = Vec::new();
         let mut stats = Stats::default();
+        let mut macros = crate::mme64::Store::default();
+        let mut qmds = crate::qmd3::Scheduler::default();
         let results = {
             let mut cx = Cx {
                 mem: &mem,
@@ -266,6 +272,8 @@ mod tests {
                 channel: 1,
                 syncpt: 1,
                 level: 0,
+                macros: &mut macros,
+                qmds: &mut qmds,
             };
             ws.iter().map(|w| ch.execute(&mut cx, *w)).collect()
         };
@@ -288,6 +296,8 @@ mod tests {
         let mut sp = Syncpoints::new();
         sp.increment(5, 3);
         let (mut woken, mut stats) = (Vec::new(), Stats::default());
+        let mut macros = crate::mme64::Store::default();
+        let mut qmds = crate::qmd3::Scheduler::default();
         let mut cx = Cx {
             mem: &mem,
             space: &space,
@@ -299,6 +309,8 @@ mod tests {
             channel: 1,
             syncpt: 1,
             level: 0,
+            macros: &mut macros,
+            qmds: &mut qmds,
         };
         let mut ch = Channel::default();
         // SEMAPHOREA..D at syncpoint 5's word of the shim, payload `want`, operation `op`.

@@ -24,6 +24,7 @@ pub mod media;
 pub mod mem;
 pub mod methods;
 pub mod mme;
+pub mod mme64;
 pub mod names;
 pub mod nvdrv;
 pub mod nvmap;
@@ -42,6 +43,8 @@ pub use mem::GuestMemory;
 
 /// Counters of what the command processor has done, and where it is, for a watchdog that looks at
 /// a run from another thread (`NX_WATCHDOG` in `nx_runtime`).
+pub mod qmd3;
+
 pub mod progress {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 

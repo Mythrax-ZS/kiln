@@ -28,6 +28,39 @@ pub mod class {
     pub const AMPERE_COMPUTE: u32 = 0xC7C0;
     pub const AMPERE_GPFIFO: u32 = 0xC56F;
     pub const AMPERE_DMA_COPY: u32 = 0xC7B5;
+
+    /// What an engine class is, whichever generation's number it has: the Ampere classes run on
+    /// the engines of the Maxwell ones, whose methods they keep (A-208).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Kind {
+        ThreeD,
+        Compute,
+        TwoD,
+        InlineToMemory,
+        Copy,
+        Gpfifo,
+        Other,
+    }
+
+    pub fn kind(class_num: u32) -> Kind {
+        match class_num {
+            THREED | AMPERE_THREED => Kind::ThreeD,
+            COMPUTE | AMPERE_COMPUTE => Kind::Compute,
+            TWOD => Kind::TwoD,
+            INLINE_TO_MEMORY => Kind::InlineToMemory,
+            DMA_COPY | AMPERE_DMA_COPY => Kind::Copy,
+            GPFIFO | AMPERE_GPFIFO => Kind::Gpfifo,
+            _ => Kind::Other,
+        }
+    }
+
+    /// Whether a class is one of the Switch 2's, whose macros are MME64's (A-208).
+    pub fn is_ampere(class_num: u32) -> bool {
+        matches!(
+            class_num,
+            AMPERE_THREED | AMPERE_COMPUTE | AMPERE_DMA_COPY | AMPERE_GPFIFO
+        )
+    }
 }
 
 /// `SUBMIT_GPFIFO` flags (Switchbrew, "NV services", section 9; bit 8 is what `libnx` sets).
@@ -85,6 +118,11 @@ pub struct Gpu {
     /// Where submissions go instead of being run by the call that makes them, if anywhere
     /// (A-124).
     pub queue: Option<Arc<dyn Queue>>,
+    /// The MME64 macro code of the process's Ampere engines and their channels' data RAM
+    /// (A-208).
+    pub mme64: crate::mme64::Store,
+    /// The QMDs of version 3 scheduled or waited for, of all channels (A-210).
+    pub qmds: crate::qmd3::Scheduler,
     next_space: u32,
     next_channel: u32,
 }
@@ -122,6 +160,8 @@ impl Gpu {
             window: trace_window(),
             base_level: trace_level(),
             queue: None,
+            mme64: Default::default(),
+            qmds: Default::default(),
             next_space: 1,
             next_channel: 1,
         }
@@ -356,6 +396,8 @@ impl Gpu {
                     channel: job.channel,
                     syncpt: job.syncpt,
                     level: self.level,
+                    macros: &mut self.mme64,
+                    qmds: &mut self.qmds,
                 };
                 let _phase = crate::progress::enter(crate::progress::METHODS_RUNNING);
                 for chunk in bytes.as_chunks::<4>().0 {

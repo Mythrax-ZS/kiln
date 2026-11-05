@@ -11,14 +11,16 @@ use crate::gpu::class;
 use crate::i2m::{self, I2m};
 use crate::mem::GuestMemory;
 use crate::mme;
+use crate::mme64;
 use crate::names;
+use crate::qmd3;
 use crate::render::{Backend, Clear, Draw, Scene, Source};
 use crate::shaders::Inventory;
 use crate::state::{CbufBindings, Regs};
 use crate::syncpt::Syncpoints;
 use crate::twod;
 use crate::vm::AddressSpace;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 /// How many registers (words) an engine has: methods are 12 bits wide.
 pub const REGISTERS: usize = 0x1000;
@@ -60,6 +62,8 @@ pub struct Stats {
     pub macro_writes: BTreeMap<(u32, u32), u64>,
     pub draws: DrawStats,
     pub semaphore_releases: u64,
+    /// Releases of the Switch 2's classes to GPU address 0, which are dropped (A-211).
+    pub releases_to_zero: u64,
     /// Inline uploads (data sent in the command stream, written to memory) and their bytes.
     pub inline_uploads: u64,
     pub inline_bytes: u64,
@@ -179,6 +183,41 @@ pub struct Cx<'a> {
     pub syncpt: u32,
     /// 0 none, 1 submissions, 2 every method.
     pub level: u8,
+    /// The MME64 macro code of the process and the data RAM of its channels (A-208).
+    pub macros: &'a mut mme64::Store,
+    /// The QMDs of version 3 scheduled or waited for (A-210).
+    pub qmds: &'a mut qmd3::Scheduler,
+}
+
+/// GPU memory as the QMD scheduler reads and writes it.
+struct QmdMemory<'a> {
+    mem: &'a dyn GuestMemory,
+    space: &'a AddressSpace,
+}
+
+impl qmd3::Memory for QmdMemory<'_> {
+    fn read(&mut self, va: u64, out: &mut [u32]) -> Result<(), String> {
+        let mut bytes = vec![0u8; out.len() * 4];
+        if !self.space.read(self.mem, va, &mut bytes) {
+            return Err(format!(
+                "a QMD read of GPU address {va:#x}, which is not mapped"
+            ));
+        }
+        for (w, b) in out.iter_mut().zip(bytes.as_chunks::<4>().0) {
+            *w = u32::from_le_bytes(*b);
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, va: u64, words: &[u32]) -> Result<(), String> {
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        if !self.space.write(self.mem, va, &bytes) {
+            return Err(format!(
+                "a QMD release to GPU address {va:#x}, which is not mapped"
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Cx<'_> {
@@ -329,7 +368,7 @@ fn traced_macro(id: u32) -> bool {
 fn traced_register(class_num: u32, method: u32) -> bool {
     use std::sync::OnceLock;
     static LIST: OnceLock<Vec<u32>> = OnceLock::new();
-    if class_num != class::THREED {
+    if class::kind(class_num) != class::Kind::ThreeD {
         return false;
     }
     let list = LIST.get_or_init(|| {
@@ -407,6 +446,74 @@ fn topology_name(op: u32) -> String {
         .map_or_else(|| format!("primitive {op}"), |n| (*n).to_string())
 }
 
+/// The words an MME DMA read may take at once (A-208).
+const MME_DMA_WORDS: u32 = 0x1000;
+/// The methods (word indices) of a request to the falcon in the 3D and the compute classes, and
+/// the scratch register its completion shows in (A-209).
+const FALCON_3D: u32 = 0x8C4;
+const FALCON_COMPUTE: u32 = 0x144;
+const SCRATCH: u32 = 0xD00;
+
+/// What an MME64 macro sees of the engine it runs in.
+struct Macro64Host<'a, 'b> {
+    engine: &'a mut Engine,
+    cx: &'a mut Cx<'b>,
+    id: u32,
+}
+
+impl mme64::Host for Macro64Host<'_, '_> {
+    fn state(&mut self, method: u32) -> u32 {
+        let value = self.engine.reg(method);
+        if traced_macro(self.id) {
+            eprintln!(
+                "[gpu]     macro {} reads {} = {value:#x}",
+                self.id,
+                names::method_name(self.engine.class, method * 4)
+            );
+        }
+        value
+    }
+
+    fn traced(&self) -> bool {
+        traced_macro(self.id)
+    }
+
+    fn emit(&mut self, method: u32, data: u32, params: &mut VecDeque<u32>) -> Result<(), String> {
+        let class_num = self.engine.class;
+        if method >= mme64::method::CALL_FIRST {
+            return Err(format!(
+                "macro {} called a macro (a write to {})",
+                self.id,
+                names::method_name(class_num, method * 4)
+            ));
+        }
+        *self
+            .cx
+            .stats
+            .macro_writes
+            .entry((class_num, method * 4))
+            .or_default() += 1;
+        if self.cx.level >= 2 || traced_macro(self.id) {
+            eprintln!(
+                "[gpu]   macro {} writes {} = {data:#x}",
+                self.id,
+                names::method_name(class_num, method * 4)
+            );
+        }
+        // MME_DMA_READ_FIFOED(count): the words go onto the parameters the macro reads next.
+        if method == mme64::method::DMA_READ_FIFOED {
+            self.engine.regs[method as usize] = data;
+            params.extend(self.engine.dma_words(self.cx, data)?);
+            return Ok(());
+        }
+        self.engine.write(self.cx, method, data, false)
+    }
+
+    fn data_ram(&mut self) -> &mut [u32] {
+        self.cx.macros.data_ram(self.cx.channel)
+    }
+}
+
 /// What a macro sees of the engine it runs in.
 struct MacroHost<'a, 'b> {
     engine: &'a mut Engine,
@@ -448,7 +555,7 @@ impl mme::Host for MacroHost<'_, '_> {
 impl Engine {
     pub fn new(class_num: u32) -> Engine {
         let mut regs = vec![0; REGISTERS];
-        if class_num == class::THREED {
+        if class::kind(class_num) == class::Kind::ThreeD {
             // Rasterization is on until a title turns it off (it never writes the register).
             regs[m3d::SET_RASTER_ENABLE as usize] = 1;
             // The constant buffer binding group of each program slot starts as the stage it is:
@@ -508,10 +615,16 @@ impl Engine {
                 }
             );
         }
-        if self.class == class::THREED {
+        let kind = class::kind(self.class);
+        // The Switch 2's classes: macro code, macro calls and the macro engine's reads of memory
+        // go to MME64 (A-208).
+        if class::is_ampere(self.class) && self.write_ampere(cx, method, data, last)? {
+            return Ok(());
+        }
+        if kind == class::Kind::ThreeD {
             self.write_3d(cx, method, data, last)?;
         }
-        if matches!(self.class, class::COMPUTE | class::INLINE_TO_MEMORY) {
+        if matches!(kind, class::Kind::Compute | class::Kind::InlineToMemory) {
             match method {
                 i2m::reg::LAUNCH_DMA => {
                     let Engine { regs, i2m, .. } = self;
@@ -521,7 +634,7 @@ impl Engine {
                 _ => {}
             }
         }
-        if self.class == class::TWOD && method * 4 == twod::reg::PIXELS_FROM_MEMORY_SRC_Y0_INT {
+        if kind == class::Kind::TwoD && method * 4 == twod::reg::PIXELS_FROM_MEMORY_SRC_Y0_INT {
             self.blit_2d(cx)?;
         }
         // A launch: the descriptor `SEND_PCAS_A` named is scheduled (bit 1 of the signal; bit 0
@@ -533,6 +646,234 @@ impl Engine {
             self.launch_compute(cx, data)?;
         }
         Ok(())
+    }
+
+    /// A write to an engine of the Switch 2's classes that is not the Maxwell engine's: the macro
+    /// code and calls (MME64), the macro engine's reads of memory, the requests to the falcon and
+    /// the compute launches (A-208). `true` when the write is done with.
+    fn write_ampere(
+        &mut self,
+        cx: &mut Cx<'_>,
+        method: u32,
+        data: u32,
+        last: bool,
+    ) -> Result<bool, String> {
+        use mme64::method as m;
+        let kind = class::kind(self.class);
+        if !matches!(kind, class::Kind::ThreeD | class::Kind::Compute) {
+            return Ok(false);
+        }
+        if cx.macros.load(method, data) {
+            return Ok(true);
+        }
+        match method {
+            // MME_DMA_READ(count): words of memory into the data RAM, from the address the data
+            // RAM address register names.
+            m::DMA_READ => {
+                let words = self.dma_words(cx, data)?;
+                let at = self.reg(m::DATA_RAM_ADDRESS) as usize;
+                let ram = cx.macros.data_ram(cx.channel);
+                if at + words.len() > ram.len() {
+                    return Err(format!(
+                        "an MME DMA read of {} words into data RAM word {at:#x}, past its end",
+                        words.len()
+                    ));
+                }
+                ram[at..at + words.len()].copy_from_slice(&words);
+                Ok(true)
+            }
+            m::DMA_READ_FIFOED => Err(
+                "MME_DMA_READ_FIFOED outside a macro, whose parameters would take the words".into(),
+            ),
+            // A request to the falcon (the context firmware): it is acknowledged through the
+            // scratch register the macros poll, at once (A-209).
+            FALCON_3D if kind == class::Kind::ThreeD => {
+                self.regs[SCRATCH as usize] = 1;
+                Ok(false)
+            }
+            FALCON_COMPUTE if kind == class::Kind::Compute => {
+                self.regs[SCRATCH as usize] = 1;
+                Ok(false)
+            }
+            // Launches of QMDs of version 3 (A-210).
+            qmd3::method::SIGNALING_PCAS_B if kind == class::Kind::Compute => {
+                if let Some(action) = qmd3::Action::from_pcas(data) {
+                    let address = u64::from(self.reg(qmd3::method::PCAS_A)) << 8;
+                    self.qmd_action(cx, address, action)?;
+                }
+                Ok(true)
+            }
+            qmd3::method::SIGNALING_PCAS2_B if kind == class::Kind::Compute => {
+                if let Some(action) = qmd3::Action::from_pcas2(data)? {
+                    let address = u64::from(self.reg(qmd3::method::PCAS_A)) << 8;
+                    self.qmd_action(cx, address, action)?;
+                }
+                Ok(true)
+            }
+            // The last word of an inline QMD: it is written to memory, and launched when the
+            // control says so or it is not held (word 4, bit 12).
+            qmd3::method::INLINE_LAST if kind == class::Kind::Compute => {
+                let address = (u64::from(self.reg(qmd3::method::INLINE_ADDRESS_A)) << 32
+                    | u64::from(self.reg(qmd3::method::INLINE_ADDRESS_B)))
+                    << 8;
+                let first = qmd3::method::INLINE_FIRST as usize;
+                let words: Vec<u8> = self.regs[first..first + qmd3::WORDS]
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect();
+                cx.write(address, &words)?;
+                let held = self.regs[first + 4] & 1 << 12 != 0;
+                if self.reg(qmd3::method::INLINE_CONTROL) & 1 << 24 != 0 || !held {
+                    self.qmd_action(cx, address, qmd3::Action::Reload)?;
+                }
+                Ok(true)
+            }
+            m3d::CALL_MME_FIRST..=m3d::CALL_MME_LAST => {
+                let j = (method - m3d::CALL_MME_FIRST) / 2;
+                if (method - m3d::CALL_MME_FIRST).is_multiple_of(2) {
+                    if self.pending.is_some() {
+                        self.finish_macro64(cx)?;
+                    }
+                    self.pending = Some((j, vec![data]));
+                } else {
+                    match &mut self.pending {
+                        Some((id, params)) if *id == j => params.push(data),
+                        _ => {
+                            return Err(format!(
+                                "a parameter for macro {j} with no call of that macro open"
+                            ))
+                        }
+                    }
+                }
+                if last {
+                    self.finish_macro64(cx)?;
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Act on the QMD at `address` and make the launches that come of it (A-210).
+    fn qmd_action(
+        &mut self,
+        cx: &mut Cx<'_>,
+        address: u64,
+        action: qmd3::Action,
+    ) -> Result<(), String> {
+        let mut mem = QmdMemory {
+            mem: cx.mem,
+            space: cx.space,
+        };
+        let launches = cx.qmds.signal(address, action, &mut mem)?;
+        for launch in launches {
+            cx.stats.compute_launches += 1;
+            if cx.level >= 1 || trace_compute() {
+                eprintln!(
+                    "[gpu] compute launch {} (QMD {:#x}, version {:#x}): program {:#x}, grid {:?}, block {:?}",
+                    cx.stats.compute_launches,
+                    launch.address,
+                    launch.version(),
+                    launch.program(),
+                    launch.grid(),
+                    launch.block()
+                );
+            }
+            if launch.has_work() && cx.backend.is_some() {
+                cx.renderer_failed(
+                    "a compute launch",
+                    "the programs of QMD version 3 (sm_86) are not translated yet".into(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The `count` words an MME DMA read takes, from the GPU address of `SET_MME_MEM_ADDRESS_A`
+    /// and `_B` (A-208).
+    fn dma_words(&self, cx: &Cx<'_>, count: u32) -> Result<Vec<u32>, String> {
+        use mme64::method as m;
+        let va = (u64::from(self.reg(m::MEM_ADDRESS_A) & 0x1FF_FFFF) << 32)
+            | u64::from(self.reg(m::MEM_ADDRESS_B));
+        if count > MME_DMA_WORDS {
+            return Err(format!(
+                "an MME DMA read of {count} words at GPU address {va:#x}, more than {MME_DMA_WORDS}"
+            ));
+        }
+        let mut bytes = vec![0u8; count as usize * 4];
+        if !cx.space.read(cx.mem, va, &mut bytes) {
+            return Err(format!(
+                "an MME DMA read of {count} words at GPU address {va:#x}, which is not mapped"
+            ));
+        }
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect())
+    }
+
+    /// An MME64 macro call is complete: it is counted and run.
+    fn finish_macro64(&mut self, cx: &mut Cx<'_>) -> Result<(), String> {
+        let Some((id, params)) = self.pending.take() else {
+            return Ok(());
+        };
+        let e = cx.stats.macro_calls.entry(id).or_default();
+        e.0 += 1;
+        e.1 += params.len() as u64;
+        let program = std::sync::Arc::clone(&cx.macros.program);
+        let start = program.start(id);
+        let count = params.len();
+        if cx.level >= 2 || traced_macro(id) {
+            eprintln!(
+                "[gpu]   macro {id} (MME64, code at {start:#x}) called with {count} parameters: {:x?}",
+                &params[..count.min(8)]
+            );
+        }
+        if traced_macro(id) {
+            use std::collections::HashSet;
+            use std::sync::{Mutex, OnceLock};
+            static LISTED: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+            let first = LISTED
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id);
+            if first {
+                eprintln!(
+                    "[gpu]   macro {id}:\n{}",
+                    program.listing(start as usize, 48)
+                );
+            }
+        }
+        self.running = Some(id);
+        let outcome = {
+            let mut host = Macro64Host {
+                engine: &mut *self,
+                cx: &mut *cx,
+                id,
+            };
+            mme64::run(&program, start, params, &mut host)
+        };
+        self.running = None;
+        match outcome {
+            Ok(summary) => {
+                cx.stats.macro_steps += summary.steps;
+                Ok(())
+            }
+            Err(fault) => {
+                if cx.level >= 1 {
+                    eprintln!(
+                        "[gpu] macro {id} stopped ({fault}); its code from {start:#x}:\n{}",
+                        program.listing(start as usize, 40)
+                    );
+                }
+                Err(format!(
+                    "macro {id} (MME64, code at instruction {start:#x}, {count} parameters): {fault}"
+                ))
+            }
+        }
     }
 
     /// A copy was started on the 2D engine: describe it and give it to the renderer.
@@ -929,6 +1270,11 @@ impl Engine {
             // drawn, invocations) are zero, as nothing has been drawn.
             0 | 2 => {
                 let value = if report == 0 { payload } else { 0 };
+                // NVN2 releases to address 0 at the end of a command buffer; it is dropped (A-211).
+                if va == 0 && class::is_ampere(self.class) {
+                    cx.stats.releases_to_zero += 1;
+                    return Ok(());
+                }
                 if one_word {
                     cx.write(va, &value.to_le_bytes())?;
                 } else {
@@ -998,6 +1344,8 @@ mod tests {
         let (mem, space, mut sp) = world();
         let mut woken = Vec::new();
         let mut stats = Stats::default();
+        let mut macros = crate::mme64::Store::default();
+        let mut qmds = crate::qmd3::Scheduler::default();
         let r = {
             let mut cx = Cx {
                 mem: &mem,
@@ -1010,6 +1358,8 @@ mod tests {
                 channel: 1,
                 syncpt: 1,
                 level: 0,
+                macros: &mut macros,
+                qmds: &mut qmds,
             };
             f(&mut cx)
         };
@@ -1082,6 +1432,64 @@ mod tests {
         assert_eq!(stats.macro_calls.get(&3), Some(&(1, 3)));
         assert_eq!(stats.macro_calls.get(&0), Some(&(1, 1)));
         assert!(stats.macro_steps > 0);
+    }
+
+    #[test]
+    fn an_ampere_engine_runs_mme64_macros_with_their_memory_reads_and_falcon_requests() {
+        let ((), _, stats) = with_cx(|cx| {
+            let mut e = Engine::new(class::AMPERE_THREED);
+            // The macro writes its parameter to 0x200 and data RAM word 5 to 0x201; it is loaded
+            // at instruction 4 and is macro 2.
+            e.write(cx, 0x45, 4, false).unwrap();
+            for w in mme64::testing::store_macro(0x200, 5) {
+                e.write(cx, 0x46, w, false).unwrap();
+            }
+            e.write(cx, 0x47, 2, false).unwrap();
+            e.write(cx, 0x48, 4, true).unwrap();
+            // MME_DMA_READ of two words at GPU address 0x500_0010 into data RAM words 4 and 5.
+            cx.write(0x500_0010, &[1, 0, 0, 0, 0x34, 0x12, 0, 0])
+                .unwrap();
+            for (method, data) in [(0x154, 0), (0x155, 0x500_0010), (0x156, 4), (0x157, 2)] {
+                e.write(cx, method, data, true).unwrap();
+            }
+            assert_eq!(cx.macros.data_ram(cx.channel)[4..6], [1, 0x1234]);
+            e.write(cx, 0xE04, 7, true).unwrap();
+            assert_eq!((e.reg(0x200), e.reg(0x201)), (7, 0x1234));
+            // The code is the process's: another 3D engine (another channel's) has it too, with
+            // its own data RAM.
+            let mut other = Engine::new(class::AMPERE_THREED);
+            cx.channel = 2;
+            other.write(cx, 0xE04, 9, true).unwrap();
+            assert_eq!((other.reg(0x200), other.reg(0x201)), (9, 0));
+            // A request to the falcon is acknowledged in the scratch register at once.
+            e.write(cx, 0x8C4, 1, true).unwrap();
+            assert_eq!(e.reg(0xD00), 1);
+            // An inline QMD of the Ampere compute class: written to memory at 0x500_0100 (the
+            // address in units of 256 bytes), launched, and its release made to 0x500_0800.
+            let mut compute = Engine::new(class::AMPERE_COMPUTE);
+            compute.write(cx, 0xC6, 0, false).unwrap();
+            compute.write(cx, 0xC7, 0x5_0001, false).unwrap();
+            let mut qmd = [0u32; 64];
+            qmd[18] = 0x30 | 64 << 16;
+            qmd[12] = 2;
+            qmd[13] = 1;
+            qmd[14] = 1;
+            qmd[24] = 0x500_0800;
+            qmd[25] = 1 << 30 | 1 << 23;
+            qmd[26] = 0x77;
+            for (n, w) in qmd.iter().enumerate() {
+                compute.write(cx, 0xC8 + n as u32, *w, n == 63).unwrap();
+            }
+            assert_eq!(cx.read_u32(0x500_0800).unwrap(), 0x77);
+            assert_eq!(cx.read_u32(0x500_0100 + 18 * 4).unwrap(), 0x30 | 64 << 16);
+            // The same QMD scheduled again through SEND_PCAS_A and SEND_SIGNALING_PCAS2_B.
+            cx.write(0x500_0800, &[0; 4]).unwrap();
+            compute.write(cx, 0xAD, 0x5_0001, false).unwrap();
+            compute.write(cx, 0xB0, 2, true).unwrap();
+            assert_eq!(cx.read_u32(0x500_0800).unwrap(), 0x77);
+        });
+        assert_eq!(stats.macro_calls.get(&2), Some(&(2, 2)));
+        assert_eq!(stats.compute_launches, 2);
     }
 
     #[test]
