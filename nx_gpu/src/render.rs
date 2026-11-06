@@ -344,6 +344,14 @@ pub trait Backend: Send {
         Ok(())
     }
 
+    /// Whether what the renderer recorded and has not put into memory yet (launches not waited
+    /// for, their surfaces, the releases after them) may write any of the `len` bytes at `va`:
+    /// a semaphore acquire that would stop its channel waits for that work only then (A-274).
+    /// A renderer that cannot tell says yes.
+    fn may_write(&mut self, _space: &AddressSpace, _va: u64, _len: u64) -> bool {
+        true
+    }
+
     /// Whether the GPU front may read `len` bytes at `va` as memory holds them now, without
     /// waiting: nothing it gave a renderer on another thread writes them (A-288). A renderer that
     /// does everything in the call says no, and the front asks it as it always does.

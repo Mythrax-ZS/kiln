@@ -233,9 +233,9 @@ impl Channel {
                     Some(v) => v,
                     None => cx.acquire_value(va)?,
                 };
-                if !met(have) && !cx.retrying {
-                    // Before the channel stops, what is still to be released is made: it may be
-                    // what it waits for (A-274). Made again later, the acquire has that already.
+                if !met(have) && !cx.retrying && cx.renderer_may_write(va, 4) {
+                    // Before the channel stops, what is still to be released is made when it may
+                    // be what it waits for (A-274). Made again later, the acquire has that already.
                     cx.stats.front_reads[4] += 1;
                     cx.settle()?;
                     have = cx.read_u32(va)?;
@@ -539,6 +539,55 @@ mod tests {
             }
             Ok(())
         }
+        fn may_write(&mut self, _: &AddressSpace, va: u64, len: u64) -> bool {
+            self.held
+                .iter()
+                .any(|(at, data)| *at < va + len && va < at + data.len() as u64)
+        }
+    }
+
+    #[test]
+    fn an_acquire_waits_for_held_releases_only_when_they_may_write_its_word() {
+        let mut ch = channel_with(&[]);
+        let (mem, space) = env();
+        let mut sp = Syncpoints::new();
+        let (mut woken, mut stats) = (Vec::new(), Stats::default());
+        let mut macros = crate::mme64::Store::default();
+        let mut qmds = crate::qmd3::Scheduler::default();
+        let mut holding = Holding::default();
+        {
+            let mut cx = Cx {
+                mem: &mem,
+                space: &space,
+                syncpoints: &mut sp,
+                woken: &mut woken,
+                stats: &mut stats,
+                backend: Some(&mut holding),
+                lenient: false,
+                channel: 1,
+                syncpt: 1,
+                level: 0,
+                macros: &mut macros,
+                qmds: &mut qmds,
+                blocked: None,
+                retrying: false,
+            };
+            // Release 7 to one word (held), then acquire 1 at another: nothing held writes that
+            // one, so the channel stops without the held releases being made.
+            for w in [
+                write(0, 0x14, 0x500_0000, false),
+                write(0, 0x18, 7, false),
+                write(0, 0x1c, 2 | 1 << 24, false),
+                write(0, 0x14, 0x500_0010, false),
+                write(0, 0x18, 1, false),
+            ] {
+                ch.execute(&mut cx, w).unwrap();
+            }
+            ch.execute(&mut cx, write(0, 0x1c, 1, false)).unwrap();
+            assert!(cx.blocked.is_some());
+        }
+        assert_eq!(holding.settles, 0);
+        assert_eq!(holding.held.len(), 1);
     }
 
     #[test]

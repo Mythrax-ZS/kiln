@@ -1787,6 +1787,13 @@ impl Backend for Renderer {
         }
     }
 
+    fn may_write(&mut self, _space: &nx_gpu::vm::AddressSpace, va: u64, len: u64) -> bool {
+        match self.core.as_ref() {
+            Some(Ok(core)) => core.pending_may_write(va, va.saturating_add(len)),
+            _ => false,
+        }
+    }
+
     fn released_value(
         &mut self,
         space: &nx_gpu::vm::AddressSpace,

@@ -594,6 +594,16 @@ impl Core {
         self.settle(space, mem, settle::FRONT)
     }
 
+    /// Whether the launches not waited for, the surfaces still to be put and the releases still to
+    /// be made may write any of `[from, to)` (A-274).
+    pub(super) fn pending_may_write(&self, from: u64, to: u64) -> bool {
+        self.launches_pending()
+            && (self.writes_everywhere
+                || overlaps(&self.pending_writes, from, to)
+                || self.deferred.iter().any(|s| s.overlaps(from, to))
+                || self.releases.iter().any(|r| r.overlaps(from, to)))
+    }
+
     /// The word at `va` as the releases still to be made will leave it, when they alone are still
     /// to change it: no launch reaches it and no surface is to be put over it (A-274).
     pub(super) fn released_value(

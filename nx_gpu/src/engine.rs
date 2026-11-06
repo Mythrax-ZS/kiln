@@ -389,6 +389,15 @@ impl Cx<'_> {
         }
     }
 
+    /// Whether the renderer's work still to be put into memory may write `len` bytes at `va`
+    /// (yes without a renderer that can tell).
+    pub fn renderer_may_write(&mut self, va: u64, len: u64) -> bool {
+        let space = self.space;
+        self.backend
+            .as_deref_mut()
+            .is_some_and(|b| b.may_write(space, va, len))
+    }
+
     /// What was given to the renderer is done, before the front reads memory it may change
     /// (A-288).
     pub fn sync(&mut self) -> Result<(), String> {
@@ -1678,8 +1687,9 @@ impl Engine {
                     Some(v) => v,
                     None => cx.acquire_value(va)?,
                 };
-                if !met(have) && !cx.retrying {
-                    // What is still to be released may be what it waits for (A-274).
+                // What is still to be released may be what it waits for (A-274), when it can
+                // write the word at all.
+                if !met(have) && !cx.retrying && cx.renderer_may_write(va, 4) {
                     cx.stats.front_reads[4] += 1;
                     cx.settle()?;
                     have = cx.read_u32(va)?;
