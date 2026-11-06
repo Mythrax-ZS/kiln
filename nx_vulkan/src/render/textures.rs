@@ -1290,7 +1290,12 @@ impl Textures {
     /// The sampler of a header. A shader that compares against a depth needs a sampler that does
     /// (the header's own function when it has one, else less-or-equal), and one that does not must
     /// have a sampler that does not.
-    fn sampler(&mut self, vk: &Vk, tsc: Tsc, shadow: bool) -> Result<vk::Sampler, String> {
+    pub(super) fn sampler(
+        &mut self,
+        vk: &Vk,
+        tsc: Tsc,
+        shadow: bool,
+    ) -> Result<vk::Sampler, String> {
         if let Some(s) = self.samplers.get(&(tsc, shadow)) {
             return Ok(*s);
         }

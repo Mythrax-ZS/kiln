@@ -312,6 +312,23 @@ impl Core {
             None => None,
         };
         lap(&mut mark, &mut self.phases.programs, "programs");
+        // Launches not waited for are waited for now when the draw reads on the host what they
+        // write: its constant buffers, vertices, indices or texture pools (its textures are
+        // looked at one by one when they are bound), or when one of its programs reaches memory
+        // in place where a surface is still to be put (A-284).
+        if self.launches_pending() {
+            let mut programs: Vec<(&Program, u32)> = vec![(&*vs, vs_slot.group)];
+            if let (Some(p), Some(slot)) = (ps.as_deref(), ps_slot) {
+                programs.push((p, slot.group));
+            }
+            if let (Some(p), Some(slot)) = (task.as_deref(), task_slot) {
+                programs.push((p, slot.group));
+            }
+            if let Some(why) = self.draw_reads_pending(scene, draw, &programs) {
+                self.phases.draw_waits[why] += 1;
+                self.settle(scene.space, scene.mem, super::compute::settle::COMMAND)?;
+            }
+        }
 
         if self.debug.trace_textures && self.traced().is_some() {
             for group in 0..5u32 {
@@ -695,6 +712,62 @@ impl Core {
         Ok(())
     }
 
+    /// Whether the draw reads on the host what a launch not waited for writes (A-284): the
+    /// constant buffers its `programs` (with their binding groups) read, the vertex streams of
+    /// its attributes, its index buffer and the texture pools; or reaches memory in place while a
+    /// surface is still to be put.
+    /// What it reads there: 0 a constant buffer, 1 a vertex stream, 2 the index buffer, 3 a
+    /// texture pool, 4 memory in place (5 is a texture, judged when it is bound).
+    fn draw_reads_pending(
+        &self,
+        scene: &Scene<'_>,
+        draw: &Draw,
+        programs: &[(&Program, u32)],
+    ) -> Option<usize> {
+        let pending = |from: u64, to: u64| self.host_read_hazard(from, to.max(from + 1));
+        for &(p, group) in programs {
+            if p.info.global_memory && !self.deferred.is_empty() {
+                return Some(4);
+            }
+            for cb in 0..18usize {
+                if p.info.cbuf_extent[cb] == 0 && !p.info.cbuf_dynamic[cb] {
+                    continue;
+                }
+                if let Some(b) = scene.cbufs.get(group, cb as u32) {
+                    if pending(b.address, b.address + u64::from(b.size)) {
+                        return Some(0);
+                    }
+                }
+            }
+        }
+        let regs = scene.regs;
+        for i in 0..32 {
+            let a = regs.vertex_attribute(i);
+            if !a.active {
+                continue;
+            }
+            let stream = regs.vertex_stream(a.stream as usize);
+            if stream.enabled && pending(stream.address, stream.limit) {
+                return Some(1);
+            }
+        }
+        if matches!(draw.source, Source::Indexed { .. }) {
+            let ib = regs.index_buffer();
+            if pending(ib.address, ib.limit.saturating_add(1)) {
+                return Some(2);
+            }
+        }
+        let pools = regs.texture_pools();
+        (pending(
+            pools.header_address,
+            pools.header_address + 32 * u64::from(pools.header_count),
+        ) || pending(
+            pools.sampler_address,
+            pools.sampler_address + 32 * u64::from(pools.sampler_count),
+        ))
+        .then_some(3)
+    }
+
     /// Whether the instances of a draw can be one draw of that many: not for a task and mesh
     /// draw, nor when a stream an attribute reads gives one element to several instances
     /// (A-281).
@@ -956,6 +1029,8 @@ impl Core {
             self.textures.forget_bound(start, end);
         }
         let reuse = !self.sync_on && !(self.debug.trace_textures && self.traced().is_some());
+        let space = scene.space;
+        let mem = scene.mem;
         for (used, (handle, from)) in p.info.textures.iter().zip(handles) {
             let handle = *handle;
             let (tic_id, tsc_id) = (handle & 0xF_FFFF, handle >> 20);
@@ -1027,6 +1102,33 @@ impl Core {
                 &mut self.phases.texture_headers,
                 "texture_headers",
             );
+            // The image a launch stored the texture's texels in, while memory does not hold them
+            // yet: sampled as it is, with no wait for the launch (A-283).
+            if let Some(view) = self.surface_texture_view(&tic, used) {
+                let sampler = self
+                    .textures
+                    .sampler(&self.vk, tsc, used.shadow)
+                    .map_err(|e| format!("{e} [texture {}]", used.index))?;
+                self.phases.surface_textures += 1;
+                out.push((
+                    base + 24 + used.slot,
+                    vk::DescriptorImageInfo::default()
+                        .sampler(sampler)
+                        .image_view(view)
+                        .image_layout(vk::ImageLayout::GENERAL),
+                ));
+                continue;
+            }
+            // A texture whose memory a launch not waited for writes is read once the launch has
+            // run and its writes are in memory (A-284).
+            if self.launches_pending() {
+                if let Some(span) = self.textures.span(&tic, used) {
+                    if self.host_read_hazard(tic.address(), tic.address().saturating_add(span)) {
+                        self.phases.draw_waits[5] += 1;
+                        self.settle(space, mem, super::compute::settle::COMMAND)?;
+                    }
+                }
+            }
             let bound_key: super::textures::BoundKey =
                 (tic, tsc, used.dim as u8, used.arrayed, used.shadow);
             if reuse {

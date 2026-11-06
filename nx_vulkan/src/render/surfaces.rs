@@ -264,6 +264,48 @@ impl Core {
         .then_some((index, image.image, image.view))
     }
 
+    /// The view of the image a launch stored the texels of the texture `tic` in (sampled as
+    /// `used`), when they are not in memory yet and that image is the texture as it is: the same
+    /// memory, format, size and shape, one level, the components in their places (A-283).
+    pub(super) fn surface_texture_view(
+        &mut self,
+        tic: &Tic,
+        used: &nx_shader::translate::TextureUse,
+    ) -> Option<vk::ImageView> {
+        if self.deferred.is_empty() {
+            return None;
+        }
+        let span = self.textures.span(tic, used)?;
+        let (from, to) = (tic.address(), tic.address() + span);
+        let index = self.deferred.iter().rposition(|s| s.overlaps(from, to))?;
+        let shape = super::textures::shape_of(tic, used).ok()?;
+        let format = texture_format(tic.components(), tic.types()[0], tic.srgb())?;
+        let view_type = match shape.kind {
+            Kind::D2 => vk::ImageViewType::TYPE_2D,
+            Kind::D2Array => vk::ImageViewType::TYPE_2D_ARRAY,
+            Kind::D3 => vk::ImageViewType::TYPE_3D,
+            _ => return None,
+        };
+        let staged = &mut self.deferred[index];
+        let place = staged.place;
+        let image = staged.image.as_mut()?;
+        let info = &image.info;
+        let same = place.address == from
+            && place.end() == to
+            && tic.levels() <= 1
+            && !used.shadow
+            && format.vk == info.format
+            && info.view_type == view_type
+            && (info.width, info.height, info.depth, info.layers)
+                == (tic.width(), tic.height(), shape.depth, shape.layers);
+        if !same {
+            return None;
+        }
+        // The header's arrangement of the components (a texture of one or two of them reads
+        // the others as 0 and 1), in a view of its own.
+        self.vk.swizzled_view(image, tic.view_mapping()).ok()
+    }
+
     /// The image a surface of header `tic` used as `used` is made in, and where its texels lie.
     pub(super) fn surface_plan(
         &self,
@@ -343,7 +385,10 @@ impl Core {
             depth,
             layers,
             levels: 1,
+            // Sampled too: a texture over the surface's memory is the image itself while memory
+            // does not hold its texels yet (A-283).
             usage: vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::SAMPLED
                 | vk::ImageUsageFlags::TRANSFER_DST
                 | vk::ImageUsageFlags::TRANSFER_SRC,
             view_type,
@@ -491,11 +536,12 @@ impl Core {
                         staging.buffer,
                         &regions,
                     );
-                    // Back to the general layout, for a later launch to use as it is (A-280).
+                    // Back to the general layout, for a later launch to use as it is (A-280) and
+                    // a later draw or launch to sample (A-283).
                     d.cmd_pipeline_barrier(
                         cmd,
                         vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::DependencyFlags::empty(),
                         &[],
                         &[],

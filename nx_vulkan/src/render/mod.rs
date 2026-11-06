@@ -214,6 +214,12 @@ struct Phases {
     instances: [u64; 2],
     /// Texture bindings taken from those found earlier in the frame, and looked for (A-282).
     bound_reused: [u64; 2],
+    /// Textures sampled from the image a launch stored them in (A-283).
+    surface_textures: u64,
+    /// Draws that waited for launches, by what they read that a launch writes (A-284): a
+    /// constant buffer, a vertex stream, the index buffer, a texture pool, memory in place, a
+    /// texture.
+    draw_waits: [u64; 6],
     /// Finding the translated programs (comparing them with memory).
     programs: std::time::Duration,
     /// The texture handles, headers, images and samplers.
@@ -1077,7 +1083,8 @@ impl Core {
 impl Renderer {
     fn draw_command(&mut self, scene: &Scene<'_>, draw: &Draw) -> Result<(), String> {
         let core = self.core()?;
-        core.settle(scene.space, scene.mem, compute::settle::COMMAND)?;
+        // The launches before the draw are waited for when it reads on the host what they write
+        // (in `Core::draw`, A-284).
         let mut result = core.draw(scene, draw);
         core.batch_draws += 1;
         core.commands_seen += 1;
@@ -1159,7 +1166,8 @@ impl Renderer {
 
     fn clear_command(&mut self, scene: &Scene<'_>, clear: &Clear) -> Result<(), String> {
         let core = self.core()?;
-        core.settle(scene.space, scene.mem, compute::settle::COMMAND)?;
+        // A clear reads nothing of memory on the host: the launches before it are not waited
+        // for (A-284); the device runs it after them anyway.
         let result = core.clear(scene, clear);
         core.commands_seen += 1;
         if let Some(frame) = core.traced() {
@@ -1359,13 +1367,15 @@ impl Renderer {
                         ph.forwarded
                     );
                     eprintln!(
-                        "[vulkan] frame {}: putting the surfaces into memory took {:?} for {} MiB; {} surfaces were made from memory in {:?} ({} MiB)",
+                        "[vulkan] frame {}: putting the surfaces into memory took {:?} for {} MiB; {} surfaces were made from memory in {:?} ({} MiB); {} textures were sampled from a launch's image; draws waited for launches {:?} (constant buffers, vertices, indices, texture pools, memory in place, textures)",
                         p.frame,
                         ph.surfaces_put.0,
                         ph.surfaces_put.1 >> 20,
                         ph.surfaces_filled.0,
                         ph.surfaces_filled.1,
-                        ph.surfaces_filled.2 >> 20
+                        ph.surfaces_filled.2 >> 20,
+                        ph.surface_textures,
+                        ph.draw_waits
                     );
                 }
                 let s = std::mem::take(&mut self.spent);

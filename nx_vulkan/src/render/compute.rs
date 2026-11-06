@@ -493,6 +493,15 @@ impl Core {
         sent
     }
 
+    /// Whether a launch not waited for writes `[from, to)` (GPU addresses) in place, or a surface
+    /// still to be put there covers it: what the host reads there now is not what the commands
+    /// after the launch must see (A-284).
+    pub(super) fn host_read_hazard(&self, from: u64, to: u64) -> bool {
+        self.writes_everywhere
+            || overlaps(&self.pending_writes, from, to)
+            || self.deferred.iter().any(|s| s.overlaps(from, to))
+    }
+
     /// Compute launches were recorded whose effects are not all in memory yet.
     pub(super) fn launches_pending(&self) -> bool {
         self.reach_everywhere
@@ -656,6 +665,12 @@ impl Core {
         for used in &program.info.textures {
             let slot = used.source.unwrap_or(TEXTURE_TABLE);
             if let Some(tic) = handle(slot, used.index).and_then(header) {
+                // A texture that is the image a launch before stored, not in memory yet, is
+                // sampled as it is (A-283): no wait. What global writes put there is under what
+                // the surface puts there afterwards anyway (A-274).
+                if self.surface_texture_view(&tic, used).is_some() {
+                    continue;
+                }
                 let span = self.textures.span(&tic, used).unwrap_or(1);
                 spans.push((tic.address(), span, 2));
             }
