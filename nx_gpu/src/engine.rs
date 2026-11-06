@@ -431,6 +431,8 @@ pub struct Engine {
     /// A draw not given to the renderer yet: the next instances of its series join it while
     /// nothing the renderer reads changes (A-281).
     held_draw: Option<Draw>,
+    /// The engine is of a 3D class.
+    three_d: bool,
     /// The constant buffers bound to each slot of each binding group.
     pub cbufs: CbufBindings,
     /// The inline-to-memory engine (the compute and inline-to-memory classes).
@@ -452,6 +454,46 @@ fn traced_macro(id: u32) -> bool {
 
 /// `NX_TRACE_REGISTER=<byte offset>[,...]` (hexadecimal) in the environment: print each write to
 /// those methods of the 3D engine, with the number of draws so far.
+/// The methods of a 3D engine (word indices) that do something when they are written, besides
+/// setting their register: macro code and calls, the macro engine's reads of memory and requests
+/// to the falcon, semaphores, constant buffer loads and binds, the methods that begin, end and
+/// make draws, and clears (what `write_3d` and `write_ampere` act on).
+fn special_3d(method: u32) -> bool {
+    use mme64::method as m;
+    matches!(
+        method,
+        m3d::LOAD_MME_INSTRUCTION_RAM_POINTER..=m3d::LOAD_MME_START_ADDRESS_RAM
+            | m::DMA_READ
+            | m::DMA_READ_FIFOED
+            | FALCON_3D
+            | m3d::REPORT_SEMAPHORE_D
+            | m3d::CALL_MME_FIRST..=m3d::CALL_MME_LAST
+            | m3d::LOAD_CONSTANT_BUFFER_FIRST..=m3d::LOAD_CONSTANT_BUFFER_LAST
+            | m3d::BIND_GROUP_CONSTANT_BUFFER..=m3d::BIND_GROUP_CONSTANT_BUFFER_LAST
+            | m3d::BEGIN
+            | m3d::END
+            | m3d::DRAW_INLINE_VERTEX
+            | m3d::DRAW_INLINE_INDEX
+            | m3d::DRAW_INLINE_INDEX2X16
+            | m3d::DRAW_INLINE_INDEX4X8
+            | m3d::DRAW_VERTEX_ARRAY
+            | m3d::DRAW_VERTEX_ARRAY_BEGIN_END_FIRST
+            | m3d::DRAW_VERTEX_ARRAY_BEGIN_END_SUBSEQUENT
+            | m3d::DRAW_INDEX_BUFFER
+            | m3d::DRAW_INDEX_BEGIN_END_FIRST..=m3d::DRAW_INDEX_BEGIN_END_LAST
+            | m3d::DRAW_AUTO
+            | m3d::DRAW_ZERO_INDEX
+            | m3d::CLEAR_SURFACE
+    )
+}
+
+/// Whether `NX_TRACE_REGISTER` names any register (then every write is looked at).
+fn any_traced_register() -> bool {
+    use std::sync::OnceLock;
+    static ANY: OnceLock<bool> = OnceLock::new();
+    *ANY.get_or_init(|| std::env::var("NX_TRACE_REGISTER").is_ok_and(|v| !v.trim().is_empty()))
+}
+
 fn traced_register(class_num: u32, method: u32) -> bool {
     use std::sync::OnceLock;
     static LIST: OnceLock<Vec<u32>> = OnceLock::new();
@@ -669,6 +711,7 @@ impl Engine {
             inline_elements: 0,
             instance: 0,
             held_draw: None,
+            three_d: class::kind(class_num) == class::Kind::ThreeD,
             cbufs: CbufBindings::default(),
             i2m: I2m::default(),
         }
@@ -691,6 +734,18 @@ impl Engine {
         data: u32,
         last: bool,
     ) -> Result<(), String> {
+        // Most writes of a 3D engine set a register that does nothing by itself: stored, and a
+        // held draw goes to the renderer first when the value changes (A-281).
+        if self.three_d && !special_3d(method) && !any_traced_register() {
+            if let Some(&old) = self.regs.get(method as usize) {
+                if self.held_draw.is_some() && old != data {
+                    self.flush_draw(cx)?;
+                }
+                self.regs[method as usize] = data;
+                crate::progress::method();
+                return Ok(());
+            }
+        }
         if self.held_draw.is_some() && !self.keeps_held_draw(method, data) {
             self.flush_draw(cx)?;
         }
