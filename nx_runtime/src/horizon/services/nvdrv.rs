@@ -498,7 +498,7 @@ impl Shared {
             w.drain(Duration::from_secs(10));
         }
         let core = self.core.lock().unwrap_or_else(|e| e.into_inner());
-        if core.gpu.level >= 1 && core.gpu.stats.submits > 0 {
+        if core.gpu.reports() && core.gpu.stats.submits > 0 {
             // `NX_GPU_TOP` is how many of the busiest methods the report lists (25 if unset, all
             // of them for 0).
             let top = match std::env::var("NX_GPU_TOP")

@@ -206,6 +206,13 @@ impl Gpu {
         }
     }
 
+    /// Whether what the processor counted is reported when the process ends: `NX_TRACE_GPU` is 1
+    /// or more, or `NX_TRACE_GPU_WINDOW` asked for that while its frames were shown (what the
+    /// report then says is of those frames).
+    pub fn reports(&self) -> bool {
+        self.base_level >= 1 || self.window.is_some_and(|(_, _, level)| level >= 1)
+    }
+
     /// A buffer is queued for display: the frame number says which trace level the commands run
     /// from now on get.
     pub fn note_frame(&mut self, number: u64) {
