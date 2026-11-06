@@ -56,8 +56,9 @@ pub struct Stats {
     pub per_method: BTreeMap<(u32, u32), u64>,
     /// Macro calls per macro number: (calls, parameters).
     pub macro_calls: BTreeMap<u32, (u64, u64)>,
-    /// Instructions the macros ran.
+    /// Instructions the macros ran, and the macro calls (counted whatever the trace level).
     pub macro_steps: u64,
+    pub macro_runs: u64,
     /// Method writes the macros made, per (class, byte offset of the method).
     pub macro_writes: BTreeMap<(u32, u32), u64>,
     pub draws: DrawStats,
@@ -983,6 +984,7 @@ impl Engine {
         let Some((id, params)) = self.pending.take() else {
             return Ok(());
         };
+        cx.stats.macro_runs += 1;
         // Counted for the report of `NX_TRACE_GPU`, which alone shows it.
         if cx.level >= 1 {
             let e = cx.stats.macro_calls.entry(id).or_default();
@@ -1441,6 +1443,7 @@ impl Engine {
         let Some((id, params)) = self.pending.take() else {
             return Ok(());
         };
+        cx.stats.macro_runs += 1;
         // Counted for the report of `NX_TRACE_GPU`, which alone shows it.
         if cx.level >= 1 {
             let e = cx.stats.macro_calls.entry(id).or_default();

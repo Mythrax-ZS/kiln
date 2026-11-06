@@ -129,6 +129,19 @@ pub struct Gpu {
     later: Vec<EventToken>,
     next_space: u32,
     next_channel: u32,
+    /// `NX_TRACE_PERF`: the time spent running methods (the renderer's calls among them) and the
+    /// counts as of the last report, said every 100 frames.
+    perf: Option<FrontPerf>,
+}
+
+/// What the GPU front did since its last report (`NX_TRACE_PERF`).
+#[derive(Default)]
+struct FrontPerf {
+    ran: std::time::Duration,
+    methods: u64,
+    words: u64,
+    macro_runs: u64,
+    macro_steps: u64,
 }
 
 /// The window `NX_TRACE_GPU_WINDOW` names: `<first frame>:<last frame>:<level>`.
@@ -170,6 +183,7 @@ impl Gpu {
             later: Vec::new(),
             next_space: 1,
             next_channel: 1,
+            perf: std::env::var_os("NX_TRACE_PERF").map(|_| FrontPerf::default()),
         }
     }
 
@@ -193,6 +207,24 @@ impl Gpu {
     /// A buffer is queued for display: the frame number says which trace level the commands run
     /// from now on get.
     pub fn note_frame(&mut self, number: u64) {
+        if let (Some(p), true) = (self.perf.as_mut(), number.is_multiple_of(100)) {
+            let s = &self.stats;
+            eprintln!(
+                "[gpu] frame {number}: the last frames ran methods for {:?} (with the renderer's calls among them): {} methods, {} words, {} macro calls running {} instructions",
+                p.ran,
+                s.methods - p.methods,
+                s.words - p.words,
+                s.macro_runs - p.macro_runs,
+                s.macro_steps - p.macro_steps
+            );
+            *p = FrontPerf {
+                ran: std::time::Duration::ZERO,
+                methods: s.methods,
+                words: s.words,
+                macro_runs: s.macro_runs,
+                macro_steps: s.macro_steps,
+            };
+        }
         if let Some((first, last, level)) = self.window {
             self.level = if (first..=last).contains(&number) {
                 level
@@ -513,6 +545,7 @@ impl Gpu {
                 .channels
                 .remove(&job.channel)
                 .ok_or(SubmitError::Nv(NvError::INVALID_STATE))?;
+            let started = self.perf.as_ref().map(|_| std::time::Instant::now());
             let result = (|| {
                 let space = self
                     .spaces
@@ -564,6 +597,9 @@ impl Gpu {
                 Ok(None)
             })();
             self.channels.insert(job.channel, ch);
+            if let (Some(p), Some(started)) = (self.perf.as_mut(), started) {
+                p.ran += started.elapsed();
+            }
             if let Some(why) = result? {
                 return Ok(Advance::Blocked(why));
             }
