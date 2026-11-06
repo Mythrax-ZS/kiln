@@ -176,7 +176,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   60th frame it decodes as a picture; `NX_MAX_FRAMES=<n>` ends the run after `n` presented
   frames; `NX_SAVE_DIR=<dir>` is where save data goes (default `./nx_save`). `kiln symbols --exefs <dir> [--match <text>]
   [<address>...]` names the function around an address, for reading the return addresses a stop
-  report ends with. `NX_TRACE_AS=1` says every mapping the program makes in the GPU's address space
+  report ends with, and `kiln disasm --exefs <dir> <address> [<count>]` prints the instructions
+  there as the decoder reads them. `NX_TRACE_AS=1` says every mapping the program makes in the GPU's address space
   (`MAP_BUFFER_EX`, `REMAP`, `UNMAP_BUFFER`) and `NX_TRACE_UPLOADS=<hex guest address>:<hex length>`
   every inline upload that reaches that range of the guest's memory; with `NX_TRAP_WRITES` (the
   writes of the program's own code) they say who fills a buffer or a texture, and when, against the

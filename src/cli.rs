@@ -25,6 +25,7 @@ usage:
                  [--hints <file>] [--shared] [--keep-ir] [--main-only] [--romfs <dir|image>] [--reuse-objects]
   kiln relink  --out <dir> --name <name>
   kiln symbols (--exefs <dir|pfs0> | --nro <file>) [--match <text>] [<address>...]
+  kiln disasm  (--exefs <dir|pfs0> | --nro <file>) <address> [<count>]
   kiln doctor
   kiln --version
 
@@ -401,12 +402,50 @@ pub fn run(argv: &[String]) -> Result<String> {
         "build" => build_command(&args),
         "relink" => relink_command(&args),
         "symbols" => symbols_command(&args),
+        "disasm" => disasm_command(&args),
         "doctor" => Ok(doctor()),
         other => Err(Error::format(
             "command line",
             format!("unknown command `{other}`"),
         )),
     }
+}
+
+/// `kiln disasm --exefs <dir> <address> [<count>]`: the instructions at a guest address (32 by
+/// default) as the decoder reads them, to follow what a function does.
+fn disasm_command(args: &Args) -> Result<String> {
+    let number = |text: &str| {
+        text.strip_prefix("0x")
+            .map_or_else(|| text.parse::<u64>(), |h| u64::from_str_radix(h, 16))
+            .map_err(|_| Error::format("command line", format!("`{text}` is not a number")))
+    };
+    let at = number(
+        args.positional
+            .first()
+            .ok_or_else(|| Error::format("command line", "disasm needs an address"))?,
+    )?;
+    let count = args.positional.get(1).map_or(Ok(32), |c| number(c))?;
+    let program = load_program(args)?;
+    let module = program
+        .modules
+        .iter()
+        .find(|m| at >= m.base && at - m.base < m.image.len() as u64)
+        .ok_or_else(|| Error::format("command line", format!("{at:#x} is in no module")))?;
+    let mut out = String::new();
+    for i in 0..count {
+        let addr = at + 4 * i;
+        let offset = (addr - module.base) as usize;
+        let Some(bytes) = module.image.get(offset..offset + 4) else {
+            break;
+        };
+        let word = u32::from_le_bytes(bytes.try_into().expect("four bytes"));
+        let _ = writeln!(
+            out,
+            "{addr:#x}: {word:08x}  {:?}",
+            nx_runtime::a64::decode(word)
+        );
+    }
+    Ok(out)
 }
 
 /// `kiln symbols --exefs <dir> <address>...`: the exported function each guest address lies in,
@@ -688,6 +727,18 @@ mod tests {
         assert!(out.contains("0x8000180: nnMain"), "{out}");
         assert!(run(&argv(&["symbols", "--exefs", &exefs, "banana"])).is_err());
         assert!(run(&argv(&["symbols"])).is_err());
+    }
+
+    #[test]
+    fn disasm_decodes_the_words_at_an_address() {
+        let t = TempDir::new("cli-disasm");
+        t.write("exefs/main", &synthetic_nso());
+        let exefs = t.join("exefs").display().to_string();
+        let out = run(&argv(&["disasm", "--exefs", &exefs, "0x8000000", "2"])).unwrap();
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(out.starts_with("0x8000000: "), "{out}");
+        assert!(run(&argv(&["disasm", "--exefs", &exefs, "0x1"])).is_err());
+        assert!(run(&argv(&["disasm", "--exefs", &exefs])).is_err());
     }
     #[test]
     fn inspect_reports_exefs_nso_npdm_and_romfs() {
