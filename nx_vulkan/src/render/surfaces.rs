@@ -607,6 +607,7 @@ impl Core {
                 let n = space.read_prefix(mem, at, &mut tiled);
                 tiled.truncate(n);
                 place.lay_out(linear, &mut tiled);
+                self.phases.surfaces_put.1 += tiled.len() as u64;
                 if !space.write(mem, at, &tiled) {
                     result = Err(format!(
                         "a surface's memory at GPU address {at:#x} is not mapped"

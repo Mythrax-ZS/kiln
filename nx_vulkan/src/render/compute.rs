@@ -516,7 +516,9 @@ impl Core {
         self.phases.settles[cause] += 1;
         let waited = self.flush();
         let deferred = std::mem::take(&mut self.deferred);
+        let put = std::time::Instant::now();
         let written = waited.and_then(|()| self.write_staged(space, mem, deferred));
+        self.phases.surfaces_put.0 += put.elapsed();
         self.pending_writes.clear();
         self.pending_reach.clear();
         self.writes_everywhere = false;

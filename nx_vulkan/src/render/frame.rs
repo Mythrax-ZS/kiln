@@ -66,6 +66,9 @@ pub struct Frame {
     pub returned: Vec<crate::image::Image>,
     /// The device was lost: nothing more is asked of it.
     lost: bool,
+    /// How long the renderer waited for the device to finish a batch, how many batches it waited
+    /// for, and how long sending the batches took, for the report.
+    pub device_wait: (std::time::Duration, u64, std::time::Duration),
 }
 
 /// Something a submission needed that can be destroyed after it ran.
@@ -128,6 +131,7 @@ impl Frame {
                 flying: VecDeque::new(),
                 garbage: Vec::new(),
                 returned: Vec::new(),
+                device_wait: Default::default(),
                 lost: false,
             })
         }
@@ -371,6 +375,7 @@ impl Frame {
             return Ok(());
         }
         let current = self.current;
+        let sending = &mut self.device_wait.2;
         let result = {
             let slot = &mut self.slots[current];
             // SAFETY: the command buffers are recording; the fence is unsignaled and belongs to
@@ -394,9 +399,11 @@ impl Frame {
                     }
                     let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
                     let _phase = nx_gpu::progress::enter(nx_gpu::progress::SUBMITTING);
+                    let started = std::time::Instant::now();
                     vk.device
                         .queue_submit(vk.queue, &submit, slot.fence)
                         .map_err(|e| (format!("submitting the commands: {e}"), lost(e)))?;
+                    *sending += started.elapsed();
                     Ok(())
                 })()
             }
@@ -432,12 +439,15 @@ impl Frame {
         };
         let fence = self.slots[index].fence;
         let _phase = nx_gpu::progress::enter(nx_gpu::progress::WAITING_FOR_DEVICE);
+        let started = std::time::Instant::now();
         // SAFETY: the fence was submitted with the slot's batch and is waited for once.
         let waited = unsafe {
             vk.device
                 .wait_for_fences(&[fence], true, 120_000_000_000)
                 .and_then(|()| vk.device.reset_fences(&[fence]))
         };
+        self.device_wait.0 += started.elapsed();
+        self.device_wait.1 += 1;
         if let Err(e) = waited {
             if e == vk::Result::ERROR_DEVICE_LOST {
                 self.lost = true;

@@ -244,6 +244,9 @@ struct Phases {
     /// global memory over a surface still to be put, and surfaces after global writes and after
     /// surfaces.
     hazard_kinds: [u64; 7],
+    /// How long putting the launches' surfaces into memory took and how many bytes they were.
+    surfaces_put: (std::time::Duration, u64),
+
     /// Surfaces that were the image a launch before wrote (A-280).
     forwarded: u64,
 }
@@ -1227,6 +1230,11 @@ impl Renderer {
                         );
                     }
                 }
+                let (waited, batches, sending) = std::mem::take(&mut core.frame.device_wait);
+                eprintln!(
+                    "[vulkan] frame {}: waited {waited:?} for the device to finish {batches} batches; sending them took {sending:?}",
+                    p.frame
+                );
                 let copies = std::mem::take(&mut core.memory_copies);
                 if copies > 0 {
                     eprintln!(
@@ -1288,6 +1296,12 @@ impl Renderer {
                         ph.hazard_kinds,
                         ph.settles[3],
                         ph.forwarded
+                    );
+                    eprintln!(
+                        "[vulkan] frame {}: putting the surfaces into memory took {:?} for {} MiB",
+                        p.frame,
+                        ph.surfaces_put.0,
+                        ph.surfaces_put.1 >> 20
                     );
                 }
                 let s = std::mem::take(&mut self.spent);
