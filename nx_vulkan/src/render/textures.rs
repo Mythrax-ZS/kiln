@@ -973,6 +973,9 @@ pub struct Textures {
     pub hash_reasons: [(u64, u64); 4],
     /// Textures made or brought up to date from memory: (new, changed, bytes), for the report.
     pub made: (u64, u64, u64),
+    /// Comparisons with memory, for the report: (times, time) found in this frame already, found
+    /// unchanged by the tracking at once, and looked at in full.
+    pub compares: [(u64, std::time::Duration); 3],
     /// How long making them took.
     pub making: std::time::Duration,
     /// Samplers by header and by whether the shader compares against a depth.
@@ -1024,6 +1027,43 @@ pub struct Near {
     pub start: u64,
     pub end: u64,
     pub targets: Vec<(Key, u64, bool)>,
+}
+
+/// Counts the time of a full comparison of a texture with memory, however it ends.
+struct FullCompare(std::time::Instant, u64, u64, String);
+
+thread_local! {
+    static FULL_COMPARES: std::cell::Cell<(u64, std::time::Duration)> =
+        const { std::cell::Cell::new((0, std::time::Duration::ZERO)) };
+    /// The slowest full comparisons since the last report: (time, GPU address, bytes).
+    static SLOWEST: std::cell::RefCell<Vec<(std::time::Duration, u64, u64, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl Drop for FullCompare {
+    fn drop(&mut self) {
+        let spent = self.0.elapsed();
+        FULL_COMPARES.with(|c| {
+            let (n, t) = c.get();
+            c.set((n + 1, t + spent));
+        });
+        SLOWEST.with(|s| {
+            let mut s = s.borrow_mut();
+            s.push((spent, self.1, self.2, std::mem::take(&mut self.3)));
+            s.sort_by_key(|e| std::cmp::Reverse(e.0));
+            s.truncate(6);
+        });
+    }
+}
+
+/// The full comparisons counted since the last call.
+pub fn take_full_compares() -> (u64, std::time::Duration) {
+    FULL_COMPARES.with(|c| c.replace((0, std::time::Duration::ZERO)))
+}
+
+/// The slowest full comparisons since the last call.
+pub fn take_slowest() -> Vec<(std::time::Duration, u64, u64, String)> {
+    SLOWEST.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
 
 /// The bytes of a layer's memory that are hashed together: a write of the renderer into a few
@@ -1395,8 +1435,11 @@ impl Textures {
         // A texture compared with memory in this frame already is not read again.
         let current = self.frame;
         let key = (tic, shape);
+        let entered = std::time::Instant::now();
         if let Some(t) = self.map.get(&key) {
             if t.checked == current {
+                self.compares[0].0 += 1;
+                self.compares[0].1 += entered.elapsed();
                 return Ok(t.image.view);
             }
         }
@@ -1424,10 +1467,14 @@ impl Textures {
                 {
                     t.checked = current;
                     t.epoch = self.epoch;
-                    return Ok(t.image.view);
+                    let view = t.image.view;
+                    self.compares[1].0 += 1;
+                    self.compares[1].1 += entered.elapsed();
+                    return Ok(view);
                 }
             }
         }
+        let mut _full = FullCompare(entered, tic.address(), 0, String::new());
         let types = tic.types();
         let Some(format) = texture_format(tic.components(), types[0], tic.srgb()) else {
             return Err(format!(
@@ -1476,6 +1523,13 @@ impl Textures {
             total,
             ..
         } = plan(&tic, shape, format)?;
+        _full.2 = total;
+        _full.3 = format!(
+            "{width}x{height}x{depth}, {layers} layers, {levels} levels, {:?} {:?}, pitch {}",
+            format.vk,
+            shape.kind,
+            tic.is_pitch()
+        );
         // Memory that the system tracks the writes of needs no reading to be found unchanged;
         // the epoch of tracking is begun once a frame, at the first comparison.
         if self.epoch_frame != current {
@@ -1613,6 +1667,7 @@ impl Textures {
         }
         let _phase = nx_gpu::progress::enter(nx_gpu::progress::MAKING_TEXTURE);
         let making = std::time::Instant::now();
+        _full.3 += &format!(", compared in {:?}", making - entered);
         if existed {
             self.made.1 += 1;
         } else {
