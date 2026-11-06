@@ -973,6 +973,8 @@ pub struct Textures {
     pub hash_reasons: [(u64, u64); 4],
     /// Textures made or brought up to date from memory: (new, changed, bytes), for the report.
     pub made: (u64, u64, u64),
+    /// How long making them took.
+    pub making: std::time::Duration,
     /// Samplers by header and by whether the shader compares against a depth.
     samplers: FastMap<(Tsc, bool), vk::Sampler>,
     /// The number of buffers shown so far: a texture is compared with memory once per frame.
@@ -1610,6 +1612,7 @@ impl Textures {
             }
         }
         let _phase = nx_gpu::progress::enter(nx_gpu::progress::MAKING_TEXTURE);
+        let making = std::time::Instant::now();
         if existed {
             self.made.1 += 1;
         } else {
@@ -1947,6 +1950,7 @@ impl Textures {
                 );
             }
         }
+        self.making += making.elapsed();
         Ok(view)
     }
 

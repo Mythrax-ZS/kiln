@@ -138,6 +138,8 @@ pub struct Gpu {
 #[derive(Default)]
 struct FrontPerf {
     ran: std::time::Duration,
+    /// Waiting for what the renderer recorded at the ends of submissions, and how often.
+    ends: (std::time::Duration, u64),
     methods: u64,
     words: u64,
     macro_runs: u64,
@@ -210,15 +212,18 @@ impl Gpu {
         if let (Some(p), true) = (self.perf.as_mut(), number.is_multiple_of(100)) {
             let s = &self.stats;
             eprintln!(
-                "[gpu] frame {number}: the last frames ran methods for {:?} (with the renderer's calls among them): {} methods, {} words, {} macro calls running {} instructions",
+                "[gpu] frame {number}: the last frames ran methods for {:?} (with the renderer's calls among them): {} methods, {} words, {} macro calls running {} instructions; the ends of {} submissions waited {:?} for the renderer",
                 p.ran,
                 s.methods - p.methods,
                 s.words - p.words,
                 s.macro_runs - p.macro_runs,
-                s.macro_steps - p.macro_steps
+                s.macro_steps - p.macro_steps,
+                p.ends.1,
+                p.ends.0
             );
             *p = FrontPerf {
                 ran: std::time::Duration::ZERO,
+                ends: (std::time::Duration::ZERO, 0),
                 methods: s.methods,
                 words: s.words,
                 macro_runs: s.macro_runs,
@@ -614,10 +619,15 @@ impl Gpu {
         // What was recorded for the renderer is finished before any fence says it is, and what it
         // writes in place is in memory with the releases that follow it (A-274).
         if let Some(backend) = self.backend.as_deref_mut() {
+            let started = self.perf.as_ref().map(|_| std::time::Instant::now());
             let settled = match self.spaces.get(&job.space) {
                 Some(space) => backend.settle(space, &*self.mem, None),
                 None => Ok(()),
             };
+            if let (Some(p), Some(started)) = (self.perf.as_mut(), started) {
+                p.ends.0 += started.elapsed();
+                p.ends.1 += 1;
+            }
             if let Err(why) = settled.and_then(|()| backend.finish()) {
                 if self.lenient {
                     eprintln!("[gpu] the renderer could not finish a submission: {why}");

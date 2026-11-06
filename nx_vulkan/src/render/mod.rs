@@ -1304,11 +1304,12 @@ impl Renderer {
                 );
                 let made = std::mem::take(&mut core.textures.made);
                 eprintln!(
-                    "[vulkan] frame {}: textures made from memory: {} new, {} again (their memory changed), {} MiB",
+                    "[vulkan] frame {}: textures made from memory: {} new, {} again (their memory changed), {} MiB, in {:?}",
                     p.frame,
                     made.0,
                     made.1,
-                    made.2 >> 20
+                    made.2 >> 20,
+                    std::mem::take(&mut core.textures.making)
                 );
                 let why = std::mem::take(&mut core.textures.hash_reasons);
                 eprintln!(
