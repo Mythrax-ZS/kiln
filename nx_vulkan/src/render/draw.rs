@@ -815,8 +815,11 @@ impl Core {
             self.depth_read_only = true;
             layout = vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL;
         }
-        // Leaving the rendering is what lets the image change layout.
-        self.end_pass();
+        // Leaving the rendering is what lets the image change layout; a target in that layout
+        // already (read by a draw before, not drawn to since) is read inside the rendering.
+        if self.targets.existing(&key).is_none_or(|t| t.layout != layout) {
+            self.end_pass();
+        }
         let cmd = self.frame.cmd(&self.vk)?;
         let Some(target) = self.targets.existing(&key) else {
             return Ok(None);
