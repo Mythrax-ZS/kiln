@@ -15,11 +15,19 @@ programs come and whether each is carried out.
 - **733 entry points named.** The read-only data of the title's `main` holds the names of 733
   distinct NVN2 entry points (`nvn…`). That is the API the title fetches by name through
   `nvnBootstrapLoader`.
-- **Served by the title's own driver.** The loader is exported by another module, almost
-  certainly the SDK's: it is the only other module with NVN names (58 of them). That driver runs
-  recompiled like the rest of the title.
-- **Not measured:** how many of the 733 a run calls. Calls into recompiled code are not counted.
-  What those calls produce is counted below, at the services and the GPU front.
+- **Served by the title's own driver.** The loader is exported by the SDK's module (the module
+  also holds `nn::os` and the other SDK libraries), and that driver runs recompiled like the rest
+  of the title.
+- **Reached in a run:** `NX_CENSUS` counts the targets of indirect branches, which is how the
+  title calls NVN2. In a run of 3,500 frames, from the menus into the race:
+  - 306 distinct functions of the driver's code were entered through pointers, 48,969,462 times
+    in all (about 11% of the 458,889,924 indirect branches). The driver's code is taken to be the
+    targets whose nearest export before them is an `nvn…` symbol.
+  - That count covers the entry points the title calls and the driver's own calls through
+    pointers.
+  - It is a lower bound: the census lists the 12,862 most frequent of 22,274 targets, which leaves
+    out only targets called about once each (some 12,000 branches together).
+- What those calls produce is counted below, at the services and the GPU front.
 
 ## The system
 
