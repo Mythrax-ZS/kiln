@@ -26,6 +26,9 @@ const IMPORT_WINDOW: u64 = 16 << 20;
 /// The largest size word taken as a storage buffer's size.
 const LARGEST_BUFFER: u64 = 1 << 30;
 
+/// The storage buffers a table reaches, and the address space (its id and version).
+type TableKey = (Vec<(u64, u64)>, u64, u64);
+
 #[derive(Default)]
 pub struct GlobalMemory {
     /// Imported host memory by (aligned host address, size), with the frame it was last used in.
@@ -41,6 +44,11 @@ pub struct GlobalMemory {
     failures: HashMap<String, u64>,
     /// Imports made since the last report, and the time they took (`NX_TRACE_PERF`).
     pub made: (u64, std::time::Duration),
+    /// The tables put in upload memory since the batch began, by the buffers they reach and the
+    /// address space (its id and version), and the batch: a draw that reaches the same buffers
+    /// uses the same table.
+    tables: HashMap<TableKey, (vk::Buffer, u64, u64)>,
+    tables_batch: u64,
 }
 
 fn mix(h: u64, v: u64) -> u64 {
@@ -215,6 +223,14 @@ impl GlobalMemory {
         now: u64,
     ) -> Result<(vk::Buffer, u64, u64), String> {
         self.sweep(frame, now);
+        if self.tables_batch != frame.sent {
+            self.tables.clear();
+            self.tables_batch = frame.sent;
+        }
+        let key = (buffers.to_vec(), scene.space.id(), scene.space.version());
+        if let Some(&made) = self.tables.get(&key) {
+            return Ok(made);
+        }
         if self.scratch.is_none() {
             self.scratch = Some(vk.create_host_buffer(
                 PAGE,
@@ -272,7 +288,14 @@ impl GlobalMemory {
         let words = table_words(scratch, &entries);
         let align = vk.caps.min_storage_buffer_offset_alignment.max(16);
         let (buffer, offset) = frame.upload(vk, &words, align)?;
-        Ok((buffer, offset, words.len() as u64))
+        let made = (buffer, offset, words.len() as u64);
+        // An upload may have sent the batch to make room: the table is of the batch after it.
+        if self.tables_batch != frame.sent {
+            self.tables.clear();
+            self.tables_batch = frame.sent;
+        }
+        self.tables.insert(key, made);
+        Ok(made)
     }
 
     /// How many bytes of host memory are imported.

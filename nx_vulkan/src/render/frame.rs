@@ -73,6 +73,9 @@ pub struct Frame {
     pub device_wait: (std::time::Duration, u64, std::time::Duration),
     /// Upload chunks made since the last report, and their bytes.
     pub chunks_made: (u64, u64),
+    /// How many batches were sent: what was put in upload memory before the last one may not be
+    /// used by the commands after it.
+    pub sent: u64,
 }
 
 /// Something a submission needed that can be destroyed after it ran.
@@ -137,6 +140,7 @@ impl Frame {
                 returned: Vec::new(),
                 device_wait: Default::default(),
                 chunks_made: (0, 0),
+                sent: 0,
                 lost: false,
             })
         }
@@ -381,6 +385,7 @@ impl Frame {
         if !self.pending() {
             return Ok(());
         }
+        self.sent += 1;
         let current = self.current;
         let sending = &mut self.device_wait.2;
         let result = {

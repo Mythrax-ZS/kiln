@@ -5,6 +5,9 @@
 //! recorded and run when the submission ends ([`Backend::finish`]), after which the guest may
 //! rely on them having happened.
 
+/// The most bytes a constant buffer binding covers.
+const MAX_CBUF: u64 = 1 << 16;
+
 /// The frames a texture stays on the device after it was last used, whatever the budget of its
 /// images (docs/ASSUMPTIONS.md A-260).
 pub const TEXTURE_KEPT_FRAMES: u64 = 60;
@@ -122,6 +125,15 @@ struct Pass {
 struct Core {
     vk: Vk,
     frame: Frame,
+    /// The constant buffers put in upload memory since the batch began, by GPU address and size:
+    /// a draw that reads the same bytes uses them while nothing changed their memory (A-289).
+    cbuf_cache: std::collections::BTreeMap<(u64, u32), (vk::Buffer, u64, u64)>,
+    /// What the copies there are of: the batch, the render targets' write-backs and the
+    /// renderer's other changes of memory as they were counted then.
+    cbuf_stamp: (u64, u64, u64),
+    /// Counts the renderer's own changes of guest memory other than the GPU front's writes (the
+    /// settles of launches, releases, copies) and the ends of submissions.
+    memory_writes: u64,
     targets: Targets,
     shaders: shaders::Shaders,
     textures: textures::Textures,
@@ -254,6 +266,11 @@ struct Phases {
     /// Of the descriptors, the constant buffers read and copied; of the pass, the batches sent
     /// when one ends (with the waits for a slot), and how many passes were begun.
     cbuf_copies: std::time::Duration,
+    /// Bytes of constant buffers a draw took from a copy made earlier in the batch (A-289).
+    cbuf_reused: u64,
+    /// Of the descriptors: building the tables of global memory, and writing the sets.
+    global_tables: std::time::Duration,
+    set_writes: std::time::Duration,
     cbuf_bytes: u64,
     batches_sent: std::time::Duration,
     passes_begun: u64,
@@ -392,6 +409,9 @@ impl Renderer {
                 Ok(Core {
                     vk,
                     frame,
+                    cbuf_cache: std::collections::BTreeMap::new(),
+                    cbuf_stamp: (0, 0, 0),
+                    memory_writes: 0,
                     targets: Targets::default(),
                     shaders: shaders::Shaders::new(&debug),
                     textures: textures::Textures::new(debug.trace_textures),
@@ -1089,6 +1109,8 @@ impl Core {
     /// and not waited for, unless one of them touches guest memory in place (the guest may use
     /// that memory again as soon as its fence is reached) or `NX_DEBUG_WAIT_FINISH` says to.
     fn end_submission(&mut self) -> Result<(), String> {
+        // The program may write the memory of constant buffers before its next submission.
+        self.memory_writes += 1;
         if self.global_pending || self.debug.wait_at_finish || self.sync_on {
             return self.flush();
         }
@@ -1237,7 +1259,7 @@ impl Renderer {
                      is a target, {:?} on writing targets back, {:?} on images and samplers; {} \
                      instances were drawn in draws of several, {} one by one; {} texture bindings \
                      were found earlier in the frame, {} looked for; {:?} of the descriptors on \
-                     copying constant buffers ({} MiB); {} passes begun {:?}, {:?} of the pass on sending batches",
+                     copying constant buffers ({} MiB, {} MiB more taken from copies made before), {:?} on tables of global memory, {:?} on writing the sets; {} passes begun {:?}, {:?} of the pass on sending batches",
                     p.frame,
                     ph.programs,
                     ph.textures,
@@ -1256,6 +1278,9 @@ impl Renderer {
                     ph.bound_reused[1],
                     ph.cbuf_copies,
                     ph.cbuf_bytes >> 20,
+                    ph.cbuf_reused >> 20,
+                    ph.global_tables,
+                    ph.set_writes,
                     ph.passes_begun,
                     ph.pass_reasons,
                     ph.batches_sent
@@ -1693,13 +1718,46 @@ impl Backend for Renderer {
     fn blit(&mut self, scene: &Scene<'_>, blit: &Blit) -> Result<(), String> {
         let core = self.core()?;
         core.settle(scene.space, scene.mem, compute::settle::COMMAND)?;
+        core.memory_writes += 1;
         core.copy_surface(scene, blit)
     }
 
     fn dma_copy(&mut self, scene: &Scene<'_>, copy: &nx_gpu::dma::Copy) -> Result<(), String> {
         let core = self.core()?;
         core.settle(scene.space, scene.mem, compute::settle::COMMAND)?;
+        core.memory_writes += 1;
         core.copy_engine(scene, copy)
+    }
+
+    fn write(
+        &mut self,
+        space: &nx_gpu::vm::AddressSpace,
+        mem: &dyn nx_gpu::GuestMemory,
+        va: u64,
+        data: &[u8],
+    ) -> Result<(), String> {
+        // A constant buffer word, an inline upload: the copies of what it writes over are let go
+        // (a copy is at most 64 KiB, so only those that begin that far before it can reach it).
+        if let Some(Ok(core)) = self.core.as_mut() {
+            let end = va + data.len() as u64;
+            let over: Vec<(u64, u32)> = core
+                .cbuf_cache
+                .range((va.saturating_sub(MAX_CBUF), 0)..(end, 0))
+                .map(|(k, _)| *k)
+                .filter(|&(at, size)| at + u64::from(size) > va)
+                .collect();
+            for k in over {
+                core.cbuf_cache.remove(&k);
+            }
+        }
+        if space.write(mem, va, data) {
+            Ok(())
+        } else {
+            Err(format!(
+                "a write of {} bytes to GPU address {va:#x}, which is not mapped",
+                data.len()
+            ))
+        }
     }
 
     fn settle(
@@ -1753,6 +1811,10 @@ impl Backend for Renderer {
             Some(Ok(core)) if core.launches_pending() => {
                 core.releases.push(completion);
                 Ok(())
+            }
+            Some(Ok(core)) => {
+                core.memory_writes += 1;
+                completion.apply(space, mem)
             }
             _ => completion.apply(space, mem),
         }

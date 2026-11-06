@@ -167,6 +167,8 @@ impl Target {
 /// All the targets made so far.
 #[derive(Default)]
 pub struct Targets {
+    /// How many times targets were written back to memory.
+    pub writes: u64,
     map: FastMap<Key, Target>,
     /// The target at each guest address (one at a time: a new shape retires the old one), so that
     /// a texture's memory finds its targets without looking at all of them.
@@ -430,6 +432,7 @@ impl Targets {
         keys: &[Key],
     ) -> Result<(), String> {
         // Every copy is recorded, then one submission runs them.
+        self.writes += 1;
         let mut staged: Vec<(Key, crate::compute::HostBuffer)> = Vec::new();
         let cmd = frame.cmd(vk)?;
         for key in keys {

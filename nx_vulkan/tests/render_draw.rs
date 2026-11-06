@@ -355,6 +355,51 @@ fn a_constant_buffer_bound_past_the_end_of_a_mapping_reads_what_is_mapped() {
 }
 
 #[test]
+fn a_constant_buffer_word_the_front_writes_between_two_draws_is_what_the_second_reads() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = scene(
+        &pass_through_vertex(),
+        &red_from_a_constant_buffer(),
+        16,
+        target,
+    );
+    let cbuf = GPU_BASE + 0x40_0000;
+    w.put(cbuf, &1.0f32.to_le_bytes());
+    w.cbufs.bind(4, 1, (cbuf, 256));
+    let red = [1.0, 0.0, 0.0, 1.0];
+    vertices(
+        &mut w,
+        GPU_BASE + 0x30_0000,
+        &[
+            ([-1.0, -1.0, 0.5, 1.0], red),
+            ([3.0, -1.0, 0.5, 1.0], red),
+            ([-1.0, 3.0, 0.5, 1.0], red),
+        ],
+    );
+    let draw = Draw {
+        source: Source::Arrays { first: 0, count: 3 },
+        topology: 4,
+        instance: 0,
+        instances: 1,
+    };
+    let mut r = Renderer::new(RenderConfig::default());
+    r.draw(&w.scene(), &draw).unwrap();
+    // A constant buffer update between the draws, in the same batch: the copy the first draw made
+    // is not the second's (A-289).
+    r.write(&w.space, &w.mem, cbuf, &0.5f32.to_le_bytes())
+        .unwrap();
+    r.draw(&w.scene(), &draw).unwrap();
+    let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    assert_eq!(covered(&rgba), 16 * 16);
+    for px in rgba.as_chunks::<4>().0 {
+        assert!((127..=128).contains(&px[0]), "{px:?}");
+    }
+}
+
+#[test]
 fn programs_in_a_mapping_that_runs_past_its_memory_are_read() {
     use nx_gpu::mem::GuestMemory;
     use nx_gpu::vm::{map_flags, MapRequest};

@@ -550,6 +550,7 @@ impl Core {
                         .try_into()
                         .ok()
                 };
+                let tabling = super::stopwatch();
                 let reached = super::global::storage_buffers(&p.info, read);
                 let (buffer, offset, size) = match &reached {
                     Some(buffers) => {
@@ -565,6 +566,9 @@ impl Core {
                 // the GPU front reads it (A-287).
                 if p.info.global_writes {
                     self.note_reach(reached.as_deref(), true);
+                }
+                if let Some(tabling) = tabling {
+                    self.phases.global_tables += tabling.elapsed();
                 }
                 buffer_infos.push((
                     base + 20,
@@ -585,6 +589,7 @@ impl Core {
                 image_infos.len()
             ));
         }
+        let writing = super::stopwatch();
         let mut writes =
             [const { std::mem::MaybeUninit::<vk::WriteDescriptorSet<'_>>::uninit() }; MAX_WRITES];
         let mut n = 0;
@@ -614,6 +619,9 @@ impl Core {
             let made =
                 std::slice::from_raw_parts(writes.as_ptr().cast::<vk::WriteDescriptorSet<'_>>(), n);
             self.vk.device.update_descriptor_sets(made, &[]);
+        }
+        if let Some(writing) = writing {
+            self.phases.set_writes += writing.elapsed();
         }
         self.scratch.buffer_infos = buffer_infos;
         self.scratch.image_infos = image_infos;
@@ -1625,6 +1633,22 @@ impl Core {
         };
         let size = bound_size.min(want).max(16);
         let padded = u64::from(size.next_multiple_of(16));
+        // The same bytes copied earlier in the batch, with nothing changed over them since, serve
+        // (A-289).
+        let cacheable = self.scratch.zero_data.is_none()
+            && !self.debug.trace_cbufs
+            && u64::from(size) <= super::MAX_CBUF;
+        if cacheable {
+            let stamp = (self.frame.sent, self.targets.writes, self.memory_writes);
+            if self.cbuf_stamp != stamp {
+                self.cbuf_cache.clear();
+                self.cbuf_stamp = stamp;
+            }
+            if let Some(&copied) = self.cbuf_cache.get(&(address, size)) {
+                self.phases.cbuf_reused += padded;
+                return Ok(copied);
+            }
+        }
         // Read the bytes straight into upload memory, with zeros after them.
         let (buffer, offset, ptr) = self.frame.reserve(&self.vk, padded, align)?;
         self.phases.cbuf_bytes += padded;
@@ -1684,6 +1708,16 @@ impl Core {
                 address,
                 words.join(" ")
             );
+        }
+        if cacheable {
+            // Making room may have sent the batch: the copy is of the batch after it.
+            let stamp = (self.frame.sent, self.targets.writes, self.memory_writes);
+            if self.cbuf_stamp != stamp {
+                self.cbuf_cache.clear();
+                self.cbuf_stamp = stamp;
+            }
+            self.cbuf_cache
+                .insert((address, size), (buffer, offset, padded));
         }
         Ok((buffer, offset, padded))
     }

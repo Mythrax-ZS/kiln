@@ -529,6 +529,7 @@ impl Core {
         if !self.launches_pending() {
             return Ok(());
         }
+        self.memory_writes += 1;
         let mut mark = super::stopwatch();
         self.phases.settles[cause] += 1;
         let waited = self.flush();
