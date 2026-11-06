@@ -25,10 +25,10 @@ programs come and whether each is carried out.
     targets whose nearest export before them is an `nvn…` symbol.
   - That count covers the entry points the title calls and the driver's own calls through
     pointers.
-- **Called by the title itself:** with `NX_CENSUS_FROM` set to the range of `main`, the census
+- **Called by the title itself:** with `NX_CENSUS_FROM` set to the range of the title's own modules (`main`, `subsdk0` and `subsdk1`), the census
   also counts the targets whose return address is in the title's own code. In another run to the
   same point, the census listed every target it counted:
-  - 234 distinct driver functions were called from `main`, 52,228,872 times. That is 234 of the
+  - 234 distinct driver functions were called from those modules, 52,228,872 times. That is 234 of the
     733 entry points the title names, about 32%.
   - 45 of the 234 were called 10 times or fewer (the setting up).
 - What those calls produce is counted below, at the services and the GPU front.
