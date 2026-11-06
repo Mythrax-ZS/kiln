@@ -173,6 +173,7 @@ impl Core {
             self.phases.instances[0] += u64::from(draw.instances);
         }
         self.last_textures.clear();
+        self.attached = None;
         self.depth_read_only = false;
         self.retire_targets(scene)?;
         let regs = scene.regs;
@@ -768,6 +769,25 @@ impl Core {
         .then_some(3)
     }
 
+    /// The memory (guest process addresses) of the color and depth targets the registers name,
+    /// once per draw (none for a launch).
+    fn draw_attachments(&mut self, scene: &Scene<'_>) -> Vec<u64> {
+        if let Some(list) = &self.attached {
+            return list.clone();
+        }
+        let list = match self.attachments(scene) {
+            Ok((colors, depth)) => colors
+                .iter()
+                .flatten()
+                .chain(depth.iter())
+                .map(|k| k.address)
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        self.attached = Some(list.clone());
+        list
+    }
+
     /// Whether the instances of a draw can be one draw of that many: not for a task and mesh
     /// draw, nor when a stream an attribute reads gives one element to several instances
     /// (A-281).
@@ -915,6 +935,11 @@ impl Core {
                 key.width, key.height
             );
         }
+        // A target the draw neither writes nor tests against, read in the layout for sampling:
+        // the binding stands for later draws of the frame while the target stays so (A-282).
+        self.last_target_view = (layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            && depth != Some(key))
+        .then_some((key, cpu));
         Ok(Some((view, layout)))
     }
 
@@ -1134,9 +1159,21 @@ impl Core {
                 (tic, tsc, used.dim as u8, used.arrayed, used.shadow);
             if reuse {
                 let targets = &self.targets;
-                if let Some((view, sampler, layout)) =
-                    self.textures.bound(&bound_key, |k| targets.state(k))
-                {
+                let found = self.textures.bound(&bound_key, |k| targets.state(k));
+                // A render target's picture is taken again only while it is in the layout for
+                // sampling and the draw does not write it or test against it.
+                let found = match found {
+                    Some((_, _, _, Some(key))) => {
+                        let attached = self.draw_attachments(scene);
+                        (self.targets.layout_of(&key)
+                            == Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                            && !attached.contains(&key.address))
+                        .then_some(found)
+                        .flatten()
+                    }
+                    other => other,
+                };
+                if let Some((view, sampler, layout, _)) = found {
                     self.phases.bound_reused[0] += 1;
                     out.push((
                         base + 24 + used.slot,
@@ -1173,6 +1210,7 @@ impl Core {
                 ));
                 continue;
             }
+            self.last_target_view = None;
             let target_view = self.render_target_view(scene, &tic, used)?;
             lap(&mut mark, &mut self.phases.texture_target, "texture_target");
             let decorate = |e: String| {
@@ -1185,11 +1223,34 @@ impl Core {
                     pools.sampler_address + 32 * u64::from(tsc_id)
                 )
             };
+            if target_view.is_some() {
+                self.textures.bound_misses[2] += 1;
+            }
             let bound = match target_view {
-                Some((view, layout)) => self
-                    .textures
-                    .bind_view(&self.vk, &tic, tsc, used, view, layout)
-                    .map_err(decorate)?,
+                Some((view, layout)) => {
+                    let bound = self
+                        .textures
+                        .bind_view(&self.vk, &tic, tsc, used, view, layout)
+                        .map_err(decorate)?;
+                    if let Some((key, cpu)) = self.last_target_view.take() {
+                        if let (Some((serial, dirty)), Some(bytes)) =
+                            (self.targets.state(&key), key.memory_bytes())
+                        {
+                            let near = super::textures::Near {
+                                start: cpu,
+                                end: cpu + bytes,
+                                targets: vec![(key, serial, dirty)],
+                            };
+                            self.textures.remember_target_view(
+                                bound_key,
+                                bound.view,
+                                bound.sampler,
+                                near,
+                            );
+                        }
+                    }
+                    bound
+                }
                 None => {
                     // The render targets that stand for parts of this texture: the ones that are
                     // exactly a layer and a level of it are copied into its image on the device,
@@ -1208,15 +1269,21 @@ impl Core {
                     // Kept for the frame while the render targets over the texture's memory are as
                     // they are now (A-282): one drawn to since would have to be copied or written
                     // there.
-                    if let (Some(near), true) = (alone, copies.is_empty()) {
-                        if bound.layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
-                            self.textures.remember_bound(
-                                bound_key,
-                                bound.view,
-                                bound.sampler,
-                                near,
-                            );
+                    match (alone, copies.is_empty()) {
+                        (Some(near), true) => {
+                            if bound.layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+                                self.textures.remember_bound(
+                                    bound_key,
+                                    bound.view,
+                                    bound.sampler,
+                                    near,
+                                );
+                            } else {
+                                self.textures.bound_misses[5] += 1;
+                            }
                         }
+                        (None, _) => self.textures.bound_misses[3] += 1,
+                        (Some(_), false) => self.textures.bound_misses[4] += 1,
                     }
                     lap(&mut mark, &mut self.phases.texture_bind, "texture_bind");
                     bound

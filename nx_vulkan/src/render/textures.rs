@@ -738,6 +738,8 @@ struct Texture {
     /// into since it was last compared (offsets from the layer's start, A-279).
     layer_stride: u64,
     stale: Vec<Written>,
+    /// Where in each layer's memory the levels the image holds start, and their bytes.
+    held: (u64, u64),
 }
 
 /// How a shader sees a texture: the type of image view the descriptor needs.
@@ -961,6 +963,10 @@ pub struct Textures {
     /// The bindings found in this frame for textures no render target is over, with the memory
     /// they are made of, and the frame they are for (A-282).
     bound: FastMap<BoundKey, BoundEntry>,
+    /// Why bindings were not found (for the report): not kept, a target over them changed, then
+    /// those not kept after: a render target's own view, another target near, copies made, a
+    /// layout of their own.
+    pub bound_misses: [u64; 6],
     bound_frame: u64,
     /// Why layers were hashed, for the report: (times, bytes) with nothing to compare with, after
     /// the renderer wrote into them, after the tracking saw a write, the tracking not knowing.
@@ -1001,6 +1007,8 @@ pub type BoundKey = (Tic, Tsc, u8, bool, bool);
 struct BoundEntry {
     view: vk::ImageView,
     sampler: vk::Sampler,
+    /// The view is the picture of the first of `targets`.
+    target: bool,
     layout: vk::ImageLayout,
     start: u64,
     end: u64,
@@ -1055,17 +1063,32 @@ impl Textures {
         &mut self,
         key: &BoundKey,
         state: impl Fn(&Key) -> Option<(u64, bool)>,
-    ) -> Option<(vk::ImageView, vk::Sampler, vk::ImageLayout)> {
+    ) -> Option<(vk::ImageView, vk::Sampler, vk::ImageLayout, Option<Key>)> {
         if self.bound_frame != self.frame {
             self.bound.clear();
             self.bound_frame = self.frame;
             return None;
         }
-        let e = self.bound.get(key)?;
-        e.targets
+        let Some(e) = self.bound.get(key) else {
+            self.bound_misses[0] += 1;
+            return None;
+        };
+        let found = e
+            .targets
             .iter()
             .all(|(k, serial, dirty)| state(k) == Some((*serial, *dirty)))
-            .then_some((e.view, e.sampler, e.layout))
+            .then(|| {
+                (
+                    e.view,
+                    e.sampler,
+                    e.layout,
+                    e.target.then(|| e.targets[0].0),
+                )
+            });
+        if found.is_none() {
+            self.bound_misses[1] += 1;
+        }
+        found
     }
 
     /// Keep what a texture that is a kept surface (A-285) was bound with: its image is in the
@@ -1080,6 +1103,21 @@ impl Textures {
         self.remember_bound(key, view, sampler, near);
         if let Some(e) = self.bound.get_mut(&key) {
             e.layout = vk::ImageLayout::GENERAL;
+        }
+    }
+
+    /// Keep what a texture that is a render target's picture was bound with (A-282): taken again
+    /// while the target is as it was, in the layout for sampling, and not drawn to by the draw.
+    pub fn remember_target_view(
+        &mut self,
+        key: BoundKey,
+        view: vk::ImageView,
+        sampler: vk::Sampler,
+        near: Near,
+    ) {
+        self.remember_bound(key, view, sampler, near);
+        if let Some(e) = self.bound.get_mut(&key) {
+            e.target = true;
         }
     }
 
@@ -1100,6 +1138,7 @@ impl Textures {
                 BoundEntry {
                     view,
                     sampler,
+                    target: false,
                     layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     start: near.start,
                     end: near.end,
@@ -1359,6 +1398,34 @@ impl Textures {
                 return Ok(t.image.view);
             }
         }
+        // The epoch of tracking is begun once a frame, at the first comparison.
+        if self.epoch_frame != current {
+            self.epoch = scene.begin_write_epoch();
+            self.epoch_frame = current;
+        }
+        // A texture the renderer did not write into, whose memory the tracking of writes says is
+        // as it was when the texture last looked, is as it was: asked of the levels each layer
+        // holds (not of the levels left out, which nobody asks about), before anything is worked
+        // out again (A-126).
+        if !self.always_compare {
+            if let Some(t) = self.map.get_mut(&key) {
+                let (from, len) = t.held;
+                let layers = t.stale.len() as u64;
+                if t.epoch != 0
+                    && len > 0
+                    && layers > 0
+                    && t.stale.iter().all(Vec::is_empty)
+                    && (0..layers).all(|l| {
+                        let at = tic.address() + l * t.layer_stride + from;
+                        scene.untouched_since(at, len, t.epoch) == Some(true)
+                    })
+                {
+                    t.checked = current;
+                    t.epoch = self.epoch;
+                    return Ok(t.image.view);
+                }
+            }
+        }
         let types = tic.types();
         let Some(format) = texture_format(tic.components(), types[0], tic.srgb()) else {
             return Err(format!(
@@ -1525,6 +1592,7 @@ impl Textures {
         let existed = self.map.contains_key(&key);
         if let Some(t) = self.map.get_mut(&key) {
             t.stale.iter_mut().for_each(Vec::clear);
+            t.held = (held_from, held_len);
             if t.layer_hashes == layer_hashes {
                 t.checked = current;
                 t.epoch = self.epoch;
@@ -1850,6 +1918,7 @@ impl Textures {
                 if let Some(t) = self.map.get_mut(&key) {
                     t.layer_hashes = layer_hashes;
                     t.chunk_hashes = chunk_hashes;
+                    t.held = (held_from, held_len);
                     t.hash = hash;
                     t.checked = current;
                     t.epoch = self.epoch;
@@ -1873,6 +1942,7 @@ impl Textures {
                         chunk_hashes,
                         layer_stride,
                         stale: vec![Vec::new(); layers as usize],
+                        held: (held_from, held_len),
                     },
                 );
             }

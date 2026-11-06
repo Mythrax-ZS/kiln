@@ -573,6 +573,11 @@ impl Targets {
         self.map.get_mut(key)
     }
 
+    /// The layout the target `key` is in now.
+    pub fn layout_of(&self, key: &Key) -> Option<vk::ImageLayout> {
+        self.map.get(key).map(|t| t.layout)
+    }
+
     /// A view, in the layout for sampling, of a copy of the depth that the depth target `key` holds
     /// now: what a draw that writes the target reads instead of it (the target cannot be read
     /// while it is written; docs/ASSUMPTIONS.md A-163). `None` when there is no such target. The

@@ -175,6 +175,10 @@ struct Core {
     residents: Vec<surfaces::Resident>,
     /// The memory of the kept surface the last lookup found (guest process address, bytes).
     kept_found: Option<(u64, u64)>,
+    /// The render target behind the last view `render_target_view` gave that may be kept for the
+    /// frame, and its memory; the targets the draw being made uses (computed once a draw).
+    last_target_view: Option<(targets::Key, u64)>,
+    attached: Option<Vec<u64>>,
     /// The GPU addresses the kept surfaces lie in (an upper bound).
     residents_span: Option<(u64, u64)>,
     staging_buffers: crate::fast::FastMap<u64, Vec<crate::compute::HostBuffer>>,
@@ -417,6 +421,8 @@ impl Renderer {
                     surface_images: crate::fast::FastMap::default(),
                     residents: Vec::new(),
                     kept_found: None,
+                    last_target_view: None,
+                    attached: None,
                     residents_span: None,
                     staging_buffers: crate::fast::FastMap::default(),
                     textures_trimmed: 0,
@@ -1291,6 +1297,11 @@ impl Renderer {
                         );
                     }
                 }
+                let misses = std::mem::take(&mut core.textures.bound_misses);
+                eprintln!(
+                    "[vulkan] frame {}: texture bindings not found {:?} (not kept, a target over them changed; then not kept: a target's own view, written back, copies made, a layout of its own)",
+                    p.frame, misses
+                );
                 let made = std::mem::take(&mut core.textures.made);
                 eprintln!(
                     "[vulkan] frame {}: textures made from memory: {} new, {} again (their memory changed), {} MiB",

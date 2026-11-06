@@ -691,6 +691,37 @@ fn a_target_is_not_read_while_the_same_draw_writes_it() {
     }
 }
 
+#[test]
+fn a_target_sampled_before_is_not_read_by_a_draw_that_writes_it() {
+    if vulkan().is_none() {
+        return;
+    }
+    // Within one frame: a draw into another target samples the source target (its picture is
+    // kept as the texture's binding, A-282); then a draw into the source itself samples it: not
+    // the picture it is drawing into, but what the target held before the draw (A-113), red, as
+    // without the first draw.
+    let source = GPU_BASE + 0x50_0000;
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = textured(8, target, header(0x08, 2, 8, 8, source), nearest_sampler());
+    let mut r = Renderer::new(RenderConfig::default());
+    w.color_target(0, source, 8, 8, 0xD5);
+    clear_to(&mut r, &mut w, [1.0, 0.0, 0.0, 1.0], None);
+    w.color_target(0, target, 8, 8, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    assert_eq!(&rgba[..4], [255, 0, 0, 255], "the source's picture");
+    w.color_target(0, source, 8, 8, 0xD5);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    let (rgba, _, _) = r.picture_at(w.cpu(source)).unwrap().expect("a target");
+    for px in rgba.as_chunks::<4>().0 {
+        assert_eq!(
+            px,
+            &[255, 0, 0, 255],
+            "what the target held before the draw"
+        );
+    }
+}
+
 /// Bind a depth target of `size` x `size` at `va` with the zeta format `format`.
 fn depth_target(w: &mut World, va: u64, size: u32, format: u32) {
     w.set_address(0xfe0, va);
