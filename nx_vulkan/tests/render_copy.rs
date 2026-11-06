@@ -67,6 +67,7 @@ fn green_target(w: &mut World, target: u64, size: u32) -> Renderer {
             source: Source::Arrays { first: 0, count: 3 },
             topology: 4,
             instance: 0,
+            instances: 1,
         },
     )
     .unwrap();

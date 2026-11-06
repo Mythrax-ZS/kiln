@@ -153,6 +153,25 @@ impl Core {
     pub(super) fn draw(&mut self, scene: &Scene<'_>, draw: &Draw) -> Result<(), String> {
         #[cfg(feature = "alloc_stats")]
         crate::alloc_stats::lap("outside the draws");
+        // Several instances are one draw of that many, unless a stream steps through its elements
+        // more slowly than one an instance or the draw is a task and mesh one: then each instance
+        // is drawn by itself, as the hardware runs them (A-281).
+        if draw.instances > 1 && !self.instances_together(scene) {
+            self.phases.instances[1] += u64::from(draw.instances);
+            return (0..draw.instances).try_for_each(|i| {
+                self.draw(
+                    scene,
+                    &Draw {
+                        instance: draw.instance + i,
+                        instances: 1,
+                        ..*draw
+                    },
+                )
+            });
+        }
+        if draw.instances > 1 {
+            self.phases.instances[0] += u64::from(draw.instances);
+        }
         self.last_textures.clear();
         self.depth_read_only = false;
         self.retire_targets(scene)?;
@@ -419,18 +438,19 @@ impl Core {
                 return Err(format!("vertex stream {s} is read and not enabled"));
             }
             let stride = u64::from(stream.stride);
-            let (buffer, offset, state_stride) = if stream.instanced {
-                // One element for this instance: bound with a zero stride so that every vertex
-                // reads it.
+            let (buffer, offset, state_stride, per_instance) = if stream.instanced {
+                // The elements of the draw's instances, from that of its first, bound at the rate
+                // of instances: each instance reads its own (A-281). Several instances are drawn
+                // together only when each has an element of its own (`instances_together`).
                 let divisor = u64::from(stream.frequency.max(1));
                 let (_, base_instance, _) = regs.bases();
                 let element = u64::from(base_instance) + u64::from(draw.instance) / divisor;
-                let n = stride.max(4);
+                let n = stride * u64::from(draw.instances - 1) + stride.max(4);
                 let (b, o, ptr) = self.frame.reserve(&self.vk, n, 16)?;
                 // SAFETY: `reserve` gave `n` writable bytes at `ptr`, which nothing else uses.
                 let dst = unsafe { std::slice::from_raw_parts_mut(ptr, n as usize) };
                 self.read_exact(scene, stream.address + element * stride, dst)?;
-                (b, o, 0)
+                (b, o, stream.stride, true)
             } else {
                 let (lo, hi) = vertex_range;
                 let bytes = (hi + 1) * stride;
@@ -442,10 +462,10 @@ impl Core {
                     std::slice::from_raw_parts_mut(ptr.add(from as usize), (bytes - from) as usize)
                 };
                 self.read_exact(scene, stream.address + from, dst)?;
-                (b, o, stream.stride)
+                (b, o, stream.stride, false)
             };
             bound.push((s, buffer, offset));
-            binding_state.push((s, state_stride, false));
+            binding_state.push((s, state_stride, per_instance));
         }
 
         lap(&mut mark, &mut self.phases.vertices, "vertices");
@@ -654,15 +674,39 @@ impl Core {
                 (Some(m), Some(_), _) => m.cmd_draw_mesh_tasks(cmd, count, 1, 1),
                 (_, _, Some((buffer, offset, ty, n))) => {
                     d.cmd_bind_index_buffer(cmd, buffer, offset, ty);
-                    d.cmd_draw_indexed(cmd, n, 1, 0, geometry.vertex_offset, 0);
+                    d.cmd_draw_indexed(cmd, n, draw.instances, 0, geometry.vertex_offset, 0);
                 }
-                _ => d.cmd_draw(cmd, geometry.vertices.1, 1, geometry.vertices.0, 0),
+                _ => d.cmd_draw(
+                    cmd,
+                    geometry.vertices.1,
+                    draw.instances,
+                    geometry.vertices.0,
+                    0,
+                ),
             }
         }
         let _ = geometry.restart;
         self.scratch.bound = bound;
         lap(&mut mark, &mut self.phases.record, "record");
         Ok(())
+    }
+
+    /// Whether the instances of a draw can be one draw of that many: not for a task and mesh
+    /// draw, nor when a stream an attribute reads gives one element to several instances
+    /// (A-281).
+    fn instances_together(&self, scene: &Scene<'_>) -> bool {
+        let regs = scene.regs;
+        if regs.mesh().is_some() {
+            return false;
+        }
+        (0..32).all(|i| {
+            let a = regs.vertex_attribute(i);
+            if !a.active {
+                return true;
+            }
+            let stream = regs.vertex_stream(a.stream as usize);
+            !(stream.enabled && stream.instanced && stream.frequency > 1)
+        })
     }
 
     /// A view of the render target that stands for the memory of the texture `tic`, in the layout

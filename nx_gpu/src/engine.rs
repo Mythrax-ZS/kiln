@@ -423,6 +423,9 @@ pub struct Engine {
     inline_elements: u32,
     /// The number of the instance being drawn (0 for the first of a series, see `BEGIN`).
     instance: u32,
+    /// A draw not given to the renderer yet: the next instances of its series join it while
+    /// nothing the renderer reads changes (A-281).
+    held_draw: Option<Draw>,
     /// The constant buffers bound to each slot of each binding group.
     pub cbufs: CbufBindings,
     /// The inline-to-memory engine (the compute and inline-to-memory classes).
@@ -654,6 +657,7 @@ impl Engine {
             topology: 0,
             inline_elements: 0,
             instance: 0,
+            held_draw: None,
             cbufs: CbufBindings::default(),
             i2m: I2m::default(),
         }
@@ -676,6 +680,9 @@ impl Engine {
         data: u32,
         last: bool,
     ) -> Result<(), String> {
+        if self.held_draw.is_some() && !self.keeps_held_draw(method, data) {
+            self.flush_draw(cx)?;
+        }
         let slot = self
             .regs
             .get_mut(method as usize)
@@ -728,6 +735,44 @@ impl Engine {
             self.launch_compute(cx, data)?;
         }
         Ok(())
+    }
+
+    /// Whether a write leaves a held draw as it is (A-281): the methods that begin, end and make
+    /// draws (which decide themselves), macro calls (whose writes are looked at one by one), and
+    /// a write of the value a register already holds to a register that does nothing else.
+    fn keeps_held_draw(&self, method: u32, data: u32) -> bool {
+        use mme64::method as m;
+        match method {
+            m3d::BEGIN
+            | m3d::END
+            | m3d::CALL_MME_FIRST..=m3d::CALL_MME_LAST
+            | m3d::DRAW_VERTEX_ARRAY
+            | m3d::DRAW_VERTEX_ARRAY_BEGIN_END_FIRST
+            | m3d::DRAW_VERTEX_ARRAY_BEGIN_END_SUBSEQUENT
+            | m3d::DRAW_INDEX_BUFFER
+            | m3d::DRAW_INDEX_BEGIN_END_FIRST..=m3d::DRAW_INDEX_BEGIN_END_LAST => true,
+            m3d::LOAD_MME_INSTRUCTION_RAM_POINTER..=m3d::LOAD_MME_START_ADDRESS_RAM
+            | m3d::REPORT_SEMAPHORE_D
+            | m3d::LOAD_CONSTANT_BUFFER_FIRST..=m3d::LOAD_CONSTANT_BUFFER_LAST
+            | m3d::CLEAR_SURFACE
+            | m3d::DRAW_INLINE_VERTEX
+            | m3d::DRAW_INLINE_INDEX
+            | m3d::DRAW_INLINE_INDEX2X16
+            | m3d::DRAW_INLINE_INDEX4X8
+            | m3d::DRAW_AUTO
+            | m3d::DRAW_ZERO_INDEX => false,
+            // The macro loads of MME64 are those above (A-208).
+            m::DMA_READ | m::DMA_READ_FIFOED | FALCON_3D if class::is_ampere(self.class) => false,
+            _ => self.reg(method) == data,
+        }
+    }
+
+    /// Give the renderer the draw that is held, if there is one (A-281).
+    pub fn flush_draw(&mut self, cx: &mut Cx<'_>) -> Result<(), String> {
+        match self.held_draw.take() {
+            Some(draw) => self.send_draw(cx, &draw),
+            None => Ok(()),
+        }
     }
 
     /// A write to an engine of the Switch 2's classes that is not the Maxwell engine's: the macro
@@ -1318,7 +1363,33 @@ impl Engine {
             source,
             topology,
             instance: self.instance,
+            instances: 1,
         };
+        if cx.backend.is_none() {
+            return Ok(());
+        }
+        // The next instance of the held draw's series, drawn the same way, joins it; another
+        // draw is held in its place (A-281).
+        if matches!(source, Source::Arrays { .. } | Source::Indexed { .. }) {
+            if let Some(held) = self.held_draw.as_mut() {
+                if held.source == source
+                    && held.topology == topology
+                    && held.instance.checked_add(held.instances) == Some(draw.instance)
+                {
+                    held.instances += 1;
+                    return Ok(());
+                }
+            }
+            self.flush_draw(cx)?;
+            self.held_draw = Some(draw);
+            return Ok(());
+        }
+        self.flush_draw(cx)?;
+        self.send_draw(cx, &draw)
+    }
+
+    /// Give a draw to the renderer.
+    fn send_draw(&mut self, cx: &mut Cx<'_>, draw: &Draw) -> Result<(), String> {
         let Some(backend) = cx.backend.as_mut() else {
             return Ok(());
         };
@@ -1331,7 +1402,7 @@ impl Engine {
         };
         crate::progress::command();
         let _phase = crate::progress::enter(crate::progress::DRAWING);
-        match backend.draw(&scene, &draw) {
+        match backend.draw(&scene, draw) {
             Ok(()) => Ok(()),
             Err(why) => cx.renderer_failed("a draw", why),
         }
@@ -2120,6 +2191,7 @@ mod tests {
                 source,
                 topology,
                 instance,
+                instances: 1,
             })
         };
         assert_eq!(
@@ -2175,6 +2247,62 @@ mod tests {
     }
 
     #[test]
+    fn the_next_instances_of_a_draw_with_nothing_changed_between_are_one_draw() {
+        use crate::render::testing::{Event, Recorder};
+        let mut rec = Recorder::default();
+        let events = rec.events.clone();
+        with_backend(Some(&mut rec), false, |cx| {
+            let mut e = Engine::new(class::THREED);
+            // Instances 0, 1 and 2 of 6 vertices from the vertex 30; the series's macro writes
+            // the start again with the value it holds, which changes nothing.
+            for i in 0..3 {
+                e.write(cx, 0x1618 / 4, 4 | u32::from(i > 0) << 26, false)
+                    .unwrap();
+                e.write(cx, 0xd74 / 4, 30, false).unwrap();
+                e.write(cx, 0xd78 / 4, 6, true).unwrap();
+                e.write(cx, 0x1614 / 4, 0, true).unwrap();
+            }
+            // A register that changes keeps the next instance apart: it is a draw of its own.
+            e.write(cx, 0x800 / 4, 0x12, false).unwrap();
+            e.write(cx, 0x1618 / 4, 4 | 1 << 26, false).unwrap();
+            e.write(cx, 0xd78 / 4, 6, true).unwrap();
+            e.write(cx, 0x1614 / 4, 0, true).unwrap();
+            // Nothing reaches the renderer before something else does: here, a clear.
+            assert_eq!(events.lock().unwrap().len(), 1);
+            e.write(cx, 0x19d0 / 4, 0b11_1100, true).unwrap();
+        });
+        let arrays = Source::Arrays {
+            first: 30,
+            count: 6,
+        };
+        let events = events.lock().unwrap();
+        let draws: Vec<Draw> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Draw(d) => Some(*d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            draws,
+            vec![
+                Draw {
+                    source: arrays,
+                    topology: 4,
+                    instance: 0,
+                    instances: 3,
+                },
+                Draw {
+                    source: arrays,
+                    topology: 4,
+                    instance: 3,
+                    instances: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn a_draw_the_backend_fails_stops_the_run_unless_it_goes_on() {
         use crate::render::testing::Recorder;
         let mut rec = Recorder {
@@ -2183,7 +2311,9 @@ mod tests {
         };
         with_backend(Some(&mut rec), false, |cx| {
             let mut e = Engine::new(class::THREED);
-            let err = e.write(cx, 0xd78 / 4, 3, true).unwrap_err();
+            // The draw is held (A-281): what the renderer says of it comes when it is given.
+            e.write(cx, 0xd78 / 4, 3, true).unwrap();
+            let err = e.flush_draw(cx).unwrap_err();
             assert!(
                 err.contains("a draw could not be rendered: the recorder refuses draws"),
                 "{err}"
@@ -2198,6 +2328,7 @@ mod tests {
             let mut e = Engine::new(class::THREED);
             e.write(cx, 0xd78 / 4, 3, true).unwrap();
             e.write(cx, 0xd78 / 4, 4, true).unwrap();
+            e.flush_draw(cx).unwrap();
         });
         assert_eq!(events.lock().unwrap().len(), 2, "both were still offered");
         assert_eq!(stats.failed["the recorder refuses draws"], 2);

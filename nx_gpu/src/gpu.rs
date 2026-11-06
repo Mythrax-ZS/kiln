@@ -551,6 +551,7 @@ impl Gpu {
                             ch.execute(&mut cx, w).map_err(unimplemented)?;
                             if let Some(why) = cx.blocked.take() {
                                 *pending = Some(w);
+                                ch.flush_draws(&mut cx).map_err(unimplemented)?;
                                 return Ok(Some(why));
                             }
                         }
@@ -558,6 +559,8 @@ impl Gpu {
                         Err(e) => return Err(unimplemented(e.0)),
                     }
                 }
+                // A held draw does not wait past its entry (A-281).
+                ch.flush_draws(&mut cx).map_err(unimplemented)?;
                 Ok(None)
             })();
             self.channels.insert(job.channel, ch);

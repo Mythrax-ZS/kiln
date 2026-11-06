@@ -99,6 +99,9 @@ pub struct Draw {
     /// The number of the instance this draw is: 0 for the first of a series, counting up with
     /// each `SUBSEQUENT` begin.
     pub instance: u32,
+    /// How many instances it is, from `instance` on (at least 1): the next instances of a series
+    /// drawn the same way with nothing changed between them are one draw (A-281).
+    pub instances: u32,
 }
 
 /// The buffers a `CLEAR_SURFACE` clears (its parameter word).

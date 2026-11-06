@@ -140,6 +140,7 @@ const DRAW: Draw = Draw {
     source: Source::Arrays { first: 0, count: 3 },
     topology: 4,
     instance: 0,
+    instances: 1,
 };
 
 /// A 4x4 texture of A8B8G8R8 texels (bytes R, G, B, A) in block-linear memory at `TEXELS`.

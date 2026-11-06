@@ -210,6 +210,8 @@ struct Scratch {
 /// The time the draws spent in each of their steps (reported with `NX_TRACE_GPU`).
 #[derive(Clone, Copy, Debug, Default)]
 struct Phases {
+    /// The instances of draws of several (A-281): drawn together, and drawn one by one.
+    instances: [u64; 2],
     /// Finding the translated programs (comparing them with memory).
     programs: std::time::Duration,
     /// The texture handles, headers, images and samplers.
@@ -1179,7 +1181,8 @@ impl Renderer {
                     "[vulkan] frame {}: the draws spent {:?} on programs, {:?} on textures, {:?} \
                      on the pass, {:?} on vertices, {:?} on descriptors, {:?} on the pipeline, \
                      {:?} on recording; of the textures, {:?} on headers, {:?} on whether a texture \
-                     is a target, {:?} on writing targets back, {:?} on images and samplers",
+                     is a target, {:?} on writing targets back, {:?} on images and samplers; {} \
+                     instances were drawn in draws of several, {} one by one",
                     p.frame,
                     ph.programs,
                     ph.textures,
@@ -1191,7 +1194,9 @@ impl Renderer {
                     ph.texture_headers,
                     ph.texture_target,
                     ph.texture_write_back,
-                    ph.texture_bind
+                    ph.texture_bind,
+                    ph.instances[0],
+                    ph.instances[1]
                 );
                 #[cfg(feature = "alloc_stats")]
                 {

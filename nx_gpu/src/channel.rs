@@ -62,6 +62,11 @@ impl Channel {
     pub fn execute(&mut self, cx: &mut Cx<'_>, w: MethodWrite) -> Result<(), String> {
         cx.stats.methods += 1;
         let sub = usize::from(w.subchannel);
+        // A draw held by a 3D engine goes to the renderer before anything another engine or the
+        // channel does (A-281).
+        if w.method < ENGINE_METHODS || class::kind(self.subchannels[sub]) != class::Kind::ThreeD {
+            self.flush_draws(cx)?;
+        }
         if w.method < ENGINE_METHODS {
             if cx.level >= 2 {
                 eprintln!(
@@ -104,6 +109,14 @@ impl Channel {
             .entry(class_num)
             .or_insert_with(|| Engine::new(class_num));
         engine.write(cx, w.method, w.data, w.last)
+    }
+
+    /// Give the renderer the draws the channel's engines hold (A-281).
+    pub fn flush_draws(&mut self, cx: &mut Cx<'_>) -> Result<(), String> {
+        for engine in self.engines.values_mut() {
+            engine.flush_draw(cx)?;
+        }
+        Ok(())
     }
 
     fn host_method(&mut self, cx: &mut Cx<'_>, w: MethodWrite) -> Result<(), String> {

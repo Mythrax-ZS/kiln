@@ -91,6 +91,7 @@ const DRAW: Draw = Draw {
     source: Source::Arrays { first: 0, count: 3 },
     topology: 4,
     instance: 0,
+    instances: 1,
 };
 
 #[test]
@@ -218,6 +219,7 @@ fn a_vertex_program_sees_the_instance_counter_of_its_draw() {
                 source: Source::Arrays { first: 0, count: 3 },
                 topology: 4,
                 instance,
+                instances: 1,
             },
         )
         .unwrap();

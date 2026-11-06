@@ -34,6 +34,7 @@ fn a_triangle_covering_the_target_is_painted_with_its_flat_color() {
             source: Source::Arrays { first: 0, count: 3 },
             topology: 4,
             instance: 0,
+            instances: 1,
         },
     )
     .unwrap();
@@ -70,6 +71,7 @@ fn a_smaller_triangle_covers_part_of_the_target() {
             source: Source::Arrays { first: 0, count: 3 },
             topology: 4,
             instance: 0,
+            instances: 1,
         },
     )
     .unwrap();
@@ -117,6 +119,7 @@ fn an_attribute_that_is_switched_off_reads_as_zero_zero_zero_one() {
             source: Source::Arrays { first: 0, count: 3 },
             topology: 4,
             instance: 0,
+            instances: 1,
         },
     )
     .unwrap();
@@ -151,6 +154,7 @@ fn red_triangle_at(w: &mut World, target: u64, z: f32) -> (Vec<u8>, usize) {
             source: Source::Arrays { first: 0, count: 3 },
             topology: 4,
             instance: 0,
+            instances: 1,
         },
     )
     .unwrap();
@@ -343,6 +347,7 @@ fn a_constant_buffer_bound_past_the_end_of_a_mapping_reads_what_is_mapped() {
                 source: Source::Arrays { first: 0, count: 3 },
                 topology: 4,
                 instance: 0,
+                instances: 1,
             },
         )
         .unwrap_err();
@@ -438,6 +443,7 @@ fn indexed_quads_are_drawn_as_two_triangles() {
             },
             topology: 7,
             instance: 0,
+            instances: 1,
         },
     )
     .unwrap();
@@ -467,6 +473,7 @@ fn blending_mixes_with_what_is_there() {
         source: Source::Arrays { first: 0, count: 3 },
         topology: 4,
         instance: 0,
+        instances: 1,
     };
     let mut r = Renderer::new(RenderConfig::default());
     vertices(&mut w, GPU_BASE + 0x30_0000, &quad([1.0, 0.0, 0.0, 1.0]));
@@ -486,6 +493,73 @@ fn blending_mixes_with_what_is_there() {
     assert_eq!(px[1], 0);
     assert!((i32::from(px[2]) - 128).abs() <= 2, "{px:?}");
     assert!((i32::from(px[3]) - 191).abs() <= 2, "{px:?}");
+}
+
+#[test]
+fn the_instances_of_one_draw_each_read_their_own_element_of_an_instanced_stream() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    let picture = |together: bool| {
+        let mut w = scene(&pass_through_vertex(), &flat_color_pixel(), 16, target);
+        let unused = [0.0; 4];
+        vertices(
+            &mut w,
+            GPU_BASE + 0x30_0000,
+            &[
+                ([-1.0, -1.0, 0.5, 1.0], unused),
+                ([3.0, -1.0, 0.5, 1.0], unused),
+                ([-1.0, 3.0, 0.5, 1.0], unused),
+            ],
+        );
+        // The color (attribute 1) comes from stream 1, an element per instance (A-281).
+        let colors: Vec<u8> = [
+            [0.25f32, 0.0, 0.0, 0.25],
+            [0.0, 0.5, 0.0, 0.25],
+            [0.0, 0.0, 1.0, 0.5],
+        ]
+        .iter()
+        .flatten()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+        let at = GPU_BASE + 0x32_0000;
+        w.put(at, &colors);
+        w.set(0x1164, 1 | 7 << 27 | 1 << 21);
+        w.set(0x1c10, 16 | 1 << 12);
+        w.set_address(0x1c14, at);
+        w.set_address(0x1f08, at + colors.len() as u64 - 1);
+        w.set(0x1c1c, 1);
+        w.set(0x1884, 1);
+        // Each instance adds its color to what is there.
+        w.set(0x1360, 1);
+        w.set(0x133c, 0);
+        w.set(0x1340, 0x8006);
+        w.set(0x1344, 0x4001);
+        w.set(0x1348, 0x4001);
+        let mut r = Renderer::new(RenderConfig::default());
+        let draw = |instance, instances| Draw {
+            source: Source::Arrays { first: 0, count: 3 },
+            topology: 4,
+            instance,
+            instances,
+        };
+        if together {
+            r.draw(&w.scene(), &draw(0, 3)).unwrap();
+        } else {
+            for i in 0..3 {
+                r.draw(&w.scene(), &draw(i, 1)).unwrap();
+            }
+        }
+        let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+        rgba[..4].to_vec()
+    };
+    let one_by_one = picture(false);
+    assert_eq!(picture(true), one_by_one);
+    let expected = [64, 128, 255, 255];
+    for (got, want) in one_by_one.iter().zip(expected) {
+        assert!((i32::from(*got) - want).abs() <= 1, "{one_by_one:?}");
+    }
 }
 
 #[test]
@@ -516,6 +590,7 @@ fn a_draw_whose_first_target_is_off_draws_to_the_second() {
             source: Source::Arrays { first: 0, count: 3 },
             topology: 4,
             instance: 0,
+            instances: 1,
         },
     )
     .unwrap();
@@ -552,6 +627,7 @@ fn a_program_that_cannot_be_translated_stops_the_draw_with_its_address() {
                 source: Source::Arrays { first: 0, count: 3 },
                 topology: 4,
                 instance: 0,
+                instances: 1,
             },
         )
         .unwrap_err();
