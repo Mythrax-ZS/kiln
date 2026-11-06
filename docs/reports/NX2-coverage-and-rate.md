@@ -111,10 +111,17 @@ varies by about 15%):
 
 ## Open
 
-- **The road is sometimes black.** In about a quarter of the runs that reach the race (7 of
-  about 30 on 2026-11-06), the road surface is black from the race's start to the end of the run,
-  while its markings, the curbs and the rest of the scene are drawn. The other runs draw it gray,
-  with its lane lines. It was seen before the work on the rate too. The cause is not known.
+- **The road was sometimes black.** In about a quarter of the runs that reached the race (7 of
+  about 30 on 2026-11-06), the road surface was black from the race's start to the end of the
+  run, while its markings, the curbs and the rest of the scene were drawn. It was seen before the
+  work on the rate too.
+  - The likely cause: a macro's `MME_DMA_READ_FIFOED` (how an indirect draw takes its
+    arguments) read memory without waiting for the work the renderer still held. In the race
+    those reads cover words that a held release writes, so they took the old value. Fixed in
+    dd0f378 (A-287).
+  - Since then, 4 runs of 4 draw the road, with its lane lines (frame 3,500 looked at), at 10.5
+    to 11.1 s per 100 frames of the race. With black in one run of four before, that is not yet
+    proof.
 - **The rate:**
   - the waits for the device (the host reading what launches wrote, and the ends of
     submissions);
