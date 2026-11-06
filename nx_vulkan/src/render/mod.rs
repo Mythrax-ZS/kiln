@@ -1302,6 +1302,24 @@ impl Renderer {
                     "[vulkan] frame {}: texture bindings not found {:?} (not kept, a target over them changed; then not kept: a target's own view, written back, copies made, a layout of its own)",
                     p.frame, misses
                 );
+                let compares = std::mem::take(&mut core.textures.compares);
+                let full = textures::take_full_compares();
+                eprintln!(
+                    "[vulkan] frame {}: textures looked up {} times in {:?} (compared this frame), {} in {:?} (unchanged as the tracking says), {} in {:?} (compared in full)",
+                    p.frame,
+                    compares[0].0,
+                    compares[0].1,
+                    compares[1].0,
+                    compares[1].1,
+                    full.0,
+                    full.1
+                );
+                for (spent, address, bytes, what) in textures::take_slowest().into_iter().take(2) {
+                    eprintln!(
+                        "[vulkan]   a full comparison of the texture at {address:#x} ({} KiB) took {spent:?}: {what}",
+                        bytes >> 10
+                    );
+                }
                 let made = std::mem::take(&mut core.textures.made);
                 eprintln!(
                     "[vulkan] frame {}: textures made from memory: {} new, {} again (their memory changed), {} MiB, in {:?}",
@@ -1446,19 +1464,22 @@ impl Renderer {
         }
         // A displayed buffer ends a frame: textures are compared with memory again in the next.
         core.textures.frame += 1;
-        // The textures keep to a share of the device memory the driver lets the process use
-        // (A-260): 40 % of the device heap's budget, at least 1 GiB.
-        let budget = core
+        // The textures keep to what the device memory the driver lets the process use leaves
+        // (A-260): nine tenths of the device heap's budget, less what the process holds there
+        // besides the textures, at least 1 GiB.
+        let (used, budget) = core
             .vk
             .heaps()
             .iter()
             .filter(|(_, _, local)| *local)
-            .map(|(_, budget, _)| *budget)
-            .max()
-            .unwrap_or(8 << 30);
+            .map(|(used, budget, _)| (*used, *budget))
+            .max_by_key(|(_, budget)| *budget)
+            .unwrap_or((0, 8 << 30));
+        let (held, _) = core.textures.device_bytes();
+        let others = used.saturating_sub(held);
         let limit = config
             .texture_budget
-            .unwrap_or_else(|| (budget / 10 * 4).max(1 << 30));
+            .unwrap_or_else(|| (budget / 10 * 9).saturating_sub(others).max(1 << 30));
         let gone = core.textures.trim(&mut core.frame, limit);
         core.textures_trimmed += gone as u64;
         if busy && core.debug.trace_after_busy {
