@@ -3619,9 +3619,10 @@ fn an_audio_output_gives_each_buffer_back_when_its_time_has_been_played() {
         "the frames played"
     );
     assert!(!contains(&mut e, 7));
-    // Flushing gives back what has not been played.
-    append(&mut e, 9, 480, SCRATCH + 0x1000);
+    // Flushing gives back what has not been played. The output is stopped first: a buffer
+    // appended while it plays may be taken up at once, and a flush leaves the one playing.
     assert_eq!(e.call(out, &Message::new(2)).result, 0);
+    append(&mut e, 9, 480, SCRATCH + 0x1000);
     append(&mut e, 10, 480, SCRATCH + 0x1100);
     assert_eq!(e.call(out, &Message::new(11)).data, 1u32.to_le_bytes());
     assert_eq!(e.call(out, &released).data, 2u32.to_le_bytes());
