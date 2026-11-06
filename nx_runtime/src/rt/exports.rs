@@ -421,8 +421,8 @@ pub unsafe extern "C" fn nx_interp1(p: *mut NativeCpu) {
 /// The generated function for guest address `pc`, or null.
 #[no_mangle]
 pub extern "C" fn nx_lookup(pc: u64) -> *const c_void {
-    if crate::rt::census::enabled() {
-        crate::rt::census::note(crate::rt::census::Kind::Indirect, pc);
+    if census::enabled() {
+        census::note_indirect(pc);
     }
     rt().lookup(pc).unwrap_or(std::ptr::null())
 }

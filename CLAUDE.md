@@ -344,7 +344,8 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   `NX_CENSUS=<file>` counts the floating-point and SIMD instruction words that reach the runtime
   (`nx_vec`, `nx_vecmem`), the words the lifter left to the interpreter, the addresses the slow
   path interprets, the targets of indirect branches (`indirect`: a graphics driver's entry points
-  are reached so) and the loads and stores that took the runtime's slow path (an access across two
+  are reached so; with `NX_CENSUS_FROM=<hex from>:<hex to>`, `indirect-from` counts again those
+  whose return address is in that range, a program's own calls told from a library's) and the loads and stores that took the runtime's slow path (an access across two
   pages, an unmapped page, a missing permission; `slow`), and rewrites the file every ten seconds, most frequent first, with the decoded
   instruction: what to lower to native code next.
 - Unicorn (AArch64 oracle): `UNICORN_DLL`, else `.venv` (`py -m venv .venv`, then

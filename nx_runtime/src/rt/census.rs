@@ -18,8 +18,8 @@ const BITS: u32 = 18;
 const SLOTS: usize = 1 << BITS;
 /// How far a lookup walks before giving up on a full table.
 const PROBES: usize = 64;
-/// How many lines a report keeps.
-const REPORT_LINES: usize = 30_000;
+/// How many lines a report keeps: all of the table, so that what runs once is counted too.
+const REPORT_LINES: usize = SLOTS;
 
 /// What a count is about.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -38,6 +38,9 @@ pub enum Kind {
     /// The target of an indirect branch or call (`nx_lookup`): which functions are reached
     /// through pointers, as a graphics driver's entry points are.
     Indirect = 6,
+    /// The target of an indirect branch whose return address (`x30`) is in the range
+    /// `NX_CENSUS_FROM` names: a program's own calls into a library, told from the library's.
+    IndirectFrom = 7,
 }
 
 struct Table {
@@ -93,6 +96,42 @@ impl Table {
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static TABLE: OnceLock<Table> = OnceLock::new();
+/// The return addresses `[lo, hi)` whose indirect branches are counted as [`Kind::IndirectFrom`].
+static FROM: OnceLock<(u64, u64)> = OnceLock::new();
+
+thread_local! {
+    /// The CPU of the guest thread this host thread runs, for the return address of a branch.
+    static CPU: std::cell::Cell<*const crate::rt::abi::NativeCpu> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// This host thread runs the guest thread of `cpu` (looked at only while the census is on).
+pub fn enter(cpu: *const crate::rt::abi::NativeCpu) {
+    if enabled() {
+        CPU.with(|c| c.set(cpu));
+    }
+}
+
+/// Count the target `pc` of an indirect branch, and again as [`Kind::IndirectFrom`] when the
+/// running thread's return address is in the range of `NX_CENSUS_FROM`.
+pub fn note_indirect(pc: u64) {
+    note(Kind::Indirect, pc);
+    if let Some(&(lo, hi)) = FROM.get() {
+        let cpu = CPU.with(|c| c.get());
+        // SAFETY: set by `enter` for the guest thread this host thread is running.
+        let lr = (!cpu.is_null()).then(|| unsafe { (*cpu).state.x[30] });
+        if lr.is_some_and(|lr| (lo..hi).contains(&lr)) {
+            note(Kind::IndirectFrom, pc);
+        }
+    }
+}
+
+/// `NX_CENSUS_FROM=<hex lo>:<hex hi>`.
+fn parse_from(text: &str) -> Option<(u64, u64)> {
+    let (lo, hi) = text.split_once(':')?;
+    let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    Some((hex(lo)?, hex(hi)?))
+}
 
 /// Is the census on? A relaxed load: the callers check it on every floating-point instruction.
 #[inline(always)]
@@ -114,6 +153,12 @@ pub fn start_from_env() {
     };
     if TABLE.set(Table::new()).is_err() {
         return;
+    }
+    if let Some(range) = std::env::var("NX_CENSUS_FROM")
+        .ok()
+        .and_then(|t| parse_from(&t))
+    {
+        let _ = FROM.set(range);
     }
     ENABLED.store(true, Ordering::Release);
     let _ = std::thread::Builder::new()
@@ -150,6 +195,7 @@ fn kind_name(kind: u8) -> &'static str {
         k if k == Kind::Fallback as u8 => "fallback",
         k if k == Kind::Slow as u8 => "slow",
         k if k == Kind::Indirect as u8 => "indirect",
+        k if k == Kind::IndirectFrom as u8 => "indirect-from",
         _ => "interpreted",
     }
 }
@@ -164,6 +210,7 @@ fn report(entries: &[(u8, u64, u64)]) -> String {
         Kind::Interpreted,
         Kind::Slow,
         Kind::Indirect,
+        Kind::IndirectFrom,
     ] {
         let (distinct, total) = entries
             .iter()
@@ -209,6 +256,16 @@ mod tests {
         let text = report(&e);
         assert!(text.contains("# vec: 6 executions of 2 distinct"), "{text}");
         assert!(text.contains("\n5 vec 0x1e222820 "), "{text}");
+    }
+
+    #[test]
+    fn the_range_of_return_addresses_is_read_in_hexadecimal() {
+        assert_eq!(
+            parse_from("8020000:c1e0000"),
+            Some((0x802_0000, 0xc1e_0000))
+        );
+        assert_eq!(parse_from("0x10:0x20"), Some((0x10, 0x20)));
+        assert_eq!(parse_from("10"), None);
     }
 
     #[test]

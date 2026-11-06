@@ -632,6 +632,7 @@ pub unsafe fn interpret_one(cpu: *mut NativeCpu) {
 /// # Safety
 /// `cpu` must be valid and exclusively used by the caller.
 pub unsafe fn run(cpu: *mut NativeCpu, entry: u64) -> u32 {
+    super::census::enter(cpu);
     (*cpu).state.pc = entry;
     (*cpu).state.x[30] = EXIT_PC;
     (*cpu).ctl.stop = stop::NONE;
