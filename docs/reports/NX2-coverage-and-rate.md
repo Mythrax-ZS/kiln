@@ -32,6 +32,34 @@ programs come and whether each is carried out.
   - 234 distinct driver functions were called from those modules, 52,228,872 times. That is 234
     of the 733 entry points the title names, about 32%.
   - 45 of the 234 were called 10 times or fewer (the setting up).
+- **By name:** the driver's `nvnDeviceGetProcAddress` (traced with `kiln disasm`) finds a name by
+  binary search over 731 sorted names. With the title's device, it gives a different function for
+  each name than without one, and those are the functions the title calls. Asking it for every
+  name once the title had a device, then matching the census of a run into the race:
+  - **246 NVN2 functions** were called from the title's code, 53,266,180 times, 39 of them 10
+    times or fewer. This count is exact, by name, and replaces the estimate of 234 above.
+  - **By class:**
+
+    | Class | Functions |
+    |-------|-----------|
+    | `CommandBuffer` | 72 |
+    | `Texture` | 48 |
+    | `Sampler` | 22 |
+    | `Queue` | 15 |
+    | `MemoryPool` | 14 |
+    | `Device` | 11 |
+    | `Window` | 10 |
+    | Others (programs, buffers, render state) | 54 |
+
+    Each class counts its builders, views and pools with it.
+
+  - **Most called:**
+    - `nvnCommandBufferBindTexture`: 6,088,354
+    - `nvnDeviceGetTextureHandle`: 5,801,644
+    - `nvnChannelMaskStateSetChannelMask`: 3,513,941
+    - `nvnBufferMap`: 2,151,952
+  - These 246 functions are what an implementation of NVN2 in place of the driver would have to
+    provide for this title, as far as the race.
 - What those calls produce is counted below, at the services and the GPU front.
 
 ## The system
