@@ -10,6 +10,17 @@ through the driver's channels to the GPU front. Coverage is therefore measured a
 boundaries: which requests come and whether each is served, and which methods, macros and
 programs come and whether each is carried out.
 
+## NVN2
+
+- **733 entry points named.** The read-only data of the title's `main` holds the names of 733
+  distinct NVN2 entry points (`nvn…`). That is the API the title fetches by name through
+  `nvnBootstrapLoader`.
+- **Served by the title's own driver.** The loader is exported by another module, almost
+  certainly the SDK's: it is the only other module with NVN names (58 of them). That driver runs
+  recompiled like the rest of the title.
+- **Not measured:** how many of the 733 a run calls. Calls into recompiled code are not counted.
+  What those calls produce is counted below, at the services and the GPU front.
+
 ## The system
 
 From one run with `NX_TRACE_SVC=1` (into the menus, past frame 500; the trace slows the run too
