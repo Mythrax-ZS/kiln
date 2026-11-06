@@ -212,6 +212,8 @@ struct Scratch {
 struct Phases {
     /// The instances of draws of several (A-281): drawn together, and drawn one by one.
     instances: [u64; 2],
+    /// Texture bindings taken from those found earlier in the frame, and looked for (A-282).
+    bound_reused: [u64; 2],
     /// Finding the translated programs (comparing them with memory).
     programs: std::time::Duration,
     /// The texture handles, headers, images and samplers.
@@ -1182,7 +1184,8 @@ impl Renderer {
                      on the pass, {:?} on vertices, {:?} on descriptors, {:?} on the pipeline, \
                      {:?} on recording; of the textures, {:?} on headers, {:?} on whether a texture \
                      is a target, {:?} on writing targets back, {:?} on images and samplers; {} \
-                     instances were drawn in draws of several, {} one by one",
+                     instances were drawn in draws of several, {} one by one; {} texture bindings \
+                     were found earlier in the frame, {} looked for",
                     p.frame,
                     ph.programs,
                     ph.textures,
@@ -1196,7 +1199,9 @@ impl Renderer {
                     ph.texture_write_back,
                     ph.texture_bind,
                     ph.instances[0],
-                    ph.instances[1]
+                    ph.instances[1],
+                    ph.bound_reused[0],
+                    ph.bound_reused[1]
                 );
                 #[cfg(feature = "alloc_stats")]
                 {

@@ -939,6 +939,12 @@ impl Core {
         if self.debug.trace_textures && self.traced().is_some() {
             self.say_texture_pool(scene, pools);
         }
+        // A binding found in this frame stands while no target is placed over its memory and the
+        // renderer writes nothing there (A-282); what was traced or waited for is looked at anew.
+        for (start, end) in self.targets.take_placed() {
+            self.textures.forget_bound(start, end);
+        }
+        let reuse = !self.sync_on && !(self.debug.trace_textures && self.traced().is_some());
         for (used, (handle, from)) in p.info.textures.iter().zip(handles) {
             let handle = *handle;
             let (tic_id, tsc_id) = (handle & 0xF_FFFF, handle >> 20);
@@ -1010,6 +1016,24 @@ impl Core {
                 &mut self.phases.texture_headers,
                 "texture_headers",
             );
+            let bound_key: super::textures::BoundKey =
+                (tic, tsc, used.dim as u8, used.arrayed, used.shadow);
+            if reuse {
+                let targets = &self.targets;
+                if let Some((view, sampler)) = self.textures.bound(&bound_key, |k| targets.state(k))
+                {
+                    self.phases.bound_reused[0] += 1;
+                    out.push((
+                        base + 24 + used.slot,
+                        vk::DescriptorImageInfo::default()
+                            .sampler(sampler)
+                            .image_view(view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                    ));
+                    continue;
+                }
+            }
+            self.phases.bound_reused[1] += 1;
             let target_view = self.render_target_view(scene, &tic, used)?;
             lap(&mut mark, &mut self.phases.texture_target, "texture_target");
             let decorate = |e: String| {
@@ -1031,7 +1055,7 @@ impl Core {
                     // The render targets that stand for parts of this texture: the ones that are
                     // exactly a layer and a level of it are copied into its image on the device,
                     // the others that were drawn to are written into the memory it is read from.
-                    let overlays = self.sync_targets(scene, &tic, used)?;
+                    let (overlays, alone) = self.sync_targets(scene, &tic, used)?;
                     lap(
                         &mut mark,
                         &mut self.phases.texture_write_back,
@@ -1042,6 +1066,19 @@ impl Core {
                         .bind(&self.vk, &mut self.frame, scene, tic, tsc, used, &overlays)
                         .map_err(decorate)?;
                     self.record_copies(&copies)?;
+                    // Kept for the frame while the render targets over the texture's memory are as
+                    // they are now (A-282): one drawn to since would have to be copied or written
+                    // there.
+                    if let (Some(near), true) = (alone, copies.is_empty()) {
+                        if bound.layout == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL {
+                            self.textures.remember_bound(
+                                bound_key,
+                                bound.view,
+                                bound.sampler,
+                                near,
+                            );
+                        }
+                    }
                     lap(&mut mark, &mut self.phases.texture_bind, "texture_bind");
                     bound
                 }
@@ -1067,12 +1104,12 @@ impl Core {
         scene: &Scene<'_>,
         tic: &Tic,
         used: &TextureUse,
-    ) -> Result<Vec<Overlay>, String> {
+    ) -> Result<(Vec<Overlay>, Option<super::textures::Near>), String> {
         let Some(bytes) = self.textures.span(tic, used) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         };
         let Some((cpu, _)) = scene.host_address(tic.address()) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         };
         let covering = self.targets.covering(cpu, cpu + bytes);
         // Depth targets that are layers or parts of the texture (the cascades of a shadow map
@@ -1080,8 +1117,22 @@ impl Core {
         // (A-275).
         let depths = self.targets.depth_covering(cpu, cpu + bytes);
         if covering.is_empty() && depths.is_empty() {
-            return Ok(Vec::new());
+            let near = super::textures::Near {
+                start: cpu,
+                end: cpu + bytes,
+                targets: Vec::new(),
+            };
+            return Ok((Vec::new(), Some(near)));
         }
+        let near = super::textures::Near {
+            start: cpu,
+            end: cpu + bytes,
+            targets: covering
+                .iter()
+                .chain(&depths)
+                .map(|c| (c.key, c.serial, c.dirty))
+                .collect(),
+        };
         let mut overlays = Vec::new();
         let mut dirty = Vec::new();
         for c in covering {
@@ -1116,7 +1167,7 @@ impl Core {
             .filter(|key| self.targets.memory_unchanged(scene.mem, key))
             .collect();
         if keys.is_empty() {
-            return Ok(overlays);
+            return Ok((overlays, Some(near)));
         }
         let _phase = nx_gpu::progress::enter(nx_gpu::progress::WRITING_BACK);
         let cause = self.write_back_causes.entry(tic.address()).or_default();
@@ -1165,7 +1216,7 @@ impl Core {
                 tic.address()
             );
         }
-        Ok(overlays)
+        Ok((overlays, None))
     }
 
     /// Record the copies of render targets into layers and levels of texture images.

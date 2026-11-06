@@ -517,6 +517,35 @@ fn a_render_target_is_sampled_from_the_target_and_not_from_memory() {
     }
 }
 
+#[test]
+fn a_texture_sampled_before_a_target_is_drawn_over_its_memory_is_the_target_after() {
+    if vulkan().is_none() {
+        return;
+    }
+    // Within one frame: the texture is read from memory (all green), then a target is drawn
+    // over that memory (red), then the texture is sampled again: what was found for it the first
+    // time no longer stands (A-282).
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = textured(4, target, header(0x08, 2, 4, 4, TEXELS), nearest_sampler());
+    put_rgba_texture(&w, |_, _| [0, 255, 0, 255]);
+    let mut r = Renderer::new(RenderConfig::default());
+    let first_pixel = |r: &mut Renderer, w: &World| {
+        r.draw(&w.scene(), &DRAW).unwrap();
+        let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+        [rgba[0], rgba[1], rgba[2], rgba[3]]
+    };
+    assert_eq!(first_pixel(&mut r, &w), [0, 255, 0, 255]);
+    w.color_target(0, TEXELS, 4, 4, 0xD5);
+    clear_to(&mut r, &mut w, [1.0, 0.0, 0.0, 1.0], None);
+    w.color_target(0, target, 4, 4, 0xD5);
+    assert_eq!(first_pixel(&mut r, &w), [255, 0, 0, 255]);
+    // Drawn to again in the same frame, the target is what the texture is again.
+    w.color_target(0, TEXELS, 4, 4, 0xD5);
+    clear_to(&mut r, &mut w, [0.0, 0.0, 1.0, 1.0], None);
+    w.color_target(0, target, 4, 4, 0xD5);
+    assert_eq!(first_pixel(&mut r, &w), [0, 0, 255, 255]);
+}
+
 /// More submissions than a target that nothing draws to is kept for.
 const LONG: usize = 350;
 

@@ -174,6 +174,9 @@ pub struct Targets {
     /// The addresses of the targets whose memory reaches into each 2 MiB of the guest's address
     /// space, so that the targets over a texture are found without looking at those near it.
     buckets: std::collections::BTreeMap<u64, Vec<u64>>,
+    /// The memory of the targets placed since it was last taken ([`Targets::take_placed`]): the
+    /// textures bound there in this frame are looked at again (A-282).
+    placed: Vec<(u64, u64)>,
     /// How many submissions have run, to age targets by.
     pub submissions: u64,
     /// Counts the draws to targets, for [`Target::serial`].
@@ -337,10 +340,21 @@ impl Targets {
 
     fn place(&mut self, placed: Placed) {
         let address = placed.key.address;
+        self.placed.push((address, address + placed.bytes.max(1)));
         for b in Self::buckets_of(address, address + placed.bytes) {
             self.buckets.entry(b).or_default().push(address);
         }
         self.by_address.insert(address, placed);
+    }
+
+    /// When the target `key` was last drawn to and whether it holds pixels its memory does not.
+    pub fn state(&self, key: &Key) -> Option<(u64, bool)> {
+        self.map.get(key).map(|t| (t.serial, t.dirty))
+    }
+
+    /// The memory of the targets placed since the last call.
+    pub fn take_placed(&mut self) -> Vec<(u64, u64)> {
+        std::mem::take(&mut self.placed)
     }
 
     fn unplace(&mut self, address: u64) {

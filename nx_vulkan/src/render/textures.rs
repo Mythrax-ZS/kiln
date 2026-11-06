@@ -958,6 +958,10 @@ pub fn levels_left_out(
 #[derive(Default)]
 pub struct Textures {
     map: FastMap<(Tic, Shape), Texture>,
+    /// The bindings found in this frame for textures no render target is over, with the memory
+    /// they are made of, and the frame they are for (A-282).
+    bound: FastMap<BoundKey, BoundEntry>,
+    bound_frame: u64,
     /// Why layers were hashed, for the report: (times, bytes) with nothing to compare with, after
     /// the renderer wrote into them, after the tracking saw a write, the tracking not knowing.
     pub hash_reasons: [(u64, u64); 4],
@@ -984,6 +988,30 @@ pub struct Textures {
 
 /// A texture's `checked` that matches no frame: it is compared with memory again.
 const UNCHECKED: u64 = u64::MAX;
+
+/// What a texture binding is found by within a frame (A-282): its header, its sampler, and the
+/// dimension, arrayness and depth comparison it is sampled with.
+pub type BoundKey = (Tic, Tsc, u8, bool, bool);
+
+/// A texture binding kept for the frame, the guest memory the texture is made of, and the render
+/// targets over that memory as they were (when each was drawn to, whether it is dirty).
+#[derive(Clone, Debug)]
+struct BoundEntry {
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+    start: u64,
+    end: u64,
+    targets: Vec<(Key, u64, bool)>,
+}
+
+/// The guest memory a texture is made of and the render targets over it, as a binding found for
+/// it depends on them (A-282).
+#[derive(Clone, Debug, Default)]
+pub struct Near {
+    pub start: u64,
+    pub end: u64,
+    pub targets: Vec<(Key, u64, bool)>,
+}
 
 /// The bytes of a layer's memory that are hashed together: a write of the renderer into a few
 /// bytes of a large texture has those parts of it compared again, not the whole layer (A-279).
@@ -1015,6 +1043,57 @@ impl Textures {
             trace,
             always_compare: std::env::var_os("NX_DEBUG_ALWAYS_COMPARE").is_some(),
             ..Textures::default()
+        }
+    }
+
+    /// The view and sampler found in this frame for a texture, while the render targets over its
+    /// memory are as they were then (`state` says how each is now; A-282).
+    pub fn bound(
+        &mut self,
+        key: &BoundKey,
+        state: impl Fn(&Key) -> Option<(u64, bool)>,
+    ) -> Option<(vk::ImageView, vk::Sampler)> {
+        if self.bound_frame != self.frame {
+            self.bound.clear();
+            self.bound_frame = self.frame;
+            return None;
+        }
+        let e = self.bound.get(key)?;
+        e.targets
+            .iter()
+            .all(|(k, serial, dirty)| state(k) == Some((*serial, *dirty)))
+            .then_some((e.view, e.sampler))
+    }
+
+    /// Keep what a texture made of the guest memory `[start, end)` was bound with, for the rest
+    /// of the frame or until that memory is written, a render target is placed over it, or one
+    /// of the `targets` over it (with when each was drawn to and whether it was put into memory)
+    /// changes.
+    pub fn remember_bound(
+        &mut self,
+        key: BoundKey,
+        view: vk::ImageView,
+        sampler: vk::Sampler,
+        near: Near,
+    ) {
+        if self.bound_frame == self.frame {
+            self.bound.insert(
+                key,
+                BoundEntry {
+                    view,
+                    sampler,
+                    start: near.start,
+                    end: near.end,
+                    targets: near.targets,
+                },
+            );
+        }
+    }
+
+    /// Forget the bindings of textures made of memory in `[start, end)`.
+    pub fn forget_bound(&mut self, start: u64, end: u64) {
+        if !self.bound.is_empty() {
+            self.bound.retain(|_, e| e.end <= start || e.start >= end);
         }
     }
 
@@ -1774,6 +1853,7 @@ impl Textures {
     /// it): the textures made of memory there are compared with it again when next used, the
     /// others keep what they were found to be this frame.
     pub fn memory_written(&mut self, start: u64, end: u64) {
+        self.forget_bound(start, end);
         for t in self.map.values_mut() {
             if t.cpu == 0 || (t.cpu < end && t.cpu + t.bytes > start) {
                 t.checked = UNCHECKED;
