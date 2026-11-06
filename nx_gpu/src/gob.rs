@@ -3,7 +3,7 @@
 //! A GOB is sixteen sectors of 16 bytes. The Switch's GPU (the X1's) orders them x5 y2 y1 x4 y0
 //! (from the high bit of the sector number down: bit 5 of the byte's column, bit 2 of its row, and
 //! so on); the Switch 2's orders them x5 y2 x4 y1 y0, bits 5 and 6 of the offset exchanged. Block
-//! heights, sizes and mip offsets are the same (NVN2 guide 8.1; NeXium's `set_swapped_gob_sectors`;
+//! heights, sizes and mip offsets are the same (NeXium's `set_swapped_gob_sectors`;
 //! docs/ASSUMPTIONS.md A-248). A process has one GPU, so the order is set once for it.
 
 use std::sync::atomic::{AtomicBool, Ordering};

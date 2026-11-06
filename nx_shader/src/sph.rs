@@ -8,7 +8,7 @@
 pub const SPH_WORDS: usize = 20;
 /// Bytes in a header: the code starts this far into the program.
 pub const SPH_BYTES: usize = SPH_WORDS * 4;
-/// Bytes in a version 4 header (the Switch 2's, NVN2 guide 9.1): its first 0x50 keep version 3's
+/// Bytes in a version 4 header (the Switch 2's): its first 0x50 keep version 3's
 /// layout, and the code starts after all of them.
 pub const SPH_V4_BYTES: usize = 0x80;
 

@@ -304,7 +304,7 @@ pub(super) fn ast(tx: &mut Tx<'_>, i: &I) -> R<()> {
 }
 
 /// `IPA Rd, a[addr]`: the interpolation unit's value of a pixel shader input (the address in words
-/// in bits 64..71). As on Maxwell the program divides by w itself (NVN2 guide 9.1): a perspective
+/// in bits 64..71). As on Maxwell the program divides by w itself: a perspective
 /// input comes multiplied by `1/w` ([`super::super::io::interpolated`]).
 pub(super) fn ipa(tx: &mut Tx<'_>, i: &I) -> R<()> {
     let inst = i.inst;

@@ -67,8 +67,8 @@ pub(super) enum Dest {
 /// The scoreboard of sm_86 code: an instruction that sets a write barrier (a variable-latency
 /// one: a texture, an attribute or memory load, a special function...) writes its registers when
 /// its result comes back, which the code waits for with a wait mask or a `DEPBAR` count; until then
-/// the registers hold their old values, which the code may still read (NVN2 guide 9.1,
-/// docs/ASSUMPTIONS.md A-256). Such writes are held in variables of their own here and land when
+/// the registers hold their old values, which the code may still read (docs/ASSUMPTIONS.md
+/// A-256). Such writes are held in variables of their own here and land when
 /// the code waits for them, or at the end of the block.
 #[derive(Default)]
 pub(super) struct Scoreboard {

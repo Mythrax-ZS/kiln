@@ -257,7 +257,7 @@ pub(super) fn sust(tx: &mut Tx<'_>, i: &I) -> R<()> {
 
 /// `SURED.op.type [Ra], Rb, c[slot][word]`: an atomic operation on a texel, with no result (NAK's
 /// fields as `SUATOM`'s: the operation in bits 87..89, the type in 73..75; the title has only
-/// `.ADD.U32`, NVN2 guide 9.2). The image's texels are 32-bit unsigned integers.
+/// `.ADD.U32`). The image's texels are 32-bit unsigned integers.
 pub(super) fn sured(tx: &mut Tx<'_>, i: &I) -> R<()> {
     let inst = i.inst;
     if inst.field(87, 3) != 0 || inst.field(73, 3) != 0 {

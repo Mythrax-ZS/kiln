@@ -151,7 +151,7 @@ pub(super) fn fsetp(tx: &mut Tx<'_>, i: &I) -> R<()> {
 }
 
 /// `MUFU.op Rd, ±|B|`: the special functions. `SIN` and `COS` take the angle in turns, not radians
-/// (NVN2 guide 9.1; NeXium).
+/// (NeXium).
 pub(super) fn mufu(tx: &mut Tx<'_>, i: &I) -> R<()> {
     if i.inst.bit(73) {
         return tx.fail("MUFU of a half-precision value");

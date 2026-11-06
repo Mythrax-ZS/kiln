@@ -6,8 +6,8 @@ renderer refuses every draw at its programs, which are sm_86 (M13).
 
 The task (part of the owner's request of 2026-11-04): what a Switch 2 program's graphics need below
 NVN2, at the driver level, until the title submits its first frames and they are traced. The plan
-is in `docs/reports/M11-switch2-boot.md`. References: the NVN2 guide and the NVN guide the owner
-supplied, NeXium (the owner's emulator) and Eglantine (a Switch 2 emulator derived from Eden,
+is in `docs/reports/M11-switch2-boot.md`. References:
+NeXium (the owner's emulator) and Eglantine (a Switch 2 emulator derived from Eden,
 GPL-3.0: used for what the services do, none of its code is taken), and the title's own SDK,
 disassembled where the references disagree or say nothing; each fact used is in
 docs/ASSUMPTIONS.md with its source.

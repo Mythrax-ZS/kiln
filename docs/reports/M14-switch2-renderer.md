@@ -7,7 +7,7 @@ there, not at full speed.
 
 The task (the last part of the owner's request of 2026-11-04, laid out in
 `docs/reports/M11-switch2-boot.md`): what the renderer lacked for the Switch 2's draws once their
-sm_86 programs translate (M13). References: the NVN2 guide and the NVN guide the owner supplied,
+sm_86 programs translate (M13). References:
 NeXium (the owner's emulator, for field layouts), NVIDIA's class headers, and the title's own SDK
 where they say nothing; each fact used is in docs/ASSUMPTIONS.md (A-259 to A-279) with its source.
 The title is the owner's own dump; this report gives aggregate numbers only and does not name it.

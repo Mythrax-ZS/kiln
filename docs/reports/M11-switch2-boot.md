@@ -29,7 +29,7 @@ start-up:
    read-only data (A-193).
 4. **The first unimplemented call** is `ISelfController` command 2000, which
    `nn::gsv::BootWithRemoteMemory` sends for `nn::gs::sdk::BootGraphicsSystem`: the request for the
-   graphics supervisor (`nx2:gsv` in the NVN2 guide), through which a Switch 2 program reaches its
+   graphics supervisor (`nx2:gsv`), through which a Switch 2 program reaches its
    GPU. The run stops there with status 101:
 
    ```
@@ -92,7 +92,7 @@ The run takes under a second: 177 supervisor calls (70 `SendSyncRequest`, 38 `Ge
 The title is at the point where the Switch title of M7 was when it asked for `nvdrv`. A Switch 2
 program compiles NVN2 into its own `sdk` module, so the recompiled code issues the GPU's commands
 itself, and the work is at the driver level, as in M8 and as NeXium (the owner's emulator, MIT)
-does it. In order, with NeXium's implementation and the NVN2 guide as the references:
+does it. In order, with NeXium's implementation as the reference:
 
 1. **M12, the GPU front for NX2**: the graphics supervisor and its sessions (`nx2:syncpt` with its
    shared page, `nx2:gpu` memory, `vi2` presentation, `nx2:nvsrv` for the `nvdrv` nodes), the

@@ -1,4 +1,4 @@
-//! The Switch 2's graphics supervisor (`nx2:gsv` in the NVN2 guide): the session a Switch 2
+//! The Switch 2's graphics supervisor (`nx2:gsv`): the session a Switch 2
 //! program's SDK asks the applet for (`ISelfController` command 2000, from
 //! `nn::gsv::BootWithRemoteMemory`) and through which it reaches its GPU. It speaks TIPC
 //! (docs/ASSUMPTIONS.md A-194).

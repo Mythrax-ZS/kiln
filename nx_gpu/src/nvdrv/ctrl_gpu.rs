@@ -89,8 +89,8 @@ pub fn characteristics() -> [u8; 160] {
 }
 
 /// The Switch 2's `struct nvgpu_gpu_characteristics`, for its Ampere T239: 208 bytes, the GM20B's
-/// with the fields the Switch 2 changes (the NVN2 guide, appendix A.1, checked by NeXium against a
-/// Switch 2 title; A-199).
+/// with the fields the Switch 2 changes (NeXium's, checked against a Switch 2
+/// title; A-199).
 pub fn characteristics_switch_2() -> [u8; 208] {
     use super::super::gpu::class;
     let mut b = [0u8; 208];

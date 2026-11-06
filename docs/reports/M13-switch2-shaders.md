@@ -8,7 +8,7 @@ the title reaches its title screen, drawn (frame 400 dumped and looked at), in a
 The task (part of the owner's request of 2026-11-04, laid out in `docs/reports/M12-switch2-gpu-front.md`):
 the version 4 program header and the sm_86 instruction set, for the draws' and the compute launches'
 programs. References: Mesa's NAK (`sm70_encode.rs`, MIT licence) for the fields of each instruction,
-NeXium (the owner's emulator) for the semantics that differ from Maxwell, and the NVN2 guide; each
+NeXium (the owner's emulator) for the semantics that differ from Maxwell; each
 fact used is in docs/ASSUMPTIONS.md (A-240 to A-258) with its source. The title is the owner's own
 dump; this report gives aggregate numbers only and does not name it.
 

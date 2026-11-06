@@ -73,7 +73,7 @@ impl Tic {
     }
 
     /// The GPU address of the first byte. The Switch 2's headers have 17 bits of the address's
-    /// upper part where the Switch's have 16 (NVN2 guide 8.2; docs/ASSUMPTIONS.md A-251).
+    /// upper part where the Switch's have 16 (docs/ASSUMPTIONS.md A-251).
     pub fn address(&self) -> u64 {
         let upper_bits = if nx_gpu::gob::is_switch_2() { 17 } else { 16 };
         let high = u64::from(self.bits(64, upper_bits)) << 32;
