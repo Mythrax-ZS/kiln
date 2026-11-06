@@ -965,6 +965,8 @@ pub struct Textures {
     /// Why layers were hashed, for the report: (times, bytes) with nothing to compare with, after
     /// the renderer wrote into them, after the tracking saw a write, the tracking not knowing.
     pub hash_reasons: [(u64, u64); 4],
+    /// Textures made or brought up to date from memory: (new, changed, bytes), for the report.
+    pub made: (u64, u64, u64),
     /// Samplers by header and by whether the shader compares against a depth.
     samplers: FastMap<(Tsc, bool), vk::Sampler>,
     /// The number of buffers shown so far: a texture is compared with memory once per frame.
@@ -1498,6 +1500,7 @@ impl Textures {
             .iter()
             .fold(layers as u64, |a, h| a.rotate_left(7) ^ h);
         let mut update: Option<(vk::Image, vk::ImageView, Vec<u32>)> = None;
+        let existed = self.map.contains_key(&key);
         if let Some(t) = self.map.get_mut(&key) {
             t.stale.iter_mut().for_each(Vec::clear);
             if t.layer_hashes == layer_hashes {
@@ -1517,6 +1520,12 @@ impl Textures {
             }
         }
         let _phase = nx_gpu::progress::enter(nx_gpu::progress::MAKING_TEXTURE);
+        if existed {
+            self.made.1 += 1;
+        } else {
+            self.made.0 += 1;
+        }
+        self.made.2 += total;
         if skip > 0 && !self.reduced.contains(&tic.address()) {
             self.reduced.push(tic.address());
             eprintln!(

@@ -233,7 +233,12 @@ impl Core {
             place,
             written: used.written,
         };
+        let started = std::time::Instant::now();
         self.fill_surface(scene, &surface)?;
+        self.phases.surfaces_filled.0 += 1;
+        self.phases.surfaces_filled.1 += started.elapsed();
+        self.phases.surfaces_filled.2 +=
+            surface.place.layer_bytes() * u64::from(surface.place.layers);
         Ok(surface)
     }
 

@@ -259,6 +259,8 @@ struct Phases {
     hazard_kinds: [u64; 7],
     /// How long putting the launches' surfaces into memory took and how many bytes they were.
     surfaces_put: (std::time::Duration, u64),
+    /// Surfaces made from memory for launches: how many, how long it took, and the bytes.
+    surfaces_filled: (u64, std::time::Duration, u64),
 
     /// Surfaces that were the image a launch before wrote (A-280).
     forwarded: u64,
@@ -1269,6 +1271,14 @@ impl Renderer {
                         );
                     }
                 }
+                let made = std::mem::take(&mut core.textures.made);
+                eprintln!(
+                    "[vulkan] frame {}: textures made from memory: {} new, {} again (their memory changed), {} MiB",
+                    p.frame,
+                    made.0,
+                    made.1,
+                    made.2 >> 20
+                );
                 let why = std::mem::take(&mut core.textures.hash_reasons);
                 eprintln!(
                     "[vulkan] frame {}: texture layers hashed (times, MiB): nothing to compare with {:?}, written by the renderer {:?}, written as the tracking says {:?}, not tracked {:?}",
@@ -1349,10 +1359,13 @@ impl Renderer {
                         ph.forwarded
                     );
                     eprintln!(
-                        "[vulkan] frame {}: putting the surfaces into memory took {:?} for {} MiB",
+                        "[vulkan] frame {}: putting the surfaces into memory took {:?} for {} MiB; {} surfaces were made from memory in {:?} ({} MiB)",
                         p.frame,
                         ph.surfaces_put.0,
-                        ph.surfaces_put.1 >> 20
+                        ph.surfaces_put.1 >> 20,
+                        ph.surfaces_filled.0,
+                        ph.surfaces_filled.1,
+                        ph.surfaces_filled.2 >> 20
                     );
                 }
                 let s = std::mem::take(&mut self.spent);
