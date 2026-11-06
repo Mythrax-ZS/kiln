@@ -996,6 +996,9 @@ pub struct Textures {
     /// The decoder of ASTC blocks on the device, made at the first ASTC texture (A-286), unless
     /// `NX_ASTC_HOST=1` keeps decoding on the host.
     astc: Option<crate::astc_gpu::Decoder>,
+    /// The encoder of decoded ASTC texels into BC7 blocks (A-291), made at the first ASTC texture
+    /// decoded on the device, unless `NX_ASTC_RGBA=1` keeps the texels as they are.
+    bc7: Option<crate::astc_gpu::Decoder>,
     /// `NX_DEBUG_ALWAYS_COMPARE=1`: every texture is compared with memory once a frame, even
     /// where the tracking of writes says its memory is unchanged (it does not see what the device
     /// writes into guest memory in place: a texture's fault, or the tracking's?).
@@ -1721,11 +1724,21 @@ impl Textures {
             let _ = std::fs::write(path, read_at(0, total));
         }
         let components = tic.view_mapping();
+        // ASTC is decoded on the device (A-286): the blocks are uploaded as they are, and each
+        // level is decoded into a buffer of the device that the image is copied from. A 2D one is
+        // then encoded as BC7, which takes a quarter of the memory of its texels (A-291).
+        let on_device = format.astc && std::env::var_os("NX_ASTC_HOST").is_none();
+        let bc7 = on_device && depth == 1 && std::env::var_os("NX_ASTC_RGBA").is_none();
+        let image_format = match (bc7, format.vk) {
+            (true, vk::Format::R8G8B8A8_SRGB) => vk::Format::BC7_SRGB_BLOCK,
+            (true, _) => vk::Format::BC7_UNORM_BLOCK,
+            (false, f) => f,
+        };
         let made = if update.is_some() {
             None
         } else {
             Some(vk.create_image(ImageInfo {
-                format: format.vk,
+                format: image_format,
                 width: (width >> skip).max(1),
                 height: (height >> skip).max(1),
                 depth: (depth >> skip).max(1),
@@ -1752,11 +1765,11 @@ impl Textures {
             Some((_, _, changed)) => changed.clone(),
             None => (0..layers).collect(),
         };
-        // ASTC is decoded on the device (A-286): the blocks are uploaded as they are, and each
-        // level is decoded into a buffer of the device that the image is copied from.
-        let on_device = format.astc && std::env::var_os("NX_ASTC_HOST").is_none();
         if on_device && self.astc.is_none() {
             self.astc = Some(crate::astc_gpu::Decoder::new(vk)?);
+        }
+        if bc7 && self.bc7.is_none() {
+            self.bc7 = Some(crate::astc_gpu::Decoder::bc7_encoder(vk)?);
         }
         // (offset of the blocks in the upload, offset of the texels in the decoded buffer, width,
         // height) of each level to decode.
@@ -1898,9 +1911,31 @@ impl Textures {
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
             )?)
         };
-        let buffer = match &decoded {
-            Some(d) => d.buffer,
-            None => {
+        // The BC7 blocks of each level (A-291): where they are in their buffer, the image copied
+        // from them, rows a whole number of blocks long.
+        let mut encoded_at = Vec::new();
+        let encoded = if bc7 && !jobs.is_empty() {
+            let mut at = 0u64;
+            for (r, &(_, _, w, h)) in regions.iter_mut().zip(&jobs) {
+                let (across, down) = (w.div_ceil(4), h.div_ceil(4));
+                encoded_at.push(at);
+                *r = r
+                    .buffer_offset(at)
+                    .buffer_row_length(across * 4)
+                    .buffer_image_height(down * 4);
+                at += u64::from(across * down) * 16;
+            }
+            Some(vk.create_device_buffer(
+                at.max(16),
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+            )?)
+        } else {
+            None
+        };
+        let buffer = match (&encoded, &decoded) {
+            (Some(e), _) => e.buffer,
+            (None, Some(d)) => d.buffer,
+            (None, None) => {
                 for r in &mut regions {
                     r.buffer_offset += base_offset;
                 }
@@ -1930,6 +1965,25 @@ impl Textures {
         if let Some(decoder) = &self.astc {
             for _ in &jobs {
                 sets.push(frame.descriptor_set(vk, decoder.set_layout)?);
+            }
+        }
+        // The encoder's parameters and sets: width, height, blocks across and down, the first word
+        // of the texels, the first word of the blocks.
+        let mut encode_params = Vec::new();
+        let mut encode_sets = Vec::new();
+        if let (Some(encoder), Some(_)) = (&self.bc7, &encoded) {
+            for (&(_, texels_at, w, h), &blocks_at) in jobs.iter().zip(&encoded_at) {
+                let words = [
+                    w,
+                    h,
+                    w.div_ceil(4),
+                    h.div_ceil(4),
+                    (texels_at / 4) as u32,
+                    (blocks_at / 4) as u32,
+                ];
+                let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                encode_params.push(frame.upload(vk, &bytes, align)?);
+                encode_sets.push(frame.descriptor_set(vk, encoder.set_layout)?);
             }
         }
         // The uploads run before the draws of the batch. A texture is compared with memory at its
@@ -2053,12 +2107,77 @@ impl Textures {
                     let blocks = w.div_ceil(format.block.0) * h.div_ceil(format.block.1);
                     d.cmd_dispatch(cmd, blocks.div_ceil(crate::astc_gpu::WORKGROUP), 1, 1);
                 }
+                // The texels are encoded as BC7 blocks first when the image is of BC7 (A-291).
+                let copied_from = match (&self.bc7, &encoded) {
+                    (Some(encoder), Some(blocks)) => {
+                        let decoded_now = [vk::BufferMemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .buffer(out.buffer)
+                            .offset(0)
+                            .size(vk::WHOLE_SIZE)];
+                        d.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &decoded_now,
+                            &[],
+                        );
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, encoder.pipeline);
+                        for ((&(_, _, w, h), &(params_buffer, params_at)), &set) in
+                            jobs.iter().zip(&encode_params).zip(&encode_sets)
+                        {
+                            let infos = [
+                                vk::DescriptorBufferInfo::default()
+                                    .buffer(params_buffer)
+                                    .offset(params_at)
+                                    .range(24),
+                                vk::DescriptorBufferInfo::default()
+                                    .buffer(out.buffer)
+                                    .offset(0)
+                                    .range(vk::WHOLE_SIZE),
+                                vk::DescriptorBufferInfo::default()
+                                    .buffer(blocks.buffer)
+                                    .offset(0)
+                                    .range(vk::WHOLE_SIZE),
+                            ];
+                            let writes: Vec<vk::WriteDescriptorSet> = infos
+                                .iter()
+                                .enumerate()
+                                .map(|(b, info)| {
+                                    vk::WriteDescriptorSet::default()
+                                        .dst_set(set)
+                                        .dst_binding(b as u32)
+                                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                        .buffer_info(std::slice::from_ref(info))
+                                })
+                                .collect();
+                            d.update_descriptor_sets(&writes, &[]);
+                            d.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                encoder.layout,
+                                0,
+                                &[set],
+                                &[],
+                            );
+                            let count = w.div_ceil(4) * h.div_ceil(4);
+                            d.cmd_dispatch(cmd, count.div_ceil(crate::astc_gpu::WORKGROUP), 1, 1);
+                        }
+                        blocks.buffer
+                    }
+                    _ => out.buffer,
+                };
                 let written = [vk::BufferMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(out.buffer)
+                    .buffer(copied_from)
                     .offset(0)
                     .size(vk::WHOLE_SIZE)];
                 d.cmd_pipeline_barrier(
@@ -2104,6 +2223,9 @@ impl Textures {
         // The decoded texels go once the batch has copied them.
         if let Some(d) = decoded {
             frame.garbage.push(Garbage::Device(d));
+        }
+        if let Some(e) = encoded {
+            frame.garbage.push(Garbage::Device(e));
         }
         match made {
             None => {
@@ -2180,6 +2302,9 @@ impl Textures {
         if let Some(decoder) = self.astc.take() {
             decoder.destroy(vk);
         }
+        if let Some(encoder) = self.bc7.take() {
+            encoder.destroy(vk);
+        }
         for (_, t) in self.map.drain() {
             vk.destroy_image(t.image);
         }
@@ -2234,6 +2359,36 @@ impl Textures {
             }
         }
         gone
+    }
+
+    /// For the report: how many guest addresses the textures are made of, the device bytes of the
+    /// ASTC textures, and the guest bytes the images are made of (each byte once).
+    pub fn sharing(&self) -> (usize, u64, u64) {
+        let addresses: std::collections::HashSet<u64> =
+            self.map.keys().map(|(tic, _)| tic.address()).collect();
+        // The guest memory once (overlapping textures counted once), and the device bytes of the
+        // ASTC textures, which are decoded to four bytes a texel.
+        let mut spans: Vec<(u64, u64)> = self
+            .map
+            .values()
+            .filter(|t| t.cpu != 0)
+            .map(|t| (t.cpu, t.cpu + t.bytes))
+            .collect();
+        spans.sort_unstable();
+        let (mut guest, mut end) = (0u64, 0u64);
+        for (a, b) in spans {
+            if b > end {
+                guest += b - a.max(end);
+                end = b;
+            }
+        }
+        let astc: u64 = self
+            .map
+            .iter()
+            .filter(|((tic, _), _)| crate::astc::footprint(tic.components()).is_some())
+            .map(|(_, t)| t.image.bytes)
+            .sum();
+        (addresses.len(), astc, guest)
     }
 
     /// How many bytes of device memory the textures' images hold, and how many textures there are.

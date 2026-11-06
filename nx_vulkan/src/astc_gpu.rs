@@ -21,6 +21,21 @@ pub fn spirv() -> Vec<u32> {
 /// Invocations a workgroup of the decoder has.
 pub const WORKGROUP: u32 = 64;
 
+/// The words of the BC7 encoder's SPIR-V (`shaders/bc7_encode.comp`, A-291). Its bindings (set
+/// 0, storage buffers): 0 the parameters (six words: width, height, blocks across, blocks down,
+/// the first word of the texels, the first word of the blocks), 1 the texels (a word each, RGBA8,
+/// rows packed), 2 the blocks (four words each). Workgroups of [`WORKGROUP`] invocations, one a
+/// block.
+pub fn bc7_spirv() -> Vec<u32> {
+    let bytes = include_bytes!("../shaders/bc7_encode.spv");
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| u32::from_le_bytes(*w))
+        .collect()
+}
+
 use crate::device::Vk;
 use ash::vk;
 
@@ -34,13 +49,21 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn new(vk: &Vk) -> Result<Decoder, String> {
+        Decoder::with(vk, &spirv(), "the ASTC decoder")
+    }
+
+    /// The BC7 encoder (A-291), which has the same shape: three storage buffers.
+    pub fn bc7_encoder(vk: &Vk) -> Result<Decoder, String> {
+        Decoder::with(vk, &bc7_spirv(), "the BC7 encoder")
+    }
+
+    fn with(vk: &Vk, code: &[u32], what: &str) -> Result<Decoder, String> {
         let d = &vk.device;
-        let code = spirv();
         // SAFETY: valid create infos; everything made is destroyed in `destroy`.
         unsafe {
             let module = d
-                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
-                .map_err(|e| format!("making the ASTC decoder's module: {e}"))?;
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None)
+                .map_err(|e| format!("making {what}'s module: {e}"))?;
             let bindings: Vec<_> = (0..3)
                 .map(|b| {
                     vk::DescriptorSetLayoutBinding::default()
@@ -55,14 +78,14 @@ impl Decoder {
                     &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
                     None,
                 )
-                .map_err(|e| format!("making the ASTC decoder's set layout: {e}"))?;
+                .map_err(|e| format!("making {what}'s set layout: {e}"))?;
             let set_layouts = [set_layout];
             let layout = d
                 .create_pipeline_layout(
                     &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
                     None,
                 )
-                .map_err(|e| format!("making the ASTC decoder's layout: {e}"))?;
+                .map_err(|e| format!("making {what}'s layout: {e}"))?;
             let stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(module)
@@ -72,7 +95,7 @@ impl Decoder {
                 .layout(layout)];
             let pipeline = d
                 .create_compute_pipelines(vk::PipelineCache::null(), &info, None)
-                .map_err(|(_, e)| format!("making the ASTC decoder's pipeline: {e}"))?[0];
+                .map_err(|(_, e)| format!("making {what}'s pipeline: {e}"))?[0];
             Ok(Decoder {
                 set_layout,
                 layout,

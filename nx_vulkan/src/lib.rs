@@ -7,6 +7,7 @@
 pub mod alloc_stats;
 pub mod astc;
 pub mod astc_gpu;
+pub mod bc7;
 pub mod blocklinear;
 pub mod compute;
 pub mod device;

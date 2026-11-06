@@ -310,7 +310,9 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   decoder written as a compute program (`nx_vulkan/shaders/astc_decode.comp`, A-286; its SPIR-V is
   kept beside it, made with `glslc --target-env=vulkan1.1 -O astc_decode.comp -o astc_decode.spv`
   after any change), which `nx_vulkan/tests/astc_gpu.rs` holds to the host decoder's bytes;
-  `NX_ASTC_HOST=1` decodes on the host instead.
+  `NX_ASTC_HOST=1` decodes on the host instead. A decoded 2D texture is then encoded as BC7 on the
+  device (`nx_vulkan/shaders/bc7_encode.comp`, its SPIR-V made the same way, A-291), held to an
+  error bound by the same test; `NX_ASTC_RGBA=1` keeps the decoded texels.
 - Opus decoder: `nx_opus/tests/vectors.rs` decodes the official test vectors (RFC 8251 section 11;
   `KILN_OPUS_VECTORS` = the directory of `testvector01.bit` and the rest) to stereo and mono at every
   output rate, checks the final range of every packet, and applies the reference's quality metric

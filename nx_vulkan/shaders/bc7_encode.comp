@@ -1,0 +1,178 @@
+// 8-bit RGBA texels encoded as BC7 blocks on the device, in mode 6 alone (one subset, RGBA
+// endpoints of seven bits and a p-bit each, sixteen weights): the decoded texels of an ASTC texture
+// take a quarter of the memory so (A-291). One invocation a block of 4x4 texels; a block that the
+// image ends inside repeats its last column and row. The endpoints are the ends of the texels'
+// principal axis; a test decodes what this writes on the host and holds it to an error bound.
+//
+// Compiled by hand with `glslc --target-env=vulkan1.1 -O bc7_encode.comp -o bc7_encode.spv`; the
+// SPIR-V is kept beside this file (`include_bytes!` in `src/astc_gpu.rs`).
+#version 450
+
+layout(local_size_x = 64) in;
+
+// What the launch encodes: an image of `width` x `height` texels, a word each, rows packed, from
+// word `in_at` of `texels`, into `across` x `down` blocks of four words from word `out_at` of
+// `blocks`.
+layout(std430, set = 0, binding = 0) readonly buffer Params {
+    uint width;
+    uint height;
+    uint across;
+    uint down;
+    uint in_at;
+    uint out_at;
+} params;
+
+layout(std430, set = 0, binding = 1) readonly buffer Texels {
+    uint texels[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer Blocks {
+    uint blocks[];
+};
+
+const uint WEIGHTS[16] = uint[](0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64);
+
+vec4 unpack(uint w) {
+    return vec4(float(w & 0xFFu), float((w >> 8) & 0xFFu), float((w >> 16) & 0xFFu), float(w >> 24));
+}
+
+// The seven bits and the p-bit of an endpoint closest to `e` (each channel `2q + p`).
+void quantize(vec4 e, out uvec4 q, out uint p) {
+    float best = 1e30;
+    q = uvec4(0u);
+    p = 0u;
+    for (uint bit = 0u; bit < 2u; bit++) {
+        uvec4 c = uvec4(clamp(round((e - float(bit)) * 0.5), vec4(0.0), vec4(127.0)));
+        vec4 d = vec4(c * 2u + bit) - e;
+        // Alpha counts twice: an opaque block stays opaque when the p-bit cannot suit every
+        // channel (255 and 0 in one color).
+        float err = dot(d, d) + d.a * d.a;
+        if (err < best) {
+            best = err;
+            q = c;
+            p = bit;
+        }
+    }
+}
+
+uint bits[4];
+uint at;
+
+void put(uint value, uint count) {
+    uint word = at >> 5;
+    uint shift = at & 31u;
+    bits[word] |= value << shift;
+    if (shift + count > 32u) {
+        bits[word + 1u] |= value >> (32u - shift);
+    }
+    at += count;
+}
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= params.across * params.down) {
+        return;
+    }
+    uint bx = b % params.across;
+    uint by = b / params.across;
+    vec4 px[16];
+    vec4 mean = vec4(0.0);
+    vec4 lo = vec4(255.0);
+    vec4 hi = vec4(0.0);
+    for (uint i = 0u; i < 16u; i++) {
+        uint x = min(bx * 4u + (i & 3u), params.width - 1u);
+        uint y = min(by * 4u + (i >> 2u), params.height - 1u);
+        px[i] = unpack(texels[params.in_at + y * params.width + x]);
+        mean += px[i];
+        lo = min(lo, px[i]);
+        hi = max(hi, px[i]);
+    }
+    mean *= 1.0 / 16.0;
+    // The principal axis: power iteration on the covariance, from the diagonal of the box.
+    mat4 cov = mat4(0.0);
+    for (uint i = 0u; i < 16u; i++) {
+        vec4 d = px[i] - mean;
+        cov += outerProduct(d, d);
+    }
+    vec4 axis = hi - lo;
+    float len = length(axis);
+    if (len > 0.0) {
+        axis /= len;
+        for (uint k = 0u; k < 8u; k++) {
+            vec4 next = cov * axis;
+            float l = length(next);
+            if (l < 1e-4) {
+                break;
+            }
+            axis = next / l;
+        }
+    }
+    float tmin = 0.0;
+    float tmax = 0.0;
+    for (uint i = 0u; i < 16u; i++) {
+        float t = dot(px[i] - mean, axis);
+        tmin = min(tmin, t);
+        tmax = max(tmax, t);
+    }
+    vec4 e0 = clamp(mean + axis * tmin, vec4(0.0), vec4(255.0));
+    vec4 e1 = clamp(mean + axis * tmax, vec4(0.0), vec4(255.0));
+    uvec4 q0;
+    uvec4 q1;
+    uint p0;
+    uint p1;
+    quantize(e0, q0, p0);
+    quantize(e1, q1, p1);
+    uvec4 v0 = q0 * 2u + p0;
+    uvec4 v1 = q1 * 2u + p1;
+    // Each texel's weight: the nearest of the sixteen colors between the endpoints.
+    uint index[16];
+    for (uint i = 0u; i < 16u; i++) {
+        float best = 1e30;
+        uint pick = 0u;
+        for (uint k = 0u; k < 16u; k++) {
+            uint w = WEIGHTS[k];
+            vec4 c = vec4((v0 * (64u - w) + v1 * w + 32u) >> 6u);
+            vec4 d = c - px[i];
+            float err = dot(d, d);
+            if (err < best) {
+                best = err;
+                pick = k;
+            }
+        }
+        index[i] = pick;
+    }
+    // The first texel's weight has no top bit: the endpoints are swapped when it would.
+    if (index[0] >= 8u) {
+        uvec4 tq = q0;
+        q0 = q1;
+        q1 = tq;
+        uint tp = p0;
+        p0 = p1;
+        p1 = tp;
+        for (uint i = 0u; i < 16u; i++) {
+            index[i] = 15u - index[i];
+        }
+    }
+    bits[0] = 0u;
+    bits[1] = 0u;
+    bits[2] = 0u;
+    bits[3] = 0u;
+    at = 0u;
+    // Mode 6: six zeros and a one.
+    put(64u, 7u);
+    for (uint c = 0u; c < 4u; c++) {
+        put(q0[c], 7u);
+        put(q1[c], 7u);
+    }
+    put(p0, 1u);
+    put(p1, 1u);
+    put(index[0], 3u);
+    for (uint i = 1u; i < 16u; i++) {
+        put(index[i], 4u);
+    }
+    uint o = params.out_at + b * 4u;
+    blocks[o] = bits[0];
+    blocks[o + 1u] = bits[1];
+    blocks[o + 2u] = bits[2];
+    blocks[o + 3u] = bits[3];
+}

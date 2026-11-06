@@ -934,7 +934,10 @@ fn an_astc_texture_is_decoded_on_the_device_and_sampled() {
                 (0, 1) => [0, 0, 255, 255],
                 _ => [128, 128, 0, 64],
             };
-            assert_eq!(got, want, "pixel ({px}, {py})");
+            // The texels are encoded as BC7 on the device (A-291): within a step of the color.
+            let close = got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= 1);
+            assert!(close, "pixel ({px}, {py}): {got:?}, not {want:?}");
+            assert_eq!(got[3], want[3], "pixel ({px}, {py}): alpha");
         }
     }
 }

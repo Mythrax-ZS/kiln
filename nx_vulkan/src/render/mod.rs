@@ -1395,17 +1395,20 @@ impl Renderer {
                     })
                     .collect();
                 let (texture_bytes, textures) = core.textures.device_bytes();
+                let (addresses, astc_bytes, guest_bytes) = core.textures.sharing();
                 let trimmed = std::mem::take(&mut core.textures_trimmed);
                 let (target_bytes, targets) = core.targets.device_bytes();
                 let made = std::mem::take(&mut core.global.made);
                 eprintln!(
-                    "[vulkan] frame {}: device memory: {} MiB in images and buffers ({} MiB in {textures} textures, {trimmed} let go, {} MiB in {targets} render targets), {} MiB of guest memory imported in {} runs ({} MiB of it distinct; {} imports made in {:?}); heaps used/budget (MiB): {}",
+                    "[vulkan] frame {}: device memory: {} MiB in images and buffers ({} MiB in {textures} textures of {addresses} addresses ({} MiB of them ASTC, made of {} MiB of guest memory), {trimmed} let go, {} MiB in {targets} render targets), {} MiB of guest memory imported in {} runs ({} MiB of it distinct; {} imports made in {:?}); heaps used/budget (MiB): {}",
                     p.frame,
                     mib(core
                         .vk
                         .allocated
                         .load(std::sync::atomic::Ordering::Relaxed)),
                     mib(texture_bytes),
+                    mib(astc_bytes),
+                    mib(guest_bytes),
                     mib(target_bytes),
                     mib(core.global.bytes()),
                     core.global.runs(),

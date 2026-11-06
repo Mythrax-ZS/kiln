@@ -107,3 +107,100 @@ fn the_device_decodes_astc_blocks_as_the_host_does() {
         }
     }
 }
+
+/// The BC7 encoder of the device (A-291), decoded on the host: a block of one color comes back
+/// within a step of it, smooth gradients within a few, and anything at all within reason, in an
+/// image that ends inside its last column and row of blocks.
+#[test]
+fn the_device_encodes_texels_as_bc7_close_to_them() {
+    let Some(vk) = vulkan() else { return };
+    let spirv = nx_vulkan::astc_gpu::bc7_spirv();
+    let (width, height) = (63u32, 37u32);
+    let (across, down) = (width.div_ceil(4), height.div_ceil(4));
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    // Four kinds of picture: flat colors a block each, gradients along one direction (the colors
+    // of a block on a line), gradients along two (on a plane, which one line of mode 6 can only
+    // come near), and noise.
+    for kind in 0..4 {
+        let mut texels = vec![0u8; (width * height * 4) as usize];
+        let flat: Vec<[u8; 4]> = (0..across * down)
+            .map(|_| rng.next().to_le_bytes())
+            .collect();
+        for y in 0..height {
+            for x in 0..width {
+                let t = match kind {
+                    0 => flat[((y / 4) * across + x / 4) as usize],
+                    1 => [
+                        (x * 4) as u8,
+                        (x * 3 + 20) as u8,
+                        (200 - x * 2) as u8,
+                        (x * 4) as u8,
+                    ],
+                    2 => [
+                        (x * 4) as u8,
+                        (y * 6) as u8,
+                        ((x + y) * 2) as u8,
+                        (255 - x * 2) as u8,
+                    ],
+                    _ => rng.next().to_le_bytes(),
+                };
+                let at = ((y * width + x) * 4) as usize;
+                texels[at..at + 4].copy_from_slice(&t);
+            }
+        }
+        let mut params: Vec<u8> = [width, height, across, down, 0, 0]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let mut source = texels.clone();
+        let mut blocks = vec![0u8; (across * down * 16) as usize];
+        let mut list: Vec<(u32, &mut [u8])> = vec![
+            (0, &mut params[..]),
+            (1, &mut source[..]),
+            (2, &mut blocks[..]),
+        ];
+        vk.run_compute_with(
+            &spirv,
+            &mut list,
+            &[],
+            &[],
+            [(across * down).div_ceil(64), 1, 1],
+        )
+        .unwrap();
+        drop(list);
+        let (mut worst, mut squares, mut count) = (0u32, 0f64, 0f64);
+        for by in 0..down {
+            for bx in 0..across {
+                let at = ((by * across + bx) * 16) as usize;
+                let block: [u8; 16] = blocks[at..at + 16].try_into().unwrap();
+                let decoded = nx_vulkan::bc7::decode_mode6(&block).expect("a block of mode 6");
+                for (i, d) in decoded.iter().enumerate() {
+                    let (x, y) = (bx * 4 + i as u32 % 4, by * 4 + i as u32 / 4);
+                    if x >= width || y >= height {
+                        continue;
+                    }
+                    let t = &texels[((y * width + x) * 4) as usize..][..4];
+                    for c in 0..4 {
+                        let e = (i32::from(d[c]) - i32::from(t[c])).unsigned_abs();
+                        worst = worst.max(e);
+                        squares += f64::from(e * e);
+                        count += 1.0;
+                    }
+                }
+            }
+        }
+        let rms = (squares / count).sqrt();
+        match kind {
+            0 => assert!(worst <= 1, "flat blocks: worst error {worst}"),
+            1 => assert!(
+                rms <= 1.0,
+                "gradients on a line: RMS error {rms:.2}, worst {worst}"
+            ),
+            2 => assert!(
+                rms <= 4.0,
+                "gradients on a plane: RMS error {rms:.2}, worst {worst}"
+            ),
+            _ => assert!(rms <= 64.0, "noise: RMS error {rms:.2}"),
+        }
+    }
+}

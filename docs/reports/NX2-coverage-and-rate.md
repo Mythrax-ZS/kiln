@@ -202,9 +202,10 @@ Where 100 frames of the race go now, on that one thread (with `NX_TRACE_PERF`):
 | Settles of launches (waiting for the device, surfaces put into memory) | 1.7 to 1.9 s |
 | The harvest of write tracking | about 0.45 s |
 
-**Device memory runs out as the race loads.** About 3,300 textures hold about 12.5 GB (ASTC
-textures are decoded to four bytes a texel), and 70 to 90 draws a run are skipped when an image
-cannot be allocated.
+**Device memory ran out as the race loaded.** About 3,300 textures held about 12.5 GB, 7.6 to
+8 GB of it ASTC textures decoded to four bytes a texel, and 70 to 90 draws a run were skipped when
+an image could not be allocated. ASTC textures are now encoded as BC7 on the device (A-291): they
+hold about 4.7 GB, all the textures 9.4 GB, and no allocation failed in a run into the race.
 
 ## Open
 
@@ -225,4 +226,3 @@ cannot be allocated.
   - the cost of a draw's textures and descriptors;
   - the GPU front's interpreter on the renderer's thread.
 - **The two refused kinds of command.**
-- **Device memory in the race's load** (images that cannot be allocated).
