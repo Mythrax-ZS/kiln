@@ -188,7 +188,7 @@ struct Watched {
 }
 
 /// The part of a block that is harvested, or not, as a whole.
-const CHUNK: usize = 16 << 20;
+const CHUNK: usize = 2 << 20;
 
 /// The epochs a chunk nobody asks about stays harvested. Harvesting is the system walking the
 /// chunk's pages, every epoch; a chunk let go keeps its pages' written bits with the system, and
@@ -1314,9 +1314,16 @@ mod tests {
         let e1 = mem.begin_epoch();
         assert!(e1 > 0);
         assert_eq!(mem.untouched_since(host(base), 8192, e1), None);
+        // The part of the block far away is another part of the tracking (A-277): it is asked
+        // about too.
+        assert_eq!(mem.untouched_since(host(base + (3 << 20)), 100, e1), None);
         let e2 = mem.begin_epoch();
         assert!(e2 > e1);
         assert_eq!(mem.untouched_since(host(base), 8192, e2), Some(true));
+        assert_eq!(
+            mem.untouched_since(host(base + (3 << 20)), 100, e2),
+            Some(true)
+        );
         // A write to the second page of the range, and one far away.
         mem.write_bytes(base + 4096 + 8, &[1, 2, 3], true).unwrap();
         mem.write_bytes(base + (3 << 20), &[9], true).unwrap();
