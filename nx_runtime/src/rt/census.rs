@@ -2,8 +2,9 @@
 //!
 //! Counts which floating-point and SIMD instruction words reach the runtime (`nx_vec`,
 //! `nx_vecmem`), which words the lifter left to the interpreter (`nx_interp1`) and at which
-//! addresses the slow path interprets guest code, and writes the counts to the file every ten
-//! seconds, most frequent first, with the decoded instruction. It says what is worth lowering to
+//! addresses the slow path interprets guest code (and the targets of indirect branches), and
+//! writes the counts to the file every ten seconds, most frequent first, with the decoded
+//! instruction. It says what is worth lowering to
 //! native code: nothing else tells how often a program really runs an instruction, and the
 //! numbers are the only thing it keeps of the program.
 
@@ -34,6 +35,9 @@ pub enum Kind {
     /// The address of a load or store that took the runtime's slow path (an access straddling
     /// two pages, an unmapped page, a missing permission), with the instruction.
     Slow = 5,
+    /// The target of an indirect branch or call (`nx_lookup`): which functions are reached
+    /// through pointers, as a graphics driver's entry points are.
+    Indirect = 6,
 }
 
 struct Table {
@@ -145,6 +149,7 @@ fn kind_name(kind: u8) -> &'static str {
         k if k == Kind::VecMem as u8 => "vecmem",
         k if k == Kind::Fallback as u8 => "fallback",
         k if k == Kind::Slow as u8 => "slow",
+        k if k == Kind::Indirect as u8 => "indirect",
         _ => "interpreted",
     }
 }
@@ -158,6 +163,7 @@ fn report(entries: &[(u8, u64, u64)]) -> String {
         Kind::Fallback,
         Kind::Interpreted,
         Kind::Slow,
+        Kind::Indirect,
     ] {
         let (distinct, total) = entries
             .iter()
