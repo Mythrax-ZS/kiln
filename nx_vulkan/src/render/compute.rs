@@ -524,6 +524,9 @@ impl Core {
         let mut mark = super::stopwatch();
         self.phases.settles[cause] += 1;
         let waited = self.flush();
+        // What the launches wrote in place is in memory now: the surfaces kept from before that
+        // it may have reached are looked at again (A-285).
+        self.recheck_residents();
         let deferred = std::mem::take(&mut self.deferred);
         let put = std::time::Instant::now();
         let written = waited.and_then(|()| self.write_staged(space, mem, deferred));
@@ -552,6 +555,9 @@ impl Core {
     ) -> Result<(), String> {
         if let Some((at, len)) = range {
             let to = at.saturating_add(len);
+            // The front reads or writes those bytes itself: a surface kept over them may no
+            // longer be what memory holds (A-285).
+            self.forget_residents(at, to);
             if !self.reach_everywhere
                 && !overlaps(&self.pending_reach, at, to)
                 && !self.deferred.iter().any(|s| s.overlaps(at, to))
@@ -668,7 +674,10 @@ impl Core {
                 // A texture that is the image a launch before stored, not in memory yet, is
                 // sampled as it is (A-283): no wait. What global writes put there is under what
                 // the surface puts there afterwards anyway (A-274).
-                if self.surface_texture_view(&tic, used).is_some() {
+                if self
+                    .surface_texture_view(scene, &tic, used, false)
+                    .is_some()
+                {
                     continue;
                 }
                 let span = self.textures.span(&tic, used).unwrap_or(1);

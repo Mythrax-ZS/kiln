@@ -1027,6 +1027,7 @@ impl Core {
         // renderer writes nothing there (A-282); what was traced or waited for is looked at anew.
         for (start, end) in self.targets.take_placed() {
             self.textures.forget_bound(start, end);
+            self.forget_residents_cpu(start, end);
         }
         let reuse = !self.sync_on && !(self.debug.trace_textures && self.traced().is_some());
         let space = scene.space;
@@ -1104,7 +1105,7 @@ impl Core {
             );
             // The image a launch stored the texture's texels in, while memory does not hold them
             // yet: sampled as it is, with no wait for the launch (A-283).
-            if let Some(view) = self.surface_texture_view(&tic, used) {
+            if let Some(view) = self.surface_texture_view(scene, &tic, used, false) {
                 let sampler = self
                     .textures
                     .sampler(&self.vk, tsc, used.shadow)
@@ -1133,7 +1134,8 @@ impl Core {
                 (tic, tsc, used.dim as u8, used.arrayed, used.shadow);
             if reuse {
                 let targets = &self.targets;
-                if let Some((view, sampler)) = self.textures.bound(&bound_key, |k| targets.state(k))
+                if let Some((view, sampler, layout)) =
+                    self.textures.bound(&bound_key, |k| targets.state(k))
                 {
                     self.phases.bound_reused[0] += 1;
                     out.push((
@@ -1141,12 +1143,36 @@ impl Core {
                         vk::DescriptorImageInfo::default()
                             .sampler(sampler)
                             .image_view(view)
-                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                            .image_layout(layout),
                     ));
                     continue;
                 }
             }
             self.phases.bound_reused[1] += 1;
+            // A surface a launch stored and memory holds now, kept on the device (A-285): sampled
+            // as it is, and found again in this frame as any texture is (A-282).
+            if let Some(view) = self.surface_texture_view(scene, &tic, used, true) {
+                let sampler = self
+                    .textures
+                    .sampler(&self.vk, tsc, used.shadow)
+                    .map_err(|e| format!("{e} [texture {}]", used.index))?;
+                if let Some((start, bytes)) = self.kept_found.take() {
+                    let near = super::textures::Near {
+                        start,
+                        end: start + bytes,
+                        targets: Vec::new(),
+                    };
+                    self.textures.remember_kept(bound_key, view, sampler, near);
+                }
+                out.push((
+                    base + 24 + used.slot,
+                    vk::DescriptorImageInfo::default()
+                        .sampler(sampler)
+                        .image_view(view)
+                        .image_layout(vk::ImageLayout::GENERAL),
+                ));
+                continue;
+            }
             let target_view = self.render_target_view(scene, &tic, used)?;
             lap(&mut mark, &mut self.phases.texture_target, "texture_target");
             let decorate = |e: String| {
@@ -1319,8 +1345,9 @@ impl Core {
             .write_back(&self.vk, &mut self.frame, scene.mem, &keys)?;
         for key in &keys {
             let start = key.address;
-            self.textures
-                .memory_written(start, start + key.memory_bytes().unwrap_or(u64::MAX / 2));
+            let end = start + key.memory_bytes().unwrap_or(u64::MAX / 2);
+            self.textures.memory_written(start, end);
+            self.forget_residents_cpu(start, end);
         }
         if self.debug.trace_textures {
             eprintln!(

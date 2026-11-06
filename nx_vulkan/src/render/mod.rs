@@ -170,6 +170,11 @@ struct Core {
     /// Surface images and staging buffers of launches that have run, for the next launches of
     /// the same shapes (A-278).
     surface_images: crate::fast::FastMap<surfaces::ImageShape, Vec<crate::image::Image>>,
+    /// The images of surfaces whose texels are in memory, kept for later launches and textures
+    /// (A-285).
+    residents: Vec<surfaces::Resident>,
+    /// The memory of the kept surface the last lookup found (guest process address, bytes).
+    kept_found: Option<(u64, u64)>,
     staging_buffers: crate::fast::FastMap<u64, Vec<crate::compute::HostBuffer>>,
     /// Textures let go to keep to the device memory budget (A-260), for the report.
     textures_trimmed: u64,
@@ -216,6 +221,8 @@ struct Phases {
     bound_reused: [u64; 2],
     /// Textures sampled from the image a launch stored them in (A-283).
     surface_textures: u64,
+    /// Kept surfaces taken by a launch, and sampled as textures (A-285).
+    residents_used: [u64; 2],
     /// Draws that waited for launches, by what they read that a launch writes (A-284): a
     /// constant buffer, a vertex stream, the index buffer, a texture pool, memory in place, a
     /// texture.
@@ -406,6 +413,8 @@ impl Renderer {
                     deferred: Vec::new(),
                     releases: Vec::new(),
                     surface_images: crate::fast::FastMap::default(),
+                    residents: Vec::new(),
+                    kept_found: None,
                     staging_buffers: crate::fast::FastMap::default(),
                     textures_trimmed: 0,
                     memory_copies: 0,
@@ -1367,7 +1376,7 @@ impl Renderer {
                         ph.forwarded
                     );
                     eprintln!(
-                        "[vulkan] frame {}: putting the surfaces into memory took {:?} for {} MiB; {} surfaces were made from memory in {:?} ({} MiB); {} textures were sampled from a launch's image; draws waited for launches {:?} (constant buffers, vertices, indices, texture pools, memory in place, textures)",
+                        "[vulkan] frame {}: putting the surfaces into memory took {:?} for {} MiB; {} surfaces were made from memory in {:?} ({} MiB); {} textures were sampled from a launch's image; kept surfaces were used by launches {} and sampled {} times; draws waited for launches {:?} (constant buffers, vertices, indices, texture pools, memory in place, textures)",
                         p.frame,
                         ph.surfaces_put.0,
                         ph.surfaces_put.1 >> 20,
@@ -1375,6 +1384,8 @@ impl Renderer {
                         ph.surfaces_filled.1,
                         ph.surfaces_filled.2 >> 20,
                         ph.surface_textures,
+                        ph.residents_used[0],
+                        ph.residents_used[1],
                         ph.draw_waits
                     );
                 }
@@ -1754,6 +1765,9 @@ impl Drop for Renderer {
                 for image in images {
                     core.vk.destroy_image(image);
                 }
+            }
+            for r in std::mem::take(&mut core.residents) {
+                core.vk.destroy_image(r.into_image());
             }
             for (_, buffers) in core.staging_buffers.drain() {
                 for buffer in buffers {

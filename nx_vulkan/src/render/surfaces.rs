@@ -132,6 +132,31 @@ impl Staged {
     }
 }
 
+/// The image a launch stored a surface in, kept once the texels are in memory (A-285): a later
+/// launch with the same surface takes it instead of making one from memory, and a texture that is
+/// the surface samples it, while memory holds what was put there.
+pub struct Resident {
+    place: Place,
+    /// Where the surface's memory starts in the guest process, and its bytes.
+    cpu: u64,
+    bytes: u64,
+    image: Image,
+    /// The hash of the memory as it was put there, and the frame it was last found so in
+    /// (`u64::MAX`: to be looked at again).
+    hash: u64,
+    checked: u64,
+}
+
+impl Resident {
+    /// Its image, to destroy.
+    pub fn into_image(self) -> Image {
+        self.image
+    }
+}
+
+/// The most surfaces kept on the device after their texels are in memory.
+const RESIDENTS: usize = 96;
+
 /// How many bytes of memory the surface of header `tic` that a program uses as `used` takes, as
 /// [`Core::surface`] lays it out.
 pub fn span(tic: &Tic, used: &ImageUse) -> Option<u64> {
@@ -227,6 +252,20 @@ impl Core {
                 written: used.written,
             });
         }
+        // The image a launch before stored the surface in, while memory holds what it put there
+        // (A-285).
+        if let Some(i) = self.resident(scene.space, scene.mem, &place, |r| {
+            shape_of_image(&r.image.info) == shape_of_image(&info)
+        }) {
+            let r = self.residents.remove(i);
+            self.textures.forget_bound(r.cpu, r.cpu + r.bytes);
+            self.phases.residents_used[0] += 1;
+            return Ok(Surface {
+                image: SurfaceImage::Own(r.image),
+                place,
+                written: used.written,
+            });
+        }
         let image = self.surface_image(info)?;
         let surface = Surface {
             image: SurfaceImage::Own(image),
@@ -269,15 +308,23 @@ impl Core {
     /// memory, format, size and shape, one level, the components in their places (A-283).
     pub(super) fn surface_texture_view(
         &mut self,
+        scene: &Scene<'_>,
         tic: &Tic,
         used: &nx_shader::translate::TextureUse,
+        kept: bool,
     ) -> Option<vk::ImageView> {
-        if self.deferred.is_empty() {
+        // Most textures are neither: no surface is staged and none is kept at their address.
+        if (!kept && self.deferred.is_empty())
+            || (kept
+                && !self
+                    .residents
+                    .iter()
+                    .any(|r| r.place.address == tic.address()))
+        {
             return None;
         }
         let span = self.textures.span(tic, used)?;
         let (from, to) = (tic.address(), tic.address() + span);
-        let index = self.deferred.iter().rposition(|s| s.overlaps(from, to))?;
         let shape = super::textures::shape_of(tic, used).ok()?;
         let format = texture_format(tic.components(), tic.types()[0], tic.srgb())?;
         let view_type = match shape.kind {
@@ -286,19 +333,37 @@ impl Core {
             Kind::D3 => vk::ImageViewType::TYPE_3D,
             _ => return None,
         };
+        let same = |place: &Place, info: &ImageInfo| {
+            place.address == from
+                && place.end() == to
+                && tic.levels() <= 1
+                && !used.shadow
+                && format.vk == info.format
+                && info.view_type == view_type
+                && (info.width, info.height, info.depth, info.layers)
+                    == (tic.width(), tic.height(), shape.depth, shape.layers)
+        };
+        let staged = self.deferred.iter().rposition(|s| s.overlaps(from, to));
+        if kept && staged.is_some() {
+            return None;
+        }
+        let Some(index) = staged else {
+            if !kept {
+                return None;
+            }
+            // Nothing is still to be put there: a surface kept once it was (A-285).
+            let i = self.resident_at(scene.space, scene.mem, from, to, |r| {
+                same(&r.place, &r.image.info)
+            })?;
+            self.phases.residents_used[1] += 1;
+            self.kept_found = Some((self.residents[i].cpu, self.residents[i].bytes));
+            let image = &mut self.residents[i].image;
+            return self.vk.swizzled_view(image, tic.view_mapping()).ok();
+        };
         let staged = &mut self.deferred[index];
         let place = staged.place;
         let image = staged.image.as_mut()?;
-        let info = &image.info;
-        let same = place.address == from
-            && place.end() == to
-            && tic.levels() <= 1
-            && !used.shadow
-            && format.vk == info.format
-            && info.view_type == view_type
-            && (info.width, info.height, info.depth, info.layers)
-                == (tic.width(), tic.height(), shape.depth, shape.layers);
-        if !same {
+        if !same(&place, &image.info) {
             return None;
         }
         // The header's arrangement of the components (a texture of one or two of them reads
@@ -493,6 +558,145 @@ impl Core {
         Ok(())
     }
 
+    /// The resident surface at exactly `place` that `fits`, while memory holds what was put
+    /// there (A-285): its index.
+    fn resident(
+        &mut self,
+        space: &AddressSpace,
+        mem: &dyn GuestMemory,
+        place: &Place,
+        fits: impl Fn(&Resident) -> bool,
+    ) -> Option<usize> {
+        let (from, to) = (place.address, place.end());
+        self.resident_at(space, mem, from, to, |r| {
+            r.place.layer_stride == place.layer_stride && fits(r)
+        })
+    }
+
+    /// The resident surface over exactly `[from, to)` (GPU addresses) that `fits`, while memory
+    /// holds what was put there: no launch not waited for writes it, and it hashes as it did then
+    /// (looked at once a frame, and again after anything wrote there). A surface found changed is
+    /// let go.
+    fn resident_at(
+        &mut self,
+        space: &AddressSpace,
+        mem: &dyn GuestMemory,
+        from: u64,
+        to: u64,
+        fits: impl Fn(&Resident) -> bool,
+    ) -> Option<usize> {
+        let i = self
+            .residents
+            .iter()
+            .position(|r| r.place.address == from && r.place.end() == to)?;
+        if !fits(&self.residents[i]) || self.host_read_hazard(from, to) {
+            return None;
+        }
+        let frame = self.textures.frame;
+        if self.residents[i].checked != frame {
+            let (hash, n) = space.hash(mem, from, to - from);
+            if n != to - from || hash != self.residents[i].hash {
+                let gone = self.residents.remove(i);
+                self.textures.forget_bound(gone.cpu, gone.cpu + gone.bytes);
+                self.frame
+                    .garbage
+                    .push(super::frame::Garbage::Surface(gone.image));
+                return None;
+            }
+            self.residents[i].checked = frame;
+        }
+        Some(i)
+    }
+
+    /// Keep the image a launch stored the surface at `place` in, now that its texels are in
+    /// memory (A-285).
+    fn keep_resident(
+        &mut self,
+        space: &AddressSpace,
+        mem: &dyn GuestMemory,
+        place: Place,
+        image: Image,
+    ) {
+        let (from, to) = (place.address, place.end());
+        let (hash, n) = space.hash(mem, from, to - from);
+        let Some((cpu, _)) = space.translate(from) else {
+            self.frame
+                .garbage
+                .push(super::frame::Garbage::Surface(image));
+            return;
+        };
+        if n != to - from {
+            self.frame
+                .garbage
+                .push(super::frame::Garbage::Surface(image));
+            return;
+        }
+        self.forget_residents(from, to);
+        if self.residents.len() >= RESIDENTS {
+            let oldest = self.residents.remove(0);
+            self.textures
+                .forget_bound(oldest.cpu, oldest.cpu + oldest.bytes);
+            self.frame
+                .garbage
+                .push(super::frame::Garbage::Surface(oldest.image));
+        }
+        self.residents.push(Resident {
+            place,
+            cpu,
+            bytes: to - from,
+            image,
+            hash,
+            checked: self.textures.frame,
+        });
+    }
+
+    /// Let go the resident surfaces over `[from, to)` (GPU addresses): something wrote there.
+    pub(super) fn forget_residents(&mut self, from: u64, to: u64) {
+        let mut i = 0;
+        while i < self.residents.len() {
+            let r = &self.residents[i];
+            if r.place.address < to && from < r.place.end() {
+                let gone = self.residents.remove(i);
+                self.textures.forget_bound(gone.cpu, gone.cpu + gone.bytes);
+                self.frame
+                    .garbage
+                    .push(super::frame::Garbage::Surface(gone.image));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Let go the resident surfaces whose memory in the guest process overlaps `[start, end)`.
+    pub(super) fn forget_residents_cpu(&mut self, start: u64, end: u64) {
+        let mut i = 0;
+        while i < self.residents.len() {
+            let r = &self.residents[i];
+            if r.cpu < end && start < r.cpu + r.bytes {
+                let gone = self.residents.remove(i);
+                self.textures.forget_bound(gone.cpu, gone.cpu + gone.bytes);
+                self.frame
+                    .garbage
+                    .push(super::frame::Garbage::Surface(gone.image));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// The resident surfaces that global writes of launches may have reached are looked at again
+    /// (all of them when the writes are not attributed).
+    pub(super) fn recheck_residents(&mut self) {
+        for r in &mut self.residents {
+            let (from, to) = (r.place.address, r.place.end());
+            if self.writes_everywhere
+                || self.pending_writes.iter().any(|&(a, b)| a < to && from < b)
+            {
+                r.checked = u64::MAX;
+            }
+        }
+    }
+
     /// After a launch is recorded: copy what it stored in its surfaces out for the host (after
     /// it, in the same batch), and let the images go once the batch is over (A-274).
     pub(super) fn stage_surfaces(&mut self, surfaces: Vec<Surface>) -> Result<Vec<Staged>, String> {
@@ -680,9 +884,13 @@ impl Core {
                 }
             }
             if let Some(image) = s.image {
-                self.frame
-                    .garbage
-                    .push(super::frame::Garbage::Surface(image));
+                if result.is_ok() {
+                    self.keep_resident(space, mem, place, image);
+                } else {
+                    self.frame
+                        .garbage
+                        .push(super::frame::Garbage::Surface(image));
+                }
             }
             let list = self.staging_buffers.entry(s.staging.size).or_default();
             if list.len() < POOLED {

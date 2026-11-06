@@ -1001,6 +1001,7 @@ pub type BoundKey = (Tic, Tsc, u8, bool, bool);
 struct BoundEntry {
     view: vk::ImageView,
     sampler: vk::Sampler,
+    layout: vk::ImageLayout,
     start: u64,
     end: u64,
     targets: Vec<(Key, u64, bool)>,
@@ -1054,7 +1055,7 @@ impl Textures {
         &mut self,
         key: &BoundKey,
         state: impl Fn(&Key) -> Option<(u64, bool)>,
-    ) -> Option<(vk::ImageView, vk::Sampler)> {
+    ) -> Option<(vk::ImageView, vk::Sampler, vk::ImageLayout)> {
         if self.bound_frame != self.frame {
             self.bound.clear();
             self.bound_frame = self.frame;
@@ -1064,7 +1065,22 @@ impl Textures {
         e.targets
             .iter()
             .all(|(k, serial, dirty)| state(k) == Some((*serial, *dirty)))
-            .then_some((e.view, e.sampler))
+            .then_some((e.view, e.sampler, e.layout))
+    }
+
+    /// Keep what a texture that is a kept surface (A-285) was bound with: its image is in the
+    /// general layout.
+    pub fn remember_kept(
+        &mut self,
+        key: BoundKey,
+        view: vk::ImageView,
+        sampler: vk::Sampler,
+        near: Near,
+    ) {
+        self.remember_bound(key, view, sampler, near);
+        if let Some(e) = self.bound.get_mut(&key) {
+            e.layout = vk::ImageLayout::GENERAL;
+        }
     }
 
     /// Keep what a texture made of the guest memory `[start, end)` was bound with, for the rest
@@ -1084,6 +1100,7 @@ impl Textures {
                 BoundEntry {
                     view,
                     sampler,
+                    layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     start: near.start,
                     end: near.end,
                     targets: near.targets,

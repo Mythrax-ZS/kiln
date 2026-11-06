@@ -187,6 +187,7 @@ impl Core {
         // What textures made from that memory held is not what the memory is now.
         if let Some(bytes) = dst_key.memory_bytes() {
             self.textures.memory_written(dst_cpu, dst_cpu + bytes);
+            self.forget_residents_cpu(dst_cpu, dst_cpu + bytes);
         }
         Ok(())
     }
@@ -250,6 +251,7 @@ impl Core {
             self.targets.release(&stale, &mut self.frame);
         }
         self.textures.memory_written(written.0, written.1);
+        self.forget_residents_cpu(written.0, written.1);
         self.memory_copies += 1;
         Ok(())
     }
@@ -302,6 +304,7 @@ impl Core {
                 self.targets.release(&stale, &mut self.frame);
             }
             self.textures.memory_written(start, end);
+            self.forget_residents_cpu(start, end);
         }
         self.memory_copies += 1;
         Ok(())
