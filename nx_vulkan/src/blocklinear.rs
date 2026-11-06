@@ -43,6 +43,14 @@ impl Geometry {
         512 << (self.block_height_log2 + self.block_depth_log2)
     }
 
+    /// Whether the texels fill every byte of the tiled surface: rows of whole GOBs, the height and
+    /// depth whole blocks, so that laying them out leaves nothing of what memory held.
+    pub fn fills_its_blocks(&self) -> bool {
+        self.row_bytes().is_multiple_of(64)
+            && u64::from(self.height).is_multiple_of(8 << self.block_height_log2)
+            && u64::from(self.depth).is_multiple_of(1 << self.block_depth_log2)
+    }
+
     /// The bytes the tiled surface takes, every block whole.
     pub fn tiled_size(&self) -> u64 {
         self.blocks_x() * self.blocks_y() * self.blocks_z() * self.block_bytes()
@@ -177,6 +185,25 @@ fn walk(g: &Geometry, mut f: impl FnMut(usize, usize, usize)) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_surface_of_whole_blocks_fills_them_and_another_does_not() {
+        let g = |width, height, bytes_per_element, block_height_log2| Geometry {
+            width,
+            height,
+            depth: 1,
+            bytes_per_element,
+            block_height_log2,
+            block_depth_log2: 0,
+        };
+        // 256 x 256 texels of 8 bytes: rows of 32 GOBs, 16 blocks of 16 rows down.
+        assert!(g(256, 256, 8, 1).fills_its_blocks());
+        // 44 x 24 of 8 bytes: 352 bytes a row, not whole GOBs.
+        assert!(!g(44, 24, 8, 0).fills_its_blocks());
+        // 64 x 12 of 4 bytes: whole GOBs across, but 12 rows are not a block of 16.
+        assert!(!g(64, 12, 4, 1).fills_its_blocks());
+    }
+
     use super::*;
 
     fn pattern(n: usize) -> Vec<u8> {

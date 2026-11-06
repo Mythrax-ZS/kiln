@@ -873,8 +873,17 @@ impl Core {
                 let linear = &s.staging.as_slice()[layer * per_layer..(layer + 1) * per_layer];
                 let at = place.address + layer as u64 * place.layer_stride;
                 let mut tiled = vec![0u8; place.layer_bytes() as usize];
-                let n = space.read_prefix(mem, at, &mut tiled);
-                tiled.truncate(n);
+                // What memory holds is kept where the texels do not reach; a surface of whole
+                // blocks reaches every byte, and memory need not be read.
+                let whole = place.pitch.is_none()
+                    && place.geometry.fills_its_blocks()
+                    && space
+                        .translate(at)
+                        .is_some_and(|(_, run)| run >= place.layer_bytes());
+                if !whole {
+                    let n = space.read_prefix(mem, at, &mut tiled);
+                    tiled.truncate(n);
+                }
                 place.lay_out(linear, &mut tiled);
                 self.phases.surfaces_put.1 += tiled.len() as u64;
                 if !space.write(mem, at, &tiled) {
