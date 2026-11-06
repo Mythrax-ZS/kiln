@@ -19,8 +19,10 @@ use std::collections::VecDeque;
 /// Size of the chunks the upload memory is carved from.
 const CHUNK: u64 = 16 << 20;
 
-/// The upload memory a slot keeps from one batch to the next.
-const KEPT_UPLOAD: u64 = 64 << 20;
+/// The upload memory a slot keeps from one batch to the next: a busy pass of the title's race
+/// takes some 100 MB of constant buffers and vertices, and memory made and let go again for every
+/// batch costs more than holding it.
+const KEPT_UPLOAD: u64 = 256 << 20;
 
 /// How many batches there are: one is recorded while the others run.
 const SLOTS: usize = 3;
@@ -69,6 +71,8 @@ pub struct Frame {
     /// How long the renderer waited for the device to finish a batch, how many batches it waited
     /// for, and how long sending the batches took, for the report.
     pub device_wait: (std::time::Duration, u64, std::time::Duration),
+    /// Upload chunks made since the last report, and their bytes.
+    pub chunks_made: (u64, u64),
 }
 
 /// Something a submission needed that can be destroyed after it ran.
@@ -132,6 +136,7 @@ impl Frame {
                 garbage: Vec::new(),
                 returned: Vec::new(),
                 device_wait: Default::default(),
+                chunks_made: (0, 0),
                 lost: false,
             })
         }
@@ -215,6 +220,8 @@ impl Frame {
             .get(slot.in_use)
             .is_some_and(|c| c.buffer.size >= size);
         if !reusable {
+            self.chunks_made.0 += 1;
+            self.chunks_made.1 += size.max(CHUNK);
             let buffer = vk.create_host_buffer(
                 size.max(CHUNK),
                 vk::BufferUsageFlags::TRANSFER_SRC

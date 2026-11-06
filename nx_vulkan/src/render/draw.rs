@@ -501,7 +501,11 @@ impl Core {
                     .iter()
                     .find(|z| z.0 == slot.address && z.1 == cb)
                     .map(|z| (z.2, z.3));
+                let copying = super::stopwatch();
                 let (buffer, offset, range) = self.constant_buffer(scene, slot.group, cb, want)?;
+                if let Some(copying) = copying {
+                    self.phases.cbuf_copies += copying.elapsed();
+                }
                 self.scratch.zero_data = None;
                 buffer_infos.push((
                     base + cb,
@@ -817,7 +821,11 @@ impl Core {
         }
         // Leaving the rendering is what lets the image change layout; a target in that layout
         // already (read by a draw before, not drawn to since) is read inside the rendering.
-        if self.targets.existing(&key).is_none_or(|t| t.layout != layout) {
+        if self
+            .targets
+            .existing(&key)
+            .is_none_or(|t| t.layout != layout)
+        {
             self.end_pass();
         }
         let cmd = self.frame.cmd(&self.vk)?;
@@ -1417,6 +1425,7 @@ impl Core {
         let padded = u64::from(size.next_multiple_of(16));
         // Read the bytes straight into upload memory, with zeros after them.
         let (buffer, offset, ptr) = self.frame.reserve(&self.vk, padded, align)?;
+        self.phases.cbuf_bytes += padded;
         // SAFETY: `reserve` gave `padded` writable bytes at `ptr`, which nothing else uses.
         let data = unsafe { std::slice::from_raw_parts_mut(ptr, padded as usize) };
         // A program that indexes the buffer may reach all of what is bound, and the part of it that

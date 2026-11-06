@@ -232,6 +232,15 @@ struct Phases {
     texture_target: std::time::Duration,
     texture_write_back: std::time::Duration,
     texture_bind: std::time::Duration,
+    /// Of the descriptors, the constant buffers read and copied; of the pass, the batches sent
+    /// when one ends (with the waits for a slot), and how many passes were begun.
+    cbuf_copies: std::time::Duration,
+    cbuf_bytes: u64,
+    batches_sent: std::time::Duration,
+    passes_begun: u64,
+    /// Why passes were begun: none was going on (something ended it), other color targets,
+    /// another depth target, the depth read only or not, another size.
+    pass_reasons: [u64; 5],
     /// The dynamic state and the draw command.
     record: std::time::Duration,
     /// The steps of compute launches: the program, the constant buffers, the textures, the
@@ -643,11 +652,25 @@ impl Core {
         if self.pass.as_ref() == Some(&wanted) {
             return Ok(());
         }
+        match &self.pass {
+            None => self.phases.pass_reasons[0] += 1,
+            Some(p) if p.colors != wanted.colors => self.phases.pass_reasons[1] += 1,
+            Some(p) if p.depth != wanted.depth => self.phases.pass_reasons[2] += 1,
+            Some(p) if p.depth_read_only != wanted.depth_read_only => {
+                self.phases.pass_reasons[3] += 1
+            }
+            Some(_) => self.phases.pass_reasons[4] += 1,
+        }
         self.end_pass();
+        self.phases.passes_begun += 1;
         // A pass that ends is a good place to give the device what was recorded: it works on that
         // while the next pass is recorded (A-123).
         if self.batch_draws >= BATCH_DRAWS && !self.sync_on {
+            let sent = stopwatch();
             self.send_batch()?;
+            if let Some(sent) = sent {
+                self.phases.batches_sent += sent.elapsed();
+            }
         }
         let cmd = self.frame.cmd(&self.vk)?;
         let mut color_infos = Vec::new();
@@ -1185,7 +1208,8 @@ impl Renderer {
                      {:?} on recording; of the textures, {:?} on headers, {:?} on whether a texture \
                      is a target, {:?} on writing targets back, {:?} on images and samplers; {} \
                      instances were drawn in draws of several, {} one by one; {} texture bindings \
-                     were found earlier in the frame, {} looked for",
+                     were found earlier in the frame, {} looked for; {:?} of the descriptors on \
+                     copying constant buffers ({} MiB); {} passes begun {:?}, {:?} of the pass on sending batches",
                     p.frame,
                     ph.programs,
                     ph.textures,
@@ -1201,7 +1225,12 @@ impl Renderer {
                     ph.instances[0],
                     ph.instances[1],
                     ph.bound_reused[0],
-                    ph.bound_reused[1]
+                    ph.bound_reused[1],
+                    ph.cbuf_copies,
+                    ph.cbuf_bytes >> 20,
+                    ph.passes_begun,
+                    ph.pass_reasons,
+                    ph.batches_sent
                 );
                 #[cfg(feature = "alloc_stats")]
                 {
@@ -1251,9 +1280,12 @@ impl Renderer {
                 );
                 let (waited, batches, sending) = std::mem::take(&mut core.frame.device_wait);
                 eprintln!(
-                    "[vulkan] frame {}: waited {waited:?} for the device to finish {batches} batches; sending them took {sending:?}",
-                    p.frame
+                    "[vulkan] frame {}: waited {waited:?} for the device to finish {batches} batches; sending them took {sending:?}; {} upload chunks were made ({} MiB)",
+                    p.frame,
+                    core.frame.chunks_made.0,
+                    core.frame.chunks_made.1 >> 20
                 );
+                core.frame.chunks_made = (0, 0);
                 let copies = std::mem::take(&mut core.memory_copies);
                 if copies > 0 {
                     eprintln!(
