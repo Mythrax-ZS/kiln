@@ -69,6 +69,11 @@ pub struct Shared {
     way_clear: Condvar,
     /// How many calls have locked the driver (for the report of `NX_TRACE_PERF`).
     calls: std::sync::atomic::AtomicU64,
+    /// Held from taking the driver's signals until they are applied to the events, so that the
+    /// signals of two threads are applied in the order the driver made them: the clearing of an
+    /// event when a wait is armed, then its setting when the value comes, never the other way
+    /// round (which leaves the event clear and the waiter asleep for ever).
+    delivering: Mutex<()>,
 }
 
 /// The driver, locked for a call. While a caller waits for it the worker makes way.
@@ -293,6 +298,7 @@ impl Shared {
                 way: Mutex::new(()),
                 way_clear: Condvar::new(),
                 calls: std::sync::atomic::AtomicU64::new(0),
+                delivering: Mutex::new(()),
             }
         })
     }
@@ -512,6 +518,7 @@ impl Shared {
 
     /// Apply what the driver asked for since the last call to the kernel's events.
     fn deliver_signals(&self, kernel: &Kernel) {
+        let _in_order = self.delivering.lock().unwrap_or_else(|e| e.into_inner());
         let signals = self
             .core
             .lock()
