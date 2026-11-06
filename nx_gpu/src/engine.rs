@@ -636,7 +636,7 @@ impl mme64::Host for Macro64Host<'_, '_> {
         // MME_DMA_READ_FIFOED(count): the words go onto the parameters the macro reads next.
         if method == mme64::method::DMA_READ_FIFOED {
             self.engine.regs[method as usize] = data;
-            params.extend(self.engine.dma_words(self.cx, data)?);
+            params.extend(self.engine.dma_read(self.cx, data)?);
             return Ok(());
         }
         self.engine.write(self.cx, method, data, false)
@@ -863,10 +863,7 @@ impl Engine {
             // MME_DMA_READ(count): words of memory into the data RAM, from the address the data
             // RAM address register names.
             m::DMA_READ => {
-                let va = (u64::from(self.reg(m::MEM_ADDRESS_A) & 0x1FF_FFFF) << 32)
-                    | u64::from(self.reg(m::MEM_ADDRESS_B));
-                cx.settle_range(va, u64::from(data) * 4)?;
-                let words = self.dma_words(cx, data)?;
+                let words = self.dma_read(cx, data)?;
                 let at = self.reg(m::DATA_RAM_ADDRESS) as usize;
                 let ram = cx.macros.data_ram(cx.channel);
                 if at + words.len() > ram.len() {
@@ -1017,6 +1014,17 @@ impl Engine {
 
     /// The `count` words an MME DMA read takes, from the GPU address of `SET_MME_MEM_ADDRESS_A`
     /// and `_B` (A-208).
+    /// The words of an MME DMA read (`MME_DMA_READ`, `MME_DMA_READ_FIFOED`), once what the
+    /// renderer has still to write there is in memory: the arguments of an indirect draw that a
+    /// launch wrote are read so (A-287).
+    fn dma_read(&mut self, cx: &mut Cx<'_>, count: u32) -> Result<Vec<u32>, String> {
+        use mme64::method as m;
+        let va = (u64::from(self.reg(m::MEM_ADDRESS_A) & 0x1FF_FFFF) << 32)
+            | u64::from(self.reg(m::MEM_ADDRESS_B));
+        cx.settle_range(va, u64::from(count) * 4)?;
+        self.dma_words(cx, count)
+    }
+
     fn dma_words(&self, cx: &Cx<'_>, count: u32) -> Result<Vec<u32>, String> {
         use mme64::method as m;
         let va = (u64::from(self.reg(m::MEM_ADDRESS_A) & 0x1FF_FFFF) << 32)
@@ -1755,6 +1763,67 @@ mod tests {
         assert_eq!(stats.macro_calls.get(&3), Some(&(1, 3)));
         assert_eq!(stats.macro_calls.get(&0), Some(&(1, 1)));
         assert!(stats.macro_steps > 0);
+    }
+
+    /// A backend whose last launch wrote a word that is not in memory yet: it is put there when a
+    /// settle asks for those bytes, or for everything (A-274).
+    struct LateWord {
+        at: u64,
+        value: u32,
+        settled: bool,
+    }
+
+    impl Backend for LateWord {
+        fn draw(&mut self, _: &Scene<'_>, _: &Draw) -> Result<(), String> {
+            Ok(())
+        }
+        fn clear(&mut self, _: &Scene<'_>, _: &Clear) -> Result<(), String> {
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn present(&mut self, _: &crate::render::Present) -> Result<(), String> {
+            Ok(())
+        }
+        fn settle(
+            &mut self,
+            space: &AddressSpace,
+            mem: &dyn GuestMemory,
+            range: Option<(u64, u64)>,
+        ) -> Result<(), String> {
+            let reaches = range.is_none_or(|(va, len)| va <= self.at && self.at < va + len);
+            if reaches && !self.settled {
+                self.settled = true;
+                assert!(space.write(mem, self.at, &self.value.to_le_bytes()));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_macro_reads_onto_its_parameters_what_a_launch_still_to_be_waited_for_writes() {
+        let mut late = LateWord {
+            at: 0x500_0010,
+            value: 0x77,
+            settled: false,
+        };
+        with_backend(Some(&mut late), false, |cx| {
+            let mut e = Engine::new(class::AMPERE_THREED);
+            // Macro 2, at instruction 4: one word read onto its parameters, written to 0x200.
+            e.write(cx, 0x45, 4, false).unwrap();
+            for w in mme64::testing::fifo_read_macro(0x200) {
+                e.write(cx, 0x46, w, false).unwrap();
+            }
+            e.write(cx, 0x47, 2, false).unwrap();
+            e.write(cx, 0x48, 4, true).unwrap();
+            // The address of the read (MME_MEM_ADDRESS_A and _B), then the call.
+            e.write(cx, 0x154, 0, true).unwrap();
+            e.write(cx, 0x155, 0x500_0010, true).unwrap();
+            e.write(cx, 0xE04, 1, true).unwrap();
+            assert_eq!(e.reg(0x200), 0x77, "the word as the launch left it");
+        });
+        assert!(late.settled);
     }
 
     #[test]

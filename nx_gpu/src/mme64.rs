@@ -687,6 +687,28 @@ pub(crate) mod testing {
         first.end = true;
         [first, nop()].iter().flat_map(encode).collect()
     }
+
+    /// The code of a macro that takes its one parameter, reads a word of memory onto its
+    /// parameters with `MME_DMA_READ_FIFOED` (at the address the methods name before the call)
+    /// and writes that word to the register `to`: an indirect draw's arguments are read so.
+    pub(crate) fn fifo_read_macro(to: u16) -> Vec<u32> {
+        let mut dma = nop();
+        dma.alu[0] = alu(ADD, 0, R_LOAD0, R_ZERO);
+        dma.imm = [1, method::DMA_READ_FIFOED as u16];
+        dma.out[0] = Out {
+            method: O_IMM1,
+            emit: O_IMM0,
+        };
+        let mut read = nop();
+        read.alu[0] = alu(ADD, 1, R_LOAD0, R_ZERO);
+        read.imm = [0, to];
+        read.out[0] = Out {
+            method: O_IMM1,
+            emit: O_ALU0,
+        };
+        read.end = true;
+        [dma, read, nop()].iter().flat_map(encode).collect()
+    }
 }
 #[cfg(test)]
 mod tests {

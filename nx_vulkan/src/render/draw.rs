@@ -550,16 +550,22 @@ impl Core {
                         .try_into()
                         .ok()
                 };
-                let (buffer, offset, size) = match super::global::storage_buffers(&p.info, read) {
+                let reached = super::global::storage_buffers(&p.info, read);
+                let (buffer, offset, size) = match &reached {
                     Some(buffers) => {
                         self.global
-                            .table_for(&self.vk, &mut self.frame, scene, &buffers, now)?
+                            .table_for(&self.vk, &mut self.frame, scene, buffers, now)?
                     }
                     None => {
                         let (b, s) = self.global.table(&self.vk, &mut self.frame, scene, now)?;
                         (b, 0, s)
                     }
                 };
+                // What a draw writes there is waited for as a launch's is, before the host or
+                // the GPU front reads it (A-287).
+                if p.info.global_writes {
+                    self.note_reach(reached.as_deref(), true);
+                }
                 buffer_infos.push((
                     base + 20,
                     vk::DescriptorBufferInfo::default()

@@ -433,22 +433,7 @@ impl Core {
         if program.info.global_memory {
             self.phases.launch_kinds[2] += 1;
             self.global_pending = true;
-            match &reached {
-                Some(buffers) => {
-                    let ranges: Vec<(u64, u64)> = buffers
-                        .iter()
-                        .map(|&(at, len)| (at, at.saturating_add(len)))
-                        .collect();
-                    if program.info.global_writes {
-                        self.pending_writes.extend_from_slice(&ranges);
-                    }
-                    self.pending_reach.extend(ranges);
-                }
-                None => {
-                    self.reach_everywhere = true;
-                    self.writes_everywhere |= program.info.global_writes;
-                }
-            }
+            self.note_reach(reached.as_deref(), program.info.global_writes);
         }
         if !staged.is_empty() {
             self.phases.launch_kinds[0] += 1;
@@ -500,6 +485,29 @@ impl Core {
         self.writes_everywhere
             || overlaps(&self.pending_writes, from, to)
             || self.deferred.iter().any(|s| s.overlaps(from, to))
+    }
+
+    /// What a launch, or a draw that writes global memory, reaches of global memory in place (the
+    /// storage buffers it accesses, all of memory when they are not known): the host and the GPU
+    /// front wait for it before they read what it writes or change what it reaches (A-274,
+    /// A-287).
+    pub(super) fn note_reach(&mut self, reached: Option<&[(u64, u64)]>, writes: bool) {
+        match reached {
+            Some(buffers) => {
+                let ranges: Vec<(u64, u64)> = buffers
+                    .iter()
+                    .map(|&(at, len)| (at, at.saturating_add(len)))
+                    .collect();
+                if writes {
+                    self.pending_writes.extend_from_slice(&ranges);
+                }
+                self.pending_reach.extend(ranges);
+            }
+            None => {
+                self.reach_everywhere = true;
+                self.writes_everywhere |= writes;
+            }
+        }
     }
 
     /// Compute launches were recorded whose effects are not all in memory yet.
