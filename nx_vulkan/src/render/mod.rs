@@ -1230,6 +1230,15 @@ impl Renderer {
                         );
                     }
                 }
+                let why = std::mem::take(&mut core.textures.hash_reasons);
+                eprintln!(
+                    "[vulkan] frame {}: texture layers hashed (times, MiB): nothing to compare with {:?}, written by the renderer {:?}, written as the tracking says {:?}, not tracked {:?}",
+                    p.frame,
+                    (why[0].0, why[0].1 >> 20),
+                    (why[1].0, why[1].1 >> 20),
+                    (why[2].0, why[2].1 >> 20),
+                    (why[3].0, why[3].1 >> 20)
+                );
                 let (waited, batches, sending) = std::mem::take(&mut core.frame.device_wait);
                 eprintln!(
                     "[vulkan] frame {}: waited {waited:?} for the device to finish {batches} batches; sending them took {sending:?}",

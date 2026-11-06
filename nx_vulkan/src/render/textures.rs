@@ -730,12 +730,14 @@ struct Texture {
     layers: u32,
     /// The largest levels left out of the image (A-250).
     skip: u32,
-    /// The hash of each layer's memory, of the levels the image holds.
+    /// The hash of each layer's memory, of the levels the image holds, and the hashes of each
+    /// [`HASH_CHUNK`] of it that it is made of.
     layer_hashes: Vec<u64>,
-    /// The bytes from one layer to the next in memory, and the layers the renderer wrote into
-    /// since they were last compared (A-279).
+    chunk_hashes: Vec<Vec<u64>>,
+    /// The bytes from one layer to the next in memory, and what of each layer the renderer wrote
+    /// into since it was last compared (offsets from the layer's start, A-279).
     layer_stride: u64,
-    stale_layers: Vec<bool>,
+    stale: Vec<Written>,
 }
 
 /// How a shader sees a texture: the type of image view the descriptor needs.
@@ -956,6 +958,9 @@ pub fn levels_left_out(
 #[derive(Default)]
 pub struct Textures {
     map: FastMap<(Tic, Shape), Texture>,
+    /// Why layers were hashed, for the report: (times, bytes) with nothing to compare with, after
+    /// the renderer wrote into them, after the tracking saw a write, the tracking not knowing.
+    pub hash_reasons: [(u64, u64); 4],
     /// Samplers by header and by whether the shader compares against a depth.
     samplers: FastMap<(Tsc, bool), vk::Sampler>,
     /// The number of buffers shown so far: a texture is compared with memory once per frame.
@@ -979,6 +984,13 @@ pub struct Textures {
 
 /// A texture's `checked` that matches no frame: it is compared with memory again.
 const UNCHECKED: u64 = u64::MAX;
+
+/// The bytes of a layer's memory that are hashed together: a write of the renderer into a few
+/// bytes of a large texture has those parts of it compared again, not the whole layer (A-279).
+const HASH_CHUNK: u64 = 1 << 20;
+
+/// What of a layer the renderer wrote into: byte ranges from the layer's start.
+type Written = Vec<(u64, u64)>;
 
 /// Everything a draw needs of a texture.
 pub struct Bound {
@@ -1324,37 +1336,78 @@ impl Textures {
         } else {
             (0, layer_stride)
         };
-        // The hashes of the layers whose memory was not written since the texture last looked at
-        // it stay: a write into one layer of a large array (a target written back into it) does
-        // not make every layer be read again.
-        let known: Option<(u32, Vec<u64>, Vec<bool>)> = self
+        // The hashes of the parts of the layers whose memory was not written since the texture
+        // last looked at it stay: a write into a few bytes of a large array (a small target
+        // written back into it) does not make the layer be read again (A-279).
+        let chunks = held_len.div_ceil(HASH_CHUNK).max(1) as usize;
+        let known: Option<(u32, Vec<Vec<u64>>, Vec<Written>)> = self
             .map
             .get(&key)
             .filter(|t| {
                 !self.always_compare
                     && t.epoch != 0
                     && t.skip == skip
-                    && t.layer_hashes.len() == layers as usize
+                    && t.chunk_hashes.len() == layers as usize
+                    && t.chunk_hashes.iter().all(|c| c.len() == chunks)
             })
-            .map(|t| (t.epoch, t.layer_hashes.clone(), t.stale_layers.clone()));
+            .map(|t| (t.epoch, t.chunk_hashes.clone(), t.stale.clone()));
         let mut readable = 0;
-        let layer_hashes: Vec<u64> = (0..layers)
+        let mut reasons = [(0u64, 0u64); 4];
+        let chunk_hashes: Vec<Vec<u64>> = (0..layers)
             .map(|l| {
                 let at = tic.address() + u64::from(l) * layer_stride + held_from;
-                if let Some((epoch, hashes, stale)) = &known {
-                    // A layer the renderer wrote into is read again: the tracking of writes says
-                    // what this epoch wrote only from the next one on.
-                    if !stale.get(l as usize).copied().unwrap_or(true)
-                        && scene.untouched_since(at, held_len, *epoch) == Some(true)
-                    {
-                        readable += held_len;
-                        return hashes[l as usize];
-                    }
+                let whole = known.as_ref().and_then(|(epoch, hashes, stale)| {
+                    // A layer the renderer did not write into, which the tracking of writes says
+                    // is unchanged, keeps its hashes.
+                    let fresh = stale.get(l as usize).is_some_and(Vec::is_empty);
+                    (fresh && scene.untouched_since(at, held_len, *epoch) == Some(true))
+                        .then(|| hashes[l as usize].clone())
+                });
+                if let Some(hashes) = whole {
+                    readable += held_len;
+                    return hashes;
                 }
-                let (h, n) = scene.hash(at, held_len);
-                readable += n;
-                h
+                (0..chunks as u64)
+                    .map(|c| {
+                        let from = c * HASH_CHUNK;
+                        let len = HASH_CHUNK.min(held_len - from);
+                        let mut why = 0;
+                        if let Some((epoch, hashes, stale)) = &known {
+                            // A part the renderer wrote into is read again: the tracking of
+                            // writes says what this epoch wrote only from the next one on.
+                            let (lo, hi) = (held_from + from, held_from + from + len);
+                            let written = stale
+                                .get(l as usize)
+                                .is_none_or(|r| r.iter().any(|&(a, b)| a < hi && lo < b));
+                            if written {
+                                why = 1;
+                            } else {
+                                match scene.untouched_since(at + from, len, *epoch) {
+                                    Some(true) => {
+                                        readable += len;
+                                        return hashes[l as usize][c as usize];
+                                    }
+                                    Some(false) => why = 2,
+                                    None => why = 3,
+                                }
+                            }
+                        }
+                        reasons[why].0 += 1;
+                        reasons[why].1 += len;
+                        let (h, n) = scene.hash(at + from, len);
+                        readable += n;
+                        h
+                    })
+                    .collect()
             })
+            .collect();
+        for (total, r) in self.hash_reasons.iter_mut().zip(reasons) {
+            total.0 += r.0;
+            total.1 += r.1;
+        }
+        let layer_hashes: Vec<u64> = chunk_hashes
+            .iter()
+            .map(|c| c.iter().fold(c.len() as u64, |a, h| a.rotate_left(5) ^ h))
             .collect();
         if readable == 0 {
             return Err(format!(
@@ -1367,10 +1420,11 @@ impl Textures {
             .fold(layers as u64, |a, h| a.rotate_left(7) ^ h);
         let mut update: Option<(vk::Image, vk::ImageView, Vec<u32>)> = None;
         if let Some(t) = self.map.get_mut(&key) {
-            t.stale_layers.fill(false);
+            t.stale.iter_mut().for_each(Vec::clear);
             if t.layer_hashes == layer_hashes {
                 t.checked = current;
                 t.epoch = self.epoch;
+                t.chunk_hashes = chunk_hashes;
                 return Ok(t.image.view);
             }
             if layers > 1 && t.skip == skip && t.overlays.is_empty() {
@@ -1685,6 +1739,7 @@ impl Textures {
             None => {
                 if let Some(t) = self.map.get_mut(&key) {
                     t.layer_hashes = layer_hashes;
+                    t.chunk_hashes = chunk_hashes;
                     t.hash = hash;
                     t.checked = current;
                     t.epoch = self.epoch;
@@ -1705,8 +1760,9 @@ impl Textures {
                         layers,
                         skip,
                         layer_hashes,
+                        chunk_hashes,
                         layer_stride,
-                        stale_layers: vec![false; layers as usize],
+                        stale: vec![Vec::new(); layers as usize],
                     },
                 );
             }
@@ -1723,7 +1779,7 @@ impl Textures {
                 t.checked = UNCHECKED;
                 // The layers the write reaches are hashed again; the others keep what the
                 // tracking of writes says of them (A-279). Without a layout to go by, all are.
-                let layers = t.stale_layers.len() as u64;
+                let layers = t.stale.len() as u64;
                 if t.cpu == 0 || t.layer_stride == 0 || layers == 0 {
                     t.epoch = 0;
                     continue;
@@ -1731,7 +1787,16 @@ impl Textures {
                 let first = start.saturating_sub(t.cpu) / t.layer_stride;
                 let last = (end - 1).saturating_sub(t.cpu) / t.layer_stride;
                 for l in first..=last.min(layers - 1) {
-                    t.stale_layers[l as usize] = true;
+                    let base = t.cpu + l * t.layer_stride;
+                    let range = (start.saturating_sub(base), (end - base).min(t.layer_stride));
+                    let list = &mut t.stale[l as usize];
+                    // A layer written in many places is read again whole.
+                    if list.len() < 16 {
+                        list.push(range);
+                    } else {
+                        list.truncate(1);
+                        list[0] = (0, t.layer_stride);
+                    }
                 }
             }
         }
