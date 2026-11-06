@@ -569,12 +569,14 @@ impl mme64::Host for Macro64Host<'_, '_> {
                 names::method_name(class_num, method * 4)
             ));
         }
-        *self
-            .cx
-            .stats
-            .macro_writes
-            .entry((class_num, method * 4))
-            .or_default() += 1;
+        if self.cx.level >= 1 {
+            *self
+                .cx
+                .stats
+                .macro_writes
+                .entry((class_num, method * 4))
+                .or_default() += 1;
+        }
         if self.cx.level >= 2 || traced_macro(self.id) {
             eprintln!(
                 "[gpu]   macro {} writes {} = {data:#x}",
@@ -617,12 +619,14 @@ impl mme::Host for MacroHost<'_, '_> {
                 names::method_name(class::THREED, method)
             ));
         }
-        *self
-            .cx
-            .stats
-            .macro_writes
-            .entry((class::THREED, method))
-            .or_default() += 1;
+        if self.cx.level >= 1 {
+            *self
+                .cx
+                .stats
+                .macro_writes
+                .entry((class::THREED, method))
+                .or_default() += 1;
+        }
         if self.cx.level >= 2 || traced_macro(self.id) {
             eprintln!(
                 "[gpu]   macro {} writes {} = {data:#x}",
@@ -979,9 +983,12 @@ impl Engine {
         let Some((id, params)) = self.pending.take() else {
             return Ok(());
         };
-        let e = cx.stats.macro_calls.entry(id).or_default();
-        e.0 += 1;
-        e.1 += params.len() as u64;
+        // Counted for the report of `NX_TRACE_GPU`, which alone shows it.
+        if cx.level >= 1 {
+            let e = cx.stats.macro_calls.entry(id).or_default();
+            e.0 += 1;
+            e.1 += params.len() as u64;
+        }
         let program = cx.macros.program(cx.channel);
         let start = program.start(id);
         let count = params.len();
@@ -1434,9 +1441,12 @@ impl Engine {
         let Some((id, params)) = self.pending.take() else {
             return Ok(());
         };
-        let e = cx.stats.macro_calls.entry(id).or_default();
-        e.0 += 1;
-        e.1 += params.len() as u64;
+        // Counted for the report of `NX_TRACE_GPU`, which alone shows it.
+        if cx.level >= 1 {
+            let e = cx.stats.macro_calls.entry(id).or_default();
+            e.0 += 1;
+            e.1 += params.len() as u64;
+        }
         let Some(start) = self.mme.starts.get(id as usize).copied() else {
             return Err(format!("macro {id} was called and has no start address"));
         };
@@ -1603,7 +1613,7 @@ mod tests {
                 lenient,
                 channel: 1,
                 syncpt: 1,
-                level: 0,
+                level: 1,
                 macros: &mut macros,
                 qmds: &mut qmds,
                 blocked: None,

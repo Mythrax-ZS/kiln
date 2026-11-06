@@ -77,10 +77,13 @@ impl Channel {
                     w.data
                 );
             }
-            *cx.stats
-                .per_method
-                .entry((class::GPFIFO, w.method * 4))
-                .or_default() += 1;
+            // Counted for the report of `NX_TRACE_GPU`, which alone shows it.
+            if cx.level >= 1 {
+                *cx.stats
+                    .per_method
+                    .entry((class::GPFIFO, w.method * 4))
+                    .or_default() += 1;
+            }
             return self.host_method(cx, w);
         }
         let class_num = self.subchannels[sub];
@@ -90,10 +93,12 @@ impl Channel {
                 w.method * 4
             ));
         }
-        *cx.stats
-            .per_method
-            .entry((class_num, w.method * 4))
-            .or_default() += 1;
+        if cx.level >= 1 {
+            *cx.stats
+                .per_method
+                .entry((class_num, w.method * 4))
+                .or_default() += 1;
+        }
         if cx.level >= 2 {
             eprintln!(
                 "[gpu]   ch{} sc{} {} {} = {:#x}",
@@ -294,7 +299,7 @@ mod tests {
                 lenient: false,
                 channel: 1,
                 syncpt: 1,
-                level: 0,
+                level: 1,
                 macros: &mut macros,
                 qmds: &mut qmds,
                 blocked: None,
@@ -338,7 +343,7 @@ mod tests {
             lenient: false,
             channel: 1,
             syncpt: 1,
-            level: 0,
+            level: 1,
             macros: &mut macros,
             qmds: &mut qmds,
             blocked: None,
