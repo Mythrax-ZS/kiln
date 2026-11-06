@@ -161,6 +161,51 @@ varies by about 15%):
   methods and 5.6 million macro calls.
 - **The harvest of tracked memory: about 5 ms a frame.**
 
+### What limits the rate (2026-11-07)
+
+Measured in the race, at 223229c:
+
+- **One thread sets the pace.** The thread that runs the GPU front and the renderer is busy
+  about 93% of the time. The device is about 20% busy, and the title's own threads mostly wait for
+  the fences of their submissions. Replacing the title's NVN2 driver with native code would not
+  raise the rate: that code runs on the title's threads, which are not the limit.
+- **The loop is bound by latency.** The title waits for the fence of each submission before it
+  goes far with the next. A fence can be given only once the commands before it are recorded,
+  so the front and the renderer cannot overlap across submissions.
+- **The renderer on a thread of its own** (`NX_GPU_SPLIT=1`, A-288) overlaps the front with the
+  renderer within a submission:
+  - The front waits for the renderer's thread about 45% of the time; the renderer's thread is
+    about 65% busy.
+  - The waits are where the front reads memory the renderer's work may change (macro reads of
+    memory, compute descriptors, acquires that stop a channel), and at the ends of submissions.
+- **Constant buffers** are copied once per batch (A-289): 93% of the bytes repeat a copy made
+  earlier in the batch, and the descriptors of the draws take 0.74 to 0.83 s instead of 1.16 to
+  1.28 s per 100 frames.
+
+Rate, without `NX_TRACE_PERF` (from the times of the frames dumped at 3,500 and 4,000):
+
+| Mode | 100 frames of the race | Frames a second |
+|------|------------------------|-----------------|
+| Default | 10.5 s | about 9.5 |
+| `NX_GPU_SPLIT=1` | 10.2 s | about 9.8 |
+
+Where 100 frames of the race go now, on that one thread (with `NX_TRACE_PERF`):
+
+| Part | Time |
+|------|------|
+| The GPU front (methods, macros) | about 4 s |
+| Draws: textures | 1.1 to 1.6 s |
+| Draws: descriptors | 0.74 to 0.83 s |
+| Draws: the pass | about 0.6 s |
+| Draws: vertices and recording | about 0.8 s |
+| Compute launches | about 1.1 s |
+| Settles of launches (waiting for the device, surfaces put into memory) | 1.7 to 1.9 s |
+| The harvest of write tracking | about 0.45 s |
+
+**Device memory runs out as the race loads.** About 3,300 textures hold about 12.5 GB (ASTC
+textures are decoded to four bytes a texel), and 70 to 90 draws a run are skipped when an image
+cannot be allocated.
+
 ## Open
 
 - **The road was sometimes black.** In about a quarter of the runs that reached the race (7 of
@@ -180,3 +225,4 @@ varies by about 15%):
   - the cost of a draw's textures and descriptors;
   - the GPU front's interpreter on the renderer's thread.
 - **The two refused kinds of command.**
+- **Device memory in the race's load** (images that cannot be allocated).
