@@ -78,9 +78,10 @@ pub struct Stats {
     pub failed: BTreeMap<String, u64>,
     /// The GPU front's own reads of memory that the renderer's work may change: semaphore
     /// acquires, those answered by the releases still to be made, macro reads of memory, compute
-    /// descriptors read, acquires that waited for everything, and acquires that memory as it was
-    /// satisfied without waiting for a renderer on another thread (`NX_TRACE_PERF`).
-    pub front_reads: [u64; 6],
+    /// descriptors read, acquires that waited for everything, acquires that memory as it was
+    /// satisfied without waiting for a renderer on another thread, and compute descriptors read
+    /// after waiting for it (`NX_TRACE_PERF`).
+    pub front_reads: [u64; 7],
 }
 
 impl Stats {
@@ -371,6 +372,7 @@ impl Cx<'_> {
         {
             return Ok(());
         }
+        self.stats.front_reads[6] += 1;
         self.sync()
     }
 
@@ -1666,13 +1668,15 @@ impl Engine {
                 cx.stats.front_reads[0] += 1;
                 // With a renderer on another thread, memory as the front knows it answers
                 // without waiting when it satisfies the acquire, and when the acquire is one that
-                // stopped its channel, tried again (A-288).
+                // stopped its channel, tried again; when it does not satisfy a new one, the settle
+                // before the channel stops says the rest (A-288).
                 let mut have = match cx.word_now(va) {
                     Some(v) if met(v) || cx.retrying => {
                         cx.stats.front_reads[5] += 1;
                         v
                     }
-                    _ => cx.acquire_value(va)?,
+                    Some(v) => v,
+                    None => cx.acquire_value(va)?,
                 };
                 if !met(have) && !cx.retrying {
                     // What is still to be released may be what it waits for (A-274).

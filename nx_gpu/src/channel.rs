@@ -223,13 +223,15 @@ impl Channel {
                 cx.stats.front_reads[0] += 1;
                 // With a renderer on another thread, memory as the front knows it answers
                 // without waiting when it satisfies the acquire, and when the acquire is one that
-                // stopped its channel, tried again (A-288).
+                // stopped its channel, tried again; when it does not satisfy a new one, the settle
+                // before the channel stops says the rest (A-288).
                 let mut have = match cx.word_now(va) {
                     Some(v) if met(v) || cx.retrying => {
                         cx.stats.front_reads[5] += 1;
                         v
                     }
-                    _ => cx.acquire_value(va)?,
+                    Some(v) => v,
+                    None => cx.acquire_value(va)?,
                 };
                 if !met(have) && !cx.retrying {
                     // Before the channel stops, what is still to be released is made: it may be

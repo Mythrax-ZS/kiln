@@ -121,7 +121,7 @@ pub struct Split {
     shadow: HashMap<u64, u32>,
     /// `NX_TRACE_PERF`: the waits for the renderer's thread by cause (finish, present, released
     /// value, sync) and the time they took, said every 100 frames.
-    waits: Option<([u64; 4], std::time::Duration, u64)>,
+    waits: Option<([u64; 4], [std::time::Duration; 4], u64)>,
     /// Commands in the batch not handed over yet.
     commands: usize,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -195,7 +195,7 @@ impl Split {
             older: None,
             shadow: HashMap::new(),
             waits: std::env::var_os("NX_TRACE_PERF")
-                .map(|_| ([0; 4], std::time::Duration::ZERO, 0)),
+                .map(|_| ([0; 4], [std::time::Duration::ZERO; 4], 0)),
             commands: 0,
             thread: Some(thread),
         }
@@ -324,7 +324,7 @@ impl Split {
         }
         if let (Some(w), Some(began)) = (self.waits.as_mut(), began) {
             w.0[cause] += 1;
-            w.1 += began.elapsed();
+            w.1[cause] += began.elapsed();
         }
     }
 
@@ -487,7 +487,7 @@ impl Backend for Split {
                     "[split] the GPU front waited for the renderer's thread {counts:?} times (ends of submissions, frames, released values, reads) for {time:?} in the last 100 frames"
                 );
                 *counts = [0; 4];
-                *time = std::time::Duration::ZERO;
+                *time = [std::time::Duration::ZERO; 4];
             }
         }
         self.inner().present(present)
