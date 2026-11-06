@@ -303,7 +303,11 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
 - ASTC decoder: `nx_vulkan/tests/astc_reference.rs` compares it with ARM's `astcenc`
   (`KILN_ASTCENC=<path>`, or `astcenc` on the `PATH`; the tool may be unpacked from a distribution
   package without installing it); `KILN_ASTC_BATCHES` (default 4, 4,096 blocks each) scales it and
-  `KILN_ASTC_ONLY=<n>` runs one footprint.
+  `KILN_ASTC_ONLY=<n>` runs one footprint. The renderer decodes ASTC on the device with the same
+  decoder written as a compute program (`nx_vulkan/shaders/astc_decode.comp`, A-286; its SPIR-V is
+  kept beside it, made with `glslc --target-env=vulkan1.1 -O astc_decode.comp -o astc_decode.spv`
+  after any change), which `nx_vulkan/tests/astc_gpu.rs` holds to the host decoder's bytes;
+  `NX_ASTC_HOST=1` decodes on the host instead.
 - Opus decoder: `nx_opus/tests/vectors.rs` decodes the official test vectors (RFC 8251 section 11;
   `KILN_OPUS_VECTORS` = the directory of `testvector01.bit` and the rest) to stereo and mono at every
   output rate, checks the final range of every packet, and applies the reference's quality metric

@@ -993,6 +993,9 @@ pub struct Textures {
     nulls: FastMap<(Kind, bool), Image>,
     /// The textures made from a smaller level so far (A-250), said once each.
     reduced: Vec<u64>,
+    /// The decoder of ASTC blocks on the device, made at the first ASTC texture (A-286), unless
+    /// `NX_ASTC_HOST=1` keeps decoding on the host.
+    astc: Option<crate::astc_gpu::Decoder>,
     /// `NX_DEBUG_ALWAYS_COMPARE=1`: every texture is compared with memory once a frame, even
     /// where the tracking of writes says its memory is unchanged (it does not see what the device
     /// writes into guest memory in place: a texture's fault, or the tracking's?).
@@ -1749,6 +1752,16 @@ impl Textures {
             Some((_, _, changed)) => changed.clone(),
             None => (0..layers).collect(),
         };
+        // ASTC is decoded on the device (A-286): the blocks are uploaded as they are, and each
+        // level is decoded into a buffer of the device that the image is copied from.
+        let on_device = format.astc && std::env::var_os("NX_ASTC_HOST").is_none();
+        if on_device && self.astc.is_none() {
+            self.astc = Some(crate::astc_gpu::Decoder::new(vk)?);
+        }
+        // (offset of the blocks in the upload, offset of the texels in the decoded buffer, width,
+        // height) of each level to decode.
+        let mut jobs: Vec<(u64, u64, u32, u32)> = Vec::new();
+        let mut decoded_bytes = 0u64;
         // Linear texels of every level and layer in upload order.
         let mut packed: Vec<u8> = Vec::new();
         let mut not_numbers = 0usize;
@@ -1783,7 +1796,7 @@ impl Textures {
                 if depth24 {
                     depth_from_words(tic.components(), &mut linear);
                 }
-                if format.astc {
+                if format.astc && !on_device {
                     linear = crate::astc::decode_image(
                         &linear,
                         (width >> level).max(1),
@@ -1837,9 +1850,20 @@ impl Textures {
                 let offset = (packed.len() as u64).next_multiple_of(16);
                 packed.resize(offset as usize, 0);
                 packed.extend_from_slice(&linear);
+                // The texels of an ASTC level decoded on the device are copied from the decoded
+                // buffer: their offset there.
+                let copy_from = if on_device {
+                    let (w, h) = ((width >> level).max(1), (height >> level).max(1));
+                    let at = decoded_bytes;
+                    jobs.push((offset, at, w, h));
+                    decoded_bytes = (at + u64::from(w) * u64::from(h) * 4).next_multiple_of(16);
+                    at
+                } else {
+                    offset
+                };
                 regions.push(
                     vk::BufferImageCopy::default()
-                        .buffer_offset(offset)
+                        .buffer_offset(copy_from)
                         .image_subresource(vk::ImageSubresourceLayers {
                             aspect_mask: aspect,
                             mip_level: level as u32 - skip,
@@ -1864,9 +1888,49 @@ impl Textures {
             );
             packed.fill(0);
         }
-        let (buffer, base_offset) = frame.upload(vk, &packed, 16)?;
-        for r in &mut regions {
-            r.buffer_offset += base_offset;
+        let (upload, base_offset) = frame.upload(vk, &packed, 16)?;
+        // The buffer the image is copied from: the upload, or the texels decoded on the device.
+        let decoded = if jobs.is_empty() {
+            None
+        } else {
+            Some(vk.create_device_buffer(
+                decoded_bytes,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+            )?)
+        };
+        let buffer = match &decoded {
+            Some(d) => d.buffer,
+            None => {
+                for r in &mut regions {
+                    r.buffer_offset += base_offset;
+                }
+                upload
+            }
+        };
+        // The parameters of each level's decoding, each where a storage buffer may start.
+        let align = vk.caps.min_storage_buffer_offset_alignment.max(16);
+        let mut params = Vec::new();
+        for &(blocks_at, texels_at, w, h) in &jobs {
+            let (bw, bh) = format.block;
+            let words = [
+                w,
+                h,
+                bw,
+                bh,
+                w.div_ceil(bw),
+                h.div_ceil(bh),
+                u32::from(tic.srgb()),
+                ((base_offset + blocks_at) / 4) as u32,
+                (texels_at / 4) as u32,
+            ];
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            params.push(frame.upload(vk, &bytes, align)?);
+        }
+        let mut sets = Vec::new();
+        if let Some(decoder) = &self.astc {
+            for _ in &jobs {
+                sets.push(frame.descriptor_set(vk, decoder.set_layout)?);
+            }
         }
         // The uploads run before the draws of the batch. A texture is compared with memory at its
         // first use in a frame, so no draw of the batch has read the image as it was; the draws of
@@ -1942,6 +2006,72 @@ impl Textures {
                     .subresource_range(*r)
             })
             .collect();
+        // The ASTC levels are decoded first, into the buffer the image is copied from (A-286).
+        if let (Some(decoder), Some(out)) = (&self.astc, &decoded) {
+            // SAFETY: the upload command buffer is recording, outside any rendering; the sets
+            // were just allocated and the buffers live until the batch is over.
+            unsafe {
+                let d = &vk.device;
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, decoder.pipeline);
+                for ((&(_, _, w, h), &(params_buffer, params_at)), &set) in
+                    jobs.iter().zip(&params).zip(&sets)
+                {
+                    let infos = [
+                        vk::DescriptorBufferInfo::default()
+                            .buffer(params_buffer)
+                            .offset(params_at)
+                            .range(36),
+                        vk::DescriptorBufferInfo::default()
+                            .buffer(upload)
+                            .offset(0)
+                            .range(vk::WHOLE_SIZE),
+                        vk::DescriptorBufferInfo::default()
+                            .buffer(out.buffer)
+                            .offset(0)
+                            .range(vk::WHOLE_SIZE),
+                    ];
+                    let writes: Vec<vk::WriteDescriptorSet> = infos
+                        .iter()
+                        .enumerate()
+                        .map(|(b, info)| {
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(set)
+                                .dst_binding(b as u32)
+                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                .buffer_info(std::slice::from_ref(info))
+                        })
+                        .collect();
+                    d.update_descriptor_sets(&writes, &[]);
+                    d.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        decoder.layout,
+                        0,
+                        &[set],
+                        &[],
+                    );
+                    let blocks = w.div_ceil(format.block.0) * h.div_ceil(format.block.1);
+                    d.cmd_dispatch(cmd, blocks.div_ceil(crate::astc_gpu::WORKGROUP), 1, 1);
+                }
+                let written = [vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(out.buffer)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE)];
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &written,
+                    &[],
+                );
+            }
+        }
         // SAFETY: the upload command buffer is recording, outside any rendering; the handles are
         // valid.
         unsafe {
@@ -1970,6 +2100,10 @@ impl Textures {
                 &[],
                 &to_read,
             );
+        }
+        // The decoded texels go once the batch has copied them.
+        if let Some(d) = decoded {
+            frame.garbage.push(Garbage::Device(d));
         }
         match made {
             None => {
@@ -2043,6 +2177,9 @@ impl Textures {
     }
 
     pub fn destroy(&mut self, vk: &Vk) {
+        if let Some(decoder) = self.astc.take() {
+            decoder.destroy(vk);
+        }
         for (_, t) in self.map.drain() {
             vk.destroy_image(t.image);
         }

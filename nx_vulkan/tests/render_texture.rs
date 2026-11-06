@@ -897,7 +897,7 @@ fn astc_solid(rgba: [u16; 4]) -> [u8; 16] {
 }
 
 #[test]
-fn an_astc_texture_is_decoded_on_the_host_and_sampled() {
+fn an_astc_texture_is_decoded_on_the_device_and_sampled() {
     if vulkan().is_none() {
         return;
     }
