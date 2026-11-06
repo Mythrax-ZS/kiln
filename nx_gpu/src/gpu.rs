@@ -565,11 +565,15 @@ impl Gpu {
                     macros: &mut self.mme64,
                     qmds: &mut self.qmds,
                     blocked: None,
+                    retrying: false,
                 };
                 let _phase = crate::progress::enter(crate::progress::METHODS_RUNNING);
                 // The write that stopped the channel is made again first.
                 if let Some(w) = pending.take() {
-                    ch.execute(&mut cx, w).map_err(unimplemented)?;
+                    cx.retrying = true;
+                    let made = ch.execute(&mut cx, w);
+                    cx.retrying = false;
+                    made.map_err(unimplemented)?;
                     if let Some(why) = cx.blocked.take() {
                         *pending = Some(w);
                         return Ok(Some(why));

@@ -229,6 +229,10 @@ pub struct Cx<'a> {
     /// What the channel waits for, once a semaphore acquire that the memory does not satisfy
     /// yet has stopped it: it goes on from there when the memory does (A-238).
     pub blocked: Option<String>,
+    /// The write being made is the one that stopped the channel, made again: what was to be
+    /// released before the channel stopped is in memory already, and waiting for the device again
+    /// changes nothing the acquire reads (A-274).
+    pub retrying: bool,
 }
 
 impl Cx<'_> {
@@ -1544,7 +1548,7 @@ impl Engine {
                 let ge = d >> 16 & 1 != 0;
                 let met = |have: u32| (ge && have >= payload) || (!ge && have == payload);
                 let mut have = cx.acquire_value(va)?;
-                if !met(have) {
+                if !met(have) && !cx.retrying {
                     // What is still to be released may be what it waits for (A-274).
                     cx.settle()?;
                     have = cx.read_u32(va)?;
@@ -1620,6 +1624,7 @@ mod tests {
                 macros: &mut macros,
                 qmds: &mut qmds,
                 blocked: None,
+                retrying: false,
             };
             f(&mut cx)
         };

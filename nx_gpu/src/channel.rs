@@ -221,9 +221,9 @@ impl Channel {
                     _ => have & payload != 0,
                 };
                 let mut have = cx.acquire_value(va)?;
-                if !met(have) {
+                if !met(have) && !cx.retrying {
                     // Before the channel stops, what is still to be released is made: it may be
-                    // what it waits for (A-274).
+                    // what it waits for (A-274). Made again later, the acquire has that already.
                     cx.settle()?;
                     have = cx.read_u32(va)?;
                 }
@@ -303,6 +303,7 @@ mod tests {
                 macros: &mut macros,
                 qmds: &mut qmds,
                 blocked: None,
+                retrying: false,
             };
             // A write that stops the channel at an acquire is reported with what it waits for.
             ws.iter()
@@ -347,6 +348,7 @@ mod tests {
             macros: &mut macros,
             qmds: &mut qmds,
             blocked: None,
+            retrying: false,
         };
         let mut ch = Channel::default();
         // SEMAPHOREA..D at syncpoint 5's word of the shim, payload `want`, operation `op`.
@@ -555,6 +557,7 @@ mod tests {
                 macros: &mut macros,
                 qmds: &mut qmds,
                 blocked: None,
+                retrying: false,
             };
             // Release 7 (one word): the backend holds it.
             for w in [
@@ -654,6 +657,7 @@ mod tests {
                 macros: &mut macros,
                 qmds: &mut qmds,
                 blocked: None,
+                retrying: false,
             };
             for w in [
                 write(0, 0x14, 0x500_0000, false),
