@@ -546,12 +546,14 @@ struct Macro64Host<'a, 'b> {
     engine: &'a mut Engine,
     cx: &'a mut Cx<'b>,
     id: u32,
+    /// `NX_TRACE_MACRO` names this macro: decided once for the call, not at every write.
+    traced: bool,
 }
 
 impl mme64::Host for Macro64Host<'_, '_> {
     fn state(&mut self, method: u32) -> u32 {
         let value = self.engine.reg(method);
-        if traced_macro(self.id) {
+        if self.traced {
             eprintln!(
                 "[gpu]     macro {} reads {} = {value:#x}",
                 self.id,
@@ -562,7 +564,7 @@ impl mme64::Host for Macro64Host<'_, '_> {
     }
 
     fn traced(&self) -> bool {
-        traced_macro(self.id)
+        self.traced
     }
 
     fn emit(&mut self, method: u32, data: u32, params: &mut VecDeque<u32>) -> Result<(), String> {
@@ -582,7 +584,7 @@ impl mme64::Host for Macro64Host<'_, '_> {
                 .entry((class_num, method * 4))
                 .or_default() += 1;
         }
-        if self.cx.level >= 2 || traced_macro(self.id) {
+        if self.cx.level >= 2 || self.traced {
             eprintln!(
                 "[gpu]   macro {} writes {} = {data:#x}",
                 self.id,
@@ -1026,6 +1028,7 @@ impl Engine {
                 engine: &mut *self,
                 cx: &mut *cx,
                 id,
+                traced: traced_macro(id),
             };
             mme64::run(&program, start, params, &mut host)
         };
