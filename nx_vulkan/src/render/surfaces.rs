@@ -77,8 +77,9 @@ fn shape_of_image(info: &ImageInfo) -> ImageShape {
     )
 }
 
-/// The images and staging buffers of each shape kept for later launches.
-const POOLED: usize = 8;
+/// The images and staging buffers of each shape kept for later launches: the title's passes write
+/// a dozen surfaces of one size in a frame.
+const POOLED: usize = 32;
 
 /// A surface made for a launch.
 pub struct Surface {
@@ -648,10 +649,23 @@ impl Core {
             hash,
             checked: self.textures.frame,
         });
+        // The GPU addresses the kept surfaces lie in, at most.
+        self.residents_span = Some(match self.residents_span {
+            Some((lo, hi)) => (lo.min(from), hi.max(to)),
+            None => (from, to),
+        });
     }
 
     /// Let go the resident surfaces over `[from, to)` (GPU addresses): something wrote there.
     pub(super) fn forget_residents(&mut self, from: u64, to: u64) {
+        // Most of what the front touches is nowhere near a kept surface.
+        if self.residents.is_empty()
+            || !self
+                .residents_span
+                .is_some_and(|(lo, hi)| from < hi && lo < to)
+        {
+            return;
+        }
         let mut i = 0;
         while i < self.residents.len() {
             let r = &self.residents[i];

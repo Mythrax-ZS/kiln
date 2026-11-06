@@ -175,6 +175,8 @@ struct Core {
     residents: Vec<surfaces::Resident>,
     /// The memory of the kept surface the last lookup found (guest process address, bytes).
     kept_found: Option<(u64, u64)>,
+    /// The GPU addresses the kept surfaces lie in (an upper bound).
+    residents_span: Option<(u64, u64)>,
     staging_buffers: crate::fast::FastMap<u64, Vec<crate::compute::HostBuffer>>,
     /// Textures let go to keep to the device memory budget (A-260), for the report.
     textures_trimmed: u64,
@@ -415,6 +417,7 @@ impl Renderer {
                     surface_images: crate::fast::FastMap::default(),
                     residents: Vec::new(),
                     kept_found: None,
+                    residents_span: None,
                     staging_buffers: crate::fast::FastMap::default(),
                     textures_trimmed: 0,
                     memory_copies: 0,
