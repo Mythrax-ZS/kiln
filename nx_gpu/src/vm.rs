@@ -100,6 +100,9 @@ pub struct AddressSpace {
     pub userspace_managed: bool,
     regions: BTreeMap<u64, Region>,
     maps: BTreeMap<u64, Mapping>,
+    /// The mapping the last translation found (start, length, CPU address; a length of 0 for
+    /// none): translations come in runs over the same buffer. Changed with the mappings.
+    last: std::cell::Cell<(u64, u64, u64)>,
 }
 
 impl Default for AddressSpace {
@@ -136,6 +139,7 @@ impl AddressSpace {
             userspace_managed: false,
             regions: BTreeMap::new(),
             maps: BTreeMap::new(),
+            last: std::cell::Cell::new((0, 0, 0)),
         }
     }
 
@@ -328,7 +332,7 @@ impl AddressSpace {
         }
         let end = r.start + r.len;
         self.regions.remove(&offset);
-        self.maps.retain(|&s, _| s < offset || s >= end);
+        self.maps_mut().retain(|&s, _| s < offset || s >= end);
         Ok(())
     }
 
@@ -371,7 +375,7 @@ impl AddressSpace {
             self.find_free(len, u64::from(page_size), page_size)
                 .ok_or(NvError::INSUFFICIENT_MEMORY)?
         };
-        self.maps.insert(
+        self.maps_mut().insert(
             start,
             Mapping {
                 start,
@@ -400,7 +404,7 @@ impl AddressSpace {
 
     /// `UNMAP_BUFFER`: remove the mapping that starts at `offset`.
     pub fn unmap_buffer(&mut self, offset: u64) -> NvResult<Mapping> {
-        self.maps.remove(&offset).ok_or(NvError::BAD_VALUE)
+        self.maps_mut().remove(&offset).ok_or(NvError::BAD_VALUE)
     }
 
     /// Cut `[start, start + len)` out of the mappings: those inside go, those that stick out on
@@ -414,7 +418,7 @@ impl AddressSpace {
             .map(|(k, _)| *k)
             .collect();
         for k in hit {
-            let Some(m) = self.maps.remove(&k) else {
+            let Some(m) = self.maps_mut().remove(&k) else {
                 continue;
             };
             if m.start < start {
@@ -422,7 +426,7 @@ impl AddressSpace {
                     len: start - m.start,
                     ..m.clone()
                 };
-                self.maps.insert(left.start, left);
+                self.maps_mut().insert(left.start, left);
             }
             if m.start + m.len > end {
                 let right = Mapping {
@@ -431,7 +435,7 @@ impl AddressSpace {
                     cpu: m.cpu + (end - m.start),
                     ..m
                 };
-                self.maps.insert(right.start, right);
+                self.maps_mut().insert(right.start, right);
             }
         }
     }
@@ -450,7 +454,8 @@ impl AddressSpace {
         }
         self.carve(start, len);
         if let Some(t) = target {
-            self.maps.insert(
+            let page_size = self.big_page_size;
+            self.maps_mut().insert(
                 start,
                 Mapping {
                     start,
@@ -458,7 +463,7 @@ impl AddressSpace {
                     handle: t.handle,
                     cpu: t.cpu,
                     kind: t.kind,
-                    page_size: self.big_page_size,
+                    page_size,
                     cacheable: t.cacheable,
                 },
             );
@@ -471,7 +476,7 @@ impl AddressSpace {
     pub fn map_range(&mut self, start: u64, len: u64, cpu: u64, kind: u32) -> NvResult<()> {
         self.check_range(start, len)?;
         self.carve(start, len);
-        self.maps.insert(
+        self.maps_mut().insert(
             start,
             Mapping {
                 start,
@@ -518,9 +523,24 @@ impl AddressSpace {
 
     /// The CPU address of GPU address `va` and how many bytes of the same mapping follow it.
     pub fn translate(&self, va: u64) -> Option<(u64, u64)> {
+        let (start, len, cpu) = self.last.get();
+        let off = va.wrapping_sub(start);
+        if off < len {
+            return Some((cpu + off, len - off));
+        }
         let (_, m) = self.maps.range(..=va).next_back()?;
         let off = va - m.start;
-        (off < m.len).then(|| (m.cpu + off, m.len - off))
+        if off >= m.len {
+            return None;
+        }
+        self.last.set((m.start, m.len, m.cpu));
+        Some((m.cpu + off, m.len - off))
+    }
+
+    /// The mappings, to change: what the last translation found is forgotten.
+    fn maps_mut(&mut self) -> &mut BTreeMap<u64, Mapping> {
+        self.last.set((0, 0, 0));
+        &mut self.maps
     }
 
     /// A hash of up to `len` bytes of GPU memory at `va` as they are now, and how many of them
