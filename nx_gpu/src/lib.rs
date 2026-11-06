@@ -34,6 +34,7 @@ pub mod parcel;
 pub mod pushbuf;
 pub mod render;
 pub mod shaders;
+pub mod split;
 pub mod state;
 pub mod syncpt;
 pub mod time;

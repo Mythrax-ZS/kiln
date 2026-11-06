@@ -76,6 +76,11 @@ pub struct Stats {
     pub shaders: Inventory,
     /// What the renderer could not do (when the run goes on past that): the message and how often.
     pub failed: BTreeMap<String, u64>,
+    /// The GPU front's own reads of memory that the renderer's work may change: semaphore
+    /// acquires, those answered by the releases still to be made, macro reads of memory, compute
+    /// descriptors read, acquires that waited for everything, and acquires that memory as it was
+    /// satisfied without waiting for a renderer on another thread (`NX_TRACE_PERF`).
+    pub front_reads: [u64; 6],
 }
 
 impl Stats {
@@ -265,6 +270,7 @@ impl Cx<'_> {
         if self.space.shim_syncpoint(va).is_none() {
             if let Some(backend) = self.backend.as_deref_mut() {
                 if let Some(v) = backend.released_value(self.space, self.mem, va) {
+                    self.stats.front_reads[1] += 1;
                     return Ok(v);
                 }
             }
@@ -305,7 +311,7 @@ impl Cx<'_> {
         }
     }
 
-    pub fn read_u32(&self, va: u64) -> Result<u32, String> {
+    pub fn read_u32(&mut self, va: u64) -> Result<u32, String> {
         // The Switch 2's syncpoint shim reads as the syncpoints (A-200).
         if let Some(id) = self.space.shim_syncpoint(va) {
             return self
@@ -313,6 +319,7 @@ impl Cx<'_> {
                 .value(id)
                 .ok_or_else(|| format!("a read of the syncpoint shim for syncpoint {id}"));
         }
+        self.sync()?;
         let mut b = [0u8; 4];
         if self.space.read(self.mem, va, &mut b) {
             Ok(u32::from_le_bytes(b))
@@ -323,11 +330,14 @@ impl Cx<'_> {
         }
     }
 
-    pub fn write(&self, va: u64, data: &[u8]) -> Result<(), String> {
+    pub fn write(&mut self, va: u64, data: &[u8]) -> Result<(), String> {
         if self.space.shim_syncpoint(va).is_some() {
             return Err(format!(
                 "a write to GPU address {va:#x}, in the read-only syncpoint shim"
             ));
+        }
+        if let Some(backend) = self.backend.as_deref_mut() {
+            return backend.write(self.space, self.mem, va, data);
         }
         if self.space.write(self.mem, va, data) {
             Ok(())
@@ -336,6 +346,53 @@ impl Cx<'_> {
                 "a write of {} bytes to GPU address {va:#x}, which is not mapped",
                 data.len()
             ))
+        }
+    }
+
+    /// The word at `va` as memory holds it now, when a renderer on another thread has nothing
+    /// to write there that the front gave it (A-288); `None` otherwise.
+    pub fn word_now(&mut self, va: u64) -> Option<u32> {
+        if self.space.shim_syncpoint(va).is_some() {
+            return None;
+        }
+        self.backend
+            .as_deref_mut()?
+            .word_now(self.space, self.mem, va)
+    }
+
+    /// Wait for the renderer before reading `len` bytes at `va`, unless it has nothing to write
+    /// there (A-288).
+    pub fn sync_for(&mut self, va: u64, len: u64) -> Result<(), String> {
+        let space = self.space;
+        if self
+            .backend
+            .as_deref_mut()
+            .is_none_or(|b| b.readable_now(space, va, len))
+        {
+            return Ok(());
+        }
+        self.sync()
+    }
+
+    /// Write memory at once, not in the order of what the renderer was given: for what only the
+    /// front reads (an inline compute descriptor, A-288).
+    pub fn write_now(&mut self, va: u64, data: &[u8]) -> Result<(), String> {
+        if self.space.write(self.mem, va, data) {
+            Ok(())
+        } else {
+            Err(format!(
+                "a write of {} bytes to GPU address {va:#x}, which is not mapped",
+                data.len()
+            ))
+        }
+    }
+
+    /// What was given to the renderer is done, before the front reads memory it may change
+    /// (A-288).
+    pub fn sync(&mut self) -> Result<(), String> {
+        match self.backend.as_deref_mut().map(|b| b.sync()) {
+            Some(Err(why)) => self.renderer_failed("waiting for the renderer", why),
+            _ => Ok(()),
         }
     }
 
@@ -437,6 +494,8 @@ pub struct Engine {
     pub cbufs: CbufBindings,
     /// The inline-to-memory engine (the compute and inline-to-memory classes).
     i2m: I2m,
+    /// The registers and bindings written since a renderer on another thread was told (A-288).
+    changes: crate::render::Changes,
 }
 
 /// `NX_TRACE_MACRO=<number>[,...]` in the environment: print each call of those macros and what
@@ -636,6 +695,7 @@ impl mme64::Host for Macro64Host<'_, '_> {
         // MME_DMA_READ_FIFOED(count): the words go onto the parameters the macro reads next.
         if method == mme64::method::DMA_READ_FIFOED {
             self.engine.regs[method as usize] = data;
+            self.engine.changes.register(method as usize);
             params.extend(self.engine.dma_read(self.cx, data)?);
             return Ok(());
         }
@@ -714,6 +774,7 @@ impl Engine {
             three_d: class::kind(class_num) == class::Kind::ThreeD,
             cbufs: CbufBindings::default(),
             i2m: I2m::default(),
+            changes: crate::render::Changes::new(),
         }
     }
 
@@ -724,6 +785,18 @@ impl Engine {
     /// The register file, to decode state from.
     pub fn regs(&self) -> Regs<'_> {
         Regs(&self.regs)
+    }
+
+    /// What the renderer is given with a command of this engine.
+    fn scene<'s>(&'s self, mem: &'s dyn GuestMemory, space: &'s AddressSpace) -> Scene<'s> {
+        Scene {
+            regs: Regs(&self.regs),
+            class: self.class,
+            cbufs: &self.cbufs,
+            mem,
+            space,
+            changes: &self.changes,
+        }
     }
 
     /// A write to `method` (a word index). `last` marks the last word of its command.
@@ -742,6 +815,7 @@ impl Engine {
                     self.flush_draw(cx)?;
                 }
                 self.regs[method as usize] = data;
+                self.changes.register(method as usize);
                 crate::progress::method();
                 return Ok(());
             }
@@ -754,6 +828,7 @@ impl Engine {
             .get_mut(method as usize)
             .ok_or_else(|| format!("method {method:#x} is outside the engine"))?;
         *slot = data;
+        self.changes.register(method as usize);
         crate::progress::method();
         if traced_register(self.class, method) {
             eprintln!(
@@ -882,10 +957,12 @@ impl Engine {
             // scratch register the macros poll, at once (A-209).
             FALCON_3D if kind == class::Kind::ThreeD => {
                 self.regs[SCRATCH as usize] = 1;
+                self.changes.register(SCRATCH as usize);
                 Ok(false)
             }
             FALCON_COMPUTE if kind == class::Kind::Compute => {
                 self.regs[SCRATCH as usize] = 1;
+                self.changes.register(SCRATCH as usize);
                 Ok(false)
             }
             // Launches of QMDs of version 3 (A-210).
@@ -914,7 +991,7 @@ impl Engine {
                     .iter()
                     .flat_map(|w| w.to_le_bytes())
                     .collect();
-                cx.write(address, &words)?;
+                cx.write_now(address, &words)?;
                 let held = self.regs[first + 4] & 1 << 12 != 0;
                 if self.reg(qmd3::method::INLINE_CONTROL) & 1 << 24 != 0 || !held {
                     self.qmd_action(cx, address, qmd3::Action::Reload)?;
@@ -954,6 +1031,8 @@ impl Engine {
         address: u64,
         action: qmd3::Action,
     ) -> Result<(), String> {
+        cx.stats.front_reads[3] += 1;
+        cx.sync_for(address, qmd3::WORDS as u64 * 4)?;
         let mut mem = qmd3::GpuMemory {
             mem: cx.mem,
             space: cx.space,
@@ -994,13 +1073,7 @@ impl Engine {
                 Ok(d) => d,
                 Err(why) => return cx.renderer_failed("a compute launch", why),
             };
-            let scene = Scene {
-                regs: Regs(&self.regs),
-                class: self.class,
-                cbufs: &self.cbufs,
-                mem: cx.mem,
-                space: cx.space,
-            };
+            let scene = self.scene(cx.mem, cx.space);
             let _phase = crate::progress::enter(crate::progress::DISPATCHING);
             let Some(backend) = cx.backend.as_mut() else {
                 return Ok(());
@@ -1021,7 +1094,9 @@ impl Engine {
         use mme64::method as m;
         let va = (u64::from(self.reg(m::MEM_ADDRESS_A) & 0x1FF_FFFF) << 32)
             | u64::from(self.reg(m::MEM_ADDRESS_B));
+        cx.stats.front_reads[2] += 1;
         cx.settle_range(va, u64::from(count) * 4)?;
+        cx.sync()?;
         self.dma_words(cx, count)
     }
 
@@ -1131,13 +1206,7 @@ impl Engine {
         let Some(backend) = cx.backend.as_mut() else {
             return Ok(());
         };
-        let scene = Scene {
-            regs: Regs(&self.regs),
-            class: self.class,
-            cbufs: &self.cbufs,
-            mem: cx.mem,
-            space: cx.space,
-        };
+        let scene = self.scene(cx.mem, cx.space);
         match backend.blit(&scene, &blit) {
             Ok(()) => Ok(()),
             Err(why) => cx.renderer_failed("a 2D copy", why),
@@ -1152,13 +1221,7 @@ impl Engine {
             eprintln!("[gpu] copy engine launch {data:#x}: {launch:?}");
         }
         if let Some(copy) = &launch.copy {
-            let scene = Scene {
-                regs: Regs(&self.regs),
-                class: self.class,
-                cbufs: &self.cbufs,
-                mem: cx.mem,
-                space: cx.space,
-            };
+            let scene = self.scene(cx.mem, cx.space);
             let done = match cx.backend.as_mut() {
                 Some(backend) => backend.dma_copy(&scene, copy),
                 None => copy.run(cx.mem, cx.space),
@@ -1184,6 +1247,8 @@ impl Engine {
     /// A compute launch was signalled: read the descriptor and give the launch to the renderer.
     fn launch_compute(&mut self, cx: &mut Cx<'_>, signal: u32) -> Result<(), String> {
         let qmd = u64::from(self.reg(compute::reg::SEND_PCAS_A)) << 8;
+        cx.stats.front_reads[3] += 1;
+        cx.sync_for(qmd, compute::QMD_WORDS as u64 * 4)?;
         let mut bytes = [0u8; compute::QMD_WORDS * 4];
         if !cx.space.read(cx.mem, qmd, &mut bytes) {
             return Err(format!(
@@ -1212,13 +1277,7 @@ impl Engine {
         let Some(backend) = cx.backend.as_mut() else {
             return Ok(());
         };
-        let scene = Scene {
-            regs: Regs(&self.regs),
-            class: self.class,
-            cbufs: &self.cbufs,
-            mem: cx.mem,
-            space: cx.space,
-        };
+        let scene = self.scene(cx.mem, cx.space);
         let _phase = crate::progress::enter(crate::progress::DISPATCHING);
         match backend.dispatch(&scene, &dispatch) {
             Ok(()) => Ok(()),
@@ -1284,6 +1343,8 @@ impl Engine {
                 cx.settle_range(address + u64::from(offset), 4)?;
                 cx.write(address + u64::from(offset), &data.to_le_bytes())?;
                 self.regs[m3d::LOAD_CONSTANT_BUFFER_OFFSET as usize] = (offset + 4) & 0xFFFF;
+                self.changes
+                    .register(m3d::LOAD_CONSTANT_BUFFER_OFFSET as usize);
             }
             // The buffer the selector names is bound to the slot the write gives.
             m3d::BIND_GROUP_CONSTANT_BUFFER..=m3d::BIND_GROUP_CONSTANT_BUFFER_LAST
@@ -1292,6 +1353,7 @@ impl Engine {
                 let group = ((method - m3d::BIND_GROUP_CONSTANT_BUFFER) / 8) as usize;
                 let selected = self.regs().selected_constant_buffer();
                 self.cbufs.bind(group, data, selected);
+                self.changes.bindings();
             }
             m3d::BEGIN => {
                 self.topology = data & 0xFFFF;
@@ -1472,13 +1534,7 @@ impl Engine {
         let Some(backend) = cx.backend.as_mut() else {
             return Ok(());
         };
-        let scene = Scene {
-            regs: Regs(&self.regs),
-            class: self.class,
-            cbufs: &self.cbufs,
-            mem: cx.mem,
-            space: cx.space,
-        };
+        let scene = self.scene(cx.mem, cx.space);
         crate::progress::command();
         let _phase = crate::progress::enter(crate::progress::DRAWING);
         match backend.draw(&scene, draw) {
@@ -1493,13 +1549,7 @@ impl Engine {
         let Some(backend) = cx.backend.as_mut() else {
             return Ok(());
         };
-        let scene = Scene {
-            regs: Regs(&self.regs),
-            class: self.class,
-            cbufs: &self.cbufs,
-            mem: cx.mem,
-            space: cx.space,
-        };
+        let scene = self.scene(cx.mem, cx.space);
         crate::progress::command();
         let _phase = crate::progress::enter(crate::progress::CLEARING);
         match backend.clear(&scene, &Clear::from_word(word)) {
@@ -1613,9 +1663,20 @@ impl Engine {
                 // The word may be what a launch not waited for writes, or one of its releases.
                 let ge = d >> 16 & 1 != 0;
                 let met = |have: u32| (ge && have >= payload) || (!ge && have == payload);
-                let mut have = cx.acquire_value(va)?;
+                cx.stats.front_reads[0] += 1;
+                // With a renderer on another thread, memory as the front knows it answers
+                // without waiting when it satisfies the acquire, and when the acquire is one that
+                // stopped its channel, tried again (A-288).
+                let mut have = match cx.word_now(va) {
+                    Some(v) if met(v) || cx.retrying => {
+                        cx.stats.front_reads[5] += 1;
+                        v
+                    }
+                    _ => cx.acquire_value(va)?,
+                };
                 if !met(have) && !cx.retrying {
                     // What is still to be released may be what it waits for (A-274).
+                    cx.stats.front_reads[4] += 1;
                     cx.settle()?;
                     have = cx.read_u32(va)?;
                 }

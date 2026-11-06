@@ -22,6 +22,71 @@ pub struct Scene<'a> {
     pub cbufs: &'a CbufBindings,
     pub mem: &'a dyn GuestMemory,
     pub space: &'a AddressSpace,
+    /// What changed of the registers and the bindings since a renderer on another thread was
+    /// last given them (A-288).
+    pub changes: &'a Changes,
+}
+
+/// Which registers of an engine, and whether its constant buffer bindings, changed since they
+/// were last taken: a renderer on a thread of its own keeps a copy of each engine's state, and is
+/// sent only what changed (A-288). Every engine has one; a new one says everything changed.
+#[derive(Debug)]
+pub struct Changes {
+    id: u64,
+    words: [std::cell::Cell<u64>; crate::engine::REGISTERS / 64],
+    cbufs: std::cell::Cell<bool>,
+}
+
+impl Default for Changes {
+    fn default() -> Changes {
+        Changes::new()
+    }
+}
+
+impl Changes {
+    pub fn new() -> Changes {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Changes {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            words: std::array::from_fn(|_| std::cell::Cell::new(!0)),
+            cbufs: std::cell::Cell::new(true),
+        }
+    }
+
+    /// Which engine this is.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Register `index` (a word index) was written.
+    #[inline]
+    pub fn register(&self, index: usize) {
+        if let Some(w) = self.words.get(index / 64) {
+            w.set(w.get() | 1 << (index % 64));
+        }
+    }
+
+    /// The constant buffer bindings changed.
+    pub fn bindings(&self) {
+        self.cbufs.set(true);
+    }
+
+    /// The registers written since the last call, with their values in `regs`, and whether the
+    /// bindings changed; both are forgotten.
+    pub fn take(&self, regs: &[u32]) -> (Vec<(u16, u32)>, bool) {
+        let mut out = Vec::new();
+        for (i, w) in self.words.iter().enumerate() {
+            let mut bits = w.replace(0);
+            while bits != 0 {
+                let index = i * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(&v) = regs.get(index) {
+                    out.push((index as u16, v));
+                }
+            }
+        }
+        (out, self.cbufs.replace(false))
+    }
 }
 
 impl Scene<'_> {
@@ -250,6 +315,47 @@ pub trait Backend: Send {
         release: crate::qmd3::Release,
     ) -> Result<(), String> {
         release.apply(&mut crate::qmd3::GpuMemory { mem, space })
+    }
+
+    /// The GPU front writes `data` at `va` itself (a constant buffer word, an inline upload, an
+    /// inline compute descriptor): after the commands given to the renderer before it read
+    /// memory (A-288).
+    fn write(
+        &mut self,
+        space: &AddressSpace,
+        mem: &dyn GuestMemory,
+        va: u64,
+        data: &[u8],
+    ) -> Result<(), String> {
+        if space.write(mem, va, data) {
+            Ok(())
+        } else {
+            Err(format!(
+                "a write of {} bytes to GPU address {va:#x}, which is not mapped",
+                data.len()
+            ))
+        }
+    }
+
+    /// The GPU front is about to read memory that what it gave the renderer may change (a
+    /// semaphore, a macro's read, a compute descriptor): all of that is done first. A renderer
+    /// that does everything in the call has nothing to do (A-288).
+    fn sync(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Whether the GPU front may read `len` bytes at `va` as memory holds them now, without
+    /// waiting: nothing it gave a renderer on another thread writes them (A-288). A renderer that
+    /// does everything in the call says no, and the front asks it as it always does.
+    fn readable_now(&mut self, _space: &AddressSpace, _va: u64, _len: u64) -> bool {
+        false
+    }
+
+    /// The word at `va` as the work the GPU front gave a renderer on another thread will leave
+    /// it, when the front can tell that without waiting (A-288); `None` otherwise, and always
+    /// for a renderer that does everything in the call.
+    fn word_now(&mut self, _space: &AddressSpace, _mem: &dyn GuestMemory, _va: u64) -> Option<u32> {
+        None
     }
 }
 

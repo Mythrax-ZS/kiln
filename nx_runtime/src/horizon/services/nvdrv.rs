@@ -244,6 +244,16 @@ impl Shared {
         // in the call, as every run did before).
         let queued =
             core.gpu.backend.is_some() && !std::env::var("NX_GPU_SYNC").is_ok_and(|v| v != "0");
+        // `NX_GPU_SPLIT=1`: the renderer runs on a thread of its own, behind the GPU front's
+        // (A-288).
+        if queued && std::env::var("NX_GPU_SPLIT").is_ok_and(|v| v != "0") {
+            if let Some(inner) = core.gpu.backend.take() {
+                core.gpu.backend = Some(Box::new(nx_gpu::split::Split::new(
+                    inner,
+                    core.gpu.mem.clone(),
+                )));
+            }
+        }
         let worker = queued.then(|| {
             Arc::new(Worker {
                 backlog: Mutex::new(Backlog::default()),

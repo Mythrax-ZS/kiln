@@ -83,8 +83,12 @@ pub struct Remap {
     pub cacheable: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct AddressSpace {
+    /// Which address space this is, for a renderer on another thread that keeps a copy (A-288).
+    id: u64,
+    /// Counts the changes of the mappings and the shim, so that such a copy is made again.
+    version: u64,
     start: u64,
     end: u64,
     /// Small pages below, big pages from here up.
@@ -128,7 +132,10 @@ pub fn hash_counts() -> (u64, u64) {
 
 impl AddressSpace {
     pub fn new() -> AddressSpace {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         AddressSpace {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            version: 0,
             start: DEFAULT_START,
             end: DEFAULT_END,
             split: DEFAULT_START + (DEFAULT_END - DEFAULT_START) / 2,
@@ -175,6 +182,7 @@ impl AddressSpace {
         self.end = end;
         self.split = split;
         self.initialized = true;
+        self.version += 1;
         Ok(())
     }
 
@@ -190,6 +198,7 @@ impl AddressSpace {
     ) -> NvResult<()> {
         self.initialize(flags, big_page_size, start, end, start)?;
         self.unified = true;
+        self.version += 1;
         Ok(())
     }
 
@@ -202,6 +211,7 @@ impl AddressSpace {
     /// `SHIM_STRIDE * id` reads as syncpoint `id` (A-200).
     pub fn set_syncpoint_shim(&mut self, va: u64) {
         self.syncpoint_shim = Some(va);
+        self.version += 1;
     }
 
     /// The syncpoint a read at `va` names, when `va` is in the syncpoint shim.
@@ -540,7 +550,18 @@ impl AddressSpace {
     /// The mappings, to change: what the last translation found is forgotten.
     fn maps_mut(&mut self) -> &mut BTreeMap<u64, Mapping> {
         self.last.set((0, 0, 0));
+        self.version += 1;
         &mut self.maps
+    }
+
+    /// Which address space this is (copies keep it).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Changes with every change of the mappings (or of the range or the shim).
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// A hash of up to `len` bytes of GPU memory at `va` as they are now, and how many of them

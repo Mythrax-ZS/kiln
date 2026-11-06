@@ -143,6 +143,7 @@ pub struct World {
     pub space: AddressSpace,
     pub regs: Vec<u32>,
     pub cbufs: CbufBindings,
+    pub changes: nx_gpu::render::Changes,
 }
 
 impl World {
@@ -166,6 +167,7 @@ impl World {
             space,
             regs: vec![0; 0x1000],
             cbufs: CbufBindings::default(),
+            changes: nx_gpu::render::Changes::new(),
         }
     }
 
@@ -176,6 +178,7 @@ impl World {
             cbufs: &self.cbufs,
             mem: &self.mem,
             space: &self.space,
+            changes: &self.changes,
         }
     }
 

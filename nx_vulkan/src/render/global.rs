@@ -39,6 +39,8 @@ pub struct GlobalMemory {
     trace: bool,
     /// Imports that failed, by reason, so each is said once.
     failures: HashMap<String, u64>,
+    /// Imports made since the last report, and the time they took (`NX_TRACE_PERF`).
+    pub made: (u64, std::time::Duration),
 }
 
 fn mix(h: u64, v: u64) -> u64 {
@@ -155,7 +157,10 @@ impl GlobalMemory {
         let page_offset = ptr as u64 % PAGE;
         let base = ptr as u64 - page_offset;
         let size = (len + page_offset).next_multiple_of(PAGE);
+        let began = std::time::Instant::now();
         let m = vk.import_host_memory(base as *mut u8, size)?;
+        self.made.0 += 1;
+        self.made.1 += began.elapsed();
         let address = m.address;
         self.imports.insert((base as usize, size), (m, now));
         Ok(address + page_offset)

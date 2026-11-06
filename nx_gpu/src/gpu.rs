@@ -144,6 +144,7 @@ struct FrontPerf {
     words: u64,
     macro_runs: u64,
     macro_steps: u64,
+    front_reads: [u64; 6],
 }
 
 /// The window `NX_TRACE_GPU_WINDOW` names: `<first frame>:<last frame>:<level>`.
@@ -219,14 +220,15 @@ impl Gpu {
         if let (Some(p), true) = (self.perf.as_mut(), number.is_multiple_of(100)) {
             let s = &self.stats;
             eprintln!(
-                "[gpu] frame {number}: the last frames ran methods for {:?} (with the renderer's calls among them): {} methods, {} words, {} macro calls running {} instructions; the ends of {} submissions waited {:?} for the renderer",
+                "[gpu] frame {number}: the last frames ran methods for {:?} (with the renderer's calls among them): {} methods, {} words, {} macro calls running {} instructions; the ends of {} submissions waited {:?} for the renderer; the front read what the renderer's work may change {:?} times (acquires, answered by releases still to be made, macro reads of memory, compute descriptors, acquires that waited for everything, acquires met by memory as it was)",
                 p.ran,
                 s.methods - p.methods,
                 s.words - p.words,
                 s.macro_runs - p.macro_runs,
                 s.macro_steps - p.macro_steps,
                 p.ends.1,
-                p.ends.0
+                p.ends.0,
+                std::array::from_fn::<u64, 6, _>(|i| s.front_reads[i] - p.front_reads[i])
             );
             *p = FrontPerf {
                 ran: std::time::Duration::ZERO,
@@ -235,6 +237,7 @@ impl Gpu {
                 words: s.words,
                 macro_runs: s.macro_runs,
                 macro_steps: s.macro_steps,
+                front_reads: s.front_reads,
             };
         }
         if let Some((first, last, level)) = self.window {

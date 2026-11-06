@@ -1372,8 +1372,9 @@ impl Renderer {
                 let (texture_bytes, textures) = core.textures.device_bytes();
                 let trimmed = std::mem::take(&mut core.textures_trimmed);
                 let (target_bytes, targets) = core.targets.device_bytes();
+                let made = std::mem::take(&mut core.global.made);
                 eprintln!(
-                    "[vulkan] frame {}: device memory: {} MiB in images and buffers ({} MiB in {textures} textures, {trimmed} let go, {} MiB in {targets} render targets), {} MiB of guest memory imported in {} runs ({} MiB of it distinct); heaps used/budget (MiB): {}",
+                    "[vulkan] frame {}: device memory: {} MiB in images and buffers ({} MiB in {textures} textures, {trimmed} let go, {} MiB in {targets} render targets), {} MiB of guest memory imported in {} runs ({} MiB of it distinct; {} imports made in {:?}); heaps used/budget (MiB): {}",
                     p.frame,
                     mib(core
                         .vk
@@ -1384,6 +1385,8 @@ impl Renderer {
                     mib(core.global.bytes()),
                     core.global.runs(),
                     mib(core.global.union_bytes()),
+                    made.0,
+                    made.1,
                     heaps.join(", ")
                 );
                 if ph.compute.iter().any(|d| !d.is_zero()) {
