@@ -47,6 +47,52 @@ fn a_triangle_covering_the_target_is_painted_with_its_flat_color() {
 }
 
 #[test]
+fn draws_of_one_batch_with_other_state_each_have_their_own() {
+    if vulkan().is_none() {
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    let mut w = scene(&pass_through_vertex(), &flat_color_pixel(), 64, target);
+    let draw = Draw {
+        source: Source::Arrays { first: 0, count: 3 },
+        topology: 4,
+        instance: 0,
+        instances: 1,
+    };
+    let mut r = Renderer::new(RenderConfig::default());
+    // The left half red, then the right half green: the same pipeline, with another scissor and
+    // other vertices, recorded into one batch.
+    let halves = [
+        (0u32, 32u32, [1.0, 0.0, 0.0, 1.0], GPU_BASE + 0x30_0000),
+        (32, 64, [0.0, 1.0, 0.0, 1.0], GPU_BASE + 0x31_0000),
+    ];
+    for (x0, x1, color, at) in halves {
+        vertices(
+            &mut w,
+            at,
+            &[
+                ([-1.0, -1.0, 0.5, 1.0], color),
+                ([3.0, -1.0, 0.5, 1.0], color),
+                ([-1.0, 3.0, 0.5, 1.0], color),
+            ],
+        );
+        w.set(0xE00, 1);
+        w.set(0xE04, x0 | x1 << 16);
+        w.set(0xE08, 64 << 16);
+        r.draw(&w.scene(), &draw).unwrap();
+    }
+    r.finish().unwrap();
+    let (rgba, width, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+    let at = |x: usize, y: usize| rgba[(y * width as usize + x) * 4..][..4].to_vec();
+    assert_eq!(at(10, 30), [255, 0, 0, 255]);
+    assert_eq!(
+        at(50, 30),
+        [0, 255, 0, 255],
+        "the second draw's scissor and vertices"
+    );
+}
+
+#[test]
 fn a_smaller_triangle_covers_part_of_the_target() {
     if vulkan().is_none() {
         return;

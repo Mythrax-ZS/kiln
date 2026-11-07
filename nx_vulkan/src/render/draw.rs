@@ -661,13 +661,24 @@ impl Core {
         self.scratch.binding_state = binding_state;
         lap(&mut mark, &mut self.phases.pipeline, "pipeline");
 
-        // Commands.
+        // Commands: what the command buffer has bound and set for an earlier draw of the batch is
+        // not said again (A-294).
         let cmd = self.frame.cmd(&self.vk)?;
+        if self.recorded.cmd != cmd || self.recorded.batch != self.frame.sent {
+            self.recorded = Recorded {
+                cmd,
+                batch: self.frame.sent,
+                ..Recorded::default()
+            };
+        }
         let d = &self.vk.device;
         // SAFETY: the command buffer is recording inside a rendering with the attachments the
         // pipeline was made for; every handle used is valid for the submission.
         unsafe {
-            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            if self.recorded.pipeline != pipeline {
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                self.recorded.pipeline = pipeline;
+            }
             d.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -686,7 +697,14 @@ impl Core {
                 &draw.instance.to_ne_bytes(),
             );
             for &(binding, buffer, offset) in &bound {
-                d.cmd_bind_vertex_buffers(cmd, binding, &[buffer], &[offset]);
+                let slot = binding as usize;
+                if self.recorded.vertex.len() <= slot {
+                    self.recorded.vertex.resize(slot + 1, None);
+                }
+                if self.recorded.vertex[slot] != Some((buffer, offset)) {
+                    d.cmd_bind_vertex_buffers(cmd, binding, &[buffer], &[offset]);
+                    self.recorded.vertex[slot] = Some((buffer, offset));
+                }
             }
         }
         if !self.set_dynamic_state(scene, cmd, &pass, &raster, &regs.depth_stencil(), &blend) {
@@ -709,7 +727,10 @@ impl Core {
                 // A task and mesh pipeline: as many workgroups as the draw has vertices (A-270).
                 (Some(m), Some(_), _) => m.cmd_draw_mesh_tasks(cmd, count, 1, 1),
                 (_, _, Some((buffer, offset, ty, n))) => {
-                    d.cmd_bind_index_buffer(cmd, buffer, offset, ty);
+                    if self.recorded.index != Some((buffer, offset, ty)) {
+                        d.cmd_bind_index_buffer(cmd, buffer, offset, ty);
+                        self.recorded.index = Some((buffer, offset, ty));
+                    }
                     d.cmd_draw_indexed(cmd, n, draw.instances, 0, geometry.vertex_offset, 0);
                 }
                 _ => d.cmd_draw(
@@ -2168,7 +2189,7 @@ impl Core {
     /// constants. False when the viewport has no area (every vertex lands on a point, so nothing
     /// is drawn and Vulkan has no such viewport).
     fn set_dynamic_state(
-        &self,
+        &mut self,
         scene: &Scene<'_>,
         cmd: vk::CommandBuffer,
         pass: &super::Pass,
@@ -2266,55 +2287,131 @@ impl Core {
                 convert::compare_op(face.func),
             )
         };
+        let depth_op = match convert::compare_op(ds.depth_func) {
+            vk::CompareOp::EQUAL if self.debug.equal_as_lequal => vk::CompareOp::LESS_OR_EQUAL,
+            op => op,
+        };
+        let back = if ds.two_sided { &ds.back } else { &ds.front };
+        let (front_ops, back_ops) = (stencil(&ds.front), stencil(back));
+        let now = Dynamic {
+            viewport: [
+                viewport.x.to_bits(),
+                viewport.y.to_bits(),
+                viewport.width.to_bits(),
+                viewport.height.to_bits(),
+                viewport.min_depth.to_bits(),
+                viewport.max_depth.to_bits(),
+            ],
+            scissor: [
+                scissor.offset.x as u32,
+                scissor.offset.y as u32,
+                scissor.extent.width,
+                scissor.extent.height,
+            ],
+            line_width: raster.line_width.max(1.0).to_bits(),
+            cull: cull.as_raw(),
+            front: front.as_raw() as u32,
+            depth: [
+                u32::from(ds.depth_test && !self.debug.no_depth_test),
+                u32::from(ds.depth_write),
+                depth_op.as_raw() as u32,
+                u32::from(ds.stencil_test),
+            ],
+            stencil_ops: [front_ops, back_ops].map(|(a, b, c, f)| {
+                [
+                    a.as_raw() as u32,
+                    b.as_raw() as u32,
+                    c.as_raw() as u32,
+                    f.as_raw() as u32,
+                ]
+            }),
+            stencil_values: [
+                ds.front.reference,
+                ds.front.func_mask,
+                ds.front.write_mask,
+                back.reference,
+                back.func_mask,
+                back.write_mask,
+            ],
+            bias: [
+                u32::from(raster.bias_fill),
+                raster.depth_bias.to_bits(),
+                raster.slope_scale_depth_bias.to_bits(),
+            ],
+            blend: blend.constant.map(f32::to_bits),
+        };
+        let was = self.recorded.dynamic;
+        let changed =
+            |part: fn(&Dynamic) -> &[u32]| was.as_ref().is_none_or(|w| part(w) != part(&now));
         // SAFETY: the command buffer is recording; the state set matches the pipeline's
-        // dynamic state list.
+        // dynamic state list, and every draw pipeline has the same list, so what was set for an
+        // earlier draw of the command buffer stands (A-294).
         unsafe {
-            d.cmd_set_viewport(cmd, 0, &[viewport]);
-            d.cmd_set_scissor(cmd, 0, &[scissor]);
-            d.cmd_set_line_width(cmd, raster.line_width.max(1.0));
-            d.cmd_set_cull_mode(cmd, cull);
-            d.cmd_set_front_face(cmd, front);
-            d.cmd_set_depth_test_enable(cmd, ds.depth_test && !self.debug.no_depth_test);
-            d.cmd_set_depth_write_enable(cmd, ds.depth_write);
-            let depth_op = match convert::compare_op(ds.depth_func) {
-                vk::CompareOp::EQUAL if self.debug.equal_as_lequal => vk::CompareOp::LESS_OR_EQUAL,
-                op => op,
-            };
-            d.cmd_set_depth_compare_op(cmd, depth_op);
-            d.cmd_set_depth_bounds_test_enable(cmd, false);
-            d.cmd_set_depth_bounds(cmd, 0.0, 1.0);
-            d.cmd_set_stencil_test_enable(cmd, ds.stencil_test);
-            let front_ops = stencil(&ds.front);
-            d.cmd_set_stencil_op(
-                cmd,
-                vk::StencilFaceFlags::FRONT,
-                front_ops.0,
-                front_ops.1,
-                front_ops.2,
-                front_ops.3,
-            );
-            let back = if ds.two_sided { &ds.back } else { &ds.front };
-            let back_ops = stencil(back);
-            d.cmd_set_stencil_op(
-                cmd,
-                vk::StencilFaceFlags::BACK,
-                back_ops.0,
-                back_ops.1,
-                back_ops.2,
-                back_ops.3,
-            );
-            d.cmd_set_stencil_reference(cmd, vk::StencilFaceFlags::FRONT, ds.front.reference);
-            d.cmd_set_stencil_compare_mask(cmd, vk::StencilFaceFlags::FRONT, ds.front.func_mask);
-            d.cmd_set_stencil_write_mask(cmd, vk::StencilFaceFlags::FRONT, ds.front.write_mask);
-            d.cmd_set_stencil_reference(cmd, vk::StencilFaceFlags::BACK, back.reference);
-            d.cmd_set_stencil_compare_mask(cmd, vk::StencilFaceFlags::BACK, back.func_mask);
-            d.cmd_set_stencil_write_mask(cmd, vk::StencilFaceFlags::BACK, back.write_mask);
-            let biased = raster.bias_fill;
-            d.cmd_set_depth_bias_enable(cmd, biased);
-            d.cmd_set_depth_bias(cmd, raster.depth_bias, 0.0, raster.slope_scale_depth_bias);
-            d.cmd_set_blend_constants(cmd, &blend.constant);
-            d.cmd_set_primitive_restart_enable(cmd, false);
+            if was.is_none() {
+                d.cmd_set_depth_bounds_test_enable(cmd, false);
+                d.cmd_set_depth_bounds(cmd, 0.0, 1.0);
+                d.cmd_set_primitive_restart_enable(cmd, false);
+            }
+            if changed(|s| &s.viewport) {
+                d.cmd_set_viewport(cmd, 0, &[viewport]);
+            }
+            if changed(|s| &s.scissor) {
+                d.cmd_set_scissor(cmd, 0, &[scissor]);
+            }
+            if changed(|s| std::slice::from_ref(&s.line_width)) {
+                d.cmd_set_line_width(cmd, raster.line_width.max(1.0));
+            }
+            if changed(|s| std::slice::from_ref(&s.cull)) {
+                d.cmd_set_cull_mode(cmd, cull);
+            }
+            if changed(|s| std::slice::from_ref(&s.front)) {
+                d.cmd_set_front_face(cmd, front);
+            }
+            if changed(|s| &s.depth) {
+                d.cmd_set_depth_test_enable(cmd, now.depth[0] != 0);
+                d.cmd_set_depth_write_enable(cmd, ds.depth_write);
+                d.cmd_set_depth_compare_op(cmd, depth_op);
+                d.cmd_set_stencil_test_enable(cmd, ds.stencil_test);
+            }
+            if changed(|s| s.stencil_ops.as_flattened()) {
+                d.cmd_set_stencil_op(
+                    cmd,
+                    vk::StencilFaceFlags::FRONT,
+                    front_ops.0,
+                    front_ops.1,
+                    front_ops.2,
+                    front_ops.3,
+                );
+                d.cmd_set_stencil_op(
+                    cmd,
+                    vk::StencilFaceFlags::BACK,
+                    back_ops.0,
+                    back_ops.1,
+                    back_ops.2,
+                    back_ops.3,
+                );
+            }
+            if changed(|s| &s.stencil_values) {
+                d.cmd_set_stencil_reference(cmd, vk::StencilFaceFlags::FRONT, ds.front.reference);
+                d.cmd_set_stencil_compare_mask(
+                    cmd,
+                    vk::StencilFaceFlags::FRONT,
+                    ds.front.func_mask,
+                );
+                d.cmd_set_stencil_write_mask(cmd, vk::StencilFaceFlags::FRONT, ds.front.write_mask);
+                d.cmd_set_stencil_reference(cmd, vk::StencilFaceFlags::BACK, back.reference);
+                d.cmd_set_stencil_compare_mask(cmd, vk::StencilFaceFlags::BACK, back.func_mask);
+                d.cmd_set_stencil_write_mask(cmd, vk::StencilFaceFlags::BACK, back.write_mask);
+            }
+            if changed(|s| &s.bias) {
+                d.cmd_set_depth_bias_enable(cmd, raster.bias_fill);
+                d.cmd_set_depth_bias(cmd, raster.depth_bias, 0.0, raster.slope_scale_depth_bias);
+            }
+            if changed(|s| &s.blend) {
+                d.cmd_set_blend_constants(cmd, &blend.constant);
+            }
         }
+        self.recorded.dynamic = Some(now);
         true
     }
 }
@@ -2404,4 +2501,32 @@ mod tests {
         assert_eq!(logic_op(0x1506), vk::LogicOp::XOR);
         assert_eq!(logic_op(0x150F), vk::LogicOp::SET);
     }
+}
+
+/// What the command buffer being recorded has bound and set for the draws of its batch (A-294).
+#[derive(Default)]
+pub(super) struct Recorded {
+    cmd: vk::CommandBuffer,
+    batch: u64,
+    pipeline: vk::Pipeline,
+    /// The vertex buffer bound at each binding, and the index buffer.
+    vertex: Vec<Option<(vk::Buffer, u64)>>,
+    index: Option<(vk::Buffer, u64, vk::IndexType)>,
+    dynamic: Option<Dynamic>,
+}
+
+/// The dynamic state of a draw, as the words that say it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Dynamic {
+    viewport: [u32; 6],
+    scissor: [u32; 4],
+    line_width: u32,
+    cull: u32,
+    front: u32,
+    /// Depth test, depth write, the depth compare operation and the stencil test.
+    depth: [u32; 4],
+    stencil_ops: [[u32; 4]; 2],
+    stencil_values: [u32; 6],
+    bias: [u32; 3],
+    blend: [u32; 4],
 }

@@ -198,6 +198,8 @@ struct Core {
     /// (A-292), by size, and the program that does it.
     layout_buffers: crate::fast::FastMap<u64, Vec<crate::compute::DeviceBuffer>>,
     layout: Option<crate::astc_gpu::Decoder>,
+    /// What the command buffer has bound and set for the draws of its batch (A-294).
+    recorded: draw::Recorded,
     /// Textures let go to keep to the device memory budget (A-260), for the report.
     textures_trimmed: u64,
     /// 2D copies made in guest memory (A-249), for the report of every 100 frames.
@@ -453,6 +455,7 @@ impl Renderer {
                     staging_buffers: crate::fast::FastMap::default(),
                     layout_buffers: crate::fast::FastMap::default(),
                     layout: None,
+                    recorded: draw::Recorded::default(),
                     textures_trimmed: 0,
                     memory_copies: 0,
                     batch_draws: 0,
