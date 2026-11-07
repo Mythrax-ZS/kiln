@@ -176,6 +176,7 @@ pub struct Kernel {
     pub process: ProcessInfo,
     /// Optional NVN2 interception, installed before any guest thread starts (A-298).
     pub(crate) nvn2: OnceLock<Arc<crate::rt::nvn2::Session>>,
+    pub(crate) native_display: OnceLock<Arc<super::services::vi::Shared>>,
     pub(super) state: Mutex<State>,
     wake: Condvar,
     registry: Mutex<BTreeMap<String, ServiceFactory>>,
@@ -452,6 +453,7 @@ impl Kernel {
         Arc::new(Kernel {
             process,
             nvn2: OnceLock::new(),
+            native_display: OnceLock::new(),
             state: Mutex::new(state),
             wake: Condvar::new(),
             registry: Mutex::new(BTreeMap::new()),

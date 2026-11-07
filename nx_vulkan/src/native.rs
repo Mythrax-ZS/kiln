@@ -181,6 +181,15 @@ impl Queue {
         completion: Arc<Completion>,
         for_cpu: bool,
     ) -> Result<(), String> {
+        self.submit_commands(completion, for_cpu, |_, _| {})
+    }
+
+    pub(crate) fn submit_commands(
+        &mut self,
+        completion: Arc<Completion>,
+        for_cpu: bool,
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
+    ) -> Result<(), String> {
         if !Arc::ptr_eq(&self.context.vk, &completion.vk) {
             return Err("a native fence belongs to another Vulkan device".to_string());
         }
@@ -191,12 +200,17 @@ impl Queue {
             }
             *state = State::Submitting;
         }
-        let result = self.submit(&completion, for_cpu);
+        let result = self.submit(&completion, for_cpu, record);
         completion.finish_submission(&result);
         result
     }
 
-    fn submit(&mut self, completion: &Arc<Completion>, for_cpu: bool) -> Result<(), String> {
+    fn submit(
+        &mut self,
+        completion: &Arc<Completion>,
+        for_cpu: bool,
+        record: impl FnOnce(&Vk, vk::CommandBuffer),
+    ) -> Result<(), String> {
         self.reap()?;
         let vk = &self.context.vk;
         // SAFETY: this pool is exclusively used by this queue.
@@ -241,6 +255,7 @@ impl Queue {
                     &[],
                     &[],
                 );
+                record(vk, cmd);
                 vk.device
                     .end_command_buffer(cmd)
                     .map_err(|e| format!("ending a native command buffer: {e}"))?;

@@ -71,6 +71,13 @@ pub(in crate::rt::nvn2) struct Waiter {
 }
 
 impl Waiter {
+    pub(in crate::rt::nvn2) fn completion(completion: Arc<Completion>) -> Self {
+        Self {
+            completion: Some(completion),
+            timeout: u64::MAX,
+            returns_status: false,
+        }
+    }
     fn wait(&self, cpu: &NativeCpu, completion: &Completion) -> Result<bool, Error> {
         let ctx = cpu.ctl.user.cast::<crate::horizon::kernel::ThreadCtx>();
         // SAFETY: Horizon threads keep ThreadCtx alive for the whole run; plain calls leave null.
@@ -124,6 +131,92 @@ impl Waiter {
 }
 
 impl Objects {
+    pub(in crate::rt::nvn2) fn acquire_sync(
+        &self,
+        address: u64,
+        device: u64,
+        devices: &Devices,
+    ) -> Result<Option<u64>, Error> {
+        if !self.syncs.contains_key(&address) {
+            if self.queues.contains_key(&address)
+                || address == device
+                || !address.is_multiple_of(8)
+                || self.next_id == u32::MAX
+            {
+                return Err(invalid("invalid acquisition sync storage"));
+            }
+            let previous = read::<32>(address)?;
+            write(address, &previous)?;
+            return Ok(None);
+        }
+        let sync = self.sync(address, devices)?;
+        if sync.device != device {
+            return Err(invalid("acquisition sync belongs to another device"));
+        }
+        Ok(Some(sync.cookie))
+    }
+
+    pub(in crate::rt::nvn2) fn install_acquire(
+        &mut self,
+        address: u64,
+        cookie: Option<u64>,
+        device: u64,
+        done: Arc<Completion>,
+        devices: &Devices,
+    ) -> Result<(), Error> {
+        if self.acquire_sync(address, device, devices)? != cookie {
+            return Err(invalid("acquisition sync was replaced during the wait"));
+        }
+        if cookie.is_none() {
+            return self.put_sync(address, device, devices.identity(device)?, Some(done));
+        }
+        let sync = self.syncs.get_mut(&address).expect("validated sync");
+        sync.origin = None;
+        sync.completion = Some(done);
+        Ok(())
+    }
+
+    fn put_sync(
+        &mut self,
+        address: u64,
+        device: u64,
+        generation: u64,
+        completion: Option<Arc<Completion>>,
+    ) -> Result<(), Error> {
+        let cookie = 0x4B53_594E_0000_0000 | u64::from(self.next_id + 1);
+        let mut header = [0; 32];
+        header[..8].copy_from_slice(&device.to_le_bytes());
+        header[24..].copy_from_slice(&cookie.to_le_bytes());
+        write(address, &header)?;
+        self.next_id += 1;
+        self.syncs.insert(
+            address,
+            Sync {
+                cookie,
+                device,
+                generation,
+                origin: None,
+                completion,
+                label: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+
+    pub(in crate::rt::nvn2) fn flush_for_present(
+        &mut self,
+        address: u64,
+        device: u64,
+        devices: &Devices,
+    ) -> Result<(), Error> {
+        if self.queue(address, devices)?.device != device {
+            return Err(invalid("presentation window belongs to another device"));
+        }
+        self.queues
+            .get_mut(&address)
+            .expect("validated queue")
+            .flush()
+    }
     pub(in crate::rt::nvn2) fn has_children(&self, device: u64) -> bool {
         self.queues.values().any(|q| q.device == device)
             || self.syncs.values().any(|s| s.device == device)
@@ -337,23 +430,7 @@ impl Objects {
                     cpu.state.x[0] = 0;
                     return Ok(());
                 }
-                let cookie = 0x4B53_594E_0000_0000 | u64::from(self.next_id + 1);
-                let mut header = [0; 32];
-                header[..8].copy_from_slice(&a.to_le_bytes());
-                header[24..].copy_from_slice(&cookie.to_le_bytes());
-                write(object, &header)?;
-                self.next_id += 1;
-                self.syncs.insert(
-                    object,
-                    Sync {
-                        cookie,
-                        device: a,
-                        generation,
-                        origin: None,
-                        completion: None,
-                        label: Vec::new(),
-                    },
-                );
+                self.put_sync(object, a, generation, None)?;
                 cpu.state.x[0] = 1;
                 Ok(())
             })(),

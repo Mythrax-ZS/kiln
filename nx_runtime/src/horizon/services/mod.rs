@@ -32,7 +32,7 @@ mod set;
 mod ssl;
 mod time;
 mod vdec;
-mod vi;
+pub(crate) mod vi;
 
 use super::kernel::Kernel;
 use super::service::Service;
@@ -65,6 +65,7 @@ pub fn register_defaults(kernel: &Arc<Kernel>) {
     // The driver of the console the program was built for (A-188, A-199).
     gpu.set_switch_2(kernel.process.platform() == crate::npdm::Platform::Nx2);
     let display = Arc::new(vi::Shared::new());
+    let _ = kernel.native_display.set(Arc::clone(&display));
     display.set_gpu(gpu.clone());
     {
         let mut a = applet.lock().unwrap_or_else(|e| e.into_inner());

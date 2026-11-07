@@ -8,6 +8,8 @@ use super::NativeCpu;
 mod owned;
 #[cfg(feature = "vulkan")]
 pub(super) use owned::Objects;
+#[cfg(feature = "vulkan")]
+pub(super) use owned::Waiter;
 
 fn invalid(message: &str) -> Error {
     Error::Invalid(format!("NVN2 queue {message}"))

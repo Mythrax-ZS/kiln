@@ -12,6 +12,8 @@ mod owned;
 mod view;
 pub(super) use descriptor::Descriptor;
 pub(super) use observe::observe;
+#[cfg(feature = "vulkan")]
+pub(super) use owned::DisplayImage;
 pub(super) use owned::Objects;
 
 fn invalid(message: &str) -> Error {

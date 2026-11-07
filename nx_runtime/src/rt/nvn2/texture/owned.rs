@@ -8,6 +8,20 @@ struct Texture {
     parent: PoolInfo,
     layout: Layout,
     label: Vec<u8>,
+    #[cfg(feature = "vulkan")]
+    surface: Option<std::sync::Arc<nx_vulkan::render::native::Surface>>,
+}
+
+#[cfg(feature = "vulkan")]
+pub(in crate::rt::nvn2) struct DisplayImage {
+    pub object: u64,
+    pub cookie: u64,
+    pub device: u64,
+    pub dimensions: [u32; 3],
+    pub format: u32,
+    pub address: u64,
+    pub size: u64,
+    pub surface: std::sync::Arc<nx_vulkan::render::native::Surface>,
 }
 
 #[derive(Default)]
@@ -17,6 +31,61 @@ pub(in crate::rt::nvn2) struct Objects {
 }
 
 impl Objects {
+    #[cfg(feature = "vulkan")]
+    pub(in crate::rt::nvn2) fn display_image(
+        &mut self,
+        object: u64,
+        memory: &Memory,
+        devices: &crate::rt::nvn2::device::Devices,
+    ) -> Result<DisplayImage, Error> {
+        use nx_vulkan::render::native::SurfaceFormat;
+        let t = self.texture(object, memory, &|d| devices.identity(d))?;
+        if t.state.int(32) & 1 == 0
+            || t.state.int(32) & 0x50 != 0
+            || t.state.int(36) != 1
+            || t.state.int(52) != 1
+            || t.state.int(60) > 1
+            || t.layout.layers != 1
+            || t.state.word(96) != 0
+        {
+            return Err(invalid(
+                "window needs single-level, single-sample, block-linear 2D display images",
+            ));
+        }
+        let format = match t.state.int(56) {
+            37 => SurfaceFormat::Rgba8,
+            56 => SurfaceFormat::Rgba8Srgb,
+            61 => SurfaceFormat::Rgb10A2,
+            41 => SurfaceFormat::Rgba16Float,
+            code => {
+                return Err(invalid(&format!(
+                    "display format {code} is not implemented"
+                )))
+            }
+        };
+        let t = self.live.get_mut(&object).expect("validated texture");
+        if t.surface.is_none() {
+            let renderer = devices.renderer(t.state.device())?;
+            let [w, h, _] = t.layout.dimensions;
+            t.surface = Some(
+                renderer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .create_native_surface(w, h, format)
+                    .map_err(|e| invalid(&e))?,
+            );
+        }
+        Ok(DisplayImage {
+            object,
+            cookie: t.cookie,
+            device: t.state.device(),
+            dimensions: t.layout.dimensions,
+            format: t.state.int(56),
+            address: t.parent.gpu + t.state.word(24),
+            size: t.layout.size,
+            surface: std::sync::Arc::clone(t.surface.as_ref().unwrap()),
+        })
+    }
     pub(in crate::rt::nvn2) fn live_count(&self) -> usize {
         self.live.len()
     }
@@ -177,6 +246,8 @@ impl Objects {
                 parent,
                 layout,
                 label: Vec::new(),
+                #[cfg(feature = "vulkan")]
+                surface: None,
             },
         );
         cpu.state.x[0] = 1;

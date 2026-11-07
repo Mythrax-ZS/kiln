@@ -69,7 +69,7 @@ pub(super) fn write(address: u64, bytes: &[u8]) -> Result<(), Error> {
 struct Host {
     // Keep the actual initialized renderer, rather than just a copy of a device's properties.
     #[cfg(feature = "vulkan")]
-    _renderer: nx_vulkan::Renderer,
+    renderer: std::sync::Arc<std::sync::Mutex<nx_vulkan::Renderer>>,
     #[cfg(feature = "vulkan")]
     context: nx_vulkan::native::Context,
 }
@@ -110,7 +110,7 @@ impl Devices {
             eprintln!("[nvn2] native device: {}", caps.name);
             let context = renderer.native_context()?;
             Ok(Host {
-                _renderer: renderer,
+                renderer: std::sync::Arc::new(std::sync::Mutex::new(renderer)),
                 context,
             })
         }
@@ -131,6 +131,14 @@ impl Devices {
     #[cfg(feature = "vulkan")]
     pub(super) fn context(&self, address: u64) -> Result<nx_vulkan::native::Context, Error> {
         Ok(self.device(address)?._host.context.clone())
+    }
+
+    #[cfg(feature = "vulkan")]
+    pub(super) fn renderer(
+        &self,
+        address: u64,
+    ) -> Result<std::sync::Arc<std::sync::Mutex<nx_vulkan::Renderer>>, Error> {
+        Ok(std::sync::Arc::clone(&self.device(address)?._host.renderer))
     }
 
     fn device(&self, address: u64) -> Result<&Device, Error> {

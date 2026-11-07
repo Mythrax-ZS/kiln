@@ -23,6 +23,7 @@ mod memory;
 mod queue;
 mod sampler;
 mod texture;
+mod window;
 
 #[derive(Default)]
 struct Driver {
@@ -32,6 +33,8 @@ struct Driver {
     textures: texture::Objects,
     #[cfg(feature = "vulkan")]
     queues: queue::Objects,
+    #[cfg(feature = "vulkan")]
+    windows: window::Objects,
 }
 
 impl Driver {
@@ -46,13 +49,34 @@ impl Driver {
             )));
         }
         #[cfg(feature = "vulkan")]
-        if name == "nvnDeviceFinalize" && self.queues.has_children(cpu.state.x[0]) {
+        if name == "nvnDeviceFinalize"
+            && (self.queues.has_children(cpu.state.x[0])
+                || self.windows.has_device_children(cpu.state.x[0]))
+        {
             return Some(Err(device::Error::Invalid(
-                "NVN2 device still owns queues or syncs".to_string(),
+                "NVN2 device still owns queues, syncs or windows".to_string(),
             )));
         }
         if let Some(result) =
             queue::builder_call(name, cpu, &|address| self.devices.identity(address))
+        {
+            return Some(result);
+        }
+        if let Some(result) =
+            window::builder_call(name, cpu, &|address| self.devices.identity(address))
+        {
+            return Some(result);
+        }
+        #[cfg(feature = "vulkan")]
+        if name == "nvnTextureFinalize" && self.windows.has_texture(cpu.state.x[0]) {
+            return Some(Err(device::Error::Invalid(
+                "NVN2 texture is owned by a window".to_string(),
+            )));
+        }
+        #[cfg(feature = "vulkan")]
+        if let Some(result) =
+            self.windows
+                .call(name, cpu, &self.devices, &mut self.textures, &self.memory)
         {
             return Some(result);
         }
@@ -377,6 +401,45 @@ impl Session {
             }
             _ => {
                 #[cfg(feature = "vulkan")]
+                if matches!(
+                    proc.name.as_str(),
+                    "nvnWindowAcquireTexture" | "nvnQueuePresentTexture"
+                ) {
+                    let work = {
+                        let mut driver = self.driver.lock().unwrap_or_else(|e| e.into_inner());
+                        let Driver {
+                            windows,
+                            queues,
+                            devices,
+                            ..
+                        } = &mut *driver;
+                        windows.prepare(&proc.name, c, devices, queues)
+                    };
+                    let result = work.and_then(|work| {
+                        let ctx = c.ctl.user.cast::<ThreadCtx>();
+                        // SAFETY: Horizon calls retain ThreadCtx; synthetic calls use null.
+                        let done = if let Some(ctx) = unsafe { ctx.as_ref() } {
+                            ctx.kernel
+                                .wait_on_host(ctx.thread, &ctx.core, || work.run(c))
+                        } else {
+                            work.run(c)
+                        }?;
+                        let mut driver = self.driver.lock().unwrap_or_else(|e| e.into_inner());
+                        let Driver {
+                            windows,
+                            queues,
+                            devices,
+                            ..
+                        } = &mut *driver;
+                        windows.finish(work, done, c, devices, queues)
+                    });
+                    match result {
+                        Ok(()) => c.state.pc = c.state.x[30],
+                        Err(e) => e.report(c, caller),
+                    }
+                    return;
+                }
+                #[cfg(feature = "vulkan")]
                 if matches!(proc.name.as_str(), "nvnSyncWait" | "nvnQueueFinish") {
                     let wait = {
                         let mut driver = self.driver.lock().unwrap_or_else(|e| e.into_inner());
@@ -441,6 +504,18 @@ impl Session {
         );
         if self.mode == Mode::Hle {
             let driver = self.driver.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "vulkan")]
+            let _ = writeln!(
+                out,
+                "# native windows owned: {}",
+                driver.windows.live_count()
+            );
+            #[cfg(feature = "vulkan")]
+            {
+                let stats = driver.windows.stats();
+                let _ = writeln!(out, "# native display GPU clears: {}\n# native display presentations: {}\n# native display readback bytes: {}",
+                    stats.clears, stats.presents, stats.readback_bytes);
+            }
             let _ = writeln!(
                 out,
                 "# native textures owned: {}",

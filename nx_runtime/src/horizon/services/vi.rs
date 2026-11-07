@@ -98,6 +98,24 @@ impl Shared {
         mut request: nx_gpu::render::Present,
         interval: u32,
     ) -> Result<(), Stop> {
+        self.present_owned(kernel, interval, |number, due| {
+            request.frame = number;
+            request.due = due;
+            if let Some(gpu) = self.gpu() {
+                gpu.present_native(request)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Pace/count an explicitly owned native image, shown on its owner's renderer/device.
+    /// The callback runs without a compositor or driver lock held (A-317).
+    pub(crate) fn present_owned(
+        &self,
+        kernel: &Kernel,
+        interval: u32,
+        show: impl FnOnce(u64, Option<Instant>) -> Result<(), String>,
+    ) -> Result<(), Stop> {
         let number = self.native_frames.fetch_add(1, Ordering::AcqRel) + 1;
         if self.trace {
             let mut seen = self.interval.lock().unwrap_or_else(|e| e.into_inner());
@@ -109,13 +127,8 @@ impl Shared {
             }
         }
         let tick = self.pace(self.capped(interval), number);
-        request.frame = number;
-        request.due = tick.map(|t| t + VSYNC_PERIOD);
-        if let Some(gpu) = self.gpu() {
-            gpu.present_native(request).map_err(|why| {
-                Stop(format!("the renderer could not show frame {number}: {why}"))
-            })?;
-        }
+        show(number, tick.map(|t| t + VSYNC_PERIOD))
+            .map_err(|why| Stop(format!("the renderer could not show frame {number}: {why}")))?;
         let frames = self.frames_presented();
         super::super::input::frames_presented(frames);
         if self.frame_limit.is_some_and(|limit| frames >= limit) {
@@ -599,6 +612,32 @@ impl Service for BinderDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_native_images_use_shared_frame_numbers_and_the_process_frame_limit() {
+        use crate::horizon::kernel::{ProcessInfo, ProcessKind};
+        let kernel = Kernel::new(ProcessInfo::new("owned-display", ProcessKind::Nso, None));
+        let mut display = Shared::new();
+        display.pacing = None;
+        display.frame_limit = Some(2);
+        display
+            .present_owned(&kernel, 0, |frame, due| {
+                assert_eq!(frame, 1);
+                assert!(due.is_none());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(display.frames_presented(), 1);
+        assert!(kernel.exit_state().is_none());
+        display
+            .present_owned(&kernel, 0, |frame, _| {
+                assert_eq!(frame, 2);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(display.frames_presented(), 2);
+        assert!(kernel.exit_state().is_some());
+    }
 
     fn paced() -> Shared {
         let mut s = Shared::new();
