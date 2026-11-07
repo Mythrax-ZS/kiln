@@ -277,9 +277,14 @@ the device's fences about 8%.
   - Since then, 4 runs of 4 draw the road, with its lane lines (frame 3,500 looked at), at 10.5
     to 11.1 s per 100 frames of the race. With black in one run of four before, that is not yet
     proof.
-  - It is not fixed. On 2026-11-07 the road was black at frame 3,500 in 3 of about 20 runs into
-    the race, by the brightness of the road on either side of the kart: twice before the work of
-    the afternoon (646f12e and before) and once after it.
+  - It is not fixed. On 2026-11-07 the road was black at frame 3,500 in 6 of about 28 runs into
+    the race, by the brightness of the road on either side of the kart, before and after the
+    work of that day (and after dcaa4d2, which has textures over memory that launches write in
+    place compared again: 2 of 4 runs).
+  - What is black is a large part of the road (left of the kart and under it, its lines too),
+    while the asphalt beside it is drawn: whole parts of the mesh draws are missing rather than
+    drawn with a wrong texture. The next suspect is what the task programs cull by (a depth
+    pyramid or visibility that launches compute).
 - **The rate:**
   - the waits for the device (the host reading what launches wrote, and the ends of
     submissions);
