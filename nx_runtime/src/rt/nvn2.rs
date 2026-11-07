@@ -439,6 +439,14 @@ impl Session {
             self.bootstraps.load(Ordering::Relaxed),
             rows.len()
         );
+        if self.mode == Mode::Hle {
+            let driver = self.driver.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = writeln!(
+                out,
+                "# native textures owned: {}",
+                driver.textures.live_count()
+            );
+        }
         for (count, guest, name) in rows {
             let _ = writeln!(out, "{count} {guest:#x} {name}");
         }

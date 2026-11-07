@@ -39,6 +39,7 @@ compression and sample-location policy bits; they use the guest's block choice, 
 separate initialization check validates native automatic layout selection.
 Keep reports from real programs outside the repository. A killed process leaves the initial
 `running` marker instead of a completed report.
+HLE reports also count owned native textures to verify resource construction.
 
 ## Native devices and storage
 
@@ -161,7 +162,8 @@ device with flags zero, queries its profile, sets its origin/depth modes, and cr
 native memory pool, initializes both descriptor pools, and constructs/registers a native sampler.
 It creates a native queue with flags `0x9`, 1 MiB command and control budgets and a 256 KiB compute
 budget and constructs three display textures, then stops at `nvnWindowBuilderSetDefaults`, with
-the missing entry named. This validates progress through initialization; the buffer and
+the missing entry named. Its report confirms three live owned textures. This validates progress
+through initialization; the buffer and
 virtual-mapping paths have synthetic
 coverage and have not yet been reached by this real-program HLE probe.
 

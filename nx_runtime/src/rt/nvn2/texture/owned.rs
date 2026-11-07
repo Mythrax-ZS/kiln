@@ -17,6 +17,10 @@ pub(in crate::rt::nvn2) struct Objects {
 }
 
 impl Objects {
+    pub(in crate::rt::nvn2) fn live_count(&self) -> usize {
+        self.live.len()
+    }
+
     pub(in crate::rt::nvn2) fn descriptor(
         &self,
         object: u64,
