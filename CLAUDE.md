@@ -37,13 +37,16 @@ exports (`nx_runtime/src/rt/hle.rs`, `src/codegen/native.rs`, A-187): `nn::util`
 and deflate decompressors. Add one only with its signature pinned by a test and a row in
 `docs/ASSUMPTIONS.md`; the build report lists them.
 
-NVN2 replacement starts at `nx_runtime/src/rt/nvn2.rs` (A-298, A-299), off by default.
+NVN2 replacement starts at `nx_runtime/src/rt/nvn2.rs` (A-298 through A-303), off by default.
 `NX_NVN2=trace` forwards the API to the guest driver and counts calls by name;
 `NX_NVN2=hle` uses native entries and stops at the first missing API. It currently implements
-procedure resolution and two device-builder setters; device creation and rendering remain open.
+procedure resolution, device ownership backed by an initialized Vulkan renderer, a limited
+capability profile, and memory-pool/buffer ownership with virtual mappings. Descriptor pools,
+programs, commands, queues and presentation remain open; HLE does not render a frame yet.
 These modes require an NX2 NPDM and a rebuilt optional loader stub: `kiln build --reuse-objects`
 rebuilds that unit; relink alone cannot add it to older artifacts. `NX_NVN2_REPORT=<file>` writes
-the procedure counts when the process ends. See `docs/reports/NVN2-replacement.md`.
+the procedure counts and observed trace-mode integer properties when the process ends.
+See `docs/reports/NVN2-replacement.md`.
 
 ## Inputs (owner instruction, 2026-10-12)
 

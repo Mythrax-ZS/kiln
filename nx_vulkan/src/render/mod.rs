@@ -386,6 +386,12 @@ impl Renderer {
         }
     }
 
+    /// Create the renderer's device now, for an API that initializes a device before its first
+    /// draw. The renderer retains the context and its resources for subsequent commands.
+    pub fn initialize(&mut self) -> Result<crate::Capabilities, String> {
+        Ok(self.core()?.vk.caps.clone())
+    }
+
     fn core(&mut self) -> Result<&mut Core, String> {
         if self.core.is_none() {
             let debug = Debug::from_env();

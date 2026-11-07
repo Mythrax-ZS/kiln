@@ -15,7 +15,34 @@ use std::ffi::{c_void, CStr};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+
+mod device;
+mod memory;
+
+#[derive(Default)]
+struct Driver {
+    devices: device::Devices,
+    memory: memory::Objects,
+}
+
+impl Driver {
+    fn call(&mut self, name: &str, cpu: &mut NativeCpu) -> Option<Result<(), device::Error>> {
+        if name == "nvnDeviceFinalize" && self.memory.has_children(cpu.state.x[0]) {
+            return Some(Err(device::Error::Invalid(
+                "NVN2 device still owns memory pools".to_string(),
+            )));
+        }
+        if let Some(result) = self.devices.call(name, cpu) {
+            if name == "nvnDeviceFinalize" && result.is_ok() {
+                self.memory.forget_device(cpu.state.x[0]);
+            }
+            return Some(result);
+        }
+        self.memory
+            .call(name, cpu, &|address| self.devices.identity(address))
+    }
+}
 
 /// The generated function ABI. A forward uses the same CPU, including FP arguments and stack.
 pub type GuestFunction = extern "C" fn(*mut NativeCpu);
@@ -67,6 +94,9 @@ pub(crate) struct Session {
     mode: Mode,
     registry: RwLock<Registry>,
     bootstraps: AtomicU64,
+    /// The values the guest driver wrote for each DeviceGetInteger property in trace mode.
+    integers: Mutex<BTreeMap<(u32, i32), u64>>,
+    driver: Mutex<Driver>,
 }
 
 impl Session {
@@ -75,6 +105,8 @@ impl Session {
             mode,
             registry: RwLock::new(Registry::default()),
             bootstraps: AtomicU64::new(0),
+            integers: Mutex::new(BTreeMap::new()),
+            driver: Mutex::new(Driver::default()),
         }
     }
 
@@ -174,6 +206,8 @@ impl Session {
         let caller = c.state.x[30].wrapping_sub(4);
         if self.mode == Mode::Trace {
             let name = (proc.name == "nvnDeviceGetProcAddress").then(|| read_name(c.state.x[1]));
+            let integer =
+                (proc.name == "nvnDeviceGetInteger").then_some((c.state.x[1] as u32, c.state.x[2]));
             let lr = c.state.x[30];
             c.state.pc = proc.guest;
             // SAFETY: this is the exclusively used CPU of the calling thread. The pointer came
@@ -187,6 +221,17 @@ impl Session {
                 }
             }
             if returned(c, lr) {
+                if let Some((property, output)) = integer {
+                    let mut bytes = [0; 4];
+                    if rt().mem.read_bytes(output, &mut bytes, true).is_ok() {
+                        *self
+                            .integers
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .entry((property, i32::from_le_bytes(bytes)))
+                            .or_default() += 1;
+                    }
+                }
                 match name {
                     Some(Ok(name)) => self.wrap_result(c, &name),
                     Some(Err(_)) if c.state.x[0] != 0 => {
@@ -199,9 +244,22 @@ impl Session {
             return;
         }
         match proc.name.as_str() {
-            "nvnDeviceGetProcAddress" => self.resolve(c, read_name(c.state.x[1]), caller),
-            // The builder is opaque to the caller. These two layouts are pinned by observation
-            // and tests (A-299); other device operations still stop below.
+            "nvnDeviceGetProcAddress" => {
+                if c.state.x[0] != 0 {
+                    let result = self
+                        .driver
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .devices
+                        .validate(c.state.x[0]);
+                    if let Err(e) = result {
+                        e.report(c, caller);
+                        return;
+                    }
+                }
+                self.resolve(c, read_name(c.state.x[1]), caller);
+            }
+            // These builder layouts are pinned by observation and tests (A-299).
             "nvnDeviceBuilderSetDefaults" => {
                 if let Err(k) = rt().mem.write_bytes(c.state.x[0], &[0; 24], true) {
                     record_fault(c, c.state.x[0], caller, true, k);
@@ -220,13 +278,24 @@ impl Session {
                 }
                 c.state.pc = c.state.x[30];
             }
-            _ => fail(
-                c,
-                &format!(
-                    "NVN2 HLE {} is not implemented (called at {caller:#x})",
-                    proc.name
-                ),
-            ),
+            _ => {
+                let result = self
+                    .driver
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .call(&proc.name, c);
+                match result {
+                    Some(Ok(())) => c.state.pc = c.state.x[30],
+                    Some(Err(e)) => e.report(c, caller),
+                    None => fail(
+                        c,
+                        &format!(
+                            "NVN2 HLE {} is not implemented (called at {caller:#x})",
+                            proc.name
+                        ),
+                    ),
+                }
+            }
         }
     }
 
@@ -250,6 +319,14 @@ impl Session {
         );
         for (count, guest, name) in rows {
             let _ = writeln!(out, "{count} {guest:#x} {name}");
+        }
+        for (&(property, value), &calls) in self
+            .integers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            let _ = writeln!(out, "# integer {property:#x} {value} {calls}");
         }
         out
     }
@@ -356,7 +433,14 @@ pub(crate) unsafe fn start(kernel: &Arc<Kernel>, m: &ModuleDesc) -> Result<(), S
         std::fs::write(path, format!("# NVN2 {}: running\n", mode.name()))
             .map_err(|e| format!("cannot open NVN2 report {}: {e}", path.display()))?;
     }
-    let session = Arc::new(Session::new(mode));
+    let mut session = Session::new(mode);
+    session
+        .driver
+        .get_mut()
+        .unwrap_or_else(|e| e.into_inner())
+        .devices
+        .configure_from_env();
+    let session = Arc::new(session);
     kernel
         .nvn2
         .set(Arc::clone(&session))
