@@ -887,6 +887,29 @@ fn a_depth_target_is_sampled_as_a_texture_by_a_later_pass() {
 }
 
 #[test]
+fn a_depth_texture_of_the_part_of_its_target_that_was_drawn_is_the_targets_picture() {
+    if vulkan().is_none() {
+        return;
+    }
+    let depth = GPU_BASE + 0x60_0000;
+    let target = GPU_BASE + 0x20_0000;
+    // A title that scales its resolution draws 20x30 of a 32x32 depth target and describes that
+    // part in the header (A-153): the target's depth is sampled, not what memory holds.
+    let mut w = textured(
+        32,
+        target,
+        header(0x2F, 7, 20, 30, depth),
+        nearest_sampler(),
+    );
+    let mut r = Renderer::new(RenderConfig::default());
+    depth_target(&mut w, depth, 32, 0x0A);
+    clear_depth(&mut r, &mut w, 0.25);
+    w.set(0x1538, 0);
+    r.draw(&w.scene(), &DRAW).unwrap();
+    assert!(sampled_depth(&mut r, &w, target).abs_diff(64) <= 1);
+}
+
+#[test]
 fn the_depth_of_a_combined_format_is_the_second_component_of_its_header() {
     if vulkan().is_none() {
         return;

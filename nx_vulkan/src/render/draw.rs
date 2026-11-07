@@ -898,14 +898,22 @@ impl Core {
             }
             return Ok(None);
         };
-        // A depth texture may be a texel narrower or shorter than the target it shows (a title
-        // that scales its resolution describes the part of the target it drew; docs/ASSUMPTIONS.md
-        // A-153).
-        let slack = u32::from(wants_depth);
+        // A depth texture may be narrower or shorter than the target it shows, by less than a GOB
+        // (64 bytes across, 8 rows down): a title that scales its resolution describes the part of
+        // the target it drew, and makes the target that much larger (docs/ASSUMPTIONS.md A-153).
+        // A depth target's pixels are not in memory (A-275), so no other picture of them exists.
+        let fits = |target: u32, texture: u32, slack: u32| {
+            if wants_depth {
+                texture <= target + 1 && target.saturating_sub(texture) < slack
+            } else {
+                texture == target
+            }
+        };
+        let (across, down) = ((64 / format.bytes.max(1)).max(2), 8);
         if key.format != format.vk
             || key.layers != 1
-            || key.width.abs_diff(tic.width()) > slack
-            || key.height.abs_diff(tic.height()) > slack
+            || !fits(key.width, tic.width(), across)
+            || !fits(key.height, tic.height(), down)
         {
             if trace {
                 self.say_once(format!(
