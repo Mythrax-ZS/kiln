@@ -123,7 +123,7 @@ struct Pass {
 }
 
 struct Core {
-    vk: Vk,
+    vk: std::sync::Arc<Vk>,
     frame: Frame,
     /// The constant buffers put in upload memory since the batch began, by GPU address and size:
     /// a draw that reads the same bytes uses them while nothing changed their memory (A-289).
@@ -392,6 +392,14 @@ impl Renderer {
         Ok(self.core()?.vk.caps.clone())
     }
 
+    /// Share this renderer's device with native API queues. Each queue has its own command
+    /// pool; access to the physical queue is serialized by their shared device.
+    pub fn native_context(&mut self) -> Result<crate::native::Context, String> {
+        Ok(crate::native::Context::new(std::sync::Arc::clone(
+            &self.core()?.vk,
+        )))
+    }
+
     fn core(&mut self) -> Result<&mut Core, String> {
         if self.core.is_none() {
             let debug = Debug::from_env();
@@ -433,7 +441,7 @@ impl Renderer {
                     );
                 }
                 Ok(Core {
-                    vk,
+                    vk: std::sync::Arc::new(vk),
                     frame,
                     cbuf_cache: std::collections::BTreeMap::new(),
                     cbuf_stamp: (0, 0, 0),

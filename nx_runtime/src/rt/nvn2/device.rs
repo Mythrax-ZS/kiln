@@ -70,6 +70,8 @@ struct Host {
     // Keep the actual initialized renderer, rather than just a copy of a device's properties.
     #[cfg(feature = "vulkan")]
     _renderer: nx_vulkan::Renderer,
+    #[cfg(feature = "vulkan")]
+    context: nx_vulkan::native::Context,
 }
 
 struct Device {
@@ -106,8 +108,10 @@ impl Devices {
                 return Err(format!("the NVN2 profile's 256-byte uniform alignment cannot satisfy this device's {uniform_alignment}-byte alignment"));
             }
             eprintln!("[nvn2] native device: {}", caps.name);
+            let context = renderer.native_context()?;
             Ok(Host {
                 _renderer: renderer,
+                context,
             })
         }
         #[cfg(not(feature = "vulkan"))]
@@ -122,6 +126,11 @@ impl Devices {
 
     pub(super) fn identity(&self, address: u64) -> Result<u64, Error> {
         self.device(address).map(|device| device.cookie)
+    }
+
+    #[cfg(feature = "vulkan")]
+    pub(super) fn context(&self, address: u64) -> Result<nx_vulkan::native::Context, Error> {
+        Ok(self.device(address)?._host.context.clone())
     }
 
     fn device(&self, address: u64) -> Result<&Device, Error> {
@@ -286,9 +295,15 @@ fn property_value(property: u32) -> Option<i32> {
         0x39 => 128,        // linear render target stride alignment
         0x3A => 65536,      // native virtual pool page size (A-303)
         0x51 => 65536,      // queue command memory minimum
+        0x50 => 4096,       // native queue command memory granularity (A-307)
+        0x52 => 65536,      // queue command memory default
+        0x53 => 256,        // queue compute memory granularity
+        0x54 => 256,        // minimum nonzero queue compute memory
         0x55 => 262144,     // queue compute memory default
         0x5A => 0,          // no NVN debug layer
         0x5B => 4096,       // queue control memory minimum
+        0x5C => 16384,      // queue control memory default
+        0x5D => 4096,       // queue control memory granularity
         _ => return None,
     })
 }

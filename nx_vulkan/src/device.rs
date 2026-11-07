@@ -68,6 +68,7 @@ pub struct Vk {
     pub device: ash::Device,
     pub queue_family: u32,
     pub queue: vk::Queue,
+    pub(crate) queue_lock: std::sync::Mutex<()>,
     pub caps: Capabilities,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub push_descriptor: Option<khr::push_descriptor::Device>,
@@ -523,6 +524,7 @@ impl Vk {
             device,
             queue_family,
             queue,
+            queue_lock: std::sync::Mutex::new(()),
             caps,
             memory_properties,
             push_descriptor,
@@ -648,6 +650,13 @@ impl Vk {
         props.optimal_tiling_features.contains(features)
     }
 
+    /// Wait for every queue while excluding concurrent submissions and presentation.
+    pub(crate) fn wait_idle(&self) -> Result<(), vk::Result> {
+        let _lock = self.queue_lock.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the live device's physical queue is externally synchronized by this lock.
+        unsafe { self.device.device_wait_idle() }
+    }
+
     /// The index of a memory type that is allowed by `type_bits` and has all of `flags`.
     pub fn find_memory_type(&self, type_bits: u32, flags: vk::MemoryPropertyFlags) -> Option<u32> {
         (0..self.memory_properties.memory_type_count).find(|&i| {
@@ -664,7 +673,7 @@ impl Drop for Vk {
         // SAFETY: nothing else uses the device once the owner is dropped; objects made from it
         // must have been destroyed by their owners first.
         unsafe {
-            let _ = self.device.device_wait_idle();
+            let _ = self.wait_idle();
             self.device.destroy_device(None);
             if let Some((loader, messenger)) = self.debug.take() {
                 loader.destroy_debug_utils_messenger(messenger, None);

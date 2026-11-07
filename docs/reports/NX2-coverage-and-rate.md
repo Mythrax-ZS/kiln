@@ -266,7 +266,7 @@ the device's fences about 8%.
 
 ## Open
 
-- **The road was sometimes black (fixed 2026-11-07).** In about a quarter of the runs that reached the race (7 of
+- **The road is sometimes black.** In about a quarter of the runs that reached the race (7 of
   about 30 on 2026-11-06), the road surface was black from the race's start to the end of the
   run, while its markings, the curbs and the rest of the scene were drawn. It was seen before the
   work on the rate too.
@@ -296,6 +296,11 @@ the device's fences about 8%.
     memory, which holds no depth (A-275): what sampled that depth culled parts of the road. Runs
     with `NX_TRACE_TEXTURES=1`, slow enough to scale the resolution every time, drew a black road
     in 3 of 4 runs before and in none of 3 after (frames 3,500 and 4,000 looked at).
+  - Reappeared in the NVN2 queue foundation's off-mode comparison on 2026-11-07: frame 3,500
+    has a large black road region under/left of the kart. The preceding revision's capture in
+    that pair draws the road, with a different countdown phase. The cause is not isolated;
+    the earlier fixes do not establish that all cases are covered. See the measurements and
+    limits in [the replacement report](NVN2-replacement.md#validation).
 - **The rate:**
   - the waits for the device (the host reading what launches wrote, and the ends of
     submissions);

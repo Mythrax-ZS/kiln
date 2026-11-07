@@ -248,7 +248,7 @@ fn hle_reports_bad_name_and_builder_memory_as_guest_faults() {
     assert_eq!(c.ctl.stop, stop::UNIMPLEMENTED);
 }
 
-fn native_call(session: &Session, name: &str, args: &[u64]) -> NativeCpu {
+pub(super) fn native_call(session: &Session, name: &str, args: &[u64]) -> NativeCpu {
     let mut c = cpu();
     c.state.x[..args.len()].copy_from_slice(args);
     c.state.pc = session.bind(name, 0).unwrap();

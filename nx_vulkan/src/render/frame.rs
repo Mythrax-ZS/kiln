@@ -412,9 +412,11 @@ impl Frame {
                     let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
                     let _phase = nx_gpu::progress::enter(nx_gpu::progress::SUBMITTING);
                     let started = std::time::Instant::now();
-                    vk.device
-                        .queue_submit(vk.queue, &submit, slot.fence)
-                        .map_err(|e| (format!("submitting the commands: {e}"), lost(e)))?;
+                    let submitted = {
+                        let _lock = vk.queue_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        vk.device.queue_submit(vk.queue, &submit, slot.fence)
+                    };
+                    submitted.map_err(|e| (format!("submitting the commands: {e}"), lost(e)))?;
                     *sending += started.elapsed();
                     Ok(())
                 })()

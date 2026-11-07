@@ -91,8 +91,11 @@ impl Vk {
                     .map_err(|e| format!("creating a fence: {e}"))?;
                 let cmds = [cmd];
                 let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
-                let outcome = d
-                    .queue_submit(self.queue, &submit, fence)
+                let submitted = {
+                    let _lock = self.queue_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    d.queue_submit(self.queue, &submit, fence)
+                };
+                let outcome = submitted
                     .and_then(|()| d.wait_for_fences(&[fence], true, 60_000_000_000))
                     .map_err(|e| format!("running a command buffer: {e}"));
                 d.destroy_fence(fence, None);

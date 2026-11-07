@@ -256,7 +256,7 @@ impl Display {
         if let Some(old) = self.swapchain.take() {
             // SAFETY: nothing of ours uses the swapchain once the device is idle.
             unsafe {
-                let _ = vk.device.device_wait_idle();
+                let _ = vk.wait_idle();
                 for s in old.release {
                     vk.device.destroy_semaphore(s, None);
                 }
@@ -356,6 +356,7 @@ impl Display {
                     .wait_dst_stage_mask(&stages)
                     .command_buffers(&cmds)
                     .signal_semaphores(&signals)];
+                let _queue_lock = vk.queue_lock.lock().unwrap_or_else(|e| e.into_inner());
                 vk.device
                     .queue_submit(vk.queue, &submit, self.fence)
                     .map_err(|e| format!("submitting the frame to show: {e}"))?;
@@ -391,10 +392,7 @@ impl Display {
     }
 
     pub fn destroy(&mut self, vk: &Vk) {
-        // SAFETY: the device is idle before anything is destroyed.
-        unsafe {
-            let _ = vk.device.device_wait_idle();
-        }
+        let _ = vk.wait_idle();
         self.retire(vk);
         if let Some(s) = self.scratch.take() {
             vk.destroy_image(s);

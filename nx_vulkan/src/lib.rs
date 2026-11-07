@@ -15,6 +15,7 @@ pub mod fast;
 pub mod formats;
 pub mod image;
 pub mod input;
+pub mod native;
 pub mod png;
 pub mod render;
 #[cfg(feature = "window")]

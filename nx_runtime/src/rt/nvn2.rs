@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, RwLock};
 mod descriptors;
 mod device;
 mod memory;
+mod queue;
 mod sampler;
 
 #[derive(Default)]
@@ -27,6 +28,8 @@ struct Driver {
     devices: device::Devices,
     memory: memory::Objects,
     descriptors: descriptors::Objects,
+    #[cfg(feature = "vulkan")]
+    queues: queue::Objects,
 }
 
 impl Driver {
@@ -38,6 +41,21 @@ impl Driver {
             return Some(Err(device::Error::Invalid(
                 "NVN2 device still owns native resources".to_string(),
             )));
+        }
+        #[cfg(feature = "vulkan")]
+        if name == "nvnDeviceFinalize" && self.queues.has_children(cpu.state.x[0]) {
+            return Some(Err(device::Error::Invalid(
+                "NVN2 device still owns queues or syncs".to_string(),
+            )));
+        }
+        if let Some(result) =
+            queue::builder_call(name, cpu, &|address| self.devices.identity(address))
+        {
+            return Some(result);
+        }
+        #[cfg(feature = "vulkan")]
+        if let Some(result) = self.queues.call(name, cpu, &self.devices) {
+            return Some(result);
         }
         if name == "nvnMemoryPoolFinalize" && self.descriptors.has_pool_children(cpu.state.x[0]) {
             return Some(Err(device::Error::Invalid(
@@ -309,6 +327,31 @@ impl Session {
                 c.state.pc = c.state.x[30];
             }
             _ => {
+                #[cfg(feature = "vulkan")]
+                if matches!(proc.name.as_str(), "nvnSyncWait" | "nvnQueueFinish") {
+                    let wait = {
+                        let mut driver = self.driver.lock().unwrap_or_else(|e| e.into_inner());
+                        let Driver {
+                            queues, devices, ..
+                        } = &mut *driver;
+                        queues.prepare_wait(&proc.name, c, devices)
+                    };
+                    let result = wait.and_then(|w| {
+                        let ctx = c.ctl.user.cast::<ThreadCtx>();
+                        // SAFETY: a Horizon thread keeps ThreadCtx alive for its whole run;
+                        // synthetic calls leave a null user pointer.
+                        if let Some(ctx) = unsafe { ctx.as_ref() } {
+                            ctx.kernel.wait_on_host(ctx.thread, &ctx.core, || w.run(c))
+                        } else {
+                            w.run(c)
+                        }
+                    });
+                    match result {
+                        Ok(()) => c.state.pc = c.state.x[30],
+                        Err(e) => e.report(c, caller),
+                    }
+                    return;
+                }
                 let result = self
                     .driver
                     .lock()

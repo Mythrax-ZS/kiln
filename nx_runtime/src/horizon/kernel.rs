@@ -1017,6 +1017,21 @@ impl Kernel {
         self.cores.is_some() && super::cores::gives_way(imm)
     }
 
+    /// Leave a modeled core available to guest threads that can flush the native queue a
+    /// thread is waiting on, as a blocking supervisor call does.
+    #[cfg(feature = "vulkan")]
+    pub(crate) fn wait_on_host<T>(
+        &self,
+        thread: u64,
+        held: &AtomicUsize,
+        wait: impl FnOnce() -> T,
+    ) -> T {
+        self.give_core(held);
+        let result = wait();
+        self.take_core(thread, held);
+        result
+    }
+
     fn thread_ended(&self, thread: u64, reason: u32, cpu: &NativeCpu) {
         let is_main = self.lock().threads.get(&thread).is_some_and(|t| t.is_main);
         match reason {
