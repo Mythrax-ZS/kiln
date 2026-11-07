@@ -994,6 +994,44 @@ impl Core {
     }
 
     /// Read GPU memory into `out`, failing with a message when it is not all mapped.
+    /// Where the texture header pool and the sampler pool of `pools` are in host memory, each
+    /// when it is one run there (A-295): found once while the address space and the pools stay as
+    /// they are.
+    fn pool_hosts(
+        &mut self,
+        scene: &Scene<'_>,
+        pools: &nx_gpu::draw_state::TexturePools,
+    ) -> (Option<usize>, Option<usize>) {
+        let key = (
+            scene.space.id(),
+            scene.space.version(),
+            pools.header_address,
+            pools.header_count,
+            pools.sampler_address,
+            pools.sampler_count,
+        );
+        if let Some((k, hosts)) = self.pool_hosts {
+            if k == key {
+                return hosts;
+            }
+        }
+        let host = |address: u64, count: u32| -> Option<usize> {
+            let bytes = u64::from(count) * 32;
+            let (cpu, left) = scene.space.translate(address)?;
+            if bytes == 0 || left < bytes {
+                return None;
+            }
+            let (ptr, run) = scene.mem.host_run(cpu, bytes)?;
+            (run >= bytes).then_some(ptr as usize)
+        };
+        let hosts = (
+            host(pools.header_address, pools.header_count),
+            host(pools.sampler_address, pools.sampler_count),
+        );
+        self.pool_hosts = Some((key, hosts));
+        hosts
+    }
+
     pub(super) fn read_exact(
         &self,
         scene: &Scene<'_>,
@@ -1092,6 +1130,7 @@ impl Core {
         let reuse = !self.sync_on && !(self.debug.trace_textures && self.traced().is_some());
         let space = scene.space;
         let mem = scene.mem;
+        let (tic_pool, tsc_pool) = self.pool_hosts(scene, pools);
         for (used, (handle, from)) in p.info.textures.iter().zip(handles) {
             let handle = *handle;
             let (tic_id, tsc_id) = (handle & 0xF_FFFF, handle >> 20);
@@ -1103,17 +1142,30 @@ impl Core {
             }
             let mut mark = super::stopwatch();
             let mut tic_bytes = [0u8; 32];
-            self.read_exact(
-                scene,
-                pools.header_address + 32 * u64::from(tic_id),
-                &mut tic_bytes,
-            )?;
+            match tic_pool {
+                // SAFETY: the pool's bytes are host memory that stays where it is (A-295), and the
+                // entry is inside it (the id was checked against the count).
+                Some(at) => unsafe {
+                    tic_bytes = ((at + 32 * tic_id as usize) as *const [u8; 32]).read_unaligned();
+                },
+                None => self.read_exact(
+                    scene,
+                    pools.header_address + 32 * u64::from(tic_id),
+                    &mut tic_bytes,
+                )?,
+            }
             let mut tsc_bytes = [0u8; 32];
-            self.read_exact(
-                scene,
-                pools.sampler_address + 32 * u64::from(tsc_id),
-                &mut tsc_bytes,
-            )?;
+            match tsc_pool {
+                // SAFETY: as above.
+                Some(at) => unsafe {
+                    tsc_bytes = ((at + 32 * tsc_id as usize) as *const [u8; 32]).read_unaligned();
+                },
+                None => self.read_exact(
+                    scene,
+                    pools.sampler_address + 32 * u64::from(tsc_id),
+                    &mut tsc_bytes,
+                )?,
+            }
             let words = |b: &[u8]| -> [u32; 8] {
                 std::array::from_fn(|i| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()))
             };

@@ -200,6 +200,9 @@ struct Core {
     layout: Option<crate::astc_gpu::Decoder>,
     /// What the command buffer has bound and set for the draws of its batch (A-294).
     recorded: draw::Recorded,
+    /// Where the texture header and sampler pools last bound are in host memory, by the address
+    /// space (its id and version) and the pools (A-295).
+    pool_hosts: Option<(PoolKey, PoolHosts)>,
     /// Textures let go to keep to the device memory budget (A-260), for the report.
     textures_trimmed: u64,
     /// 2D copies made in guest memory (A-249), for the report of every 100 frames.
@@ -218,6 +221,13 @@ struct Core {
     #[cfg(feature = "window")]
     display: Option<display::Display>,
 }
+
+/// The address space (its id and version) and the texture pools (header address and count,
+/// sampler address and count) the host addresses of the pools were found for.
+type PoolKey = (u64, u64, u64, u32, u64, u32);
+
+/// The host addresses of the texture header pool and of the sampler pool, each when it is one run.
+type PoolHosts = (Option<usize>, Option<usize>);
 
 /// How many draws a batch has at least when the end of a pass sends it to the device.
 const BATCH_DRAWS: u32 = 24;
@@ -456,6 +466,7 @@ impl Renderer {
                     layout_buffers: crate::fast::FastMap::default(),
                     layout: None,
                     recorded: draw::Recorded::default(),
+                    pool_hosts: None,
                     textures_trimmed: 0,
                     memory_copies: 0,
                     batch_draws: 0,
