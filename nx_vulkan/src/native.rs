@@ -14,6 +14,9 @@ pub struct Context {
 }
 
 impl Context {
+    pub(crate) fn uses_device(&self, vk: &Arc<Vk>) -> bool {
+        Arc::ptr_eq(&self.vk, vk)
+    }
     pub(crate) fn new(vk: Arc<Vk>) -> Self {
         Self { vk }
     }

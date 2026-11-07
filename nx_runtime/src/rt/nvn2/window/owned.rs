@@ -259,6 +259,7 @@ impl Objects {
         cpu: &NativeCpu,
         devices: &Devices,
         queues: &mut queue::Objects,
+        memory: &memory::Objects,
     ) -> Result<Work, Error> {
         let (object, a, b) = (cpu.state.x[0], cpu.state.x[1], cpu.state.x[2]);
         if name == "nvnWindowAcquireTexture" {
@@ -288,7 +289,7 @@ impl Objects {
         if w.busy || w.held != Some(index) || index >= w.active {
             return Err(invalid("presentation needs the acquired active texture"));
         }
-        queues.flush_for_present(object, w.device, devices)?;
+        queues.flush_for_present(object, w.device, devices, memory)?;
         let [x, y, width, height] = w.crop;
         let work = Work::Present {
             window: a,

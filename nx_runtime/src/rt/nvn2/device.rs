@@ -295,7 +295,9 @@ fn property_value(property: u32) -> Option<i32> {
         0x0D => 4,          // indirect draw alignment
         0x0F | 0x10 => 32,  // texture/sampler descriptor bytes
         0x11 | 0x12 => 256, // reserved descriptors
+        0x13 => 4,          // native command memory alignment
         0x14 => 8,          // command control memory alignment
+        0x15 | 0x16 => 256, // native command/control callback minimum blocks
         0x18 => 576,        // recommended shader scratch scale, in the virtual device's profile
         0x19 => 4096,       // shader scratch alignment
         0x1A => 16384,      // shader scratch granularity

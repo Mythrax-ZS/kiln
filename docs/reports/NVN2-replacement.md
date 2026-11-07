@@ -1,10 +1,12 @@
-# NVN2 replacement: native display images
+# NVN2 replacement: native command recording
 
 Updated 2026-11-07. The objective is to replace the guest graphics driver and remove the GPU
 front's command decoding from its draws. The optional API boundary now owns native devices,
-memory pools, buffers, descriptor pools, samplers, textures/views, queues, syncs and windows.
-The owner's NX2 program creates a window with three real Vulkan display images, then stops at
-command-buffer initialization. Synthetic tests execute GPU clears and native presentation;
+memory pools, buffers, descriptor pools, samplers, textures/views, queues, syncs, windows and
+command buffers. Typed command sets now execute native GPU color clears and barriers, with
+allocation callbacks and ordered fences. The owner's NX2 program creates a window with three
+real Vulkan display images and its first command buffer, then stops at `nvnProgramInitialize`.
+Synthetic tests record, submit and present GPU clears;
 the title has not rendered an HLE frame. No race-rate improvement is established. The default
 remains off.
 
@@ -44,6 +46,9 @@ Keep reports from real programs outside the repository. A killed process leaves 
 HLE reports also count owned native textures/windows and display GPU clears, presentations and
 pixel-readback bytes across live windows. These counters cover the explicit display-image
 boundary, excluding GPU-to-GPU display blits and other resource transfers.
+They also count owned command buffers, recorded command sets, GPU submissions across live
+native queues and the scratch-binding byte ranges retained in those queues' state. Scratch
+binding metadata alone does not implement shader execution or allocate shader scratch storage.
 
 ## Native devices and storage
 
@@ -70,7 +75,10 @@ presented frame:
 These values describe the emulated API, including its scratch-allocation policy; they do not
 describe the host GPU's physical layout. The native virtual-pool model additionally reports
 64-KiB pages through `0x3A`. Unknown selectors stop before writing the output. Only API version
-queries accept a null device. Texture/image handles use the observed 20-bit texture and 12-bit
+queries accept a null device. Native command recording additionally reports alignment four
+through `0x13` and minimum command/control allocation callbacks of 256 bytes through
+`0x15`/`0x16`. These are native memory-budget choices, not guest hardware-stream sizes.
+Texture/image handles use the observed 20-bit texture and 12-bit
 sampler packing. Explicit fast-clear registration returns false.
 
 Pool and buffer builders preserve their observed fields and padding. Native object headers
@@ -85,7 +93,7 @@ without logging their contents.
 Flush/invalidate validate ranges and fence coherent host storage. Native queues submit
 completion markers; no accepted draw/copy/dispatch payload can write guest storage yet.
 Completion/writeback, resource lifetimes during execution and sparse GPU access semantics must
-be connected before payload submissions are accepted. Native-handle and allocator-backed pools
+be connected before draw/copy/dispatch submissions are accepted. Native-handle and allocator-backed pools
 remain unsupported. Display-image initialization additionally submits native GPU clears;
 the title does not yet submit draw/copy/dispatch payloads through HLE.
 
@@ -117,18 +125,18 @@ graphics payloads can consume these resources.
 
 Queue builders now preserve the observed NX2 ABI, including boolean size getters with output
 pointers. Native queues own Vulkan command pools on the device already created by HLE. They
-keep separate pending markers and checked command/control budgets; secondary queues hold
+keep ordered pending command sets/markers and checked command/control budgets; secondary queues hold
 their parent live. Supplied queue storage is leased, otherwise a host arena is allocated.
 Normal priority and the observed base/parent/secondary flags are supported; other priorities,
 unknown flags and nonzero ray-tracing budgets are refused.
 
-FenceSync queues a fresh GPU completion without flushing. Flush submits the pending markers;
+FenceSync queues a fresh GPU completion without flushing. Flush submits the pending prefix;
 Finish appends a completion and waits. A sync created without a fence reports FAILED, an
 unflushed fence can time out, and re-fencing keeps an older waiter's completion alive. CPU waits
 release the driver lock and modeled core, and notice process termination. Renderer and native
-queues share the actual Vulkan device and serialize access to its physical queue. Command
-recording and draw/copy/dispatch payloads remain unimplemented; completion tests exercise marker
-submissions. Graphics submission must also implement the distinct vertex-stage
+queues share the actual Vulkan device and serialize access to its physical queue. Typed clear
+and barrier payloads now execute alongside those markers. Draw/copy/dispatch payloads remain
+unimplemented. Graphics submission must also implement the distinct vertex-stage
 completion condition and connect guest resource visibility before those payloads are accepted.
 
 ## Native windows
@@ -158,7 +166,48 @@ copy pixels out; the display counters record those bytes. Image destruction curr
 for the device as a conservative lifetime barrier; normal presentation does not call device
 idle. More granular retirement remains an optimization to complete with command execution.
 
-The layouts, ownership policy and remaining limits are recorded in A-299 through A-317.
+## Command recording and submission
+
+Native command buffers preserve the observed 176-byte SDK header and supported inline
+bookkeeping. Command blocks use checked ordinary CPU/GPU-accessible pools; control blocks use
+mapped CPU storage. A replacement block retains earlier allocations already consumed by the
+current recording. Used/free queries describe native recording budgets, not encoded GPU method
+bytes. Inlined BeginRecording bookkeeping is adopted; unaccounted inline command words stop
+explicitly instead of being omitted or replayed.
+
+Allocation callbacks run on the caller's guest core with the driver mutex released. They can
+reenter AddCommandMemory/AddControlMemory. Normal returns retry the pending operation;
+insufficient allocation, disabled callbacks, faults and nonlocal unwinds are handled explicitly.
+Callback changes to FP status, TLS and exclusive state survive the callback boundary.
+
+EndRecording produces an immutable typed command set with an opaque native token and a small
+control-storage stamp. Sets survive recorder finalization. Reusing their command/control
+storage invalidates old handles through interval indexes; pool/device generations are checked
+again at submission and flush. CallCommands retains referenced sets; CopyCommands copies their
+typed operations independently. Called graphs are limited to 64 levels and one million expanded
+operations. No host pointers or guest GPU method streams are stored in the command handles.
+
+The current payload subset binds display render targets, records full-image RGBA color clears,
+binds scratch-memory ranges and records the known ordering/cache barrier bits. Views, depth/
+stencil targets, partial color masks, scissors, programs, draws, copies and dispatch remain
+unsupported and stop at their named entries. Scratch bindings retain validated state for
+future shader execution; they do not execute a shader.
+
+QueueSubmitCommands snapshots and validates the complete handle array before enqueueing any
+prefix, including device identities and cross-page faults. Queued sets retain their resources
+and block premature command-pool retirement. Flush expands the typed sets in order, batching
+image clears/barriers into a Vulkan command buffer between fence markers. Image locks remain
+held through GPU submission, and real completion fences retain their image lifetimes. Recording,
+clear execution and headless presentation upload/read back no pixel buffers. Explicit diagnostic
+reads and configured dumps still copy pixels out and are counted separately.
+
+Native display pixels currently live in retained Vulkan images. GPU image writes are not yet
+made coherent with raw mapped guest-pool bytes; general CPU image access, aliasing and texture
+flush/invalidate/read/write operations remain open. The synthetic clear validation reads the
+actual Vulkan image through an explicit diagnostic helper. It does not validate mapped texture
+storage coherence, which must be completed with general resource execution.
+
+The layouts, ownership policy and remaining limits are recorded in A-299 through A-320.
 
 ## Validation
 
@@ -194,11 +243,12 @@ device with flags zero, queries its profile, sets its origin/depth modes, and cr
 native memory pool, initializes both descriptor pools, and constructs/registers a native sampler.
 It creates a native queue with flags `0x9`, 1 MiB command and control budgets and a 256 KiB compute
 budget. It constructs three display textures and a native window with three 3840×2160 Vulkan
-images, then stops at `nvnCommandBufferInitialize`, with the missing entry named. Its report
-confirms three owned textures, one window and three GPU clears, with zero presentations and
-zero display readback bytes. This validates progress through initialization; the buffer and
-virtual-mapping paths have synthetic
-coverage and have not yet been reached by this real-program HLE probe.
+images, initializes its first command buffer and callbacks, then stops at `nvnProgramInitialize`,
+with the missing entry named. Its report confirms three owned textures, one window, one command
+buffer and three GPU clears, with zero recorded sets, native queue submissions, presentations
+or display readback bytes. It also constructs/maps its first native buffer. Recording, callback
+execution and queued payloads currently have synthetic evidence; the real program stops before
+using them. Virtual mappings have not yet been reached by this real-program HLE probe.
 
 The synthetic window test checks builder padding/interval encoding, FP/stack metadata arguments,
 checked outputs, GPU-backed acquisition, repeated presentation/reuse, active-buffer changes,
@@ -210,6 +260,19 @@ display-service test checks shared frame numbering and process frame limits. The
 clears do not establish native title rendering or a gameplay I/O/performance improvement. The
 window tests also pass with Vulkan required; opt-in real-title differential tests are outside
 the standard gate used here.
+
+All 35 NVN2-focused tests pass with Vulkan required. Six new command tests cover callback
+reentry, preserved caller state and callback side effects, disabled/insufficient allocation,
+faults/unwinds, inline begin/queries, recorder and handle lifetimes, called versus copied sets,
+memory reuse, cross-device rejection, atomic handle-array validation and cancellation of
+fences whose control storage was overwritten. The GPU test records thirty color clears into
+one command set, finalizes the recorder, submits the set and a fence, then flushes. It verifies
+two native queue GPU submissions: one batch of thirty clears, followed by the fence marker.
+It presents the acquired image, checks every diagnostic pixel is green and inspects its PNG.
+The caller's color/target arrays are overwritten before submission to verify recording copied
+their values; upper integer argument bits are also checked through actual GPU execution.
+Readback counters remain zero until that explicit diagnostic. This is native synthetic command
+execution, not evidence of a native title frame or a measured gameplay speed-up.
 
 The texture validation trace completed 3,600 frames through the race. These comparisons all
 had zero differences:
@@ -257,6 +320,7 @@ The same device, input script, frame dumps every 250 frames and `NX_TRACE_PERF=1
 | Devices and storage, off | 10.18 | 10.12 |
 | Queues and completion, off | 12.25 | 11.21 |
 | Windows and display images, off | 10.83 | 11.62 |
+| Typed command recording, off | 11.53 | 11.66 |
 
 These are single runs with substantial timing variation. The original runtime was built from
 that revision and linked with the original objects; its embedded guest image was checked to be
@@ -290,16 +354,24 @@ issue remains open; this one capture does not isolate it. The renderer refused 1
 draws and one unsupported-format compute launch. Builds/tests overlapped this diagnostic run,
 so its timing does not establish a performance change or a full rendering-regression pass.
 
-On Windows, `cargo fmt --all --check`, `cargo lint` and `cargo test` pass: 1,195 tests passed and
+The typed-command off-mode check completed 3,600 frames in 361 seconds, exit zero. Frame 3,500
+was inspected: the road and HUD are drawn, the start lights are green, and a large black band
+crosses the middle of the road. Black road markings, dark structures/characters and foreground
+geometry remain. This confirms the intermittent road issue is still present; the different
+start phase prevents a matched visual comparison with the prior capture. The renderer refused
+15 texture-type draws and one unsupported-format compute launch. Builds/tests overlapped this
+diagnostic too; these samples establish neither a performance gain nor a rendering-regression
+pass.
+
+On Windows, `cargo fmt --all --check`, `cargo lint` and `cargo test` pass: 1,201 tests passed and
 one was ignored.
 
 ## Next
 
-1. Command-buffer ownership and typed recording, programs/render state, plus remaining texture
-   modes and image/texel operations. Program creation must retain sm_86 programs for the existing
-   native translator.
-2. Command buffers that record draw-level operations and preserve API ordering, callbacks,
-   indirect arguments, memory visibility and events.
+1. Program ownership/binaries and render state, plus remaining texture modes and image/texel
+   operations. Program creation must retain sm_86 programs for the existing native translator.
+2. Extend typed recording to draws/copies/dispatch, views/scissors and indirect arguments;
+   complete resource visibility and event semantics beyond the current clear/barrier subset.
 3. Connect queued payloads to the renderer, retained display images and owned address
    spaces without replaying method streams. Complete GPU visibility, sparse access and in-flight
    resource lifetime handling here. Validate frames and time the race before enabling HLE by default.

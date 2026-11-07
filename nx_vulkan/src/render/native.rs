@@ -59,6 +59,98 @@ pub struct Surface {
     state: Mutex<State>,
 }
 
+/// Already validated typed image operations, recorded in one native GPU submission.
+pub enum SurfaceCommand {
+    Clear {
+        surface: Arc<Surface>,
+        color: [f32; 4],
+    },
+    Barrier,
+}
+
+fn memory_barrier(vk: &Vk, cmd: vk::CommandBuffer) {
+    // SAFETY: recording outside rendering; this dependency orders all preceding image writes.
+    unsafe {
+        vk.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)],
+            &[],
+            &[],
+        );
+    }
+}
+
+impl Queue {
+    /// Retain/lock each distinct image through recording and queue submission. Consistent
+    /// address order avoids a lock cycle when independent logical queues share images.
+    pub fn submit_surfaces(
+        &mut self,
+        commands: &[SurfaceCommand],
+        done: Arc<Completion>,
+    ) -> Result<(), String> {
+        let mut surfaces: Vec<_> = commands
+            .iter()
+            .filter_map(|c| match c {
+                SurfaceCommand::Clear { surface, .. } => Some(Arc::clone(surface)),
+                SurfaceCommand::Barrier => None,
+            })
+            .collect();
+        surfaces.sort_unstable_by_key(|s| Arc::as_ptr(s) as usize);
+        surfaces.dedup_by(|a, b| Arc::ptr_eq(a, b));
+        if surfaces.iter().any(|s| !self.context().uses_device(&s.vk)) {
+            return Err("native command image belongs to another Vulkan device".to_string());
+        }
+        let mut guards: Vec<_> = surfaces
+            .iter()
+            .map(|s| s.state.lock().unwrap_or_else(|e| e.into_inner()))
+            .collect();
+        let mut clears = vec![0; guards.len()];
+        self.submit_commands(Arc::clone(&done), false, |vk, cmd| {
+            for operation in commands {
+                match operation {
+                    SurfaceCommand::Clear { surface, color } => {
+                        let i = surfaces
+                            .binary_search_by_key(&(Arc::as_ptr(surface) as usize), |s| {
+                                Arc::as_ptr(s) as usize
+                            })
+                            .expect("retained image");
+                        let target = guards[i].target.as_mut().expect("live surface");
+                        // Same-layout consecutive transfer writes need an explicit dependency.
+                        memory_barrier(vk, cmd);
+                        target.transition(vk, cmd, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+                        // SAFETY: a retained single-layer color image with transfer usage, in
+                        // the correct layout. Every use of its state remains locked until submit.
+                        unsafe {
+                            vk.device.cmd_clear_color_image(
+                                cmd,
+                                target.image.image,
+                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                &vk::ClearColorValue { float32: *color },
+                                &[vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .level_count(1)
+                                    .layer_count(1)],
+                            );
+                        }
+                        clears[i] += 1;
+                    }
+                    SurfaceCommand::Barrier => memory_barrier(vk, cmd),
+                }
+            }
+        })?;
+        for (i, state) in guards.iter_mut().enumerate() {
+            state.last = Arc::clone(&done);
+            state.stats.clears += clears[i];
+        }
+        Ok(())
+    }
+}
+
 impl Surface {
     pub fn stats(&self) -> SurfaceStats {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).stats

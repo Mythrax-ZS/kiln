@@ -1,11 +1,20 @@
 //! Native queue/sync lifetimes and GPU fence ordering (A-308).
 
 use super::{invalid, read, write, Builder, Error, NativeCpu};
+use crate::rt::nvn2::{command, memory::Objects as Memory};
 use crate::rt::nvn2::{device::Devices, memory::label, rt};
 use nx_vulkan::native::{Completion, Queue as GpuQueue};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[path = "execute.rs"]
+mod execute;
+
+enum Pending {
+    Fence(Arc<Completion>, bool),
+    Commands(Arc<command::Recording>),
+}
 
 struct Queue {
     cookie: u64,
@@ -14,7 +23,8 @@ struct Queue {
     primary: u64,
     flags: u32,
     gpu: GpuQueue,
-    pending: Vec<(Arc<Completion>, bool)>,
+    pending: Vec<Pending>,
+    execution: execute::Execution,
     _storage: Vec<u8>,
     _guest_storage: (u64, u64),
     _compute_size: u64,
@@ -22,24 +32,24 @@ struct Queue {
 }
 
 impl Queue {
-    fn flush(&mut self) -> Result<(), Error> {
+    fn flush(&mut self, validation: Option<(&Memory, &Devices)>) -> Result<(), Error> {
         let pending = std::mem::take(&mut self.pending);
-        for (index, (completion, for_cpu)) in pending.iter().enumerate() {
-            if let Err(e) = self.gpu.submit_marker(Arc::clone(completion), *for_cpu) {
-                for (completion, _) in &pending[index..] {
-                    completion.cancel(&e);
+        let result = self.execute(&pending, validation);
+        if let Err(error) = &result {
+            for item in &pending {
+                if let Pending::Fence(completion, _) = item {
+                    completion.cancel(&format!("native submission failed: {error:?}"));
                 }
-                return Err(invalid_gpu(e));
             }
         }
-        Ok(())
+        result
     }
 }
 
 impl Drop for Queue {
     fn drop(&mut self) {
         // A retired queue must not leave a pending sync permanently waiting for a flush.
-        let _ = self.flush();
+        let _ = self.flush(None);
     }
 }
 
@@ -208,14 +218,16 @@ impl Objects {
         address: u64,
         device: u64,
         devices: &Devices,
+        memory: &Memory,
     ) -> Result<(), Error> {
         if self.queue(address, devices)?.device != device {
             return Err(invalid("presentation window belongs to another device"));
         }
+        self.validate_pending(address, devices, memory)?;
         self.queues
             .get_mut(&address)
             .expect("validated queue")
-            .flush()
+            .flush(Some((memory, devices)))
     }
     pub(in crate::rt::nvn2) fn has_children(&self, device: u64) -> bool {
         self.queues.values().any(|q| q.device == device)
@@ -331,6 +343,7 @@ impl Objects {
                 flags: builder.flags,
                 gpu,
                 pending: Vec::new(),
+                execution: execute::Execution::default(),
                 _storage: storage,
                 _guest_storage: (builder.memory, builder.memory_size),
                 _compute_size: builder.compute,
@@ -350,6 +363,7 @@ impl Objects {
         name: &str,
         cpu: &NativeCpu,
         devices: &Devices,
+        memory: &Memory,
     ) -> Result<Waiter, Error> {
         let address = cpu.state.x[0];
         if name == "nvnSyncWait" {
@@ -359,11 +373,14 @@ impl Objects {
                 returns_status: true,
             });
         }
+        self.validate_pending(address, devices, memory)?;
         let queue = self.queue(address, devices)?;
         let completion = queue.gpu.context().completion().map_err(invalid_gpu)?;
         let queue = self.queues.get_mut(&address).expect("validated queue");
-        queue.pending.push((Arc::clone(&completion), true));
-        queue.flush()?;
+        queue
+            .pending
+            .push(Pending::Fence(Arc::clone(&completion), true));
+        queue.flush(Some((memory, devices)))?;
         Ok(Waiter {
             completion: Some(completion),
             timeout: u64::MAX,
@@ -376,6 +393,8 @@ impl Objects {
         name: &str,
         cpu: &mut NativeCpu,
         devices: &Devices,
+        memory: &Memory,
+        commands: &command::Objects,
     ) -> Option<Result<(), Error>> {
         let (object, a, b, c) = (
             cpu.state.x[0],
@@ -384,26 +403,29 @@ impl Objects {
             cpu.state.x[3],
         );
         let result = match name {
+            "nvnQueueSubmitCommands" => self.submit(cpu, devices, memory, commands),
             "nvnQueueInitialize" => self.initialize(cpu, devices),
             "nvnQueueFinalize" => (|| {
                 self.queue(object, devices)?;
+                self.validate_pending(object, devices, memory)?;
                 if self.queues.values().any(|q| q.primary == object) {
                     return Err(invalid("still owns secondary queues"));
                 }
                 self.queues
                     .get_mut(&object)
                     .expect("validated queue")
-                    .flush()?;
+                    .flush(Some((memory, devices)))?;
                 write(object.wrapping_add(0xF8), &0u64.to_le_bytes())?;
                 self.queues.remove(&object);
                 Ok(())
             })(),
             "nvnQueueFlush" => (|| {
                 self.queue(object, devices)?;
+                self.validate_pending(object, devices, memory)?;
                 self.queues
                     .get_mut(&object)
                     .expect("validated queue")
-                    .flush()
+                    .flush(Some((memory, devices)))
             })(),
             "nvnQueueSetDebugLabel" => (|| {
                 self.queue(object, devices)?;
@@ -460,7 +482,7 @@ impl Objects {
                     .get_mut(&object)
                     .expect("validated queue")
                     .pending
-                    .push((Arc::clone(&completion), c as u32 & 1 != 0));
+                    .push(Pending::Fence(Arc::clone(&completion), c as u32 & 1 != 0));
                 let sync = self.syncs.get_mut(&a).expect("validated sync");
                 sync.origin = Some(origin);
                 sync.completion = Some(completion);
@@ -488,7 +510,7 @@ impl Objects {
                     .get_mut(&object)
                     .expect("validated queue")
                     .pending
-                    .push((barrier, false));
+                    .push(Pending::Fence(barrier, false));
                 cpu.state.x[0] = 1;
                 Ok(())
             })(),

@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+#[cfg(feature = "vulkan")]
+mod command;
 mod descriptors;
 mod device;
 mod memory;
@@ -35,6 +37,8 @@ struct Driver {
     queues: queue::Objects,
     #[cfg(feature = "vulkan")]
     windows: window::Objects,
+    #[cfg(feature = "vulkan")]
+    commands: command::Objects,
 }
 
 impl Driver {
@@ -51,7 +55,8 @@ impl Driver {
         #[cfg(feature = "vulkan")]
         if name == "nvnDeviceFinalize"
             && (self.queues.has_children(cpu.state.x[0])
-                || self.windows.has_device_children(cpu.state.x[0]))
+                || self.windows.has_device_children(cpu.state.x[0])
+                || self.commands.has_device_children(cpu.state.x[0]))
         {
             return Some(Err(device::Error::Invalid(
                 "NVN2 device still owns queues, syncs or windows".to_string(),
@@ -86,7 +91,10 @@ impl Driver {
             return Some(result);
         }
         #[cfg(feature = "vulkan")]
-        if let Some(result) = self.queues.call(name, cpu, &self.devices) {
+        if let Some(result) =
+            self.queues
+                .call(name, cpu, &self.devices, &self.memory, &self.commands)
+        {
             return Some(result);
         }
         if name == "nvnMemoryPoolFinalize"
@@ -97,9 +105,20 @@ impl Driver {
                 "NVN2 memory pool still owns descriptor pools or textures".to_string(),
             )));
         }
+        #[cfg(feature = "vulkan")]
+        if name == "nvnMemoryPoolFinalize"
+            && (self.commands.has_pool_children(cpu.state.x[0])
+                || self.queues.has_pool_children(cpu.state.x[0]))
+        {
+            return Some(Err(device::Error::Invalid(
+                "NVN2 memory pool still supplies live command buffers".to_string(),
+            )));
+        }
         if let Some(result) = self.devices.call(name, cpu) {
             if name == "nvnDeviceFinalize" && result.is_ok() {
                 self.memory.forget_device(cpu.state.x[0]);
+                #[cfg(feature = "vulkan")]
+                self.commands.retire_device(cpu.state.x[0]);
             }
             return Some(result);
         }
@@ -121,8 +140,16 @@ impl Driver {
         }) {
             return Some(result);
         }
-        self.memory
-            .call(name, cpu, &|address| self.devices.identity(address))
+        #[cfg(feature = "vulkan")]
+        let address = cpu.state.x[0];
+        let result = self
+            .memory
+            .call(name, cpu, &|address| self.devices.identity(address));
+        #[cfg(feature = "vulkan")]
+        if name == "nvnMemoryPoolFinalize" && matches!(result, Some(Ok(()))) {
+            self.commands.retire_pool(address);
+        }
+        result
     }
 }
 
@@ -401,6 +428,54 @@ impl Session {
             }
             _ => {
                 #[cfg(feature = "vulkan")]
+                if proc.name.starts_with("nvnCommandBuffer") {
+                    for _ in 0..8 {
+                        let step = {
+                            let mut driver = self.driver.lock().unwrap_or_else(|e| e.into_inner());
+                            let Driver {
+                                commands,
+                                devices,
+                                memory,
+                                textures,
+                                ..
+                            } = &mut *driver;
+                            commands
+                                .call(&proc.name, c, devices, memory, textures)
+                                .expect("command entry")
+                        };
+                        match step {
+                            Ok(command::Step::Done) => {
+                                c.state.pc = c.state.x[30];
+                                return;
+                            }
+                            Ok(command::Step::Callback(callback)) => {
+                                let normal = callback.run(c);
+                                let result = {
+                                    let mut driver =
+                                        self.driver.lock().unwrap_or_else(|e| e.into_inner());
+                                    let Driver {
+                                        commands, devices, ..
+                                    } = &mut *driver;
+                                    commands.finish_callback(&callback, devices, normal)
+                                };
+                                if !normal {
+                                    return;
+                                }
+                                if let Err(error) = result {
+                                    error.report(c, caller);
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                error.report(c, caller);
+                                return;
+                            }
+                        }
+                    }
+                    fail(c, "NVN2 command allocation callbacks did not converge");
+                    return;
+                }
+                #[cfg(feature = "vulkan")]
                 if matches!(
                     proc.name.as_str(),
                     "nvnWindowAcquireTexture" | "nvnQueuePresentTexture"
@@ -411,9 +486,10 @@ impl Session {
                             windows,
                             queues,
                             devices,
+                            memory,
                             ..
                         } = &mut *driver;
-                        windows.prepare(&proc.name, c, devices, queues)
+                        windows.prepare(&proc.name, c, devices, queues, memory)
                     };
                     let result = work.and_then(|work| {
                         let ctx = c.ctl.user.cast::<ThreadCtx>();
@@ -444,9 +520,12 @@ impl Session {
                     let wait = {
                         let mut driver = self.driver.lock().unwrap_or_else(|e| e.into_inner());
                         let Driver {
-                            queues, devices, ..
+                            queues,
+                            devices,
+                            memory,
+                            ..
                         } = &mut *driver;
-                        queues.prepare_wait(&proc.name, c, devices)
+                        queues.prepare_wait(&proc.name, c, devices, memory)
                     };
                     let result = wait.and_then(|w| {
                         let ctx = c.ctl.user.cast::<ThreadCtx>();
@@ -515,6 +594,23 @@ impl Session {
                 let stats = driver.windows.stats();
                 let _ = writeln!(out, "# native display GPU clears: {}\n# native display presentations: {}\n# native display readback bytes: {}",
                     stats.clears, stats.presents, stats.readback_bytes);
+            }
+            #[cfg(feature = "vulkan")]
+            let _ = writeln!(
+                out,
+                "# native command sets recorded: {}",
+                driver.commands.recordings
+            );
+            #[cfg(feature = "vulkan")]
+            let _ = writeln!(
+                out,
+                "# native command buffers owned: {}",
+                driver.commands.live_count()
+            );
+            #[cfg(feature = "vulkan")]
+            {
+                let (submissions, scratch) = driver.queues.command_stats();
+                let _ = writeln!(out, "# native queue GPU submissions: {submissions}\n# native queue scratch binding bytes: {scratch}");
             }
             let _ = writeln!(
                 out,

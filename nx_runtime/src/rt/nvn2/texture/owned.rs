@@ -13,6 +13,7 @@ struct Texture {
 }
 
 #[cfg(feature = "vulkan")]
+#[derive(Clone)]
 pub(in crate::rt::nvn2) struct DisplayImage {
     pub object: u64,
     pub cookie: u64,
@@ -21,6 +22,8 @@ pub(in crate::rt::nvn2) struct DisplayImage {
     pub format: u32,
     pub address: u64,
     pub size: u64,
+    pub pool: u64,
+    pub parent: PoolInfo,
     pub surface: std::sync::Arc<nx_vulkan::render::native::Surface>,
 }
 
@@ -83,6 +86,8 @@ impl Objects {
             format: t.state.int(56),
             address: t.parent.gpu + t.state.word(24),
             size: t.layout.size,
+            pool: t.state.word(16),
+            parent: t.parent,
             surface: std::sync::Arc::clone(t.surface.as_ref().unwrap()),
         })
     }
