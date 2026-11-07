@@ -1,4 +1,5 @@
 use super::*;
+mod indices;
 
 fn word(fields: &[(u32, u32, u64)]) -> u128 {
     let mut value = (7u128 << 12) | (7 << 87) | (7 << 110) | (7 << 113);
@@ -327,16 +328,10 @@ fn array_draw_fixed_state_changes_the_actual_pixels() {
     }
 }
 
-#[test]
-fn array_instances_use_the_nonzero_base_and_increment_the_shader_id() {
-    let Some(f) = Fixture::with_pool_flags(0x62) else {
-        return;
-    };
+fn instance_geometry(f: &Fixture) {
     let b = f.b();
-    let buffer = b + 0x500;
-    setup_draw(&f, buffer);
     binary(
-        &f,
+        f,
         0,
         &[
             word(&[
@@ -398,6 +393,17 @@ fn array_instances_use_the_nonzero_base_and_increment_the_shader_id() {
             .collect::<Vec<_>>(),
     )
     .unwrap();
+}
+
+#[test]
+fn array_instances_use_the_nonzero_base_and_increment_the_shader_id() {
+    let Some(f) = Fixture::with_pool_flags(0x62) else {
+        return;
+    };
+    let b = f.b();
+    let buffer = b + 0x500;
+    setup_draw(&f, buffer);
+    instance_geometry(&f);
     f.memory(buffer, 0x8000, 0xD000);
     let handle = record_with(&f, buffer, |f, buffer| {
         f.call(

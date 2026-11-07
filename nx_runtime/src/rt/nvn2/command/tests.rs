@@ -372,6 +372,11 @@ fn command_sets_outlive_recorders_copy_independently_and_detect_memory_reuse() {
         "nvnCommandBufferAddCommandMemory",
         &[buffers[0], b + 0x380, 0x8000, 1024],
     );
+    // Supplying capacity alone does not overwrite the earlier set. The first actual word
+    // consumed from it retires that set and its called parent; the copied set is independent.
+    f.call("nvnCommandBufferBeginRecording", &[buffers[0]]);
+    f.call("nvnCommandBufferBarrier", &[buffers[0], 1]);
+    f.call("nvnCommandBufferEndRecording", &[buffers[0]]);
     for handle in [source, handles[0]] {
         write(b + 0xD00, &handle.to_le_bytes()).unwrap();
         assert_ne!(
@@ -399,6 +404,91 @@ fn command_sets_outlive_recorders_copy_independently_and_detect_memory_reuse() {
     f.call("nvnMemoryPoolFinalize", &[b + 0x380]);
     f.call("nvnQueueFinalize", &[b + 0x200]);
     f.call("nvnDeviceFinalize", &[b]);
+}
+
+#[test]
+fn overlapping_arena_capacity_preserves_sets_until_their_consumed_bytes_are_reused() {
+    let Some(f) = Fixture::new() else { return };
+    let b = f.b();
+    let (first, second) = (b + 0x500, b + 0x700);
+    f.initialize(first);
+    f.memory(first, 0x8000, 0xD000);
+    let source = f.record_barrier(first);
+    f.call("nvnCommandBufferFinalize", &[first]);
+    f.initialize(second);
+    f.memory(second, 0x7F00, 0xCF00);
+    write(b + 0xD00, &source.to_le_bytes()).unwrap();
+    f.call("nvnCommandBufferBeginRecording", &[second]);
+    f.call("nvnCommandBufferCallCommands", &[second, 1, b + 0xD00]);
+    let parent = f.call("nvnCommandBufferEndRecording", &[second]);
+    f.submit(parent);
+    f.flush();
+    // Replacing control capacity does not retire a still-intact stamp. Beginning a recording
+    // consumes its header and now really overlaps that saved control range.
+    f.call(
+        "nvnCommandBufferAddControlMemory",
+        &[second, f.backing + 0xD000, 512],
+    );
+    f.submit(source);
+    f.flush();
+    f.call("nvnCommandBufferBeginRecording", &[second]);
+    assert_eq!(
+        native_call(
+            &f.session,
+            "nvnCommandBufferCallCommands",
+            &[second, 1, b + 0xD00]
+        )
+        .ctl
+        .stop,
+        stop::UNIMPLEMENTED
+    );
+    f.call("nvnCommandBufferEndRecording", &[second]);
+    // The caller copied source control metadata, so its command-data reference survives.
+    f.submit(parent);
+    f.flush();
+    f.call(
+        "nvnCommandBufferAddCommandMemory",
+        &[second, b + 0x380, 0x8000, 1024],
+    );
+    f.record_barrier(second);
+    write(b + 0xD00, &parent.to_le_bytes()).unwrap();
+    assert_eq!(
+        native_call(
+            &f.session,
+            "nvnQueueSubmitCommands",
+            &[b + 0x200, 1, b + 0xD00]
+        )
+        .ctl
+        .stop,
+        stop::UNIMPLEMENTED
+    );
+}
+
+#[test]
+fn an_active_recording_checks_consumed_intervals_instead_of_arena_capacity() {
+    let Some(f) = Fixture::new() else { return };
+    let b = f.b();
+    let buffer = b + 0x500;
+    f.initialize(buffer);
+    f.memory(buffer, 0x8100, 0xD100);
+    f.call("nvnCommandBufferBeginRecording", &[buffer]);
+    f.call("nvnCommandBufferBarrier", &[buffer, 1]);
+    f.memory(buffer, 0x8000, 0xD000);
+    f.call("nvnCommandBufferBarrier", &[buffer, 1]);
+    // A replacement block may overlap capacity, but cannot consume already used words.
+    f.call(
+        "nvnCommandBufferAddCommandMemory",
+        &[buffer, b + 0x380, 0x8100, 1024],
+    );
+    assert_eq!(
+        native_call(&f.session, "nvnCommandBufferBarrier", &[buffer, 1])
+            .ctl
+            .stop,
+        stop::UNIMPLEMENTED
+    );
+    let set = f.call("nvnCommandBufferEndRecording", &[buffer]);
+    f.submit(set);
+    f.flush();
 }
 
 #[test]

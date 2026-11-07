@@ -187,6 +187,7 @@ pub struct ColorBlend {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GraphicsState {
+    pub restart: bool,
     pub attributes: Vec<Attribute>,
     pub streams: Vec<Stream>,
     pub primitive: Primitive,
@@ -213,6 +214,12 @@ struct Upload {
     staging: Option<HostBuffer>,
 }
 impl InputBuffer {
+    pub(super) fn shared(&self) -> bool {
+        self.shared.is_some()
+    }
+    pub(super) fn belongs_to(&self, context: &Context) -> bool {
+        context.uses_device(&self.vk)
+    }
     pub fn len(&self) -> u64 {
         self.len
     }
@@ -273,6 +280,7 @@ impl Drop for InputBuffer {
 }
 
 pub struct GraphicsPipeline {
+    state_restart: bool,
     vk: Arc<Vk>,
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) layout: vk::PipelineLayout,
@@ -337,10 +345,10 @@ impl Context {
             .create_host_buffer(size, vk::BufferUsageFlags::TRANSFER_SRC)?;
         staging.as_mut_slice().fill(0);
         staging.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        let data = match self
-            .vk
-            .create_device_buffer(size, vk::BufferUsageFlags::VERTEX_BUFFER)
-        {
+        let data = match self.vk.create_device_buffer(
+            size,
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER,
+        ) {
             Ok(data) => data,
             Err(e) => {
                 self.vk.destroy_host_buffer(staging);
@@ -391,6 +399,14 @@ impl Context {
         format: super::super::render::native::SurfaceFormat,
         state: GraphicsState,
     ) -> Result<Arc<GraphicsPipeline>, String> {
+        if state.restart
+            && !matches!(
+                state.primitive,
+                Primitive::LineStrip | Primitive::TriangleStrip | Primitive::TriangleFan
+            )
+        {
+            return Err("native fixed restart needs a strip/fan topology".into());
+        }
         if !Arc::ptr_eq(&vertex.vk, &self.vk)
             || !Arc::ptr_eq(&pixel.vk, &self.vk)
             || vertex.stage != Stage::Vertex
@@ -516,8 +532,9 @@ impl Context {
         let input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_attribute_descriptions(&attributes)
             .vertex_binding_descriptions(&bindings);
-        let assembly =
-            vk::PipelineInputAssemblyStateCreateInfo::default().topology(key.state.primitive.vk());
+        let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(key.state.primitive.vk())
+            .primitive_restart_enable(key.state.restart);
         let viewport = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
             .scissor_count(1);
@@ -616,6 +633,7 @@ impl Context {
             }
         };
         Ok(Arc::new(GraphicsPipeline {
+            state_restart: key.state.restart,
             vk: Arc::clone(&self.vk),
             pipeline,
             layout,
@@ -629,6 +647,8 @@ impl Context {
 }
 
 pub struct NativeDraw {
+    pub indices: Option<Arc<super::IndexBuffer>>,
+    pub base_vertex: i32,
     pub pipeline: Arc<GraphicsPipeline>,
     pub inputs: Vec<(u32, Arc<InputBuffer>)>,
     pub viewport: [f32; 6],
@@ -653,6 +673,30 @@ impl NativeDraw {
             return Err(
                 "native draw resources belong to a different device or image format".into(),
             );
+        }
+        if let Some(indices) = &self.indices {
+            indices.validate(context, self.count)?;
+            indices.vertex_range(self.base_vertex)?;
+            if self.first != 0 || indices.native_restart() != self.pipeline.state_restart {
+                return Err(
+                    "native indexed draw has an invalid first index or restart pipeline".into(),
+                );
+            }
+            if indices.draws.len() > 1
+                && (indices.draws.len() as u64) * u64::from(self.instances) > 65536
+            {
+                return Err("native split indexed draw exceeds the 65536-command budget".into());
+            }
+        } else if self.pipeline.state_restart || self.base_vertex != 0 {
+            return Err("native array draw cannot use indexed restart/base vertex".into());
+        }
+        if self.instances != 0
+            && self
+                .first_instance
+                .checked_add(self.instances - 1)
+                .is_none()
+        {
+            return Err("native instance range overflows".into());
         }
         let [x, y, w, h, n, f] = self.viewport;
         let [sx, sy, sw, sh] = self.scissor;
@@ -697,12 +741,21 @@ impl NativeDraw {
                     .find(|(i, _)| *i == a.binding)
                     .expect("validated input");
                 let last = if stream.instanced {
-                    self.first_instance.checked_add(self.instances - 1)
+                    Some(
+                        self.first_instance
+                            .checked_add(self.instances - 1)
+                            .ok_or("native instance range overflows")?,
+                    )
+                } else if let Some(indices) = &self.indices {
+                    indices.vertex_range(self.base_vertex)?.map(|(_, max)| max)
                 } else {
-                    self.first.checked_add(self.count - 1)
-                }
-                .ok_or("native draw range overflows")?;
-                let end = u64::from(last) * u64::from(stream.stride)
+                    Some(
+                        self.first
+                            .checked_add(self.count - 1)
+                            .ok_or("native draw range overflows")?,
+                    )
+                };
+                let end = u64::from(last.unwrap_or(0)) * u64::from(stream.stride)
                     + u64::from(a.offset)
                     + u64::from(a.format.bytes());
                 if end > input.1.len() {
@@ -755,20 +808,57 @@ impl NativeDraw {
             );
             vk.device
                 .cmd_set_blend_constants(command, &self.blend_color);
-            vk.device.cmd_push_constants(
-                command,
-                self.pipeline.layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                &self.first_instance.to_le_bytes(),
-            );
-            vk.device.cmd_draw(
-                command,
-                self.count,
-                self.instances,
-                self.first,
-                self.first_instance,
-            );
+            if let Some(indices) = &self.indices {
+                vk.device.cmd_bind_index_buffer(
+                    command,
+                    indices.buffer.handle(),
+                    indices.buffer.offset(),
+                    indices.kind.vk(),
+                );
+                let ranges = |instances, first_instance: u32| {
+                    vk.device.cmd_push_constants(
+                        command,
+                        self.pipeline.layout,
+                        vk::ShaderStageFlags::VERTEX,
+                        0,
+                        &first_instance.to_le_bytes(),
+                    );
+                    for &(first, count) in &indices.draws {
+                        vk.device.cmd_draw_indexed(
+                            command,
+                            count,
+                            instances,
+                            first,
+                            self.base_vertex,
+                            first_instance,
+                        );
+                    }
+                };
+                if indices.draws.len() > 1 && self.instances > 1 {
+                    // Primitive order is instance-major. Splitting restart segments must not
+                    // interleave the instances; each segment also receives its logical ID.
+                    for instance in 0..self.instances {
+                        ranges(1, self.first_instance + instance);
+                    }
+                } else {
+                    ranges(self.instances, self.first_instance);
+                }
+            } else {
+                vk.device.cmd_push_constants(
+                    command,
+                    self.pipeline.layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    &self.first_instance.to_le_bytes(),
+                );
+                vk.device.cmd_draw(
+                    command,
+                    self.count,
+                    self.instances,
+                    self.first,
+                    self.first_instance,
+                );
+            }
         }
     }
 }

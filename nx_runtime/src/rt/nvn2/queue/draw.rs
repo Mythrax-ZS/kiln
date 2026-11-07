@@ -1,4 +1,4 @@
-//! Typed array draws and watched immutable vertex-input versions (A-326).
+//! Typed graphics draws and watched immutable input versions (A-326, A-337..339).
 
 use super::*;
 use crate::rt::nvn2::command::{Draw, Lease, VertexBinding};
@@ -6,18 +6,53 @@ use crate::rt::nvn2::event;
 use crate::rt::nvn2::state::Bindings;
 use crate::rt::nvn2::texture::DisplayImage;
 use nx_vulkan::native::{
-    Attribute, BlendFactor, BlendOp, ColorBlend, Context, GraphicsState, InputBuffer, NativeDraw,
-    Primitive, ShaderOptions, Stream, VertexFormat, VertexKind,
+    Attribute, BlendFactor, BlendOp, ColorBlend, Context, GraphicsState, IndexBuffer, IndexType,
+    InputBuffer, NativeDraw, Primitive, ShaderOptions, Stream, VertexFormat, VertexKind,
 };
 use nx_vulkan::render::{native::SurfaceFormat, Variation};
 use std::sync::Mutex;
 
 type InputKey = (u64, u64, u64, u64);
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Role {
+    Vertex,
+    Index {
+        kind: IndexType,
+        restart: Option<u32>,
+        native_restart: bool,
+    },
+}
+#[derive(Clone)]
+enum Data {
+    Vertex(Arc<InputBuffer>),
+    Index(Arc<IndexBuffer>),
+}
+impl Data {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Vertex(b) => b.len(),
+            Self::Index(b) => b.len(),
+        }
+    }
+    fn upload_bytes(&self) -> u64 {
+        match self {
+            Self::Vertex(b) => b.upload_bytes(),
+            Self::Index(b) => b.upload_bytes(),
+        }
+    }
+    fn reap(&self) -> Result<(), String> {
+        match self {
+            Self::Vertex(b) => b.reap_upload(),
+            Self::Index(b) => b.reap_upload(),
+        }
+    }
+}
 struct Source {
     key: InputKey,
     spans: Vec<(u64, usize)>,
     hosts: Vec<(usize, u64)>,
     size: u64,
+    capacity: u64,
 }
 fn host_spans(spans: &[(u64, usize)]) -> Result<Vec<(usize, u64)>, Error> {
     let mut hosts = Vec::new();
@@ -42,7 +77,7 @@ impl Source {
         devices: &Devices,
     ) -> Result<Self, Error> {
         binding.lease.validate(memory, &|d| devices.identity(d))?;
-        if size == 0 || size > binding.size || size > 16 * 1024 * 1024 {
+        if size == 0 || size > binding.size {
             return Err(invalid(
                 "vertex input exceeds its bound range or native upload budget",
             ));
@@ -60,18 +95,41 @@ impl Source {
             spans,
             hosts,
             size,
+            capacity: binding.size,
         })
+    }
+    fn prefix(mut self, size: u64) -> Result<Self, Error> {
+        if size == 0 || size > self.size {
+            return Err(invalid("indexed draw exceeds its bound vertex range"));
+        }
+        self.size = size;
+        self.key.3 = size;
+        let mut left = size;
+        self.spans.retain_mut(|(_, n)| {
+            let take = left.min(*n as u64);
+            *n = take as usize;
+            left -= take;
+            take != 0
+        });
+        let mut left = size;
+        self.hosts.retain_mut(|(_, n)| {
+            let take = left.min(*n);
+            *n = take;
+            left -= take;
+            take != 0
+        });
+        Ok(self)
     }
 }
 struct Entry {
-    buffer: Arc<InputBuffer>,
+    buffer: Data,
     spans: Vec<(u64, usize)>,
     epoch: u32,
     used: u64,
 }
 #[derive(Default)]
 pub(super) struct Inputs {
-    cache: BTreeMap<InputKey, Entry>,
+    cache: BTreeMap<(InputKey, Role), Entry>,
     constant: Option<Arc<InputBuffer>>,
     bytes: u64,
     clock: u64,
@@ -80,6 +138,10 @@ pub(super) struct Inputs {
     pub uploads: u64,
     pub hits: u64,
     pub shared_reads: u64,
+    pub index_copied: u64,
+    pub index_uploaded: u64,
+    pub index_hits: u64,
+    pub index_shared: u64,
 }
 impl Inputs {
     fn get(
@@ -88,11 +150,36 @@ impl Inputs {
         context: &Context,
         visibility: &event::Visibility,
     ) -> Result<Arc<InputBuffer>, Error> {
+        match self.resolve(source, Role::Vertex, context, visibility)? {
+            Data::Vertex(b) => Ok(b),
+            Data::Index(_) => unreachable!(),
+        }
+    }
+    fn indices(
+        &mut self,
+        source: Source,
+        role: Role,
+        context: &Context,
+        visibility: &event::Visibility,
+    ) -> Result<Arc<IndexBuffer>, Error> {
+        match self.resolve(source, role, context, visibility)? {
+            Data::Index(b) => Ok(b),
+            Data::Vertex(_) => unreachable!(),
+        }
+    }
+    fn resolve(
+        &mut self,
+        source: Source,
+        role: Role,
+        context: &Context,
+        visibility: &event::Visibility,
+    ) -> Result<Data, Error> {
         let Source {
             key,
             spans,
             hosts,
             size,
+            capacity,
         } = source;
         if host_spans(&spans)? != hosts {
             return Err(invalid(
@@ -106,22 +193,58 @@ impl Inputs {
                         "fragmented vertex/event aliases are not implemented",
                     ));
                 }
-                self.shared_reads += size;
-                return Ok(input);
+                return match role {
+                    Role::Vertex => {
+                        self.shared_reads += size;
+                        Ok(Data::Vertex(input))
+                    }
+                    Role::Index {
+                        kind,
+                        restart,
+                        native_restart,
+                    } => {
+                        let b = context
+                            .shared_indices(input, kind, restart, native_restart)
+                            .map_err(invalid_gpu)?;
+                        self.index_shared += size;
+                        Ok(Data::Index(b))
+                    }
+                };
             }
         }
         self.clock += 1;
-        if let Some(e) = self.cache.get_mut(&key) {
-            if e.spans == spans
+        let key = (key, role);
+        let valid = |e: &Entry| {
+            prefix_matches(&e.spans, &spans, size)
                 && spans.iter().all(|(cpu, n)| {
                     rt().mem.untouched_since(*cpu, *n as u64, e.epoch) == Some(true)
                 })
-            {
-                e.used = self.clock;
-                self.hits += 1;
-                e.buffer.reap_upload().map_err(invalid_gpu)?;
-                return Ok(Arc::clone(&e.buffer));
+        };
+        let reusable = if self.cache.get(&key).is_some_and(valid) {
+            Some(key)
+        } else if role == Role::Vertex {
+            let ((pool, cookie, offset, _), _) = key;
+            self.cache
+                .range(
+                    ((pool, cookie, offset, size), Role::Vertex)
+                        ..=((pool, cookie, offset, capacity), Role::Vertex),
+                )
+                .find(|((_, role), e)| *role == Role::Vertex && valid(e))
+                .map(|(&key, _)| key)
+        } else {
+            None
+        };
+        if let Some(e) = reusable.and_then(|key| self.cache.get_mut(&key)) {
+            e.used = self.clock;
+            match role {
+                Role::Vertex => self.hits += 1,
+                Role::Index { .. } => self.index_hits += 1,
             }
+            e.buffer.reap().map_err(invalid_gpu)?;
+            return Ok(e.buffer.clone());
+        }
+        if size > 16 * 1024 * 1024 {
+            return Err(invalid("native input upload exceeds the 16 MiB budget"));
         }
         // Arm observation before the snapshot and start its epoch before reading. A write
         // after the snapshot is then newer than the saved epoch, including direct JIT stores.
@@ -141,24 +264,43 @@ impl Inputs {
                 })?;
             offset += n;
         }
-        let buffer = context.input_buffer(&bytes).map_err(invalid_gpu)?;
+        let buffer = match role {
+            Role::Vertex => Data::Vertex(context.input_buffer(&bytes).map_err(invalid_gpu)?),
+            Role::Index {
+                kind,
+                restart,
+                native_restart,
+            } => Data::Index(
+                context
+                    .index_buffer(&bytes, kind, restart, native_restart)
+                    .map_err(invalid_gpu)?,
+            ),
+        };
         if let Some(old) = self.cache.remove(&key) {
             self.bytes -= old.buffer.len();
         }
-        while self.bytes + size > 64 * 1024 * 1024 || self.cache.len() >= 4096 {
+        while self.bytes + buffer.len() > 64 * 1024 * 1024 || self.cache.len() >= 4096 {
             let Some((&old, _)) = self.cache.iter().min_by_key(|(_, e)| e.used) else {
                 break;
             };
             self.bytes -= self.cache.remove(&old).unwrap().buffer.len();
         }
-        self.copied += size;
-        self.uploaded += buffer.upload_bytes();
+        match role {
+            Role::Vertex => {
+                self.copied += size;
+                self.uploaded += buffer.upload_bytes();
+            }
+            Role::Index { .. } => {
+                self.index_copied += size;
+                self.index_uploaded += buffer.upload_bytes();
+            }
+        }
         self.uploads += 1;
-        self.bytes += size;
+        self.bytes += buffer.len();
         self.cache.insert(
             key,
             Entry {
-                buffer: Arc::clone(&buffer),
+                buffer: buffer.clone(),
                 spans,
                 epoch,
                 used: self.clock,
@@ -178,6 +320,22 @@ impl Inputs {
         self.constant = Some(Arc::clone(&buffer));
         Ok(buffer)
     }
+}
+fn prefix_matches(full: &[(u64, usize)], prefix: &[(u64, usize)], size: u64) -> bool {
+    let mut left = size;
+    let mut used = 0;
+    for &(at, n) in full {
+        if left == 0 {
+            break;
+        }
+        let take = left.min(n as u64);
+        if prefix.get(used) != Some(&(at, take as usize)) {
+            return false;
+        }
+        left -= take;
+        used += 1;
+    }
+    left == 0 && used == prefix.len()
 }
 
 pub(super) struct Scope<'a> {
@@ -286,7 +444,7 @@ impl Scope<'_> {
             return Ok(None);
         }
         let Some((memory, devices)) = self.validation else {
-            return Err(invalid("array draw needs live owned memory"));
+            return Err(invalid("draw needs live owned memory"));
         };
         Lease {
             pool: image.pool,
@@ -295,27 +453,27 @@ impl Scope<'_> {
         .validate(memory, &|d| devices.identity(d))?;
         let vs = programs[0]
             .as_ref()
-            .ok_or_else(|| invalid("array draw has no vertex program"))?;
+            .ok_or_else(|| invalid("draw has no vertex program"))?;
         let ps = programs[1]
             .as_ref()
-            .ok_or_else(|| invalid("array draw has no fragment program"))?;
+            .ok_or_else(|| invalid("draw has no fragment program"))?;
         vs.link.validate(memory, devices)?;
         ps.link.validate(memory, devices)?;
         if vs.link.device != image.device || ps.link.device != image.device {
-            return Err(invalid("array draw resources belong to another device"));
+            return Err(invalid("draw resources belong to another device"));
         }
         let vs = vs
             .link
             .shaders
             .iter()
             .find(|s| s.stage == 0)
-            .ok_or_else(|| invalid("array draw has no vertex binary"))?;
+            .ok_or_else(|| invalid("draw has no vertex binary"))?;
         let ps = ps
             .link
             .shaders
             .iter()
             .find(|s| s.stage == 1)
-            .ok_or_else(|| invalid("array draw has no fragment binary"))?;
+            .ok_or_else(|| invalid("draw has no fragment binary"))?;
         let mut formats = [None; 32];
         let mut classes = [VertexFormat {
             channels: 4,
@@ -372,6 +530,7 @@ impl Scope<'_> {
         let mut attributes = Vec::new();
         let mut streams = Vec::new();
         let mut needed = BTreeMap::<usize, u64>::new();
+        let mut indexed_fetches = BTreeMap::<usize, Vec<(u32, u32, u32)>>::new();
         let mut disabled = Vec::new();
         for (i, format) in formats.iter().enumerate() {
             if vs.info.attributes_read[i] == 0 {
@@ -394,9 +553,20 @@ impl Scope<'_> {
                 } else {
                     draw.first + draw.count - 1
                 };
-                let size = u64::from(last) * u64::from(stream[0])
-                    + u64::from(offset)
-                    + u64::from(format.bytes());
+                let size = if draw.indices.is_some() && stream[1] == 0 {
+                    indexed_fetches.entry(binding).or_default().push((
+                        offset,
+                        format.bytes(),
+                        stream[0],
+                    ));
+                    vertices[binding]
+                        .ok_or_else(|| invalid("indexed vertex stream has no bound buffer"))?
+                        .size
+                } else {
+                    u64::from(last) * u64::from(stream[0])
+                        + u64::from(offset)
+                        + u64::from(format.bytes())
+                };
                 needed
                     .entry(binding)
                     .and_modify(|v| *v = (*v).max(size))
@@ -460,11 +630,8 @@ impl Scope<'_> {
             || ms[0] >> 15 & 31 != 0
         {
             return Err(invalid(
-                "array draw alpha/depth/stencil/polygon/multisample mode is not implemented",
+                "draw alpha/depth/stencil/polygon/multisample mode is not implemented",
             ));
-        }
-        if state.restart.0 {
-            return Err(invalid("array draw primitive restart is not implemented"));
         }
         let blend = if color & (1 << 8) != 0 {
             let [equations, factors] = state.blend[0].unwrap_or([0x110C_0000, 0x0102_0102]);
@@ -493,7 +660,7 @@ impl Scope<'_> {
             4 => Primitive::Triangles,
             5 => Primitive::TriangleStrip,
             6 => Primitive::TriangleFan,
-            _ => return Err(invalid("array draw primitive is not implemented")),
+            _ => return Err(invalid("draw primitive is not implemented")),
         };
         let logic = (color >> 16 & 255) as u8;
         if logic > 15 {
@@ -504,25 +671,22 @@ impl Scope<'_> {
             56 => SurfaceFormat::Rgba8Srgb,
             61 => SurfaceFormat::Rgb10A2,
             41 => SurfaceFormat::Rgba16Float,
-            _ => return Err(invalid("array draw target format is not implemented")),
+            _ => return Err(invalid("draw target format is not implemented")),
+        };
+        let graphics = GraphicsState {
+            restart: false,
+            attributes,
+            streams,
+            primitive,
+            cull: (polygon & 3) as u8,
+            clockwise: (polygon & 4 != 0) ^ draw.lower_left,
+            blend,
+            write_mask: (state.channels.unwrap_or(u32::MAX) & 15) as u8,
+            logic: (logic != 3).then_some(logic),
         };
         let pipeline = self
             .context
-            .graphics_pipeline(
-                vs,
-                ps,
-                format,
-                GraphicsState {
-                    attributes,
-                    streams,
-                    primitive,
-                    cull: (polygon & 3) as u8,
-                    clockwise: (polygon & 4 != 0) ^ draw.lower_left,
-                    blend,
-                    write_mask: (state.channels.unwrap_or(u32::MAX) & 15) as u8,
-                    logic: (logic != 3).then_some(logic),
-                },
-            )
+            .graphics_pipeline(Arc::clone(&vs), Arc::clone(&ps), format, graphics.clone())
             .map_err(invalid_gpu)?;
         let [width, height, _] = image.dimensions;
         let [x, y, w, h] = state.viewports[0].unwrap_or([0.0, 0.0, width as f32, height as f32]);
@@ -548,7 +712,27 @@ impl Scope<'_> {
                 Source::capture(source, size, memory, devices)?,
             ));
         }
+        let index_source = draw
+            .indices
+            .map(|index| {
+                let restart = state
+                    .restart
+                    .0
+                    .then_some(state.restart.1)
+                    .filter(|&n| n <= index.kind.maximum());
+                let role = Role::Index {
+                    kind: index.kind,
+                    restart,
+                    native_restart: restart == Some(index.kind.maximum())
+                        && matches!(draw.primitive, 3 | 5 | 6),
+                };
+                Source::capture(index.source, index.source.size, memory, devices)
+                    .map(|source| (source, role, index.base_vertex))
+            })
+            .transpose()?;
         let mut draw = NativeDraw {
+            indices: None,
+            base_vertex: 0,
             pipeline,
             inputs: Vec::new(),
             viewport: [viewport[0], viewport[1], viewport[2], viewport[3], n, f],
@@ -567,7 +751,45 @@ impl Scope<'_> {
             move || {
                 let visibility = visibility.lock().unwrap_or_else(|e| e.into_inner());
                 let mut inputs = inputs.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((source, role, base)) = index_source {
+                    let index = inputs
+                        .indices(source, role, &context, &visibility)
+                        .map_err(|e| format!("native index input: {e:?}"))?;
+                    if index.is_empty() {
+                        return Ok(nx_vulkan::render::native::SurfaceCommand::Barrier);
+                    }
+                    index.vertex_range(base)?;
+                    if index.native_restart() {
+                        let mut graphics = graphics;
+                        graphics.restart = true;
+                        draw.pipeline = context.graphics_pipeline(vs, ps, format, graphics)?;
+                    }
+                    draw.base_vertex = base;
+                    draw.indices = Some(index);
+                }
                 for (binding, source) in sources {
+                    let source = if let Some(fetches) = indexed_fetches.get(&(binding as usize)) {
+                        let indices = draw.indices.as_ref().expect("indexed fetches");
+                        let max = indices.vertex_range(draw.base_vertex)?.map(|(_, max)| max);
+                        let mut needed = 0;
+                        for &(offset, bytes, stride) in fetches {
+                            let size = match max {
+                                Some(max) => {
+                                    u64::from(max) * u64::from(stride)
+                                        + u64::from(offset)
+                                        + u64::from(bytes)
+                                }
+                                None if stride == 0 => u64::from(offset) + u64::from(bytes),
+                                None => source.size,
+                            };
+                            needed = needed.max(size);
+                        }
+                        source
+                            .prefix(needed)
+                            .map_err(|e| format!("native indexed vertex range: {e:?}"))?
+                    } else {
+                        source
+                    };
                     draw.inputs.push((
                         binding,
                         inputs

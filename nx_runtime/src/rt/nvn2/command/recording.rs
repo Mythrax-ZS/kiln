@@ -1,16 +1,66 @@
 use super::*;
 
-fn consume(b: &mut Buffer, command: u64, control: u64) {
+struct Written {
+    command: Option<CommandSpan>,
+    control: Option<Span>,
+}
+fn consume(b: &mut Buffer, command: u64, control: u64) -> Result<Written, Error> {
+    let r = b.building.as_ref().expect("recording");
+    if command != 0 {
+        let c = b.command.as_ref().expect("reserved command block");
+        let span = Span {
+            start: c.span.start + c.used,
+            end: c.span.start + c.used + command,
+        };
+        if r.command_ranges
+            .get(&c.lease.unwrap().pool)
+            .is_some_and(|index| index.intersects(span))
+        {
+            return Err(invalid(
+                "command write overlaps bytes already consumed by this recording",
+            ));
+        }
+    }
+    if control != 0 {
+        let c = b.control.as_ref().expect("reserved control block");
+        let span = Span {
+            start: c.span.start + c.used,
+            end: c.span.start + c.used + control,
+        };
+        if r.control_ranges.intersects(span) {
+            return Err(invalid(
+                "control write overlaps bytes already consumed by this recording",
+            ));
+        }
+    }
+    let mut written = Written {
+        command: None,
+        control: None,
+    };
     let r = b.building.as_mut().expect("recording");
     if command != 0 {
         let c = b.command.as_mut().expect("reserved command block");
-        r.commands.push(CommandSpan {
+        let span = CommandSpan {
             lease: c.lease.unwrap(),
             range: Span {
                 start: c.span.start + c.used,
                 end: c.span.start + c.used + command,
             },
-        });
+        };
+        written.command = Some(span);
+        r.command_ranges
+            .entry(span.lease.pool)
+            .or_default()
+            .insert_merged(span.range, 0);
+        if let Some(last) = r
+            .commands
+            .last_mut()
+            .filter(|old| old.lease.pool == span.lease.pool && old.range.end == span.range.start)
+        {
+            last.range.end = span.range.end;
+        } else {
+            r.commands.push(span);
+        }
         c.used += command;
     }
     if control != 0 {
@@ -22,9 +72,16 @@ fn consume(b: &mut Buffer, command: u64, control: u64) {
         if r.stamp.is_none() {
             r.stamp = Some(span.start);
         }
-        r.controls.push(span);
+        r.control_ranges.insert_merged(span, 0);
+        if let Some(last) = r.controls.last_mut().filter(|old| old.end == span.start) {
+            last.end = span.end;
+        } else {
+            r.controls.push(span);
+        }
+        written.control = Some(span);
         c.used += control;
     }
+    Ok(written)
 }
 
 fn merge_spans(spans: &mut Vec<Span>) {
@@ -56,6 +113,10 @@ pub(super) fn collect_leases(ops: &[Op], out: &mut Vec<Lease>) {
             Op::Vertex {
                 binding: Some(b), ..
             } => out.push(b.lease),
+            Op::Draw(Draw {
+                indices: Some(indices),
+                ..
+            }) => out.push(indices.source.lease),
             Op::Program {
                 binding: Some(b), ..
             } => out.extend(b.link.shaders.iter().map(|s| s.lease)),
@@ -82,6 +143,23 @@ fn flatten(ops: &[Op], out: &mut Vec<Op>, depth: u32) -> Result<(), Error> {
 }
 
 impl Objects {
+    fn invalidate_written(&mut self, written: Written) {
+        if let Some(command) = written.command {
+            let tokens = self
+                .command_index
+                .get(&command.lease.pool)
+                .map(|i| i.overlapping(command.range))
+                .unwrap_or_default();
+            for token in tokens {
+                self.retire(token);
+            }
+        }
+        if let Some(control) = written.control {
+            for token in self.control_index.overlapping(control) {
+                self.retire_control(token);
+            }
+        }
+    }
     fn begin(&mut self, object: u64) -> Result<Step, Error> {
         let b = &self.live[&object];
         if b.building.is_some() || b.callback_active || read::<1>(object.wrapping_add(17))?[0] != 0
@@ -95,12 +173,13 @@ impl Objects {
         }
         let b = self.live.get_mut(&object).unwrap();
         b.building = Some(Building::default());
-        consume(b, 0, 16);
+        let written = consume(b, 0, 16)?;
         write(object.wrapping_add(17), &[1, 0])?;
         write(
             object.wrapping_add(80),
             &b.building.as_ref().unwrap().stamp.unwrap().to_le_bytes(),
         )?;
+        self.invalidate_written(written);
         self.header(object)?;
         Ok(Step::Done)
     }
@@ -135,7 +214,8 @@ impl Objects {
             return Err(invalid("inline recording control header is unsupported"));
         }
         b.building = Some(Building::default());
-        consume(b, 0, 16);
+        let written = consume(b, 0, 16)?;
+        self.invalidate_written(written);
         Ok(())
     }
 
@@ -149,7 +229,7 @@ impl Objects {
             return Err(invalid("command-handle identity space exhausted"));
         }
         let b = self.live.get_mut(&object).unwrap();
-        consume(b, 0, 8);
+        let written = consume(b, 0, 8)?;
         let mut r = b.building.take().unwrap();
         let token = HANDLE_BASE | u64::from(self.next_handle + 1);
         let stamp = r.stamp.expect("begin reserved header");
@@ -208,6 +288,7 @@ impl Objects {
             generation: b.generation,
             ops: r.ops,
             valid: AtomicBool::new(true),
+            command_valid: AtomicBool::new(true),
             stamp,
             token,
             controls: r.controls,
@@ -216,6 +297,7 @@ impl Objects {
             depth,
             work,
         });
+        self.invalidate_written(written);
         for &span in &recorded.controls {
             self.control_index.insert(span, token);
         }
@@ -226,6 +308,7 @@ impl Objects {
                 .insert(span.range, token);
         }
         self.recorded.insert(token, recorded);
+        self.reap_retained_controls();
         self.next_handle += 1;
         self.recordings += 1;
         write(object.wrapping_add(17), &[0])?;
@@ -277,6 +360,9 @@ impl Objects {
                     | "BindVertexBuffers"
                     | "DrawArrays"
                     | "DrawArraysInstanced"
+                    | "DrawElements"
+                    | "DrawElementsBaseVertex"
+                    | "DrawElementsInstanced"
                     | "WaitEvent"
                     | "SignalEvent"
             )
@@ -379,6 +465,7 @@ impl Objects {
                 let modes = devices.modes(owner)?;
                 (
                     vec![Op::Draw(Draw {
+                        indices: None,
                         primitive: a as u32,
                         first,
                         count,
@@ -388,6 +475,62 @@ impl Objects {
                         depth_minus_one_to_one: modes.1 == 0,
                     })],
                     32,
+                    8,
+                )
+            }
+            "DrawElements" | "DrawElementsBaseVertex" | "DrawElementsInstanced" => {
+                use nx_vulkan::native::IndexType;
+                let kind = match b as u32 {
+                    0 => IndexType::U8,
+                    1 => IndexType::U16,
+                    2 => IndexType::U32,
+                    _ => return Err(invalid("index type is invalid")),
+                };
+                let count = c as u32;
+                let base_vertex = if op == "DrawElements" { 0 } else { e as i32 };
+                let (first_instance, instances) = if op == "DrawElementsInstanced" {
+                    (cpu.state.x[6] as u32, cpu.state.x[7] as u32)
+                } else {
+                    (0, 1)
+                };
+                if count > i32::MAX as u32
+                    || instances > i32::MAX as u32
+                    || first_instance.checked_add(instances).is_none()
+                    || count != 0 && instances != 0 && !d.is_multiple_of(kind.bytes())
+                {
+                    return Err(invalid(
+                        "indexed draw range or address alignment is invalid",
+                    ));
+                }
+                let indices = if count == 0 || instances == 0 {
+                    None
+                } else {
+                    let size = u64::from(count) * kind.bytes();
+                    let (pool, info, offset) =
+                        memory.gpu_range(owner, d, size, &|d| devices.identity(d))?;
+                    Some(IndexBinding {
+                        source: VertexBinding {
+                            lease: Lease { pool, info },
+                            offset,
+                            size,
+                        },
+                        kind,
+                        base_vertex,
+                    })
+                };
+                let modes = devices.modes(owner)?;
+                (
+                    vec![Op::Draw(Draw {
+                        indices,
+                        primitive: a as u32,
+                        first: 0,
+                        count,
+                        first_instance,
+                        instances,
+                        lower_left: modes.0 == 0,
+                        depth_minus_one_to_one: modes.1 == 0,
+                    })],
+                    40,
                     8,
                 )
             }
@@ -538,8 +681,9 @@ impl Objects {
             }
         }
         let buffer = self.live.get_mut(&object).unwrap();
-        consume(buffer, command_bytes, control_bytes);
+        let written = consume(buffer, command_bytes, control_bytes)?;
         buffer.building.as_mut().unwrap().ops.extend(ops);
+        self.invalidate_written(written);
         self.header(object)?;
         Ok(Step::Done)
     }

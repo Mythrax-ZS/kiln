@@ -16,6 +16,35 @@ fn owner(address: u64) -> Result<u64, Error> {
     }
 }
 
+#[test]
+fn a_pool_address_accessor_reads_uninitialized_storage_without_adopting_it() {
+    let page = Memory::new();
+    let mut objects = Objects::default();
+    let object = page.0;
+    let result = call(&mut objects, "nvnMemoryPoolGetBufferAddress", &[object]);
+    assert_eq!((result.ctl.stop, result.state.x[0]), (stop::NONE, 0));
+    let address = 0x8888_1122_3344_5566u64;
+    write(object + 24, &address.to_le_bytes()).unwrap();
+    assert_eq!(
+        call(&mut objects, "nvnMemoryPoolGetBufferAddress", &[object])
+            .state
+            .x[0],
+        address
+    );
+    assert!(objects.pools.is_empty());
+    assert_eq!(
+        call(&mut objects, "nvnMemoryPoolMap", &[object]).ctl.stop,
+        stop::UNIMPLEMENTED
+    );
+    assert!(objects.pool_info(object, &owner).is_err());
+    let result = call(
+        &mut objects,
+        "nvnMemoryPoolGetBufferAddress",
+        &[page.0 + 0xFE4],
+    );
+    assert_ne!(result.ctl.fault_flag, 0);
+}
+
 struct Storage(u64);
 impl Storage {
     fn new() -> Storage {

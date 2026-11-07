@@ -332,9 +332,12 @@ fn run(mut queue: Queue, shared: Arc<Shared>) {
         shared.changed.notify_all();
     }
     let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+    let reason = state
+        .failed
+        .clone()
+        .unwrap_or_else(|| "native queue retired before deferred submission".into());
     for job in state.jobs.drain(..) {
-        job.done
-            .cancel("native queue retired before deferred submission");
+        job.done.cancel(&reason);
     }
     shared.changed.notify_all();
 }

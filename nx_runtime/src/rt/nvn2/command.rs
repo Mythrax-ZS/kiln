@@ -86,6 +86,7 @@ pub(super) struct VertexBinding {
 
 #[derive(Clone, Copy)]
 pub(super) struct Draw {
+    pub indices: Option<IndexBinding>,
     pub primitive: u32,
     pub first: u32,
     pub count: u32,
@@ -93,6 +94,13 @@ pub(super) struct Draw {
     pub instances: u32,
     pub lower_left: bool,
     pub depth_minus_one_to_one: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct IndexBinding {
+    pub source: VertexBinding,
+    pub kind: nx_vulkan::native::IndexType,
+    pub base_vertex: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -125,6 +133,7 @@ pub(super) struct Recording {
     pub generation: u64,
     pub ops: Vec<Op>,
     valid: AtomicBool,
+    command_valid: AtomicBool,
     stamp: u64,
     token: u64,
     controls: Vec<Span>,
@@ -139,7 +148,7 @@ impl Recording {
         self.leases.iter().any(|l| l.pool == pool)
     }
     pub(super) fn validate(&self, memory: &Memory, owner: Validate<'_>) -> Result<(), Error> {
-        if !self.valid.load(Ordering::Acquire) || owner(self.device)? != self.generation {
+        if !self.valid.load(Ordering::Acquire) {
             return Err(invalid(
                 "recorded commands were retired or their device was replaced",
             ));
@@ -150,12 +159,22 @@ impl Recording {
         {
             return Err(invalid("recorded control storage was overwritten"));
         }
+        self.validate_commands(memory, owner)
+    }
+    // CallCommands copies immutable control metadata, while the command storage remains
+    // borrowed. Reusing the source's control bytes must not invalidate those copied calls.
+    fn validate_commands(&self, memory: &Memory, owner: Validate<'_>) -> Result<(), Error> {
+        if !self.command_valid.load(Ordering::Acquire) || owner(self.device)? != self.generation {
+            return Err(invalid(
+                "recorded command data was retired or its device was replaced",
+            ));
+        }
         for lease in &self.leases {
             lease.validate(memory, owner)?;
         }
         for op in &self.ops {
             if let Op::Call(child) = op {
-                child.validate(memory, owner)?;
+                child.validate_commands(memory, owner)?;
             }
         }
         Ok(())
@@ -165,6 +184,27 @@ impl Recording {
 #[derive(Default)]
 struct Index(BTreeMap<u64, (u64, u64)>);
 impl Index {
+    fn intersects(&self, span: Span) -> bool {
+        self.0
+            .range(..span.end)
+            .next_back()
+            .is_some_and(|(&start, &(end, _))| Span { start, end }.overlaps(span))
+    }
+    fn insert_merged(&mut self, mut span: Span, token: u64) {
+        if let Some((&start, &(end, tag))) = self.0.range(..span.start).next_back() {
+            if end == span.start && tag == token {
+                span.start = start;
+                self.0.remove(&start);
+            }
+        }
+        if let Some(&(end, tag)) = self.0.get(&span.end) {
+            if tag == token {
+                self.0.remove(&span.end);
+                span.end = end;
+            }
+        }
+        self.insert(span, token);
+    }
     fn overlapping(&self, span: Span) -> Vec<u64> {
         let mut out = Vec::new();
         if let Some((_, &(end, token))) = self.0.range(..span.start).next_back() {
@@ -198,6 +238,8 @@ impl Block {
 
 #[derive(Default)]
 struct Building {
+    control_ranges: Index,
+    command_ranges: BTreeMap<u64, Index>,
     ops: Vec<Op>,
     controls: Vec<Span>,
     commands: Vec<CommandSpan>,
@@ -217,6 +259,8 @@ struct Buffer {
 
 #[derive(Default)]
 pub(super) struct Objects {
+    retained_controls: BTreeSet<u64>,
+    gc_cursor: u64,
     live: BTreeMap<u64, Buffer>,
     recorded: BTreeMap<u64, Arc<Recording>>,
     control_index: Index,
@@ -353,8 +397,15 @@ impl Objects {
         Ok(())
     }
     fn retire(&mut self, token: u64) {
+        self.remove_recording(token, true);
+    }
+    fn remove_recording(&mut self, token: u64, commands: bool) {
+        self.retained_controls.remove(&token);
         if let Some(r) = self.recorded.remove(&token) {
             r.valid.store(false, Ordering::Release);
+            if commands {
+                r.command_valid.store(false, Ordering::Release);
+            }
             for &s in &r.controls {
                 self.control_index.remove(s, token);
             }
@@ -362,6 +413,42 @@ impl Objects {
                 if let Some(index) = self.command_index.get_mut(&s.lease.pool) {
                     index.remove(s.range, token);
                 }
+            }
+        }
+    }
+    fn retire_control(&mut self, token: u64) {
+        let Some(r) = self.recorded.get(&token) else {
+            return;
+        };
+        r.valid.store(false, Ordering::Release);
+        for &span in &r.controls {
+            self.control_index.remove(span, token);
+        }
+        if r.commands.is_empty() || Arc::strong_count(r) == 1 {
+            self.remove_recording(token, false);
+        } else {
+            self.retained_controls.insert(token);
+        }
+    }
+    fn reap_retained_controls(&mut self) {
+        for _ in 0..self.retained_controls.len().min(16) {
+            let token = self
+                .retained_controls
+                .range((
+                    std::ops::Bound::Excluded(self.gc_cursor),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .or_else(|| self.retained_controls.first())
+                .copied();
+            let Some(token) = token else { break };
+            self.gc_cursor = token;
+            if self
+                .recorded
+                .get(&token)
+                .is_none_or(|r| Arc::strong_count(r) == 1)
+            {
+                self.remove_recording(token, false);
             }
         }
     }
@@ -472,21 +559,6 @@ impl Objects {
             {
                 return Err(invalid("command memory needs CPU/GPU-accessible ordinary pool storage and four-byte alignment"));
             }
-            if b.building.as_ref().is_some_and(|r| {
-                r.commands
-                    .iter()
-                    .any(|c| c.lease.pool == a && c.range.overlaps(span))
-            }) {
-                return Err(invalid("new command memory overlaps the active recording"));
-            }
-            let tokens = self
-                .command_index
-                .get(&a)
-                .map(|i| i.overlapping(span))
-                .unwrap_or_default();
-            for token in tokens {
-                self.retire(token);
-            }
             self.live.get_mut(&object).unwrap().command = Some(Block {
                 span,
                 used: 0,
@@ -500,15 +572,6 @@ impl Objects {
                 || !rt().mem.is_mapped(a, offset)
             {
                 return Err(invalid("control memory needs mapped storage, eight-byte alignment and at least 32 bytes"));
-            }
-            if b.building
-                .as_ref()
-                .is_some_and(|r| r.controls.iter().any(|s| s.overlaps(span)))
-            {
-                return Err(invalid("new control memory overlaps the active recording"));
-            }
-            for token in self.control_index.overlapping(span) {
-                self.retire(token);
             }
             self.live.get_mut(&object).unwrap().control = Some(Block {
                 span,

@@ -1,4 +1,4 @@
-# NVN2 replacement: native texel transfers
+# NVN2 replacement: retained indexed drawing
 
 Updated 2026-11-07. The objective is to replace the guest graphics driver and remove the GPU
 front's command decoding from its draws. The optional API boundary now owns native devices,
@@ -6,13 +6,14 @@ memory pools, buffers, descriptor pools, samplers, textures/views, queues, syncs
 command buffers, programs and events. Typed command sets execute native GPU color clears and barriers,
 with allocation callbacks, shader bindings and ordered fences. Programs retain sm_86 binaries
 and feed native Vulkan module/pipeline caches. Typed render state drives scissored clears and
-a limited single-target array-draw path; watched immutable vertex buffers reuse device memory
+a limited single-target array/indexed draw path; watched immutable vertex/index buffers reuse device memory
 until their CPU backing changes. Event signals update coherent guest storage on the GPU;
 logical queue workers wait without blocking the API caller or the physical device queue.
 Vertex data is resolved after waits, including direct reads of single-page event aliases.
 CPU texel writes/reads, strides and flush/invalidate now connect checked tiled backing to
-retained native images. The owner's NX2 program completes 32 texel writes and flushes, creates
-35 textures, then stops at `nvnCommandBufferDrawElements`. Synthetic tests execute translated graphics shaders,
+retained native images. The owner's NX2 program records its first indexed set, links 35
+programs and creates 94 textures, then stops at `nvnCommandBufferBindUniformBuffer`.
+Synthetic tests execute translated graphics shaders,
 draw instances, check fixed state against pixels and dispatch a translated compute module.
 The title has not rendered an HLE frame.
 No race-rate improvement is established. The default
@@ -61,7 +62,9 @@ Program counters describe live program objects, their retained binaries and thei
 Vulkan modules; code-input bytes count successful copies at program linking. Queue binding
 counters describe retained stage/sample-shading state. Vertex-input counters separate logical
 CPU bytes copied, padded GPU upload bytes and unchanged-input cache hits; queue submissions
-include those input uploads and ready-prefix splits. Shared vertex binding bytes count logical
+include vertex/index input uploads and ready-prefix splits. Index counters separately describe
+logical CPU bytes captured, padded GPU upload bytes, cache hits and shared logical binding bytes
+across live queues. Shared vertex binding bytes count logical
 ranges bound directly from event imports, not measured GPU bus reads. State updates count
 expanded typed state operations. Event counts describe live native objects. These are
 scoped counters, not a measure
@@ -112,7 +115,7 @@ used directly as buffers. CPU mapping respects the pool's access flags. Labels a
 without logging their contents.
 
 Memory-pool flush/invalidate validate ranges and fence coherent host storage. Native queues execute clears,
-limited array draws and completion markers. Display-image writes stay in their Vulkan images;
+limited array/indexed draws and completion markers. Display-image writes stay in their Vulkan images;
 explicit texel invalidate/read can now copy those writes to guest pool bytes. General raw mapped
 access, aliasing, sparse GPU access and copy/dispatch visibility
 remain open. Watched vertex inputs retain immutable GPU versions through real submission
@@ -202,7 +205,7 @@ Finish appends a completion and waits. A sync created without a fence reports FA
 unflushed fence can time out, and re-fencing keeps an older waiter's completion alive. CPU waits
 release the driver lock and modeled core, and notice process termination. Renderer and native
 queues share the actual Vulkan device and serialize access to its physical queue. Typed clear
-and limited array-draw payloads execute alongside those markers. Copies, dispatch and general
+and limited array/indexed draw payloads execute alongside those markers. Copies, dispatch and general
 guest resource visibility remain open. FenceSync condition zero supports full GPU completion;
 vertex-only condition one stops explicitly. It previously used the same full completion and
 could not establish the requested release point. Unsupported flags stop explicitly.
@@ -271,11 +274,18 @@ storage invalidates old handles through interval indexes; pool/device generation
 again at submission and flush. CallCommands retains referenced sets; CopyCommands copies their
 typed operations independently. Called graphs are limited to 64 levels and one million expanded
 operations. No host pointers or guest GPU method streams are stored in the command handles.
+Adding an arena changes available capacity without invalidating existing sets. Interval indexes
+retire only ranges actually consumed by recording, including active-recording overlap checks;
+adjacent consumed ranges merge as recording proceeds. CallCommands keeps an immutable copy of
+control metadata while borrowing command data. Reusing source control invalidates its original
+handle but preserves the called parent; reusing command data invalidates borrowed calls.
+Retired control snapshots still referenced by calls keep command lifetime tracking until their
+last owner disappears; bounded cleanup runs at EndRecording.
 
 The payload subset binds display render targets, program stages, vertex buffers and typed
-render state, records full-channel RGBA clears with optional scissors and records array draws
+render state, records full-channel RGBA clears with optional scissors and records array/indexed draws
 and supported ordering/cache barriers. Views, depth/stencil targets, partial-channel clears,
-indexed/indirect draws, copies and dispatch remain unsupported and stop explicitly. Scratch
+indirect draws, copies and dispatch remain unsupported and stop explicitly. Scratch
 bindings retain validated state for future shader execution; they do not allocate scratch storage.
 
 QueueSubmitCommands snapshots and validates the complete handle array before enqueueing any
@@ -288,10 +298,9 @@ clear execution and headless presentation upload/read back no pixel buffers. Exp
 reads and configured dumps still copy pixels out and are counted separately.
 
 Native display pixels currently live in retained Vulkan images. GPU image writes are not yet
-made coherent with raw mapped guest-pool bytes; general CPU image access, aliasing and texture
-flush/invalidate/read/write operations remain open. The synthetic clear validation reads the
-actual Vulkan image through an explicit diagnostic helper. It does not validate mapped texture
-storage coherence, which must be completed with general resource execution.
+made coherent with arbitrary raw mapped guest-pool access. Explicit texel read/write and
+flush/invalidate now connect the supported CPU API path to those same images. General mapped
+access and aliases must still be completed with wider resource execution.
 
 ## Program binaries and translation
 
@@ -320,7 +329,7 @@ binding and wider graphics/dispatch execution remain to complete. Dynamic shader
 barriers stop explicitly until writable shader storage is connected to execution; they cannot
 silently reuse the immutable link snapshot after a caller requests invalidation.
 
-The layouts, ownership policy and remaining limits are recorded in A-299 through A-332.
+The layouts, ownership policy and remaining limits are recorded in A-299 through A-342.
 
 ## Render state and array execution
 
@@ -353,6 +362,64 @@ and each queue cache at 64 MiB/4,096 entries; retained in-flight versions can ou
 Unbound fixed state uses the API defaults, and unbound viewport/scissor use the full target.
 These are native initialization policies, not wider hardware-state coverage.
 
+## Indexed execution and input reuse
+
+DrawElements, DrawElementsBaseVertex and DrawElementsInstanced retain a checked GPU-address
+range in an owned pool. Types zero/one/two mean unsigned byte/16-bit/32-bit indices. The native
+recording retains index storage alongside vertex/program/target resources, including through
+called/copied sets and queued GPU completion. Empty draws do not resolve index data or require
+render bindings. GPU addresses are translated through the pool mapping; a synthetic indexed
+draw crosses physical pages in a virtual pool and observes subsequent CPU writes.
+
+Vulkan executes actual indexed draws, including signed base vertices and independent base
+instances. Ordinary index data is copied and scanned on a cache miss, then retained in device
+memory with its bounds/restart metadata. A hit rereads no index bytes and performs no upload.
+The adjusted maximum index determines the required vertex prefix. Smaller prefixes can reuse
+a larger unchanged entry within the current binding, including a fresh larger entry when an
+older exact-size entry is stale. CPU mapping identity and page-write epochs validate reuse;
+in-flight draws retain the previous versions through their actual fences.
+
+Byte indices use native UINT8 where available; immutable byte data otherwise widens once to
+UINT16. Exact restart matching ignores a restart value outside the index type's range.
+Fixed maximum-value restart uses native strip/fan pipelines, with the widened sentinel
+adjusted when needed. Other immutable restart patterns retain split draw ranges; restarts do
+not rewrite ordinary index values. Split instanced draws preserve instance-major primitive
+order and update the shader's logical instance counter for each instance. The accepted shader
+subset does not expose primitive/draw IDs; those inputs require wider restart handling before
+being enabled. Array draws ignore indexed restart state. All-restart
+data produces no vertex fetch or indexed draw. Split ranges are limited to 65,536, ordinary
+input payloads to 16 MiB and the combined vertex/index cache to 64 MiB of logical buffer data
+and 4,096 entries. Multiple split ranges expanded across instances are capped at 65,536 draw commands.
+Widening, allocation padding, metadata and retained in-flight versions are
+separate from those source/cache limits.
+
+Event-written index aliases bind the coherent import directly, bypassing an earlier immutable
+cache entry. A GPU signal immediately before the draw changes the actual index fetch without
+a CPU snapshot, upload or readback. Their unknown index bounds use the full bound vertex
+range and require the enabled robust-buffer profile; UINT32 shared data additionally requires
+the full device index range. Shared aliases must fit one retained import. Shared byte indices
+require native UINT8 support, and shared restart currently requires fixed strip/fan restart.
+GPU conversion of other shared cases, arbitrary shader-written indices, general buffer/image
+aliasing and pool-cache-line visibility remain open. Index visibility currently follows the
+same CPU-write/event profile as vertex inputs.
+
+These draws retain the current single-display-target, basic vertex/fragment shader limits.
+Shader descriptors/global memory, depth/MRT, indirect execution and wider primitives/formats
+still stop explicitly. Queue preparation errors now reach following queued completion markers
+with their original cause, rather than a generic retirement message.
+
+The title probe records one indexed command set and reaches BindUniformBuffer after the lazy
+pool-getter and called-control lifetime fixes. It owns 35 programs/40 binaries (1,218,048 code
+bytes), 94 textures/38 resident images, five events, three queues and two command buffers.
+There are 35 texel writes/flushes, 70 uploads/278,016 payload bytes and zero readback. No title
+shader module, queue GPU submission, draw, presentation or vertex/index input transfer has
+executed yet; initialization progress is not a native frame or gameplay I/O/rate result.
+
+The observed MemoryPoolGetBufferAddress accessor reads the GPU-address field at +24 directly.
+The native getter now does the same, including a zero-initialized embedded pool probed before
+lazy initialization. It does not register/adopt storage. Mutations, mapping and GPU uses retain
+their live registry/cookie/generation checks; a field value alone grants no native ownership.
+
 ## Shared events and buffer visibility
 
 Event builders preserve the consumed 16-byte layout. Native objects preserve the consumed
@@ -372,7 +439,7 @@ dataflow; precise pipeline-release timing against the original driver remains un
 Imports requiring alignment above a guest page and virtual/physical event pools remain refused.
 
 Recording snapshots event bindings, so finalizing the event/recorder leaves queued work intact.
-A ledger retains words exposed to GPU event operations until their pool retires. A vertex read
+A ledger retains words exposed to GPU event operations until their pool retires. A vertex/index read
 aliasing one such word binds the coherent import directly; it cannot reuse a stale device-local
 snapshot after an untracked GPU write. Aliases must fit one shared page, and fragmented/larger
 aliases stop explicitly. Ordinary inputs retain their device-local cache. GPU shader resources,
@@ -597,16 +664,24 @@ rendering-regression pass. The last 100 frames at 3,400/3,500/3,600 took
 8.698/8.342/8.356 seconds. Different race-start phases and default-path timing establish no
 native gameplay I/O or rate improvement.
 
-On Windows, `cargo fmt --all --check`, `cargo lint` and `cargo test` pass: 1,241 tests passed and
-one was ignored. Required-Vulkan/SPIR-V runs pass 11 native backend tests and 65 runtime NVN2
+The indexed/lifetime off-mode check completed 3,600 frames in 310 seconds, exit zero, with no
+concurrent builds/tests. Frame 3,500 was inspected: the race-start road and HUD are drawn,
+with black bands along the left road edge and dark character/structure regions. The earlier
+intermittent road issue remains unisolated; the different start phase prevents a matched
+rendering-regression comparison. The last 100 frames at 3,400/3,500/3,600 took
+8.372/8.278/9.012 seconds. These default-path samples establish no native gameplay I/O or rate
+improvement.
+
+On Windows, `cargo fmt --all --check`, `cargo lint` and `cargo test` pass: 1,256 tests passed and
+one was ignored. Required-Vulkan/SPIR-V runs pass 12 native backend tests and 79 runtime NVN2
 tests; the no-default runtime check and release build also pass.
 
 ## Next
 
-1. Implement indexed draws at the next boundary, with checked index storage and actual GPU
-   execution. Complete shader resource bindings, general mapped-image coherence, remaining texture modes, program control/stage
+1. Implement uniform-buffer binding at the next boundary and connect actual shader resources
+   to native Vulkan execution with retained data/reuse. Complete general mapped-image coherence, remaining texture modes, program control/stage
    coverage and dynamic code invalidation.
-2. Extend typed recording/execution to depth/MRT/indexed/indirect draws, copies/dispatch and
+2. Extend typed recording/execution to depth/MRT/indirect draws, copies/dispatch and
    views. Complete resource visibility beyond retained display images and shared event pages.
 3. Implement vertex-only sync completion and validate precise event release points. Complete
    broader buffer/CPU aliases, write-epoch rollover, sparse access and in-flight resource

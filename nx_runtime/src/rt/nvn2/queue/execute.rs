@@ -48,16 +48,17 @@ impl Execution {
                 Op::State(value) => self.state.apply(value),
                 Op::Vertex { index, binding } => self.vertices[*index] = *binding,
                 Op::Draw(draw) => {
+                    if draw.count == 0 || draw.instances == 0 {
+                        continue;
+                    }
                     if self.colors.iter().skip(1).any(Option::is_some) {
-                        return Err(invalid(
-                            "array draws with multiple targets are not implemented",
-                        ));
+                        return Err(invalid("draws with multiple targets are not implemented"));
                     }
                     let image = self
                         .colors
                         .first()
                         .and_then(Option::as_ref)
-                        .ok_or_else(|| invalid("array draw has no color target"))?;
+                        .ok_or_else(|| invalid("draw has no color target"))?;
                     if let Some(draw) =
                         scope.draw(draw, image, &self.state, &self.vertices, &self.programs)?
                     {
@@ -168,6 +169,19 @@ impl Queue {
 }
 
 impl Objects {
+    pub(in crate::rt::nvn2) fn index_stats(&self) -> (u64, u64, u64, u64) {
+        self.queues
+            .values()
+            .fold((0, 0, 0, 0), |(copied, hits, uploaded, shared), q| {
+                let inputs = q.inputs.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    copied + inputs.index_copied,
+                    hits + inputs.index_hits,
+                    uploaded + inputs.index_uploaded,
+                    shared + inputs.index_shared,
+                )
+            })
+    }
     pub(in crate::rt::nvn2) fn shared_input_bytes(&self) -> u64 {
         self.queues
             .values()

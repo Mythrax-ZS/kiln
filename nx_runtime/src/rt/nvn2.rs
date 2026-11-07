@@ -701,6 +701,9 @@ impl Session {
                 let _ = writeln!(out, "# native queue GPU submissions: {submissions}\n# native queue scratch binding bytes: {scratch}");
                 let (bindings, sample) = driver.queues.binding_stats();
                 let (copied, hits, uploaded) = driver.queues.input_stats();
+                let (indices, index_hits, index_uploads, index_shared) =
+                    driver.queues.index_stats();
+                let _=writeln!(out,"# native index input bytes copied: {indices}\n# native index input cache hits: {index_hits}\n# native index GPU upload bytes: {index_uploads}\n# native shared index binding bytes: {index_shared}");
                 let _ = writeln!(
                     out,
                     "# native shared vertex binding bytes: {}",

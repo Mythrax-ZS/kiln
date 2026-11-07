@@ -548,6 +548,13 @@ impl Objects {
             "nvnMemoryPoolInitialize" => self.initialize_pool(cpu, validate),
             "nvnBufferInitialize" => self.initialize_buffer(cpu, validate),
             "nvnMemoryPoolMapVirtual" => self.map_virtual(cpu, validate),
+            "nvnMemoryPoolGetBufferAddress" => (|| {
+                // The observed accessor is a plain +24 load. Callers also use it to probe
+                // zero-initialized embedded pools before initialization (A-341). GPU uses
+                // still resolve their live owner/generation through gpu_range/pool_info.
+                cpu.state.x[0] = u64::from_le_bytes(read(object.wrapping_add(24))?);
+                Ok(())
+            })(),
             "nvnMemoryPoolFinalize" => self.finalize_pool(cpu, validate),
             "nvnBufferFinalize" => (|| {
                 self.buffer(object, validate)?;
@@ -555,10 +562,7 @@ impl Objects {
                 self.buffers.remove(&object);
                 Ok(())
             })(),
-            "nvnMemoryPoolMap"
-            | "nvnMemoryPoolGetBufferAddress"
-            | "nvnMemoryPoolGetSize"
-            | "nvnMemoryPoolGetFlags" => (|| {
+            "nvnMemoryPoolMap" | "nvnMemoryPoolGetSize" | "nvnMemoryPoolGetFlags" => (|| {
                 let pool = self.pool(object, validate)?;
                 cpu.state.x[0] = match name {
                     "nvnMemoryPoolMap" => {
@@ -568,12 +572,12 @@ impl Objects {
                             pool.memory
                         }
                     }
-                    "nvnMemoryPoolGetBufferAddress" => pool.gpu,
                     "nvnMemoryPoolGetSize" => pool.size,
                     _ => u64::from(pool.flags),
                 };
                 Ok(())
-            })(),
+            })(
+            ),
             "nvnBufferMap"
             | "nvnBufferGetAddress"
             | "nvnBufferGetMemoryPool"

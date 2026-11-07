@@ -141,16 +141,31 @@ fn duplicate_jobs_and_preparation_failures_leave_no_permanent_pending_completion
         .unwrap();
     assert!(done.wait(5_000_000_000).unwrap());
     let failed = context.completion().unwrap();
+    let (entered, started) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::channel();
     queue
         .submit(
-            vec![Operation::Prepare(Box::new(|| {
+            vec![Operation::Prepare(Box::new(move || {
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
                 Err("synthetic preparation failure".into())
             }))],
             Arc::clone(&failed),
             false,
         )
         .unwrap();
-    assert!(failed.wait(5_000_000_000).is_err());
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    let following = context.completion().unwrap();
+    queue.submit_marker(Arc::clone(&following), false).unwrap();
+    release.send(()).unwrap();
+    assert!(failed
+        .wait(5_000_000_000)
+        .unwrap_err()
+        .contains("synthetic preparation failure"));
+    assert!(following
+        .wait(5_000_000_000)
+        .unwrap_err()
+        .contains("synthetic preparation failure"));
     assert!(queue.recorded().wait(|| false).is_err());
     assert!(queue
         .error()

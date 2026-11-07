@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 mod shader;
 pub use shader::{ShaderBinary, ShaderModule, ShaderOptions, ShaderStage};
 mod graphics;
+mod indices;
+pub use indices::{IndexBuffer, IndexType};
 mod shared;
 pub use shared::{SharedMemory, SharedWord};
 mod signal;
@@ -30,6 +32,8 @@ pub use texture::{
 #[derive(Clone)]
 pub struct Context {
     vk: Arc<Vk>,
+    robust_buffer_access: bool,
+    maximum_index: u32,
     graphics: Arc<Mutex<graphics::Cache>>,
     signals: Arc<Mutex<[Option<Arc<signal::Kernel>>; 2]>>,
 }
@@ -39,8 +43,18 @@ impl Context {
         Arc::ptr_eq(&self.vk, vk)
     }
     pub(crate) fn new(vk: Arc<Vk>) -> Self {
+        // SAFETY: immutable queries of the retained device's core profile. Vk enables these
+        // supported core features at construction; keep them off the per-draw path.
+        let (features, properties) = unsafe {
+            (
+                vk.instance.get_physical_device_features(vk.physical),
+                vk.instance.get_physical_device_properties(vk.physical),
+            )
+        };
         Self {
             vk,
+            robust_buffer_access: features.robust_buffer_access != 0,
+            maximum_index: properties.limits.max_draw_indexed_index_value,
             graphics: Arc::new(Mutex::new(graphics::Cache::default())),
             signals: Arc::new(Mutex::new([None, None])),
         }

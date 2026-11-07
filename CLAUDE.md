@@ -37,7 +37,7 @@ exports (`nx_runtime/src/rt/hle.rs`, `src/codegen/native.rs`, A-187): `nn::util`
 and deflate decompressors. Add one only with its signature pinned by a test and a row in
 `docs/ASSUMPTIONS.md`; the build report lists them.
 
-NVN2 replacement starts at `nx_runtime/src/rt/nvn2.rs` (A-298 through A-336), off by default.
+NVN2 replacement starts at `nx_runtime/src/rt/nvn2.rs` (A-298 through A-342), off by default.
 `NX_NVN2=trace` forwards the API to the guest driver and counts calls by name;
 `NX_NVN2=hle` uses native entries and stops at the first missing API. It currently implements
 procedure resolution, device ownership backed by an initialized Vulkan renderer, a limited
@@ -48,17 +48,20 @@ retained Vulkan display images, acquisition and presentation. Command buffers no
 recordings, allocation callbacks and called/copied sets; native queues execute batched image
 clears/barriers with ordered fences. Programs retain bounded sm_86 binaries and recorded shader
 bindings; a native translation cache creates Vulkan modules for actual draw/launch variations.
-Packed render state, scissored clears and a limited single-target array-draw path now execute
-on Vulkan with cached pipelines and watched immutable vertex buffers in device memory. Events
+Packed render state, scissored clears and a limited single-target array/indexed draw path now execute
+on Vulkan with cached pipelines and watched immutable vertex/index buffers in device memory. Typed
+indices support three widths, base vertices/instances, cached bounds and primitive restart;
+smaller vertex prefixes can reuse larger unchanged entries. Events
 now retain coherent shared storage; GPU atomic signals update the actual guest word. Logical
 queue workers pause at events/syncs without blocking the API or physical queue, and resolve
 vertex data after waits. Single-page vertex/event aliases bind that storage directly. Explicit
 CPU texel operations now connect tiled mip/layer/volume backing to retained color/BC Vulkan images,
 with cached/uncached visibility and raw readback on the same display image. Sparse
-textures, general mapped-image coherence, shader resources, depth/MRT/indexed draws, copies and
+textures, general mapped-image coherence, shader resources, depth/MRT/indirect draws, copies and
 dispatch remain open. Vertex-only sync completion is explicitly unsupported. The real program
-owns five events, three queues and 35 textures, completes 32 texel writes/flushes, then stops at
-`nvnCommandBufferDrawElements`.
+owns five events, three queues and 94 textures, links 35 programs and records an indexed set,
+then stops at `nvnCommandBufferBindUniformBuffer`. Arena replacement preserves unconsumed sets;
+called control snapshots survive source-control reuse while still borrowing command data.
 Synthetic GPU execution is verified; no native title frame or
 gameplay speed-up yet.
 These modes require an NX2 NPDM and a rebuilt optional loader stub: `kiln build --reuse-objects`

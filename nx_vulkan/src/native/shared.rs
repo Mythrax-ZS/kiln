@@ -139,7 +139,7 @@ impl Context {
             host as *mut u8,
             len,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER,
         )?;
         Ok(Arc::new(SharedMemory {
             vk: Arc::clone(&self.vk),
