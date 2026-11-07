@@ -7,6 +7,7 @@ use crate::rt::nvn2::{
 use std::cell::RefCell;
 
 mod draws;
+mod events;
 mod programs;
 
 thread_local! {
@@ -23,6 +24,20 @@ struct Fixture {
     backing: u64,
 }
 impl Fixture {
+    fn await_submissions(&self) {
+        let recorded = {
+            let driver = self.session.driver.lock().unwrap();
+            driver
+                .queues
+                .recorded(self.b() + 0x200, &driver.devices)
+                .unwrap()
+        };
+        recorded.wait(|| false).unwrap();
+    }
+    fn flush(&self) {
+        self.call("nvnQueueFlush", &[self.b() + 0x200]);
+        self.await_submissions();
+    }
     fn new() -> Option<Self> {
         Self::with_pool_flags(0x22)
     }

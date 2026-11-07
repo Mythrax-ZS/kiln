@@ -5,21 +5,29 @@
 
 use crate::Vk;
 use ash::vk;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 mod shader;
 pub use shader::{ShaderBinary, ShaderModule, ShaderOptions, ShaderStage};
 mod graphics;
+mod shared;
+pub use shared::{SharedMemory, SharedWord};
+mod signal;
+pub use signal::Signal;
+mod scheduled;
 pub use graphics::{
     Attribute, BlendFactor, BlendOp, ColorBlend, GraphicsPipeline, GraphicsState, InputBuffer,
     NativeDraw, Primitive, Stream, VertexFormat, VertexKind,
 };
+pub use scheduled::{Operation, Recorded, ScheduledQueue};
 
 #[derive(Clone)]
 pub struct Context {
     vk: Arc<Vk>,
     graphics: Arc<Mutex<graphics::Cache>>,
+    signals: Arc<Mutex<[Option<Arc<signal::Kernel>>; 2]>>,
 }
 
 impl Context {
@@ -30,6 +38,7 @@ impl Context {
         Self {
             vk,
             graphics: Arc::new(Mutex::new(graphics::Cache::default())),
+            signals: Arc::new(Mutex::new([None, None])),
         }
     }
 
@@ -46,7 +55,7 @@ impl Context {
             context: self.clone(),
             pool,
             flying: Vec::new(),
-            submissions: 0,
+            submissions: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -63,6 +72,7 @@ impl Context {
             fence,
             state: Mutex::new(State::Pending),
             changed: Condvar::new(),
+            scheduled: AtomicBool::new(false),
         }))
     }
 }
@@ -79,9 +89,20 @@ pub struct Completion {
     fence: vk::Fence,
     state: Mutex<State>,
     changed: Condvar,
+    scheduled: AtomicBool,
 }
 
 impl Completion {
+    pub fn enqueued(&self) -> bool {
+        self.scheduled.load(Ordering::Acquire) || self.submitted()
+    }
+    fn mark_enqueued(&self) -> Result<(), String> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(*state, State::Pending) || self.scheduled.swap(true, Ordering::AcqRel) {
+            return Err("native completion was already queued or submitted".into());
+        }
+        Ok(())
+    }
     pub fn submitted(&self) -> bool {
         matches!(
             *self.state.lock().unwrap_or_else(|e| e.into_inner()),
@@ -184,7 +205,7 @@ pub struct Queue {
     context: Context,
     pool: vk::CommandPool,
     flying: Vec<Flight>,
-    submissions: u64,
+    submissions: Arc<AtomicU64>,
 }
 
 impl Queue {
@@ -202,7 +223,7 @@ impl Queue {
     }
 
     pub fn submissions(&self) -> u64 {
-        self.submissions
+        self.submissions.load(Ordering::Acquire)
     }
 
     pub fn submit_marker(
@@ -298,7 +319,7 @@ impl Queue {
         };
         match result {
             Ok(()) => {
-                self.submissions += 1;
+                self.submissions.fetch_add(1, Ordering::Release);
                 self.flying.push(Flight {
                     command: cmd,
                     done: Arc::clone(completion),

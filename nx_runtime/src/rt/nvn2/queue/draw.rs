@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::rt::nvn2::command::{Draw, Lease, VertexBinding};
+use crate::rt::nvn2::event;
 use crate::rt::nvn2::state::Bindings;
 use crate::rt::nvn2::texture::DisplayImage;
 use nx_vulkan::native::{
@@ -9,8 +10,59 @@ use nx_vulkan::native::{
     Primitive, ShaderOptions, Stream, VertexFormat, VertexKind,
 };
 use nx_vulkan::render::{native::SurfaceFormat, Variation};
+use std::sync::Mutex;
 
 type InputKey = (u64, u64, u64, u64);
+struct Source {
+    key: InputKey,
+    spans: Vec<(u64, usize)>,
+    hosts: Vec<(usize, u64)>,
+    size: u64,
+}
+fn host_spans(spans: &[(u64, usize)]) -> Result<Vec<(usize, u64)>, Error> {
+    let mut hosts = Vec::new();
+    for &(cpu, n) in spans {
+        let mut at = 0;
+        while at < n as u64 {
+            let (ptr, len) = rt()
+                .mem
+                .host_run(cpu + at, n as u64 - at)
+                .ok_or_else(|| invalid("vertex backing is no longer mapped"))?;
+            hosts.push((ptr as usize, len));
+            at += len;
+        }
+    }
+    Ok(hosts)
+}
+impl Source {
+    fn capture(
+        binding: VertexBinding,
+        size: u64,
+        memory: &Memory,
+        devices: &Devices,
+    ) -> Result<Self, Error> {
+        binding.lease.validate(memory, &|d| devices.identity(d))?;
+        if size == 0 || size > binding.size || size > 16 * 1024 * 1024 {
+            return Err(invalid(
+                "vertex input exceeds its bound range or native upload budget",
+            ));
+        }
+        let key = (
+            binding.lease.pool,
+            binding.lease.info.cookie,
+            binding.offset,
+            size,
+        );
+        let spans = memory.backing_spans(binding.lease.info, binding.offset, size)?;
+        let hosts = host_spans(&spans)?;
+        Ok(Self {
+            key,
+            spans,
+            hosts,
+            size,
+        })
+    }
+}
 struct Entry {
     buffer: Arc<InputBuffer>,
     spans: Vec<(u64, usize)>,
@@ -27,29 +79,37 @@ pub(super) struct Inputs {
     pub uploaded: u64,
     pub uploads: u64,
     pub hits: u64,
+    pub shared_reads: u64,
 }
 impl Inputs {
     fn get(
         &mut self,
-        binding: VertexBinding,
-        size: u64,
-        memory: &Memory,
-        devices: &Devices,
+        source: Source,
         context: &Context,
+        visibility: &event::Visibility,
     ) -> Result<Arc<InputBuffer>, Error> {
-        binding.lease.validate(memory, &|d| devices.identity(d))?;
-        if size == 0 || size > binding.size || size > 16 * 1024 * 1024 {
+        let Source {
+            key,
+            spans,
+            hosts,
+            size,
+        } = source;
+        if host_spans(&spans)? != hosts {
             return Err(invalid(
-                "vertex input exceeds its bound range or native upload budget",
+                "vertex backing was remapped during deferred submission",
             ));
         }
-        let key = (
-            binding.lease.pool,
-            binding.lease.info.cookie,
-            binding.offset,
-            size,
-        );
-        let spans = memory.backing_spans(binding.lease.info, binding.offset, size)?;
+        for &(host, len) in &hosts {
+            if let Some(input) = visibility.input(host, len, context)? {
+                if hosts.len() != 1 {
+                    return Err(invalid(
+                        "fragmented vertex/event aliases are not implemented",
+                    ));
+                }
+                self.shared_reads += size;
+                return Ok(input);
+            }
+        }
         self.clock += 1;
         if let Some(e) = self.cache.get_mut(&key) {
             if e.spans == spans
@@ -123,7 +183,8 @@ impl Inputs {
 pub(super) struct Scope<'a> {
     pub validation: Option<(&'a Memory, &'a Devices)>,
     pub context: &'a Context,
-    pub inputs: &'a mut Inputs,
+    pub inputs: Arc<Mutex<Inputs>>,
+    pub visibility: Arc<Mutex<event::Visibility>>,
 }
 
 pub(super) fn clip(rect: [i32; 4], extent: [u32; 3], lower_left: bool) -> [u32; 4] {
@@ -220,7 +281,7 @@ impl Scope<'_> {
         state: &Bindings,
         vertices: &[Option<VertexBinding>; 32],
         programs: &[Option<crate::rt::nvn2::program::Binding>; 6],
-    ) -> Result<Option<Arc<NativeDraw>>, Error> {
+    ) -> Result<Option<nx_vulkan::native::Operation>, Error> {
         if draw.count == 0 || draw.instances == 0 {
             return Ok(None);
         }
@@ -478,22 +539,18 @@ impl Scope<'_> {
             return Ok(None);
         }
         // Refuse unsupported pipelines and empty draws before copying any vertex data.
-        let mut inputs = Vec::new();
+        let mut sources = Vec::new();
         for (binding, size) in needed {
             let source =
                 vertices[binding].ok_or_else(|| invalid("vertex stream has no bound buffer"))?;
-            inputs.push((
+            sources.push((
                 binding as u32,
-                self.inputs
-                    .get(source, size, memory, devices, self.context)?,
+                Source::capture(source, size, memory, devices)?,
             ));
         }
-        if let Some(binding) = constant_binding {
-            inputs.push((binding, self.inputs.constant(self.context)?));
-        }
-        Ok(Some(Arc::new(NativeDraw {
+        let mut draw = NativeDraw {
             pipeline,
-            inputs,
+            inputs: Vec::new(),
             viewport: [viewport[0], viewport[1], viewport[2], viewport[3], n, f],
             scissor,
             blend_color: state.blend_color,
@@ -501,6 +558,36 @@ impl Scope<'_> {
             count: draw.count,
             first_instance: draw.first_instance,
             instances: draw.instances,
-        })))
+        };
+        let inputs = Arc::clone(&self.inputs);
+        let visibility = Arc::clone(&self.visibility);
+        let context = self.context.clone();
+        let surface = Arc::clone(&image.surface);
+        Ok(Some(nx_vulkan::native::Operation::Prepare(Box::new(
+            move || {
+                let visibility = visibility.lock().unwrap_or_else(|e| e.into_inner());
+                let mut inputs = inputs.lock().unwrap_or_else(|e| e.into_inner());
+                for (binding, source) in sources {
+                    draw.inputs.push((
+                        binding,
+                        inputs
+                            .get(source, &context, &visibility)
+                            .map_err(|e| format!("native vertex input: {e:?}"))?,
+                    ));
+                }
+                if let Some(binding) = constant_binding {
+                    draw.inputs.push((
+                        binding,
+                        inputs
+                            .constant(&context)
+                            .map_err(|e| format!("native default vertex input: {e:?}"))?,
+                    ));
+                }
+                Ok(nx_vulkan::render::native::SurfaceCommand::Draw {
+                    surface,
+                    draw: Arc::new(draw),
+                })
+            },
+        ))))
     }
 }

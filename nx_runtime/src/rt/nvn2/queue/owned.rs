@@ -3,9 +3,9 @@
 use super::{invalid, read, write, Builder, Error, NativeCpu};
 use crate::rt::nvn2::{command, memory::Objects as Memory};
 use crate::rt::nvn2::{device::Devices, memory::label, rt};
-use nx_vulkan::native::{Completion, Queue as GpuQueue};
+use nx_vulkan::native::{Completion, ScheduledQueue as GpuQueue};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[path = "draw.rs"]
@@ -14,6 +14,7 @@ mod draw;
 mod execute;
 
 enum Pending {
+    Wait(Arc<Completion>),
     Fence(Arc<Completion>, bool),
     Commands(Arc<command::Recording>),
 }
@@ -27,7 +28,10 @@ struct Queue {
     gpu: GpuQueue,
     pending: Vec<Pending>,
     execution: execute::Execution,
-    inputs: draw::Inputs,
+    inputs: Arc<Mutex<draw::Inputs>>,
+    visibility: Arc<Mutex<super::super::event::Visibility>>,
+    latest: Option<Arc<Completion>>,
+    inflight: Vec<(Arc<Completion>, Vec<Arc<command::Recording>>)>,
     _storage: Vec<u8>,
     _guest_storage: (u64, u64),
     _compute_size: u64,
@@ -38,6 +42,21 @@ impl Queue {
     fn flush(&mut self, validation: Option<(&Memory, &Devices)>) -> Result<(), Error> {
         let pending = std::mem::take(&mut self.pending);
         let result = self.execute(&pending, validation);
+        if let Some(done) = self.latest.take() {
+            let recordings = pending
+                .iter()
+                .filter_map(|p| {
+                    if let Pending::Commands(r) = p {
+                        Some(Arc::clone(r))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            self.inflight.push((done, recordings));
+        }
+        self.inflight
+            .retain(|(done, _)| !done.signaled().unwrap_or(false));
         if let Err(error) = &result {
             for item in &pending {
                 if let Pending::Fence(completion, _) = item {
@@ -144,6 +163,14 @@ impl Waiter {
 }
 
 impl Objects {
+    #[cfg(test)]
+    pub(in crate::rt::nvn2) fn recorded(
+        &self,
+        address: u64,
+        devices: &Devices,
+    ) -> Result<nx_vulkan::native::Recorded, Error> {
+        Ok(self.queue(address, devices)?.gpu.recorded())
+    }
     pub(in crate::rt::nvn2) fn acquire_sync(
         &self,
         address: u64,
@@ -222,15 +249,14 @@ impl Objects {
         device: u64,
         devices: &Devices,
         memory: &Memory,
-    ) -> Result<(), Error> {
+    ) -> Result<nx_vulkan::native::Recorded, Error> {
         if self.queue(address, devices)?.device != device {
             return Err(invalid("presentation window belongs to another device"));
         }
         self.validate_pending(address, devices, memory)?;
-        self.queues
-            .get_mut(&address)
-            .expect("validated queue")
-            .flush(Some((memory, devices)))
+        let queue = self.queues.get_mut(&address).expect("validated queue");
+        queue.flush(Some((memory, devices)))?;
+        Ok(queue.gpu.recorded())
     }
     pub(in crate::rt::nvn2) fn has_children(&self, device: u64) -> bool {
         self.queues.values().any(|q| q.device == device)
@@ -244,6 +270,9 @@ impl Objects {
             .get(&address)
             .filter(|q| q.cookie == cookie)
             .ok_or_else(|| invalid("is not initialized or its storage was replaced"))?;
+        if let Some(error) = queue.gpu.error() {
+            return Err(invalid_gpu(error));
+        }
         if devices.identity(queue.device)? != queue.generation {
             return Err(invalid("belongs to a retired device"));
         }
@@ -263,7 +292,12 @@ impl Objects {
         Ok(sync)
     }
 
-    fn initialize(&mut self, cpu: &mut NativeCpu, devices: &Devices) -> Result<(), Error> {
+    fn initialize(
+        &mut self,
+        cpu: &mut NativeCpu,
+        devices: &Devices,
+        visibility: Arc<Mutex<super::super::event::Visibility>>,
+    ) -> Result<(), Error> {
         let address = cpu.state.x[0];
         let previous = read::<256>(address)?;
         write(address, &previous)?;
@@ -314,7 +348,7 @@ impl Objects {
             cpu.state.x[0] = 0;
             return Ok(());
         }
-        let gpu = match devices.context(builder.device)?.queue() {
+        let gpu = match devices.context(builder.device)?.scheduled_queue() {
             Ok(queue) => queue,
             Err(e) => {
                 eprintln!("[nvn2] QueueInitialize failed: {e}");
@@ -347,7 +381,10 @@ impl Objects {
                 gpu,
                 pending: Vec::new(),
                 execution: execute::Execution::default(),
-                inputs: draw::Inputs::default(),
+                inputs: Arc::new(Mutex::new(draw::Inputs::default())),
+                visibility,
+                latest: None,
+                inflight: Vec::new(),
                 _storage: storage,
                 _guest_storage: (builder.memory, builder.memory_size),
                 _compute_size: builder.compute,
@@ -377,6 +414,9 @@ impl Objects {
                 returns_status: true,
             });
         }
+        if name == "nvnQueueFinalize" && self.queues.values().any(|q| q.primary == address) {
+            return Err(invalid("still owns secondary queues"));
+        }
         self.validate_pending(address, devices, memory)?;
         let queue = self.queue(address, devices)?;
         let completion = queue.gpu.context().completion().map_err(invalid_gpu)?;
@@ -399,6 +439,7 @@ impl Objects {
         devices: &Devices,
         memory: &Memory,
         commands: &command::Objects,
+        visibility: Arc<Mutex<super::super::event::Visibility>>,
     ) -> Option<Result<(), Error>> {
         let (object, a, b, c) = (
             cpu.state.x[0],
@@ -408,7 +449,7 @@ impl Objects {
         );
         let result = match name {
             "nvnQueueSubmitCommands" => self.submit(cpu, devices, memory, commands),
-            "nvnQueueInitialize" => self.initialize(cpu, devices),
+            "nvnQueueInitialize" => self.initialize(cpu, devices, visibility),
             "nvnQueueFinalize" => (|| {
                 self.queue(object, devices)?;
                 self.validate_pending(object, devices, memory)?;
@@ -475,7 +516,12 @@ impl Objects {
             "nvnQueueFenceSync" => (|| {
                 let queue = self.queue(object, devices)?;
                 let sync = self.sync(a, devices)?;
-                if sync.device != queue.device || b as u32 > 1 || c as u32 & !1 != 0 {
+                if b as u32 == 1 {
+                    return Err(invalid(
+                        "vertex-stage-only sync completion is not implemented",
+                    ));
+                }
+                if sync.device != queue.device || b as u32 != 0 || c as u32 & !1 != 0 {
                     return Err(invalid(
                         "fence has a different device or unsupported condition/flags",
                     ));
@@ -502,19 +548,17 @@ impl Objects {
                 if sync.device != queue.device {
                     return Err(invalid("wait uses a sync from another device"));
                 }
-                if sync.origin != Some((object, queue.cookie)) && !completion.submitted() {
+                if sync.origin != Some((object, queue.cookie)) && !completion.enqueued() {
                     return Err(invalid(
                         "cross-queue sync must be flushed before it is waited on",
                     ));
                 }
-                // Logical queues share one serialized physical queue. This marker's ALL_COMMANDS
-                // memory dependency orders subsequent submissions after that flushed prefix.
-                let barrier = queue.gpu.context().completion().map_err(invalid_gpu)?;
+                let completion = Arc::clone(completion);
                 self.queues
                     .get_mut(&object)
                     .expect("validated queue")
                     .pending
-                    .push(Pending::Fence(barrier, false));
+                    .push(Pending::Wait(completion));
                 cpu.state.x[0] = 1;
                 Ok(())
             })(),

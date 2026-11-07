@@ -45,6 +45,7 @@ pub(in crate::rt::nvn2) enum Work {
         renderer: Arc<Mutex<nx_vulkan::Renderer>>,
         request: nx_gpu::render::Present,
         interval: u32,
+        prefix: nx_vulkan::native::Recorded,
     },
 }
 
@@ -61,6 +62,7 @@ impl Work {
                 renderer,
                 request,
                 interval,
+                prefix,
                 ..
             } => {
                 let mut request = *request;
@@ -68,6 +70,9 @@ impl Work {
                 let ctx = cpu.ctl.user.cast::<crate::horizon::kernel::ThreadCtx>();
                 // SAFETY: real Horizon calls retain ThreadCtx for the whole call; tests use null.
                 let kernel = unsafe { ctx.as_ref() }.map(|ctx| &ctx.kernel);
+                prefix
+                    .wait(|| kernel.is_some_and(|kernel| kernel.exit_state().is_some()))
+                    .map_err(|e| invalid(&e))?;
                 let mut done = None;
                 let mut show = |frame, due| {
                     request.frame = frame;
@@ -290,9 +295,10 @@ impl Objects {
         if w.busy || w.held != Some(index) || index >= w.active {
             return Err(invalid("presentation needs the acquired active texture"));
         }
-        queues.flush_for_present(object, w.device, devices, memory)?;
+        let prefix = queues.flush_for_present(object, w.device, devices, memory)?;
         let [x, y, width, height] = w.crop;
         let work = Work::Present {
+            prefix,
             window: a,
             cookie: w.cookie,
             index,

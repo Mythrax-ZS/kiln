@@ -10,6 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 mod recording;
+pub(super) struct Resources<'a> {
+    pub devices: &'a Devices,
+    pub memory: &'a Memory,
+    pub textures: &'a mut Textures,
+    pub programs: &'a Programs,
+    pub events: &'a mut super::event::Objects,
+}
 #[cfg(test)]
 mod tests;
 
@@ -40,6 +47,15 @@ impl Lease {
 
 #[derive(Clone)]
 pub(super) enum Op {
+    WaitEvent {
+        binding: super::event::Binding,
+        mode: u32,
+        value: u32,
+    },
+    SignalEvent {
+        binding: super::event::Binding,
+        signal: Arc<nx_vulkan::native::Signal>,
+    },
     Targets(Vec<Option<DisplayImage>>),
     Clear {
         index: usize,
@@ -506,11 +522,9 @@ impl Objects {
         &mut self,
         name: &str,
         cpu: &mut NativeCpu,
-        devices: &Devices,
-        memory: &Memory,
-        textures: &mut Textures,
-        programs: &Programs,
+        resources: &mut Resources<'_>,
     ) -> Option<Result<Step, Error>> {
+        let (devices, memory) = (resources.devices, resources.memory);
         let op = name.strip_prefix("nvnCommandBuffer")?;
         Some((|| {
             let (object, a) = (cpu.state.x[0], cpu.state.x[1]);
@@ -631,7 +645,7 @@ impl Objects {
                 "IsRecording" => {
                     cpu.state.x[0] = u64::from(read::<1>(object.wrapping_add(17))?[0] != 0)
                 }
-                _ => return self.record(op, cpu, devices, memory, textures, programs),
+                _ => return self.record(op, cpu, resources),
             }
             Ok(Step::Done)
         })())

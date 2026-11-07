@@ -202,6 +202,7 @@ pub struct GraphicsState {
 pub struct InputBuffer {
     vk: Arc<Vk>,
     data: Option<DeviceBuffer>,
+    shared: Option<(Arc<super::SharedMemory>, u64)>,
     len: u64,
     upload: Mutex<Option<Upload>>,
     upload_pending: AtomicBool,
@@ -219,10 +220,16 @@ impl InputBuffer {
         self.len() == 0
     }
     pub(crate) fn handle(&self) -> vk::Buffer {
-        self.data.as_ref().expect("live input").buffer
+        self.shared.as_ref().map_or_else(
+            || self.data.as_ref().expect("live input").buffer,
+            |(memory, _)| memory.buffer(),
+        )
+    }
+    pub(crate) fn offset(&self) -> u64 {
+        self.shared.as_ref().map_or(0, |(_, offset)| *offset)
     }
     pub fn upload_bytes(&self) -> u64 {
-        self.data.as_ref().expect("live input").size
+        self.data.as_ref().map_or(0, |data| data.size)
     }
     /// Release completed staging/pool resources without waiting in the draw path.
     pub fn reap_upload(&self) -> Result<(), String> {
@@ -297,6 +304,29 @@ pub(super) struct Cache {
 }
 
 impl Context {
+    pub fn shared_input(
+        &self,
+        memory: Arc<super::SharedMemory>,
+        offset: u64,
+        len: u64,
+    ) -> Result<Arc<InputBuffer>, String> {
+        if !Arc::ptr_eq(&self.vk, &memory.vk)
+            || len == 0
+            || !offset
+                .checked_add(len)
+                .is_some_and(|end| end <= memory.len())
+        {
+            return Err("shared vertex input is outside its device's import".into());
+        }
+        Ok(Arc::new(InputBuffer {
+            vk: Arc::clone(&self.vk),
+            data: None,
+            shared: Some((memory, offset)),
+            len,
+            upload: Mutex::new(None),
+            upload_pending: AtomicBool::new(false),
+        }))
+    }
     pub fn input_buffer(&self, bytes: &[u8]) -> Result<Arc<InputBuffer>, String> {
         if bytes.is_empty() {
             return Err("native input buffer is empty".into());
@@ -344,6 +374,7 @@ impl Context {
         Ok(Arc::new(InputBuffer {
             vk: Arc::clone(&self.vk),
             data: Some(data),
+            shared: None,
             len: bytes.len() as u64,
             upload: Mutex::new(Some(Upload {
                 queue,
@@ -690,8 +721,12 @@ impl NativeDraw {
                 self.pipeline.pipeline,
             );
             for (index, buffer) in &self.inputs {
-                vk.device
-                    .cmd_bind_vertex_buffers(command, *index, &[buffer.handle()], &[0]);
+                vk.device.cmd_bind_vertex_buffers(
+                    command,
+                    *index,
+                    &[buffer.handle()],
+                    &[buffer.offset()],
+                );
             }
             let [x, y, width, height, min_depth, max_depth] = self.viewport;
             vk.device.cmd_set_viewport(

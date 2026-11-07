@@ -503,6 +503,21 @@ impl Vk {
     /// alignment) visible to the device, as a storage buffer with a device address. The device
     /// reads and writes the bytes themselves.
     pub fn import_host_memory(&self, ptr: *mut u8, size: u64) -> Result<ImportedMemory, String> {
+        self.import_host_memory_flags(
+            ptr,
+            size,
+            vk::MemoryPropertyFlags::HOST_VISIBLE,
+            vk::BufferUsageFlags::empty(),
+        )
+    }
+
+    pub(crate) fn import_host_memory_flags(
+        &self,
+        ptr: *mut u8,
+        size: u64,
+        properties: vk::MemoryPropertyFlags,
+        extra_usage: vk::BufferUsageFlags,
+    ) -> Result<ImportedMemory, String> {
         let Some(ext) = self.external_memory_host.as_ref() else {
             return Err(
                 "the device cannot import host memory (VK_EXT_external_memory_host)".to_string(),
@@ -536,7 +551,8 @@ impl Vk {
                     vk::BufferUsageFlags::STORAGE_BUFFER
                         | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                         | vk::BufferUsageFlags::TRANSFER_SRC
-                        | vk::BufferUsageFlags::TRANSFER_DST,
+                        | vk::BufferUsageFlags::TRANSFER_DST
+                        | extra_usage,
                 )
                 .sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .push_next(&mut external);
@@ -545,10 +561,9 @@ impl Vk {
                 .create_buffer(&info, None)
                 .map_err(|e| format!("creating a buffer over {size} bytes of host memory: {e}"))?;
             let req = self.device.get_buffer_memory_requirements(buffer);
-            let Some(ty) = self.find_memory_type(
-                req.memory_type_bits & props.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE,
-            ) else {
+            let Some(ty) =
+                self.find_memory_type(req.memory_type_bits & props.memory_type_bits, properties)
+            else {
                 self.device.destroy_buffer(buffer, None);
                 return Err("no memory type can hold imported host memory".to_string());
             };

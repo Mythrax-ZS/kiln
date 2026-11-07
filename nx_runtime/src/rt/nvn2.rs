@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, RwLock};
 mod command;
 mod descriptors;
 mod device;
+mod event;
 mod memory;
 #[cfg(feature = "vulkan")]
 mod program;
@@ -36,6 +37,7 @@ struct Driver {
     memory: memory::Objects,
     descriptors: descriptors::Objects,
     textures: texture::Objects,
+    events: event::Objects,
     #[cfg(feature = "vulkan")]
     programs: program::Objects,
     #[cfg(feature = "vulkan")]
@@ -48,13 +50,21 @@ struct Driver {
 
 impl Driver {
     fn call(&mut self, name: &str, cpu: &mut NativeCpu) -> Option<Result<(), device::Error>> {
+        #[cfg(feature = "vulkan")]
+        if let Some(error) = self.queues.background_error() {
+            return Some(Err(device::Error::Invalid(error)));
+        }
+        if let Some(result) = event::builder_call(name, cpu) {
+            return Some(result);
+        }
         if let Some(result) = state::call(name, cpu) {
             return Some(result);
         }
         if name == "nvnDeviceFinalize"
             && (self.memory.has_children(cpu.state.x[0])
                 || self.descriptors.has_device_children(cpu.state.x[0])
-                || self.textures.has_device_children(cpu.state.x[0]))
+                || self.textures.has_device_children(cpu.state.x[0])
+                || self.events.has_device(cpu.state.x[0]))
         {
             return Some(Err(device::Error::Invalid(
                 "NVN2 device still owns native resources".to_string(),
@@ -100,15 +110,20 @@ impl Driver {
             return Some(result);
         }
         #[cfg(feature = "vulkan")]
-        if let Some(result) =
-            self.queues
-                .call(name, cpu, &self.devices, &self.memory, &self.commands)
-        {
+        if let Some(result) = self.queues.call(
+            name,
+            cpu,
+            &self.devices,
+            &self.memory,
+            &self.commands,
+            Arc::clone(&self.events.visibility),
+        ) {
             return Some(result);
         }
         if name == "nvnMemoryPoolFinalize"
             && (self.descriptors.has_pool_children(cpu.state.x[0])
-                || self.textures.has_pool_children(cpu.state.x[0]))
+                || self.textures.has_pool_children(cpu.state.x[0])
+                || self.events.has_pool(cpu.state.x[0]))
         {
             return Some(Err(device::Error::Invalid(
                 "NVN2 memory pool still owns descriptor pools or textures".to_string(),
@@ -126,6 +141,9 @@ impl Driver {
         }
         #[cfg(feature = "vulkan")]
         if let Some(result) = self.programs.call(name, cpu, &self.devices, &self.memory) {
+            return Some(result);
+        }
+        if let Some(result) = self.events.call(name, cpu, &self.memory, &self.devices) {
             return Some(result);
         }
         if let Some(result) = self.devices.call(name, cpu) {
@@ -154,13 +172,13 @@ impl Driver {
         }) {
             return Some(result);
         }
-        #[cfg(feature = "vulkan")]
         let address = cpu.state.x[0];
         let result = self
             .memory
             .call(name, cpu, &|address| self.devices.identity(address));
-        #[cfg(feature = "vulkan")]
         if name == "nvnMemoryPoolFinalize" && matches!(result, Some(Ok(()))) {
+            self.events.retire_pool(address);
+            #[cfg(feature = "vulkan")]
             self.commands.retire_pool(address);
         }
         result
@@ -452,10 +470,21 @@ impl Session {
                                 memory,
                                 textures,
                                 programs,
+                                events,
                                 ..
                             } = &mut *driver;
                             commands
-                                .call(&proc.name, c, devices, memory, textures, programs)
+                                .call(
+                                    &proc.name,
+                                    c,
+                                    &mut command::Resources {
+                                        devices,
+                                        memory,
+                                        textures,
+                                        programs,
+                                        events,
+                                    },
+                                )
                                 .expect("command entry")
                         };
                         match step {
@@ -531,7 +560,10 @@ impl Session {
                     return;
                 }
                 #[cfg(feature = "vulkan")]
-                if matches!(proc.name.as_str(), "nvnSyncWait" | "nvnQueueFinish") {
+                if matches!(
+                    proc.name.as_str(),
+                    "nvnSyncWait" | "nvnQueueFinish" | "nvnQueueFinalize"
+                ) {
                     let wait = {
                         let mut driver = self.driver.lock().unwrap_or_else(|e| e.into_inner());
                         let Driver {
@@ -542,16 +574,28 @@ impl Session {
                         } = &mut *driver;
                         queues.prepare_wait(&proc.name, c, devices, memory)
                     };
-                    let result = wait.and_then(|w| {
-                        let ctx = c.ctl.user.cast::<ThreadCtx>();
-                        // SAFETY: a Horizon thread keeps ThreadCtx alive for its whole run;
-                        // synthetic calls leave a null user pointer.
-                        if let Some(ctx) = unsafe { ctx.as_ref() } {
-                            ctx.kernel.wait_on_host(ctx.thread, &ctx.core, || w.run(c))
-                        } else {
-                            w.run(c)
-                        }
-                    });
+                    let result = wait
+                        .and_then(|w| {
+                            let ctx = c.ctl.user.cast::<ThreadCtx>();
+                            // SAFETY: a Horizon thread keeps ThreadCtx alive for its whole run;
+                            // synthetic calls leave a null user pointer.
+                            if let Some(ctx) = unsafe { ctx.as_ref() } {
+                                ctx.kernel.wait_on_host(ctx.thread, &ctx.core, || w.run(c))
+                            } else {
+                                w.run(c)
+                            }
+                        })
+                        .and_then(|()| {
+                            if proc.name == "nvnQueueFinalize" {
+                                self.driver
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .call(&proc.name, c)
+                                    .expect("queue finalization entry")
+                            } else {
+                                Ok(())
+                            }
+                        });
                     match result {
                         Ok(()) => c.state.pc = c.state.x[30],
                         Err(e) => e.report(c, caller),
@@ -629,6 +673,11 @@ impl Session {
                 let _ = writeln!(out, "# native queue GPU submissions: {submissions}\n# native queue scratch binding bytes: {scratch}");
                 let (bindings, sample) = driver.queues.binding_stats();
                 let (copied, hits, uploaded) = driver.queues.input_stats();
+                let _ = writeln!(
+                    out,
+                    "# native shared vertex binding bytes: {}",
+                    driver.queues.shared_input_bytes()
+                );
                 let _=writeln!(out,"# native vertex input bytes copied: {copied}\n# native vertex input cache hits: {hits}\n# native vertex GPU upload bytes: {uploaded}");
                 let _ = writeln!(
                     out,
@@ -644,6 +693,7 @@ impl Session {
                 "# native textures owned: {}",
                 driver.textures.live_count()
             );
+            let _ = writeln!(out, "# native events owned: {}", driver.events.count());
         }
         for (count, guest, name) in rows {
             let _ = writeln!(out, "{count} {guest:#x} {name}");

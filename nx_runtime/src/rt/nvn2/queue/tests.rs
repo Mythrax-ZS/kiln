@@ -205,7 +205,18 @@ fn native_queue_fences_wait_for_flush_and_keep_parent_and_device_lifetimes() {
         stop::NONE
     );
     // Re-fencing must create a new completion instead of resetting a fence another waiter owns.
-    native_call(&session, "nvnQueueFenceSync", &[queue, sync, 1, 0]);
+    assert_eq!(
+        native_call(&session, "nvnQueueFenceSync", &[queue, sync, 1, 0])
+            .ctl
+            .stop,
+        stop::UNIMPLEMENTED
+    );
+    assert_eq!(
+        native_call(&session, "nvnSyncWait", &[sync, 0]).state.x[0],
+        0,
+        "an unsupported vertex condition must preserve the earlier sync"
+    );
+    native_call(&session, "nvnQueueFenceSync", &[queue, sync, 0, 0]);
     assert_eq!(
         native_call(&session, "nvnSyncWait", &[sync, 0]).state.x[0],
         2

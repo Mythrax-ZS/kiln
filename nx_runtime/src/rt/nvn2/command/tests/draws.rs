@@ -185,6 +185,74 @@ fn center(pixels: &[u8]) -> [u8; 4] {
 }
 
 #[test]
+fn a_gpu_event_write_after_flush_reaches_aliased_vertices_without_cpu_copyback() {
+    let Some(f) = Fixture::with_pool_flags(0x62) else {
+        return;
+    };
+    let b = f.b();
+    let buffer = b + 0x500;
+    setup_draw(&f, buffer);
+    f.memory(buffer, 0x8000, 0xD000);
+    let first = record(&f, buffer);
+    f.submit(first);
+    f.flush();
+    assert_eq!(center(&read_image(&f)), [0, 255, 0, 255]);
+    // The first input has a cached device-local copy. The event that will write it does not
+    // exist yet; vertex resolution must happen after the queued wait, rather than at Flush.
+    super::events::event(&f, b + 0xE40, b + 0x380, 0x6000);
+    f.memory(buffer, 0x8000, 0xD000);
+    let draw = record_with(&f, buffer, |f, buffer| {
+        f.call("nvnCommandBufferWaitEvent", &[buffer, b + 0xE40, 0, 1]);
+        f.call("nvnCommandBufferDrawArrays", &[buffer, 4, 0, 3]);
+    });
+    f.submit(draw);
+    f.call("nvnQueueFlush", &[b + 0x200]);
+    super::events::event(&f, b + 0xE00, b + 0x380, 0x3000);
+    f.call("nvnQueueBuilderSetDefaults", &[b + 0x800]);
+    f.call("nvnQueueBuilderSetDevice", &[b + 0x800, b]);
+    assert_eq!(f.call("nvnQueueInitialize", &[b + 0xF00, b + 0x800]), 1);
+    let second = b + 0x700;
+    f.initialize(second);
+    f.memory(second, 0x9000, 0xE000);
+    f.call("nvnCommandBufferBeginRecording", &[second]);
+    f.call(
+        "nvnCommandBufferSignalEvent",
+        &[second, b + 0xE00, 0, 2, 0, u64::from(0.75f32.to_bits())],
+    );
+    f.call(
+        "nvnCommandBufferSignalEvent",
+        &[second, b + 0xE40, 0, 2, 0, 1],
+    );
+    let signals = f.call("nvnCommandBufferEndRecording", &[second]);
+    f.call("nvnEventFinalize", &[b + 0xE00]);
+    write(b + 0xD00, &signals.to_le_bytes()).unwrap();
+    f.call("nvnQueueSubmitCommands", &[b + 0xF00, 1, b + 0xD00]);
+    f.call("nvnQueueFlush", &[b + 0xF00]);
+    f.await_submissions();
+    let pixels = read_image(&f);
+    assert!(
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| *p == [0, 0, 255, 255]),
+        "the updated first vertex makes the triangle degenerate"
+    );
+    assert_eq!(
+        f.session.driver.lock().unwrap().queues.input_stats(),
+        (48, 0, 48),
+        "the GPU-written data needs no CPU snapshot or upload"
+    );
+    {
+        let driver = f.session.driver.lock().unwrap();
+        assert_eq!(driver.windows.stats().draws, 2);
+        assert_eq!(driver.queues.shared_input_bytes(), 48);
+    }
+    f.call("nvnQueueFinalize", &[b + 0xF00]);
+    f.call("nvnEventFinalize", &[b + 0xE40]);
+}
+
+#[test]
 fn array_draw_fixed_state_changes_the_actual_pixels() {
     let Some(f) = Fixture::with_pool_flags(0x62) else {
         return;
@@ -206,7 +274,7 @@ fn array_draw_fixed_state_changes_the_actual_pixels() {
             f.call("nvnCommandBufferDrawArrays", &[buffer, 4, 0, 3]);
         });
         f.submit(handle);
-        f.call("nvnQueueFlush", &[b + 0x200]);
+        f.flush();
         assert_eq!(
             center(&read_image(&f)),
             expected,
@@ -249,7 +317,7 @@ fn array_draw_fixed_state_changes_the_actual_pixels() {
         // The recording owns state, including the blend constants and output mask.
         write(b + 0xDC0, &[0; 16]).unwrap();
         f.submit(handle);
-        f.call("nvnQueueFlush", &[b + 0x200]);
+        f.flush();
         let got = center(&read_image(&f));
         assert!(
             got.iter().zip(expected).all(|(&a, b)| a.abs_diff(b) <= 1),
@@ -338,7 +406,7 @@ fn array_instances_use_the_nonzero_base_and_increment_the_shader_id() {
         );
     });
     f.submit(handle);
-    f.call("nvnQueueFlush", &[b + 0x200]);
+    f.flush();
     let pixels = read_image(&f);
     for (x, expected) in [
         (10, [0, 255, 0, 255]),
@@ -391,7 +459,7 @@ fn fragment_position_y_uses_pixel_centers_in_the_recorded_origin() {
         f.memory(buffer, 0x8000, 0xD000);
         let handle = record(&f, buffer);
         f.submit(handle);
-        f.call("nvnQueueFlush", &[b + 0x200]);
+        f.flush();
         let pixels = read_image(&f);
         for y in [9, 12, 15] {
             let p = &pixels[(y * 32 + 16) * 4..(y * 32 + 16) * 4 + 4];
@@ -467,7 +535,7 @@ fn typed_array_draws_run_sm86_and_reuse_only_unchanged_vertex_inputs() {
     f.call("nvnProgramFinalize", &[b + 0x600]);
     f.call("nvnCommandBufferFinalize", &[buffer]);
     f.submit(handle);
-    f.call("nvnQueueFlush", &[b + 0x200]);
+    f.flush();
     assert_eq!(
         f.session.driver.lock().unwrap().queues.input_stats(),
         (48, 0, 48)
@@ -486,7 +554,7 @@ fn typed_array_draws_run_sm86_and_reuse_only_unchanged_vertex_inputs() {
         .count();
     assert!((150..350).contains(&green), "triangle pixels {green}");
     f.submit(handle);
-    f.call("nvnQueueFlush", &[b + 0x200]);
+    f.flush();
     assert_eq!(
         f.session.driver.lock().unwrap().queues.input_stats(),
         (48, 1, 48)
@@ -495,7 +563,7 @@ fn typed_array_draws_run_sm86_and_reuse_only_unchanged_vertex_inputs() {
     // Rewriting a watched input creates a fresh GPU buffer; an older submission keeps its version.
     geometry(&f, 0.6);
     f.submit(handle);
-    f.call("nvnQueueFlush", &[b + 0x200]);
+    f.flush();
     assert_eq!(
         f.session.driver.lock().unwrap().queues.input_stats(),
         (96, 1, 96)
@@ -557,7 +625,7 @@ fn scissored_gpu_clears_copy_state_and_respect_recorded_window_origin() {
     f.call("nvnDeviceSetWindowOriginMode", &[b, 1]);
     write(b + 0xD80, &[0; 16]).unwrap();
     f.submit(handle);
-    f.call("nvnQueueFlush", &[b + 0x200]);
+    f.flush();
     let pixels = read_image(&f);
     for y in 0..24 {
         for x in 0..32 {

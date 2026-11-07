@@ -2,6 +2,7 @@ use super::*;
 use crate::rt::nvn2::command::{Lease, Op, Recording, VertexBinding};
 use crate::rt::nvn2::program::Binding;
 use crate::rt::nvn2::texture::DisplayImage;
+use nx_vulkan::native::Operation;
 use nx_vulkan::render::native::SurfaceCommand;
 
 #[derive(Clone, Default)]
@@ -17,7 +18,7 @@ impl Execution {
     fn expand(
         &mut self,
         r: &Recording,
-        out: &mut Vec<SurfaceCommand>,
+        out: &mut Vec<Operation>,
         depth: u32,
         visited: &mut usize,
         scope: &mut super::draw::Scope<'_>,
@@ -30,6 +31,18 @@ impl Execution {
         }
         for op in &r.ops {
             match op {
+                Op::WaitEvent {
+                    binding,
+                    mode,
+                    value,
+                } => out.push(Operation::Wait {
+                    word: Arc::clone(&binding.word),
+                    mode: *mode,
+                    value: *value,
+                }),
+                Op::SignalEvent { signal, .. } => {
+                    out.push(Operation::Gpu(SurfaceCommand::Signal(Arc::clone(signal))))
+                }
                 Op::Targets(colors) => self.colors.clone_from(colors),
                 Op::Scratch(scratch) => self.scratch = *scratch,
                 Op::State(value) => self.state.apply(value),
@@ -48,10 +61,7 @@ impl Execution {
                     if let Some(draw) =
                         scope.draw(draw, image, &self.state, &self.vertices, &self.programs)?
                     {
-                        out.push(SurfaceCommand::Draw {
-                            surface: Arc::clone(&image.surface),
-                            draw,
-                        });
+                        out.push(draw);
                     }
                 }
                 Op::Program { mask, binding } => {
@@ -86,15 +96,15 @@ impl Execution {
                     if rect.is_some_and(|r| r[2] == 0 || r[3] == 0) {
                         continue;
                     }
-                    out.push(SurfaceCommand::Clear {
+                    out.push(Operation::Gpu(SurfaceCommand::Clear {
                         surface: Arc::clone(&image.surface),
                         color: *color,
                         rect,
-                    });
+                    }));
                 }
                 Op::Barrier(bits) => {
                     if *bits != 0 {
-                        out.push(SurfaceCommand::Barrier);
+                        out.push(Operation::Gpu(SurfaceCommand::Barrier));
                     }
                 }
                 Op::Call(child) => self.expand(child, out, depth + 1, visited, scope)?,
@@ -116,6 +126,9 @@ impl Queue {
         let context = self.gpu.context().clone();
         for item in pending {
             match item {
+                Pending::Wait(completion) => {
+                    operations.push(Operation::WaitCompletion(Arc::clone(completion)))
+                }
                 Pending::Commands(r) => state.expand(
                     r,
                     &mut operations,
@@ -124,7 +137,8 @@ impl Queue {
                     &mut super::draw::Scope {
                         validation,
                         context: &context,
-                        inputs: &mut self.inputs,
+                        inputs: Arc::clone(&self.inputs),
+                        visibility: Arc::clone(&self.visibility),
                     },
                 )?,
                 Pending::Fence(completion, for_cpu) => {
@@ -132,6 +146,7 @@ impl Queue {
                     self.gpu
                         .submit_marker(Arc::clone(completion), *for_cpu)
                         .map_err(invalid_gpu)?;
+                    self.latest = Some(Arc::clone(completion));
                 }
             }
         }
@@ -140,24 +155,47 @@ impl Queue {
         Ok(())
     }
 
-    fn send_operations(&mut self, operations: &mut Vec<SurfaceCommand>) -> Result<(), Error> {
+    fn send_operations(&mut self, operations: &mut Vec<Operation>) -> Result<(), Error> {
         if !operations.is_empty() {
             let done = self.gpu.context().completion().map_err(invalid_gpu)?;
             self.gpu
-                .submit_surfaces(operations, done)
+                .submit(std::mem::take(operations), Arc::clone(&done), false)
                 .map_err(invalid_gpu)?;
-            operations.clear();
+            self.latest = Some(done);
         }
         Ok(())
     }
 }
 
 impl Objects {
+    pub(in crate::rt::nvn2) fn shared_input_bytes(&self) -> u64 {
+        self.queues
+            .values()
+            .map(|q| {
+                q.inputs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .shared_reads
+            })
+            .sum()
+    }
+    pub(in crate::rt::nvn2) fn background_error(&self) -> Option<String> {
+        self.queues.values().find_map(|q| q.gpu.error())
+    }
     pub(in crate::rt::nvn2) fn input_stats(&self) -> (u64, u64, u64) {
         (
-            self.queues.values().map(|q| q.inputs.copied).sum(),
-            self.queues.values().map(|q| q.inputs.hits).sum(),
-            self.queues.values().map(|q| q.inputs.uploaded).sum(),
+            self.queues
+                .values()
+                .map(|q| q.inputs.lock().unwrap_or_else(|e| e.into_inner()).copied)
+                .sum(),
+            self.queues
+                .values()
+                .map(|q| q.inputs.lock().unwrap_or_else(|e| e.into_inner()).hits)
+                .sum(),
+            self.queues
+                .values()
+                .map(|q| q.inputs.lock().unwrap_or_else(|e| e.into_inner()).uploaded)
+                .sum(),
         )
     }
     pub(in crate::rt::nvn2) fn state_updates(&self) -> u64 {
@@ -186,7 +224,9 @@ impl Objects {
         (
             self.queues
                 .values()
-                .map(|q| q.gpu.submissions() + q.inputs.uploads)
+                .map(|q| {
+                    q.gpu.submissions() + q.inputs.lock().unwrap_or_else(|e| e.into_inner()).uploads
+                })
                 .sum(),
             self.queues
                 .values()
@@ -196,7 +236,10 @@ impl Objects {
     }
     pub(in crate::rt::nvn2) fn has_pool_children(&self, pool: u64) -> bool {
         self.queues.values().any(|q| {
-            q.pending
+            q.inflight.iter().any(|(done, recordings)| {
+                !done.signaled().unwrap_or(false) && recordings.iter().any(|r| r.has_pool(pool))
+            }) || q
+                .pending
                 .iter()
                 .any(|p| matches!(p, Pending::Commands(r) if r.has_pool(pool)))
         })

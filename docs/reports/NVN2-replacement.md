@@ -1,14 +1,17 @@
-# NVN2 replacement: native state and array draws
+# NVN2 replacement: shared events and deferred queues
 
 Updated 2026-11-07. The objective is to replace the guest graphics driver and remove the GPU
 front's command decoding from its draws. The optional API boundary now owns native devices,
 memory pools, buffers, descriptor pools, samplers, textures/views, queues, syncs, windows,
-command buffers and programs. Typed command sets execute native GPU color clears and barriers,
+command buffers, programs and events. Typed command sets execute native GPU color clears and barriers,
 with allocation callbacks, shader bindings and ordered fences. Programs retain sm_86 binaries
 and feed native Vulkan module/pipeline caches. Typed render state drives scissored clears and
 a limited single-target array-draw path; watched immutable vertex buffers reuse device memory
-until their CPU backing changes. The owner's NX2 program passes render-state construction and
-stops at `nvnEventBuilderSetDefaults`. Synthetic tests execute translated graphics shaders,
+until their CPU backing changes. Event signals update coherent guest storage on the GPU;
+logical queue workers wait without blocking the API caller or the physical device queue.
+Vertex data is resolved after waits, including direct reads of single-page event aliases.
+The owner's NX2 program creates five events and three queues, then stops at
+`nvnTextureWriteTexels`. Synthetic tests execute translated graphics shaders,
 draw instances, check fixed state against pixels and dispatch a translated compute module.
 The title has not rendered an HLE frame.
 No race-rate improvement is established. The default
@@ -57,7 +60,9 @@ Program counters describe live program objects, their retained binaries and thei
 Vulkan modules; code-input bytes count successful copies at program linking. Queue binding
 counters describe retained stage/sample-shading state. Vertex-input counters separate logical
 CPU bytes copied, padded GPU upload bytes and unchanged-input cache hits; queue submissions
-include those input uploads. State updates count executed typed state operations. These are
+include those input uploads and ready-prefix splits. Shared vertex binding bytes count logical
+ranges bound directly from event imports, not measured GPU bus reads. State updates count
+expanded typed state operations. Event counts describe live native objects. These are
 scoped counters, not a measure
 of total process CPU/GPU traffic; object retirement can reduce the live-resource counts.
 
@@ -147,7 +152,26 @@ unflushed fence can time out, and re-fencing keeps an older waiter's completion 
 release the driver lock and modeled core, and notice process termination. Renderer and native
 queues share the actual Vulkan device and serialize access to its physical queue. Typed clear
 and limited array-draw payloads execute alongside those markers. Copies, dispatch and general
-guest resource visibility remain open. Unsupported fence conditions/flags stop explicitly.
+guest resource visibility remain open. FenceSync condition zero supports full GPU completion;
+vertex-only condition one stops explicitly. It previously used the same full completion and
+could not establish the requested release point. Unsupported flags stop explicitly.
+
+Each logical queue now has a submission worker. Flush validates and enqueues a ready prefix,
+then returns. The worker submits operations before an event wait, observes the actual shared
+word and resumes when its predicate passes. Another logical queue can submit its signal while
+the first waits; no spin shader occupies the physical queue. CPU API signals notify waiters,
+while GPU and inline CPU stores are observed with one-millisecond polling timeouts. Finish and
+finalization wait outside the driver mutex and guest core. Presentation waits for its prefix
+to reach Vulkan submission before consulting the image's completion. QueueWaitSync retains
+the source completion, including a flushed prefix that has not yet reached physical submission.
+Unflushed cross-queue waits remain refused. Worker errors cancel dependent completions and
+become fatal diagnostics on subsequent calls. Native budgets cap deferred work at 4,096 queued
+jobs and one million queued operations; this excludes a currently executing job and GPU flights.
+GPU-written private completion cells order a wait after earlier writes to the same event word.
+An old matching value cannot satisfy the wait before a queued reset executes. These cells are
+reused only after GPU/CPU owners release their import; private storage is capped at 16 MiB and
+4,096 imports per logical queue. They add internal GPU writes, excluded from vertex-upload and
+pixel-readback counters. The tests do not measure total event bus traffic or release latency.
 
 ## Native windows
 
@@ -207,7 +231,8 @@ QueueSubmitCommands snapshots and validates the complete handle array before enq
 prefix, including device identities and cross-page faults. Queued sets retain their resources
 and block premature command-pool retirement. Flush expands the typed sets in order, batching
 image clears/draws/barriers into a Vulkan command buffer between fence markers. Image locks remain
-held through GPU submission, and real completion fences retain their image lifetimes. Recording,
+held through GPU submission, and real completion fences retain their image lifetimes. Submitted
+recordings also guard their pools while a deferred prefix or GPU completion remains pending. Recording,
 clear execution and headless presentation upload/read back no pixel buffers. Explicit diagnostic
 reads and configured dumps still copy pixels out and are counted separately.
 
@@ -244,7 +269,7 @@ binding and wider graphics/dispatch execution remain to complete. Dynamic shader
 barriers stop explicitly until writable shader storage is connected to execution; they cannot
 silently reuse the immutable link snapshot after a caller requests invalidation.
 
-The layouts, ownership policy and remaining limits are recorded in A-299 through A-327.
+The layouts, ownership policy and remaining limits are recorded in A-299 through A-332.
 
 ## Render state and array execution
 
@@ -266,8 +291,9 @@ Vulkan instanced draw. Vertex formats 1..48 and divisors zero/one are supported.
 global-memory shaders, depth/stencil testing, multiple targets, packed/scaled formats, larger
 divisors, advanced blending and multisample execution remain explicit stops.
 
-Vertex bindings retain owned pool/device generations. Execution resolves their current backing
-and copies only the required prefix on a miss. The cache arms existing CPU page-write tracking
+Vertex bindings retain owned pool/device generations. Flush captures checked backing spans;
+the worker resolves their data after earlier waits and refuses a changed host mapping.
+It copies only the required prefix on a miss. The cache arms existing CPU page-write tracking
 before its snapshot; unchanged mappings/pages reuse the GPU buffer without hashing, copying or
 uploading the bytes again. A rewrite creates a fresh device-local version, leaving earlier GPU
 submissions' buffers alive through their fences. Staging uploads are asynchronous; completed
@@ -275,6 +301,32 @@ staging resources are reaped without a draw-path wait. Native budgets cap each i
 and each queue cache at 64 MiB/4,096 entries; retained in-flight versions can outlive eviction.
 Unbound fixed state uses the API defaults, and unbound viewport/scissor use the full target.
 These are native initialization policies, not wider hardware-state coverage.
+
+## Shared events and buffer visibility
+
+Event builders preserve the consumed 16-byte layout. Native objects preserve the consumed
+40-byte header, using its unused last word as an identity cookie. Initialization validates an
+aligned four-byte range in an ordinary owned pool and leaves the stored value intact. CPU
+reads and writes are naturally aligned atomic word accesses; CPU ADD follows the observed
+load/add/store sequence, with wrapping arithmetic and a final memory fence. It is not an
+atomic read-modify-write operation. Builder output aliasing and object/pool generations are checked.
+
+Event storage imports its stable guest host page with HOST_VISIBLE and HOST_COHERENT required.
+No shadow value or readback copy supplies event status. GPU WRITE/ADD run small internal atomic
+kernels against that actual word, followed by a host visibility dependency. Default signals
+release preceding memory writes with an ALL_COMMANDS dependency; NO_WAIT_MEMORY uses the
+requested top, vertex or bottom source stage. Current vertex execution covers the supported
+vertex-only graphics pipeline. Tests establish storage updates, wrapping and cross-queue
+dataflow; precise pipeline-release timing against the original driver remains unverified.
+Imports requiring alignment above a guest page and virtual/physical event pools remain refused.
+
+Recording snapshots event bindings, so finalizing the event/recorder leaves queued work intact.
+A ledger retains words exposed to GPU event operations until their pool retires. A vertex read
+aliasing one such word binds the coherent import directly; it cannot reuse a stale device-local
+snapshot after an untracked GPU write. Aliases must fit one shared page, and fragmented/larger
+aliases stop explicitly. Ordinary inputs retain their device-local cache. GPU shader resources,
+general buffer/image aliases, broader CPU alias tracking and long-run write-epoch rollover still
+need completion/validation; this event subset does not establish general storage coherence.
 
 ## Validation
 
@@ -312,8 +364,8 @@ It creates a native queue with flags `0x9`, 1 MiB command and control budgets an
 budget. It constructs three display textures and a native window with three 3840×2160 Vulkan
 images, initializes its first command buffer and callbacks, creates a native program, and captures
 its vertex/fragment binaries and passes the render-state constructors before stopping at
-`nvnEventBuilderSetDefaults`. Its report
-confirms three textures, one window, one command buffer, one program, two binaries (1,536 bytes)
+`nvnTextureWriteTexels`. Its report
+confirms five events, four textures, one window, one command buffer, one program, two binaries (1,536 bytes)
 and three GPU clears, with zero translated title modules, recorded sets, native queue submissions,
 presentations or display readback bytes. Vertex copies/uploads and executed state updates are
 also zero at this boundary. It also constructs/maps its first native buffer. Recording, callback
@@ -331,7 +383,7 @@ clears do not establish native title rendering or a gameplay I/O/performance imp
 window tests also pass with Vulkan required; opt-in real-title differential tests are outside
 the standard gate used here.
 
-All 50 NVN2-focused runtime tests pass with Vulkan required. Six command tests cover callback
+All 56 NVN2-focused runtime tests pass with Vulkan required. Six command tests cover callback
 reentry, preserved caller state and callback side effects, disabled/insufficient allocation,
 faults/unwinds, inline begin/queries, recorder and handle lifetimes, called versus copied sets,
 memory reuse, cross-device rejection, atomic handle-array validation and cancellation of
@@ -364,6 +416,18 @@ operations, nonzero-base instancing, fragment Y pixel centers, out-of-range inpu
 pixel of a clipped scissored clear. That clear ignores a 1×1 viewport and preserves recorded
 state after caller memory changes. These are synthetic results, not native title rendering or
 a gameplay I/O/performance improvement.
+
+Six further runtime tests and four backend tests cover events/deferred execution with Vulkan
+and SPIR-V validation required. They check the CPU ABI, preserved initial values, wrapping GPU
+ADD, actual storage writes, cross-queue GPU wakeups, inline CPU stores without notifications,
+finalization while another thread signals, in-flight pool guards, failed initialization and
+cancelled preparations. QueueWaitSync is tested with a flushed source still blocked at an event.
+Duplicate enqueue rejection preserves the recording ticket; a queued reset followed by an
+initially matching wait is checked across all locations/flags. One draw test first caches a
+48-byte triangle input, flushes a wait plus another draw, then creates a new event pointing at
+the first vertex. Another queue changes that vertex on the GPU and releases the wait. Pixels
+verify the changed geometry; cumulative CPU copies/GPU uploads stay at 48 bytes. This covers
+the shared-page alias path without CPU copyback, not general shader/image coherence.
 
 The texture validation trace completed 3,600 frames through the race. These comparisons all
 had zero differences:
@@ -467,19 +531,26 @@ concurrent builds/tests. Frame 3,500 was inspected: race road and HUD are visibl
 through the race start; the different start phase prevents a matched rendering/performance
 comparison. It establishes no native gameplay I/O or rate improvement.
 
-On Windows, `cargo fmt --all --check`, `cargo lint` and `cargo test` pass: 1,219 tests passed and
+The event/deferred-queue off-mode check completed 3,600 frames in 341 seconds, exit zero, with
+no concurrent builds/tests. Frame 3,500 was inspected: GO overlay and HUD are visible, together
+with a large black road region and dark character/structure regions. The road issue remains
+unisolated; the capture does not establish a rendering-regression pass. The last 100 frames at
+3,400/3,500/3,600 took 10.187/10.541/11.850 seconds. These timings are for the default path and
+different race-start phases, and establish no native gameplay I/O or rate improvement.
+
+On Windows, `cargo fmt --all --check`, `cargo lint` and `cargo test` pass: 1,229 tests passed and
 one was ignored.
 
 ## Next
 
-1. Implement event ownership/CPU/GPU visibility at the next initialization boundary. Complete
-   shader resource bindings, remaining texture modes and image/texel coherence; extend program
-   control/stage coverage and dynamic code invalidation.
+1. Implement TextureWriteTexels and general image residency/coherence at the next initialization
+   boundary. Complete shader resource bindings, remaining texture modes, program control/stage
+   coverage and dynamic code invalidation.
 2. Extend typed recording/execution to depth/MRT/indexed/indirect draws, copies/dispatch and
-   views. Complete resource visibility beyond the current retained display-image subset.
-3. Complete GPU visibility, sparse access and in-flight resource lifetime handling without
-   replaying method streams. Validate native title frames and compare race I/O/rate before
-   enabling HLE by default.
+   views. Complete resource visibility beyond retained display images and shared event pages.
+3. Implement vertex-only sync completion and validate precise event release points. Complete
+   broader buffer/CPU aliases, write-epoch rollover, sparse access and in-flight resource
+   lifetimes. Validate native title frames and compare race I/O/rate before enabling HLE by default.
 
 The traced route reaches 247 API functions on the path into the race. That is an observed minimum,
 not complete coverage of NVN2 or of later gameplay.

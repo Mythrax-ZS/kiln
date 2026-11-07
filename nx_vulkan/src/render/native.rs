@@ -72,6 +72,7 @@ pub enum SurfaceCommand {
         surface: Arc<Surface>,
         draw: Arc<crate::native::NativeDraw>,
     },
+    Signal(Arc<crate::native::Signal>),
     Barrier,
 }
 
@@ -106,7 +107,7 @@ impl Queue {
                 SurfaceCommand::Clear { surface, .. } | SurfaceCommand::Draw { surface, .. } => {
                     Some(Arc::clone(surface))
                 }
-                SurfaceCommand::Barrier => None,
+                SurfaceCommand::Signal(_) | SurfaceCommand::Barrier => None,
             })
             .collect();
         surfaces.sort_unstable_by_key(|s| Arc::as_ptr(s) as usize);
@@ -119,6 +120,9 @@ impl Queue {
             .map(|s| s.state.lock().unwrap_or_else(|e| e.into_inner()))
             .collect();
         for operation in commands {
+            if let SurfaceCommand::Signal(signal) = operation {
+                signal.validate(self.context())?;
+            }
             if let SurfaceCommand::Draw { surface, draw } = operation {
                 let i = surfaces
                     .binary_search_by_key(&(Arc::as_ptr(surface) as usize), |s| {
@@ -270,18 +274,17 @@ impl Queue {
                         }
                         clears[i] += 1;
                     }
+                    SurfaceCommand::Signal(signal) => signal.record(vk, cmd),
                     SurfaceCommand::Barrier => memory_barrier(vk, cmd),
                 }
             }
         })?;
         let retained: Vec<Arc<dyn Send + Sync>> = commands
             .iter()
-            .filter_map(|operation| {
-                if let SurfaceCommand::Draw { draw, .. } = operation {
-                    Some(Arc::clone(draw) as Arc<dyn Send + Sync>)
-                } else {
-                    None
-                }
+            .filter_map(|operation| match operation {
+                SurfaceCommand::Draw { draw, .. } => Some(Arc::clone(draw) as Arc<dyn Send + Sync>),
+                SurfaceCommand::Signal(signal) => Some(Arc::clone(signal) as Arc<dyn Send + Sync>),
+                _ => None,
             })
             .collect();
         self.keep_alive(&done, retained);

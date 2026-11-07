@@ -45,6 +45,9 @@ fn merge_spans(spans: &mut Vec<Span>) {
 pub(super) fn collect_leases(ops: &[Op], out: &mut Vec<Lease>) {
     for op in ops {
         match op {
+            Op::WaitEvent { binding, .. } | Op::SignalEvent { binding, .. } => {
+                out.push(binding.lease)
+            }
             Op::Targets(images) => out.extend(images.iter().flatten().map(|t| Lease {
                 pool: t.pool,
                 info: t.parent,
@@ -235,11 +238,15 @@ impl Objects {
         &mut self,
         op: &str,
         cpu: &mut NativeCpu,
-        devices: &Devices,
-        memory: &Memory,
-        textures: &mut Textures,
-        programs: &Programs,
+        resources: &mut Resources<'_>,
     ) -> Result<Step, Error> {
+        let Resources {
+            devices,
+            memory,
+            textures,
+            programs,
+            events,
+        } = resources;
         let (object, a, b, c, d, e) = (
             cpu.state.x[0],
             cpu.state.x[1],
@@ -270,6 +277,8 @@ impl Objects {
                     | "BindVertexBuffers"
                     | "DrawArrays"
                     | "DrawArraysInstanced"
+                    | "WaitEvent"
+                    | "SignalEvent"
             )
         {
             return Err(invalid(&format!("nvnCommandBuffer{op} is not implemented")));
@@ -277,6 +286,35 @@ impl Objects {
         self.adopt_inline_begin(object)?;
         let owner = self.live[&object].device;
         let (ops, command_bytes, control_bytes) = match op {
+            "WaitEvent" | "SignalEvent" => {
+                let binding = events.snapshot(a, memory, devices)?;
+                if binding.lease.info.device != owner {
+                    return Err(invalid("event belongs to another device"));
+                }
+                let event = if op == "WaitEvent" {
+                    if b as u32 > 1 {
+                        return Err(invalid("event wait mode is invalid"));
+                    }
+                    Op::WaitEvent {
+                        binding,
+                        mode: b as u32,
+                        value: c as u32,
+                    }
+                } else {
+                    let signal = devices
+                        .context(owner)?
+                        .event_signal(
+                            Arc::clone(&binding.word),
+                            b as u32,
+                            c as u32,
+                            d as u32,
+                            e as u32,
+                        )
+                        .map_err(|e| invalid(&e))?;
+                    Op::SignalEvent { binding, signal }
+                };
+                (vec![event], 32, 8)
+            }
             _ if is_state => {
                 let value = super::super::state::snapshot(op, cpu)?;
                 (vec![Op::State(value)], 32, 8)
