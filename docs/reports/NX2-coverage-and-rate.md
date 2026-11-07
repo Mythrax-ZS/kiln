@@ -266,7 +266,7 @@ the device's fences about 8%.
 
 ## Open
 
-- **The road was sometimes black.** In about a quarter of the runs that reached the race (7 of
+- **The road was sometimes black (fixed 2026-11-07).** In about a quarter of the runs that reached the race (7 of
   about 30 on 2026-11-06), the road surface was black from the race's start to the end of the
   run, while its markings, the curbs and the rest of the scene were drawn. It was seen before the
   work on the rate too.
@@ -289,9 +289,13 @@ the device's fences about 8%.
     as they were let go, the one with the black road had drawn into targets of sizes the others
     had not (1840x1036, 1856x1044, 1408x788, 704x394, 928x518 and the like: the title rendering
     smaller than 1920x1080 when frames take long). How fast frames come differs from run to run,
-    and with it the sizes the title picks. What to look at next: targets of one address in
-    different sizes, and what reads them (a depth pyramid for culling sampled from a picture of
-    the size before).
+    and with it the sizes the title picks.
+  - Fixed: the title makes its depth targets a multiple of 16 texels wide and describes in its
+    texture headers the part it drew (958 of 960, 922 and 916 of 928, 458 of 464). With one texel
+    of slack (A-153) the renderer did not take such a header as the target's picture and read
+    memory, which holds no depth (A-275): what sampled that depth culled parts of the road. Runs
+    with `NX_TRACE_TEXTURES=1`, slow enough to scale the resolution every time, drew a black road
+    in 3 of 4 runs before and in none of 3 after (frames 3,500 and 4,000 looked at).
 - **The rate:**
   - the waits for the device (the host reading what launches wrote, and the ends of
     submissions);
