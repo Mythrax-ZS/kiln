@@ -246,6 +246,51 @@ fn the_fast_lookup_takes_only_what_it_can_do_in_one_access() {
     }
 }
 
+/// The stores of generated code to a page whose writes are tracked take the checked way, which
+/// sees them (A-126), and they are made.
+#[test]
+fn the_stores_of_generated_code_to_a_watched_page_are_seen_and_made() {
+    use super::mem::{fast_ptr, FAST_WRITE};
+    map(0x2700_0000, 0x2000);
+    let mem = &super::rt().mem;
+    let e = mem.begin_epoch();
+    assert_eq!(
+        mem.untouched_since(0x2700_0000, 0x2000, e),
+        None,
+        "now watched"
+    );
+    let e = mem.begin_epoch();
+    assert!(
+        fast_ptr(0x2700_0008, 8, FAST_WRITE).is_none(),
+        "the fast way declines"
+    );
+    let c = Cpu::new();
+    type Store = fn(*mut NativeCpu, u64);
+    let stores: [Store; 4] = [
+        |c, a| nx_st8(c, a, 0x11, 0),
+        |c, a| nx_st32(c, a, 0x2222_2222, 0),
+        |c, a| nx_stlr64(c, a, 0x3333_3333_3333_3333, 0),
+        |c, a| nx_st16(c, a, 0x4444, 0),
+    ];
+    for (i, store) in stores.iter().enumerate() {
+        let at = 0x2700_0000 + 0x40 * i as u64;
+        let e = mem.begin_epoch();
+        assert_eq!(mem.untouched_since(at, 8, e), Some(true), "store {i}");
+        store(c.0, at);
+        assert_eq!(mem.untouched_since(at, 8, e), Some(false), "store {i}");
+        // Once seen, the page is written the fast way until the next epoch watches it again.
+        assert!(fast_ptr(at & !7, 8, FAST_WRITE).is_some(), "store {i}");
+    }
+    let mut back = [0u8; 8];
+    mem.read_bytes(0x2700_0080, &mut back, false).unwrap();
+    assert_eq!(u64::from_le_bytes(back), 0x3333_3333_3333_3333);
+    assert_eq!(
+        mem.untouched_since(0x2700_1000, 8, e),
+        Some(true),
+        "the other page"
+    );
+}
+
 #[test]
 fn another_threads_store_of_every_size_fails_a_store_exclusive() {
     map(0x1800_0000, 0x1000);

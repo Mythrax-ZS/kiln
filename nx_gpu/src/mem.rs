@@ -48,6 +48,24 @@ pub trait GuestMemory: Send + Sync {
         0
     }
 
+    /// As [`GuestMemory::begin_write_epoch`], and put in `changed` the ranges (address and
+    /// length) that may have changed since the epoch before began: the pages written in it,
+    /// and the parts the tracking stops watching, whose writes it does not see from now on. A
+    /// reader that keeps what it found unchanged from one epoch to the next without asking
+    /// [`GuestMemory::untouched_since`] again drops what it holds over these ranges. By default
+    /// everything may have changed.
+    fn begin_write_epoch_into(&self, changed: &mut Vec<(u64, u64)>) -> u32 {
+        changed.clear();
+        changed.push((0, u64::MAX));
+        self.begin_write_epoch()
+    }
+
+    /// A reader still keeps what it found of the `len` bytes at `addr`: the tracking goes on
+    /// watching them as if they were asked about now (without saying anything of them).
+    fn keep_watching(&self, addr: u64, len: u64) {
+        let _ = (addr, len);
+    }
+
     /// Whether none of the `len` bytes at `addr` was written since epoch `epoch` began:
     /// `Some(true)` if none was, `Some(false)` if some was, `None` if that cannot be told (the
     /// memory is not tracked, or nobody has asked about it before). A reader looks at the bytes

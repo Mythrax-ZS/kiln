@@ -42,7 +42,36 @@ const EXEC: u64 = 4;
 /// The page is one `NX_TRAP_WRITES` asks about: it is writable but its entry does not say so, so
 /// that every write takes the checked path, which reports it ([`super::trap`]).
 const TRAP: u64 = 1 << 4;
+/// The page's writes are tracked (A-126): its entry's write bit is taken away while it is
+/// watched, so that the first write to it goes the checked way, which stamps the page and gives
+/// the bit back.
+const WATCH: u64 = 1 << 5;
+/// A watched page's permissions allow writes (its entry's write bit is away while it is watched).
+const WAS_W: u64 = 1 << 6;
 const FLAGS: u64 = 0xFFF;
+
+/// The entry of a watched page as it is when the page is no longer watched.
+fn unwatched(e: u64) -> u64 {
+    let mut n = e & !(WATCH | WAS_W);
+    if e & WAS_W != 0 && e & TRAP == 0 {
+        n |= WRITE;
+    }
+    n
+}
+
+/// The entry of a page that is to be watched, or `None` when it is not a page or is watched.
+fn watched(e: u64) -> Option<u64> {
+    if e & PRESENT == 0 || e & WATCH != 0 {
+        return None;
+    }
+    Some(if e & WRITE != 0 {
+        (e & !WRITE) | WATCH | WAS_W
+    } else if e & TRAP != 0 {
+        e | WATCH | WAS_W
+    } else {
+        e | WATCH
+    })
+}
 
 type L2 = [AtomicU64; L2_ENTRIES];
 
@@ -149,107 +178,40 @@ pub struct GuestMemory {
     traps: super::trap::Traps,
 }
 
-/// The smallest block of memory whose writes are tracked: the memory of textures is in large
-/// blocks, and a small block is not worth the system's bookkeeping.
+/// The smallest block of memory allocated from the system directly (a large one is page-aligned
+/// and zeroed by the system).
 const WATCH_MIN: usize = 1 << 20;
 
-/// Which pages of memory were written, as far as the system's write tracking says (Windows
-/// `MEM_WRITE_WATCH`; docs/ASSUMPTIONS.md A-126). Time is cut into epochs: each call of
-/// [`GuestMemory::begin_epoch`] ends one and starts the next, and a page that was written during
-/// an epoch is stamped with the number of the epoch that follows it. A reader that looked at the
-/// bytes of a range after epoch `e` began knows they are as it saw them if no page of the range
-/// has a stamp above `e`.
+/// Which pages of memory were written (docs/ASSUMPTIONS.md A-126), as the page table itself sees
+/// it: a watched page's entry has its write bit taken away ([`WATCH`]), so that the first write to
+/// it goes the checked way, which stamps the page and gives the bit back, and the pages written
+/// in an epoch are watched again when the next one begins. Time is cut into epochs: each call of
+/// [`GuestMemory::begin_epoch`] ends one and starts the next, and a page written during an epoch
+/// is stamped with the number of the epoch that follows it. A reader that looked at the bytes of
+/// a range after epoch `e` began knows they are as it saw them if no page of the range has a
+/// stamp above `e`.
 #[derive(Default)]
 struct Writes {
     epoch: u32,
-    /// The tracked blocks (address and size), by address, and whether they are harvested.
-    blocks: Vec<Watched>,
-    /// The stamps, in runs of 512 pages, by the number of the first page.
-    stamps: HashMap<usize, Box<[u32; 512]>>,
-    /// Room for the pages one harvest finds.
-    scratch: Vec<usize>,
-    /// How many pages the harvests found (for the trace).
+    /// The chunks whose pages are watched, by number: the epoch each was watched from, and the
+    /// epoch it was last asked about in. Only the chunks somebody asked about lately are watched.
+    chunks: HashMap<u64, (u32, u32)>,
+    /// The stamps of the pages of each chunk, by chunk.
+    stamps: HashMap<u64, Box<[u32; 512]>>,
+    /// The pages written since the epoch began, to be watched again when the next one begins.
+    written: Vec<u64>,
+    /// For the trace (`NX_TRACE_PERF`): the pages found written, and the chunks watched from a
+    /// question, since the last line.
     pages: usize,
-    /// The harvests made by questions about parts not harvested yet, and the time they took,
-    /// since the last trace (`NX_TRACE_PERF`).
-    asked_harvests: usize,
-    asked_time: std::time::Duration,
+    begun: usize,
 }
 
-struct Watched {
-    base: usize,
-    len: usize,
-    /// For each [`CHUNK`] of the block, whether it is harvested at each epoch: only the parts
-    /// somebody asked about lately are, as asking costs less than reading the system's bits of
-    /// memory nobody looks at (a block of the title's is 3 GB).
-    active: Vec<bool>,
-    /// For each chunk, the epoch it was last asked about in.
-    asked: Vec<u32>,
-}
+/// A chunk: the 512 pages of a second-level table, watched or not as a whole.
+const CHUNK_SHIFT: u32 = L1_SHIFT;
 
-/// The part of a block that is harvested, or not, as a whole.
-const CHUNK: usize = 2 << 20;
-
-/// The epochs a chunk nobody asks about stays harvested. Harvesting is the system walking the
-/// chunk's pages, every epoch; a chunk let go keeps its pages' written bits with the system, and
-/// the next question about it harvests it again and is answered "not known" (A-277).
+/// The epochs a chunk nobody asks about stays watched. A chunk let go is no longer tracked: the
+/// next question about it watches it again and is answered "not known" (A-277).
 const IDLE_EPOCHS: u32 = 60;
-
-/// The most the system is asked about in one call.
-const HARVEST_STEP: usize = 64 << 20;
-
-impl Writes {
-    /// Stamp the pages of `[base, base + len)` that were written since they were last harvested.
-    fn harvest_range(&mut self, base: usize, len: usize) {
-        let mut scratch = std::mem::take(&mut self.scratch);
-        let stamp = self.epoch;
-        let mut at = base;
-        while at < base + len {
-            let n = HARVEST_STEP.min(base + len - at);
-            tracking::harvest(at, n, &mut scratch);
-            let mut run: Option<(usize, *mut [u32; 512])> = None;
-            for page in scratch.iter().map(|a| a >> 12) {
-                let first = page & !511;
-                let stamps = match run {
-                    Some((f, p)) if f == first => p,
-                    _ => {
-                        let p: *mut [u32; 512] = &mut **self
-                            .stamps
-                            .entry(first)
-                            .or_insert_with(|| Box::new([0; 512]));
-                        run = Some((first, p));
-                        p
-                    }
-                };
-                // SAFETY: the box lives in `stamps`, which is not touched while `run` is used.
-                unsafe { (*stamps)[page & 511] = stamp };
-            }
-            self.pages += scratch.len();
-            at += n;
-        }
-        self.scratch = scratch;
-    }
-
-    /// Harvest every chunk of block `i` that is active.
-    fn harvest_active(&mut self, i: usize) {
-        let (base, len) = (self.blocks[i].base, self.blocks[i].len);
-        let chunks = self.blocks[i].active.len();
-        let mut c = 0;
-        while c < chunks {
-            if !self.blocks[i].active[c] {
-                c += 1;
-                continue;
-            }
-            let first = c;
-            while c < chunks && self.blocks[i].active[c] {
-                c += 1;
-            }
-            let from = first * CHUNK;
-            let to = (c * CHUNK).min(len);
-            self.harvest_range(base + from, to - from);
-        }
-    }
-}
 
 // SAFETY: the raw pointers in `blocks` are host allocations owned by this value; guest data races
 // are the guest program's business, like on hardware.
@@ -420,19 +382,6 @@ impl GuestMemory {
             layout,
             watched,
         });
-        if watched {
-            let mut w = self.writes.lock().unwrap();
-            let at = w.blocks.partition_point(|b| b.base < host as usize);
-            w.blocks.insert(
-                at,
-                Watched {
-                    base: host as usize,
-                    len: size as usize,
-                    active: vec![false; (size as usize).div_ceil(CHUNK)],
-                    asked: vec![0; (size as usize).div_ceil(CHUNK)],
-                },
-            );
-        }
         let flags = flags_of(permissions);
         for page in 0..size / PAGE_SIZE {
             let a = addr + page * PAGE_SIZE;
@@ -441,6 +390,7 @@ impl GuestMemory {
             self.l2_for_map(a)[((a >> 12) & 511) as usize]
                 .store(p | self.entry_flags(a, flags), Ordering::Release);
         }
+        self.rewatch(addr, size);
         Ok(())
     }
 
@@ -470,6 +420,7 @@ impl GuestMemory {
             self.l2_for_map(a)[((a >> 12) & 511) as usize]
                 .store(host | self.entry_flags(a, flags), Ordering::Release);
         }
+        self.rewatch(dst, size);
         Ok(())
     }
 
@@ -482,6 +433,7 @@ impl GuestMemory {
                 t[((a >> 12) & 511) as usize].store(0, Ordering::Release);
             }
         }
+        self.rewatch(addr, size);
         Ok(())
     }
 
@@ -504,94 +456,202 @@ impl GuestMemory {
                 Ordering::Release,
             );
         }
+        self.rewatch(addr, size);
         Ok(())
+    }
+
+    /// The entry of the page at `addr`, where there is a second-level table for it.
+    fn slot(&self, addr: u64) -> Option<&AtomicU64> {
+        if addr >> ADDRESS_BITS != 0 {
+            return None;
+        }
+        self.l2(addr).map(|t| &t[((addr >> 12) & 511) as usize])
+    }
+
+    /// Watch the page at `addr` (with the tracking locked).
+    fn watch_page(&self, addr: u64) {
+        if let Some(slot) = self.slot(addr) {
+            let _ = slot.try_update(Ordering::AcqRel, Ordering::Relaxed, watched);
+        }
+    }
+
+    /// A write to the watched page at `addr`: the page is stamped and written freely until the
+    /// next epoch begins.
+    #[cold]
+    fn note_write(&self, addr: u64) {
+        let mut w = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(slot) = self.slot(addr) else {
+            return;
+        };
+        let freed = slot.try_update(Ordering::AcqRel, Ordering::Relaxed, |e| {
+            (e & WATCH != 0).then(|| unwatched(e))
+        });
+        // Another write was first.
+        if freed.is_err() {
+            return;
+        }
+        let page = addr >> 12;
+        let stamp = w.epoch.wrapping_add(1);
+        w.stamps
+            .entry(addr >> CHUNK_SHIFT)
+            .or_insert_with(|| Box::new([0; 512]))[(page & 511) as usize] = stamp;
+        w.written.push(addr & !(PAGE_SIZE - 1));
+        w.pages += 1;
+    }
+
+    /// The pages of `[addr, addr + size)` changed under the tracking (mapped, unmapped, given
+    /// other permissions): those of watched chunks count as written now and are watched again.
+    fn rewatch(&self, addr: u64, size: u64) {
+        let mut w = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        if w.chunks.is_empty() || size == 0 {
+            return;
+        }
+        let stamp = w.epoch.wrapping_add(1);
+        let end = addr + size;
+        for c in addr >> CHUNK_SHIFT..=(end - 1) >> CHUNK_SHIFT {
+            if !w.chunks.contains_key(&c) {
+                continue;
+            }
+            let from = addr.max(c << CHUNK_SHIFT);
+            let to = end.min((c + 1) << CHUNK_SHIFT);
+            let stamps = w.stamps.entry(c).or_insert_with(|| Box::new([0; 512]));
+            for a in (from..to).step_by(PAGE_SIZE as usize) {
+                stamps[((a >> 12) & 511) as usize] = stamp;
+                self.watch_page(a);
+            }
+            w.written.extend((from..to).step_by(PAGE_SIZE as usize));
+        }
     }
 
     /// End the epoch of write tracking that is running and start the next: the number of the new
     /// one, to be kept by whoever looks at memory from now on and asks [`Self::untouched_since`]
-    /// later. 0 when memory is not tracked.
+    /// later.
     pub fn begin_epoch(&self) -> u32 {
-        if !tracking::AVAILABLE {
-            return 0;
-        }
-        let mut w = self.writes.lock().unwrap();
-        w.epoch = w.epoch.wrapping_add(1).max(1);
+        self.begin_epoch_into(&mut Vec::new())
+    }
+
+    /// As [`Self::begin_epoch`], and put in `changed` the guest ranges (address and length) that
+    /// may have changed since the epoch before began: the pages written in it (or remapped, or
+    /// given other permissions), and the chunks no longer watched from now on.
+    pub fn begin_epoch_into(&self, changed: &mut Vec<(u64, u64)>) -> u32 {
+        changed.clear();
+        let mut w = self.writes.lock().unwrap_or_else(|e| e.into_inner());
         let began = std::time::Instant::now();
-        w.pages = 0;
-        let mut chunks = 0;
+        // The pages written in the epoch that ends are watched again before it ends: a write
+        // after this is stamped with the number of the next.
+        let mut written = std::mem::take(&mut w.written);
+        for &a in &written {
+            if w.chunks.contains_key(&(a >> CHUNK_SHIFT)) {
+                self.watch_page(a);
+            }
+        }
+        written.sort_unstable();
+        for &a in &written {
+            match changed.last_mut() {
+                Some((at, len)) if *at + *len == a => *len += PAGE_SIZE,
+                Some((at, len)) if *at + *len > a => {}
+                _ => changed.push((a, PAGE_SIZE)),
+            }
+        }
+        written.clear();
+        w.written = written;
+        // The chunks nobody asked about lately are let go.
         let epoch = w.epoch;
-        for i in 0..w.blocks.len() {
-            let b = &mut w.blocks[i];
-            for (active, asked) in b.active.iter_mut().zip(&b.asked) {
-                if *active && epoch.wrapping_sub(*asked) > IDLE_EPOCHS {
-                    *active = false;
+        let idle: Vec<u64> = w
+            .chunks
+            .iter()
+            .filter(|(_, (_, asked))| epoch.wrapping_sub(*asked) > IDLE_EPOCHS)
+            .map(|(c, _)| *c)
+            .collect();
+        for c in idle {
+            w.chunks.remove(&c);
+            w.stamps.remove(&c);
+            changed.push((c << CHUNK_SHIFT, 1 << CHUNK_SHIFT));
+            for p in 0..512 {
+                if let Some(slot) = self.slot((c << CHUNK_SHIFT) + p * PAGE_SIZE) {
+                    let _ = slot.try_update(Ordering::AcqRel, Ordering::Relaxed, |e| {
+                        (e & WATCH != 0).then(|| unwatched(e))
+                    });
                 }
             }
-            chunks += b.active.iter().filter(|a| **a).count();
-            w.harvest_active(i);
         }
+        w.epoch = w.epoch.wrapping_add(1).max(1);
         if w.epoch.is_multiple_of(100) && std::env::var_os("NX_TRACE_PERF").is_some() {
             eprintln!(
-                "[memory] epoch {}: harvested {chunks} chunks of {} MB in {:?}, {} pages written; since the last line, questions about parts not harvested harvested {} times in {:?}",
+                "[memory] epoch {}: {} chunks of {} MB watched, {} pages written since the last line, {} chunks watched from a question; the epoch began in {:?}",
                 w.epoch,
-                CHUNK >> 20,
-                began.elapsed(),
+                w.chunks.len(),
+                (1u64 << CHUNK_SHIFT) >> 20,
                 w.pages,
-                w.asked_harvests,
-                w.asked_time
+                w.begun,
+                began.elapsed()
             );
-            w.asked_harvests = 0;
-            w.asked_time = std::time::Duration::ZERO;
+            w.pages = 0;
+            w.begun = 0;
         }
         w.epoch
     }
 
-    /// Whether none of the `len` bytes at host address `host` was written since epoch `epoch`
-    /// began (`Some(true)`), or some was (`Some(false)`). `None` if that cannot be told: the
-    /// bytes are not all in a tracked block, or the part of the block has not been looked at
-    /// before. Asking starts the harvesting of that part, so a later question about it can be
-    /// answered.
-    pub fn untouched_since(&self, host: *const u8, len: usize, epoch: u32) -> Option<bool> {
-        if !tracking::AVAILABLE || len == 0 || epoch == 0 {
-            return None;
-        }
-        let (start, end) = (host as usize, (host as usize).checked_add(len)?);
-        let mut w = self.writes.lock().unwrap();
-        let i = w
-            .blocks
-            .partition_point(|b| b.base <= start)
-            .checked_sub(1)?;
-        let b = &w.blocks[i];
-        if end > b.base + b.len {
-            return None;
-        }
-        let (first, last) = ((start - b.base) / CHUNK, (end - 1 - b.base) / CHUNK);
+    /// A reader still keeps what it found of the `len` bytes of guest memory at `addr`: the
+    /// chunks of them that are watched count as asked about now, and are not let go.
+    pub fn keep_watching(&self, addr: u64, len: u64) {
+        let Some(end) = addr.checked_add(len).filter(|_| len > 0) else {
+            return;
+        };
+        let mut w = self.writes.lock().unwrap_or_else(|e| e.into_inner());
         let now = w.epoch;
-        w.blocks[i].asked[first..=last].fill(now);
-        let b = &w.blocks[i];
-        if !b.active[first..=last].iter().all(|a| *a) {
-            // Bring the bits of the chunks up to date: the next epoch stamps what is written from
-            // now.
-            let began = std::time::Instant::now();
-            for c in first..=last {
-                if !w.blocks[i].active[c] {
-                    w.blocks[i].active[c] = true;
-                    let base = w.blocks[i].base + c * CHUNK;
-                    let len = CHUNK.min(w.blocks[i].len - c * CHUNK);
-                    w.harvest_range(base, len);
-                    w.asked_harvests += 1;
+        for c in addr >> CHUNK_SHIFT..=(end - 1) >> CHUNK_SHIFT {
+            if let Some((_, asked)) = w.chunks.get_mut(&c) {
+                *asked = now;
+            }
+        }
+    }
+
+    /// Whether none of the `len` bytes of guest memory at `addr` was written since epoch `epoch`
+    /// began (`Some(true)`), or some was (`Some(false)`). `None` if that cannot be told: a page of
+    /// the range is not mapped, or a part of it was not watched before the epoch began. Asking
+    /// starts the watching of that part, so a later question about it can be answered.
+    pub fn untouched_since(&self, addr: u64, len: u64, epoch: u32) -> Option<bool> {
+        if len == 0 || epoch == 0 {
+            return None;
+        }
+        let end = addr.checked_add(len)?;
+        if end > 1 << ADDRESS_BITS || !self.is_mapped(addr, len) {
+            return None;
+        }
+        let mut w = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        let now = w.epoch;
+        let mut known = true;
+        for c in addr >> CHUNK_SHIFT..=(end - 1) >> CHUNK_SHIFT {
+            match w.chunks.get_mut(&c) {
+                Some((since, asked)) => {
+                    *asked = now;
+                    // Watched from within the epoch or later: a write between the reader's look
+                    // and then was not seen.
+                    known &= *since < epoch;
+                }
+                None => {
+                    w.chunks.insert(c, (now, now));
+                    w.begun += 1;
+                    for p in 0..512 {
+                        self.watch_page((c << CHUNK_SHIFT) + p * PAGE_SIZE);
+                    }
+                    known = false;
                 }
             }
-            w.asked_time += began.elapsed();
+        }
+        if !known {
             return None;
         }
-        let mut page = start >> 12;
-        let last = (end - 1) >> 12;
+        let (mut page, last) = (addr >> 12, (end - 1) >> 12);
         while page <= last {
-            let first = page & !511;
-            let upto = last.min(first + 511);
-            if let Some(run) = w.stamps.get(&first) {
-                if run[page & 511..=upto & 511].iter().any(|s| *s > epoch) {
+            let c = page >> 9;
+            let upto = last.min((c << 9) + 511);
+            if let Some(stamps) = w.stamps.get(&c) {
+                if stamps[(page & 511) as usize..=(upto & 511) as usize]
+                    .iter()
+                    .any(|s| *s > epoch)
+                {
                     return Some(false);
                 }
             }
@@ -648,8 +708,14 @@ impl GuestMemory {
             return Err(FaultKind::Unmapped);
         }
         if e & if write { WRITE } else { READ } == 0 {
-            if write && e & TRAP != 0 {
-                self.traps.hit(addr, bytes, value);
+            // A trapped page and a watched writable one are written, and say so.
+            if write && e & (TRAP | WAS_W) != 0 {
+                if e & TRAP != 0 {
+                    self.traps.hit(addr, bytes, value);
+                }
+                if e & WATCH != 0 {
+                    self.note_write(addr);
+                }
             } else {
                 return Err(FaultKind::Permission);
             }
@@ -738,11 +804,14 @@ impl GuestMemory {
             if e & PRESENT == 0 {
                 return Err(FaultKind::Unmapped);
             }
-            if check && e & (WRITE | TRAP) == 0 {
+            if check && e & (WRITE | TRAP | WAS_W) == 0 {
                 return Err(FaultKind::Permission);
             }
             if e & TRAP != 0 {
                 self.traps.hit(at, n, None);
+            }
+            if e & WATCH != 0 {
+                self.note_write(at);
             }
             let dst = ((e & !FLAGS) as *mut u8).wrapping_add((at & (PAGE_SIZE - 1)) as usize);
             // SAFETY: `dst..dst + n` is inside a live page.
@@ -996,7 +1065,7 @@ unsafe fn store(p: *mut u8, size: u8, value: u128, order: Ordering) {
     }
 }
 
-/// The system's write tracking.
+/// Large blocks of memory straight from the system.
 #[cfg(windows)]
 mod tracking {
     use std::ffi::c_void;
@@ -1004,33 +1073,23 @@ mod tracking {
     extern "system" {
         fn VirtualAlloc(addr: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
         fn VirtualFree(addr: *mut c_void, size: usize, kind: u32) -> i32;
-        fn GetWriteWatch(
-            flags: u32,
-            base: *mut c_void,
-            size: usize,
-            addresses: *mut *mut c_void,
-            count: *mut usize,
-            granularity: *mut u32,
-        ) -> u32;
     }
 
     const MEM_COMMIT: u32 = 0x1000;
     const MEM_RESERVE: u32 = 0x2000;
     const MEM_RELEASE: u32 = 0x8000;
-    const MEM_WRITE_WATCH: u32 = 0x0020_0000;
     const PAGE_READWRITE: u32 = 4;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
 
     pub const AVAILABLE: bool = true;
 
-    /// `size` bytes of zeroed memory whose writes the system tracks.
+    /// `size` bytes of zeroed memory.
     pub fn alloc(size: usize) -> *mut u8 {
         // SAFETY: a plain allocation; null on failure.
         unsafe {
             VirtualAlloc(
                 std::ptr::null_mut(),
                 size,
-                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                MEM_RESERVE | MEM_COMMIT,
                 PAGE_READWRITE,
             )
             .cast()
@@ -1041,29 +1100,6 @@ mod tracking {
     /// `ptr` came from [`alloc`] and is not used again.
     pub unsafe fn free(ptr: *mut u8) {
         VirtualFree(ptr.cast(), 0, MEM_RELEASE);
-    }
-
-    /// Put in `pages` the addresses of the pages of the block that were written since the last
-    /// harvest, and forget that they were.
-    pub fn harvest(base: usize, len: usize, pages: &mut Vec<usize>) {
-        // Room for every page of the block, so that one call finds them all.
-        pages.clear();
-        pages.resize(len / 4096, 0);
-        let mut count = pages.len();
-        let mut granularity = 0u32;
-        // SAFETY: the range is one block from `alloc`; `pages` has room for `count` addresses (a
-        // `usize` is a pointer's size).
-        let status = unsafe {
-            GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
-                base as *mut c_void,
-                len,
-                pages.as_mut_ptr().cast::<*mut c_void>(),
-                &mut count,
-                &mut granularity,
-            )
-        };
-        pages.truncate(if status == 0 { count } else { 0 });
     }
 }
 
@@ -1078,8 +1114,6 @@ mod tracking {
     /// # Safety
     /// Never called: nothing is allocated.
     pub unsafe fn free(_ptr: *mut u8) {}
-
-    pub fn harvest(_base: usize, _len: usize, _pages: &mut Vec<usize>) {}
 }
 
 #[cfg(test)]
@@ -1301,91 +1335,153 @@ mod tests {
         }
     }
 
-    /// Writes to a large block are noticed by the epochs, and only the pages written.
-    #[cfg(windows)]
+    /// Writes are noticed by the epochs, and only the pages written.
     #[test]
     fn written_pages_are_found_by_the_epoch_they_were_written_in() {
         let mem = GuestMemory::new();
         let base = 0x4000_0000u64;
         let size = 4u64 << 20;
         mem.map(base, size, perm::R | perm::W).unwrap();
-        let host = |a: u64| mem.host_run(a, 4096).unwrap().0 as *const u8;
-        // The first question about a block cannot be answered; it starts the tracking.
+        // The first question about a chunk cannot be answered; it starts the watching.
         let e1 = mem.begin_epoch();
         assert!(e1 > 0);
-        assert_eq!(mem.untouched_since(host(base), 8192, e1), None);
-        // The part of the block far away is another part of the tracking (A-277): it is asked
-        // about too.
-        assert_eq!(mem.untouched_since(host(base + (3 << 20)), 100, e1), None);
+        assert_eq!(mem.untouched_since(base, 8192, e1), None);
+        // The chunk far away is watched on its own (A-277): it is asked about too.
+        assert_eq!(mem.untouched_since(base + (3 << 20), 100, e1), None);
         let e2 = mem.begin_epoch();
         assert!(e2 > e1);
-        assert_eq!(mem.untouched_since(host(base), 8192, e2), Some(true));
-        assert_eq!(
-            mem.untouched_since(host(base + (3 << 20)), 100, e2),
-            Some(true)
-        );
-        // A write to the second page of the range, and one far away.
+        assert_eq!(mem.untouched_since(base, 8192, e2), Some(true));
+        assert_eq!(mem.untouched_since(base + (3 << 20), 100, e2), Some(true));
+        // A write to the second page of the range, and one far away, each made a way the
+        // runtime writes.
         mem.write_bytes(base + 4096 + 8, &[1, 2, 3], true).unwrap();
-        mem.write_bytes(base + (3 << 20), &[9], true).unwrap();
-        let e3 = mem.begin_epoch();
+        mem.write(base + (3 << 20), 1, 9, Ordering::Relaxed)
+            .unwrap();
+        // Seen at once, and the pages stay writable.
+        assert_eq!(mem.untouched_since(base, 8192, e2), Some(false));
+        mem.write(base + 4096 + 16, 8, 5, Ordering::Relaxed)
+            .unwrap();
+        // The next epoch says which pages may have changed: those two, each once.
+        let mut changed = Vec::new();
+        let e3 = mem.begin_epoch_into(&mut changed);
         assert_eq!(
-            mem.untouched_since(host(base), 8192, e2),
+            changed,
+            [(base + 4096, PAGE_SIZE), (base + (3 << 20), PAGE_SIZE)]
+        );
+        assert_eq!(
+            mem.untouched_since(base, 8192, e2),
             Some(false),
             "the second page was written after epoch e2 began"
         );
         assert_eq!(
-            mem.untouched_since(host(base), 4096, e2),
+            mem.untouched_since(base, 4096, e2),
             Some(true),
             "the first page was not"
         );
-        assert_eq!(
-            mem.untouched_since(host(base + (3 << 20)), 100, e2),
-            Some(false)
-        );
-        // Looked at again after the write: untouched from then on.
-        assert_eq!(mem.untouched_since(host(base), 8192, e3), Some(true));
-        // A range past the block cannot be answered.
-        assert_eq!(
-            mem.untouched_since(host(base + size - 4096), 8192, e3),
-            None
-        );
+        assert_eq!(mem.untouched_since(base + (3 << 20), 100, e2), Some(false));
+        // Looked at again after the write: untouched from then on, until the next write, which
+        // the page being watched again sees.
+        assert_eq!(mem.untouched_since(base, 8192, e3), Some(true));
+        mem.compare_exchange(base + 4096 + 16, 8, 5, 6, Ordering::Relaxed)
+            .unwrap();
+        assert_eq!(mem.untouched_since(base, 8192, e3), Some(false));
+        let mut back = [0u8; 8];
+        mem.read_bytes(base + 4096 + 16, &mut back, true).unwrap();
+        assert_eq!(u64::from_le_bytes(back), 6);
+        // A range past the memory cannot be answered.
+        assert_eq!(mem.untouched_since(base + size - 4096, 8192, e3), None);
     }
 
-    /// A chunk nobody asks about is let go after a while; the next question about it is not
-    /// answered, and the writes made meanwhile are still found after it (A-277).
-    #[cfg(windows)]
+    /// A chunk nobody asks about is let go after a while, and the next question about it is not
+    /// answered (A-277): a write made meanwhile is not lost on the reader, who looks again.
     #[test]
-    fn a_chunk_nobody_asks_about_is_let_go_and_its_writes_are_still_found() {
+    fn a_chunk_nobody_asks_about_is_let_go_and_cannot_say_afterwards() {
         let mem = GuestMemory::new();
         let base = 0x4000_0000u64;
         mem.map(base, 4 << 20, perm::R | perm::W).unwrap();
-        let host = |a: u64| mem.host_run(a, 4096).unwrap().0 as *const u8;
         let e = mem.begin_epoch();
-        assert_eq!(mem.untouched_since(host(base), 4096, e), None);
+        assert_eq!(mem.untouched_since(base, 4096, e), None);
         let looked = mem.begin_epoch();
-        assert_eq!(mem.untouched_since(host(base), 4096, looked), Some(true));
-        // Nobody asks for longer than a chunk stays harvested, and the page is written meanwhile.
+        assert_eq!(mem.untouched_since(base, 4096, looked), Some(true));
+        let mut said = Vec::new();
         for _ in 0..IDLE_EPOCHS + 2 {
-            mem.begin_epoch();
+            let mut changed = Vec::new();
+            mem.begin_epoch_into(&mut changed);
+            said.extend(changed);
         }
+        // Let go: the page is as its permissions say, and a write to it is not seen; the epoch
+        // that let it go said so, once.
+        assert_eq!(mem.entry(base) & (WRITE | WATCH), WRITE);
+        assert_eq!(said, [(base, 1 << CHUNK_SHIFT)]);
         mem.write_bytes(base + 16, &[7], true).unwrap();
-        let later = mem.begin_epoch();
+        mem.begin_epoch();
         assert_eq!(
-            mem.untouched_since(host(base), 4096, looked),
+            mem.untouched_since(base, 4096, looked),
             None,
             "a chunk let go cannot say"
         );
-        let after = mem.begin_epoch();
         assert_eq!(
-            mem.untouched_since(host(base), 4096, looked),
-            Some(false),
-            "the write made while it was let go is found"
+            mem.untouched_since(base, 4096, looked),
+            None,
+            "nor when asked again: it was watched after the reader looked"
         );
-        assert_eq!(mem.untouched_since(host(base), 4096, after), Some(true));
-        let _ = later;
+        let after = mem.begin_epoch();
+        assert_eq!(mem.untouched_since(base, 4096, after), Some(true));
     }
 
-    /// A block too small to be tracked is not answered for.
+    /// Watching a page changes nothing a program can see: a read-only page stays read-only, a
+    /// writable one writable, and the permissions given to a watched page later are kept, the
+    /// page still watched.
+    #[test]
+    fn watching_a_page_keeps_its_permissions() {
+        let mem = GuestMemory::new();
+        mem.map(0x5000_0000, 64 << 10, perm::R | perm::W).unwrap();
+        mem.map(0x5001_0000, PAGE_SIZE, perm::R).unwrap();
+        let e = mem.begin_epoch();
+        assert_eq!(mem.untouched_since(0x5000_0000, 0x11000, e), None);
+        assert_ne!(mem.entry(0x5000_0000) & WATCH, 0);
+        assert_eq!(
+            mem.write(0x5001_0000, 4, 1, Ordering::Relaxed),
+            Err(FaultKind::Permission)
+        );
+        assert_eq!(
+            mem.write_bytes(0x5001_0000, &[1], true),
+            Err(FaultKind::Permission)
+        );
+        let e = mem.begin_epoch();
+        assert_eq!(mem.untouched_since(0x5000_0000, 0x11000, e), Some(true));
+        // What the runtime writes past the permissions (the loader, the GPU) is seen too.
+        mem.write_bytes(0x5001_0000, &[1], false).unwrap();
+        assert_eq!(mem.untouched_since(0x5001_0000, 16, e), Some(false));
+        // Made read-only, then writable again: still watched.
+        let e = mem.begin_epoch();
+        mem.protect(0x5000_0000, PAGE_SIZE, perm::R).unwrap();
+        assert_eq!(
+            mem.write(0x5000_0000, 4, 1, Ordering::Relaxed),
+            Err(FaultKind::Permission)
+        );
+        mem.protect(0x5000_0000, PAGE_SIZE, perm::R | perm::W)
+            .unwrap();
+        let e2 = mem.begin_epoch();
+        assert_eq!(
+            mem.untouched_since(0x5000_0000, 16, e),
+            Some(false),
+            "a change of permissions counts as a write"
+        );
+        assert_eq!(mem.untouched_since(0x5000_0000, 16, e2), Some(true));
+        mem.write(0x5000_0000, 4, 1, Ordering::Relaxed).unwrap();
+        assert_eq!(mem.untouched_since(0x5000_0000, 16, e2), Some(false));
+        // Unmapped and mapped again under a watched chunk: fresh pages, which count as written.
+        let e3 = mem.begin_epoch();
+        mem.unmap(0x5000_4000, PAGE_SIZE).unwrap();
+        assert_eq!(mem.untouched_since(0x5000_4000, 16, e3), None);
+        mem.map(0x5000_4000, PAGE_SIZE, perm::R | perm::W).unwrap();
+        assert_eq!(mem.untouched_since(0x5000_4000, 16, e3), Some(false));
+        let e4 = mem.begin_epoch();
+        mem.write(0x5000_4000, 4, 2, Ordering::Relaxed).unwrap();
+        assert_eq!(mem.untouched_since(0x5000_4000, 16, e4), Some(false));
+    }
+
     #[test]
     fn writes_to_a_trapped_page_are_reported_and_still_done() {
         use crate::rt::trap::Traps;
@@ -1430,14 +1526,5 @@ mod tests {
             Err(FaultKind::Permission)
         );
         assert_eq!(m.traps.hits(), 0);
-    }
-
-    #[test]
-    fn small_blocks_are_not_tracked() {
-        let mem = GuestMemory::new();
-        mem.map(0x5000_0000, 64 << 10, perm::R | perm::W).unwrap();
-        let p = mem.host_run(0x5000_0000, 4096).unwrap().0 as *const u8;
-        let e = mem.begin_epoch();
-        assert_eq!(mem.untouched_since(p, 4096, e), None);
     }
 }

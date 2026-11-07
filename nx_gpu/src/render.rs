@@ -118,6 +118,17 @@ impl Scene<'_> {
         self.mem.begin_write_epoch()
     }
 
+    /// As [`Scene::begin_write_epoch`], with the ranges that may have changed since the epoch
+    /// before began (see [`GuestMemory::begin_write_epoch_into`]).
+    pub fn begin_write_epoch_into(&self, changed: &mut Vec<(u64, u64)>) -> u32 {
+        self.mem.begin_write_epoch_into(changed)
+    }
+
+    /// See [`GuestMemory::keep_watching`].
+    pub fn keep_watching(&self, addr: u64, len: u64) {
+        self.mem.keep_watching(addr, len)
+    }
+
     /// Whether none of the `len` bytes of GPU memory at `va` was written since epoch `epoch`
     /// began (see [`AddressSpace::untouched_since`]).
     pub fn untouched_since(&self, va: u64, len: u64, epoch: u32) -> Option<bool> {

@@ -39,17 +39,16 @@ impl GuestMemory for ProcessMemory {
         rt().mem.begin_epoch()
     }
 
+    fn begin_write_epoch_into(&self, changed: &mut Vec<(u64, u64)>) -> u32 {
+        rt().mem.begin_epoch_into(changed)
+    }
+
+    fn keep_watching(&self, addr: u64, len: u64) {
+        rt().mem.keep_watching(addr, len)
+    }
+
     fn untouched_since(&self, addr: u64, len: u64, epoch: u32) -> Option<bool> {
-        let (mut at, mut left) = (addr, len);
-        while left > 0 {
-            let (host, run) = rt().mem.host_run(at, left)?;
-            if !rt().mem.untouched_since(host, run as usize, epoch)? {
-                return Some(false);
-            }
-            at += run;
-            left -= run;
-        }
-        Some(true)
+        rt().mem.untouched_since(addr, len, epoch)
     }
 }
 
