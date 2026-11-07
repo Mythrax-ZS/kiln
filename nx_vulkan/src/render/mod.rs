@@ -29,6 +29,7 @@ pub use shaders::Variation;
 mod surfaces;
 mod targets;
 mod textures;
+pub(crate) use textures::texture_format;
 
 use crate::device::Vk;
 use crate::formats::{color_format, depth_format};

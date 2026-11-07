@@ -460,6 +460,34 @@ impl Session {
             }
             _ => {
                 #[cfg(feature = "vulkan")]
+                if texture::is_texel_call(&proc.name) {
+                    let work = {
+                        let mut driver = self.driver.lock().unwrap_or_else(|e| e.into_inner());
+                        let Driver {
+                            textures,
+                            memory,
+                            devices,
+                            ..
+                        } = &mut *driver;
+                        textures.prepare_texels(&proc.name, c, memory, devices)
+                    };
+                    let result = work.and_then(|work| {
+                        let ctx = c.ctl.user.cast::<ThreadCtx>();
+                        // SAFETY: Horizon retains ThreadCtx for the call; tests use null.
+                        if let Some(ctx) = unsafe { ctx.as_ref() } {
+                            ctx.kernel
+                                .wait_on_host(ctx.thread, &ctx.core, || work.run())
+                        } else {
+                            work.run()
+                        }
+                    });
+                    match result {
+                        Ok(()) => c.state.pc = c.state.x[30],
+                        Err(e) => e.report(c, caller),
+                    }
+                    return;
+                }
+                #[cfg(feature = "vulkan")]
                 if proc.name.starts_with("nvnCommandBuffer") {
                     for _ in 0..8 {
                         let step = {
@@ -686,6 +714,8 @@ impl Session {
                 );
                 let _ = writeln!(out, "# native queue shader stage bindings: {bindings}\n# native queue forced sample shading bindings: {sample}");
                 let (programs, binaries, modules) = driver.programs.counts();
+                let (resident, texels) = driver.textures.texel_stats();
+                let _=writeln!(out,"# native resident textures: {resident}\n# native texel GPU uploads: {}\n# native texel GPU upload bytes: {}\n# native texel GPU reads: {}\n# native texel GPU readback bytes: {}",texels.uploads,texels.upload_bytes,texels.reads,texels.readback_bytes);
                 let _ = writeln!(out, "# native programs owned: {programs}\n# native shader binaries owned: {binaries}\n# native shader modules translated: {modules}\n# native shader GPU input bytes captured: {}", driver.programs.captured_bytes);
             }
             let _ = writeln!(

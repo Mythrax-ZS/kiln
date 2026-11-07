@@ -4,6 +4,8 @@ use super::device::{read, write, Error};
 use super::memory::Validate;
 use super::NativeCpu;
 
+#[cfg(feature = "vulkan")]
+mod copy;
 mod descriptor;
 mod format;
 mod layout;
@@ -12,6 +14,8 @@ mod owned;
 mod view;
 pub(super) use descriptor::Descriptor;
 pub(super) use observe::observe;
+#[cfg(feature = "vulkan")]
+pub(super) use owned::texels::is_texel_call;
 #[cfg(feature = "vulkan")]
 pub(super) use owned::DisplayImage;
 pub(super) use owned::Objects;

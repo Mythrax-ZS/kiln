@@ -23,6 +23,10 @@ pub struct SurfaceStats {
     pub draws: u64,
     pub presents: u64,
     pub readback_bytes: u64,
+    pub upload_bytes: u64,
+    pub uploads: u64,
+    pub texel_reads: u64,
+    pub texel_readback_bytes: u64,
 }
 
 fn readback_size(target: &targets::Target) -> u64 {
@@ -298,6 +302,77 @@ impl Queue {
 }
 
 impl Surface {
+    /// Raw storage bytes, without the diagnostic display conversion (including float formats).
+    pub fn read_texels(
+        &self,
+        region: crate::native::TextureRegion,
+    ) -> Result<(u64, crate::native::Readback), String> {
+        use crate::native::texture::{record_copy, Readback, Staging, TexelFormat};
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let target = state.target.as_ref().expect("live surface");
+        let (copy, size) =
+            region.checked(target.image.info, TexelFormat::display(target.key.format))?;
+        let staging = Staging::new(&self.vk, size, None)?;
+        let done = state.queue.context().completion()?;
+        let version = state.stats.clears + state.stats.draws;
+        let State { target, queue, .. } = &mut *state;
+        let target = target.as_mut().expect("live surface");
+        queue.submit_commands(Arc::clone(&done), true, |vk, cmd| {
+            memory_barrier(vk, cmd);
+            target.transition(vk, cmd, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            record_copy(
+                vk,
+                cmd,
+                &target.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                staging.handle(),
+                copy,
+                false,
+            );
+        })?;
+        queue.keep_alive(&done, vec![Arc::clone(&staging) as Arc<dyn Send + Sync>]);
+        state.last = Arc::clone(&done);
+        state.stats.readback_bytes += size as u64;
+        state.stats.texel_reads += 1;
+        state.stats.texel_readback_bytes += size as u64;
+        Ok((version, Readback { done, staging }))
+    }
+    pub fn write_texels(
+        &self,
+        region: crate::native::TextureRegion,
+        bytes: &[u8],
+    ) -> Result<Arc<Completion>, String> {
+        use crate::native::texture::{record_copy, Staging, TexelFormat};
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let target = state.target.as_ref().expect("live surface");
+        let (copy, size) =
+            region.checked(target.image.info, TexelFormat::display(target.key.format))?;
+        if size != bytes.len() {
+            return Err("native display upload byte count differs from region".into());
+        }
+        let staging = Staging::new(&self.vk, size, Some(bytes))?;
+        let done = state.queue.context().completion()?;
+        let State { target, queue, .. } = &mut *state;
+        let target = target.as_mut().expect("live surface");
+        queue.submit_commands(Arc::clone(&done), false, |vk, cmd| {
+            memory_barrier(vk, cmd);
+            target.transition(vk, cmd, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            record_copy(
+                vk,
+                cmd,
+                &target.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                staging.handle(),
+                copy,
+                true,
+            );
+        })?;
+        queue.keep_alive(&done, vec![staging]);
+        state.last = Arc::clone(&done);
+        state.stats.upload_bytes += size as u64;
+        state.stats.uploads += 1;
+        Ok(done)
+    }
     pub fn stats(&self) -> SurfaceStats {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).stats
     }

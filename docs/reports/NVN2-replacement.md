@@ -1,4 +1,4 @@
-# NVN2 replacement: shared events and deferred queues
+# NVN2 replacement: native texel transfers
 
 Updated 2026-11-07. The objective is to replace the guest graphics driver and remove the GPU
 front's command decoding from its draws. The optional API boundary now owns native devices,
@@ -10,8 +10,9 @@ a limited single-target array-draw path; watched immutable vertex buffers reuse 
 until their CPU backing changes. Event signals update coherent guest storage on the GPU;
 logical queue workers wait without blocking the API caller or the physical device queue.
 Vertex data is resolved after waits, including direct reads of single-page event aliases.
-The owner's NX2 program creates five events and three queues, then stops at
-`nvnTextureWriteTexels`. Synthetic tests execute translated graphics shaders,
+CPU texel writes/reads, strides and flush/invalidate now connect checked tiled backing to
+retained native images. The owner's NX2 program completes 32 texel writes and flushes, creates
+35 textures, then stops at `nvnCommandBufferDrawElements`. Synthetic tests execute translated graphics shaders,
 draw instances, check fixed state against pixels and dispatch a translated compute module.
 The title has not rendered an HLE frame.
 No race-rate improvement is established. The default
@@ -65,6 +66,10 @@ ranges bound directly from event imports, not measured GPU bus reads. State upda
 expanded typed state operations. Event counts describe live native objects. These are
 scoped counters, not a measure
 of total process CPU/GPU traffic; object retirement can reduce the live-resource counts.
+Texel counters count raw native-image upload/read operations and payload bytes, including cold
+initialization. They survive texture finalization and exclude diagnostic frame readback,
+staging allocation/padding, tile traversal and GPU-to-GPU transfers. Resident texture counts
+describe live objects; native queue submissions exclude the separate image-transfer queues.
 
 ## Native devices and storage
 
@@ -106,9 +111,10 @@ unmapping. Buffers are bounded views of ordinary or virtual pools; physical pool
 used directly as buffers. CPU mapping respects the pool's access flags. Labels are stored
 without logging their contents.
 
-Flush/invalidate validate ranges and fence coherent host storage. Native queues execute clears,
+Memory-pool flush/invalidate validate ranges and fence coherent host storage. Native queues execute clears,
 limited array draws and completion markers. Display-image writes stay in their Vulkan images;
-general writeback to guest pool bytes, aliasing, sparse GPU access and copy/dispatch visibility
+explicit texel invalidate/read can now copy those writes to guest pool bytes. General raw mapped
+access, aliasing, sparse GPU access and copy/dispatch visibility
 remain open. Watched vertex inputs retain immutable GPU versions through real submission
 fences. Native-handle and allocator-backed pools remain unsupported. The title does not yet
 submit draw/copy/dispatch payloads through HLE.
@@ -135,9 +141,54 @@ Storage sizing models buffer, pitched, block-linear, array/cube, volume, mipmapp
 and BC/ASTC geometry. Packaged layouts override the block choice; automatic layout uses bounded
 GOB dimensions, and minimal layout selects smaller blocks only when that saves storage. Sparse,
 video/external textures and depth ZCull storage still stop explicitly. Window display textures
-now materialize retained Vulkan images. Other texture residency, texel transfers, general
-resident-image updates/readback and command-resource lifetimes must be connected before
-graphics payloads can consume these resources.
+and supported CPU texel operations materialize retained Vulkan images. Shader-resource binding,
+general mapped-memory visibility and wider command-resource lifetimes remain open.
+
+## CPU texels and retained images
+
+`TextureWriteTexels`, `ReadTexels`, their strided forms, `FlushTexels` and `InvalidateTexels`
+operate on checked copy regions and optional base mip/layer views. CPU storage uses the NX2
+sector order explicitly, independent of the legacy GPU front's global GOB selection. Region
+bounds, block-compressed edges, signed strides, mip/layer ranges and address arithmetic are
+checked. The observed 1D-array API remaps Y/height to array layers; 2D arrays/cubes use Z/depth,
+while volumes use Z as a spatial coordinate. Data is staged before scatter writes, including
+overlapping input. Output pages are validated before the first output write; row/slice padding
+is preserved.
+
+The native backend retains one image through uploads and reads, with mip/layer/volume
+subresources, ordinary color and BC storage, raw float bytes and device capability checks.
+Uploads submit asynchronously and retain staging through real GPU fences. Reads explicitly
+wait for their GPU copy, outside the driver mutex and modeled guest core. Windows use the same
+display image for texel transfers, clears/draws and presentation. A partial CPU upload preserves
+GPU-written neighboring pixels; no display conversion or method-stream replay is involved.
+
+CPU_UNCACHED is flag `0x2` and CPU_CACHED is `0x4`. Cached writes update CPU bytes; flush uploads the
+requested region, and invalidate copies GPU bytes back. Cached reads alone do no readback.
+Uncached API writes upload immediately and reads refresh from an existing native image.
+Ordinary images snapshot their initial pool backing at the first write/flush; a complete
+uncached subresource write replaces its cold upload, and a complete cold flush is not uploaded
+twice. Display images keep their existing initial-clear policy. No per-frame image hashing is
+introduced. Later operations reuse the image and preserve other mip levels/layers.
+
+CPU operations lease their texture and parent pool while outside the driver lock, reject
+concurrent operations on one object, and verify host backing identity before copying. Resident
+image aliases are refused, including distinct CPU mappings of the same host allocation, rather
+than silently creating divergent images. Transfer payloads and complete logical texture storage
+are each capped at 256 MiB. Virtual pools, CPU-inaccessible pools, GPU-compressible textures,
+multisample texels, ASTC/depth/stencil GPU transfers, buffer-texture transfers and incompatible
+view targets remain explicitly unsupported on this path.
+
+This covers the explicit texel API path. Cache-line side effects, arbitrary raw mapped CPU
+stores/reads, pool-level flush/invalidate of resident images, general buffer/image aliases and
+shader-resource coherence are unfinished. In particular, cold initialization observes pool
+bytes at the first transfer, without a separate snapshot of earlier cached raw stores.
+The generic sizing/descriptor support for a format does not imply native transfer support.
+
+Required-Vulkan tests round-trip mip chains, 1D/2D arrays, 3D volumes, cubes and BC edge regions.
+Runtime tests check known NX2 sector offsets, strided views, preserved padding, cached/uncached
+visibility, GPU clears followed by invalidation, raw float bits, unchanged image identity,
+overlap/fault handling, alias refusals and retained transfer totals after finalization.
+These are synthetic checks; they establish no native title frame or gameplay speed-up.
 
 Queue builders now preserve the observed NX2 ABI, including boolean size getters with output
 pointers. Native queues own Vulkan command pools on the device already created by HLE. They
@@ -538,13 +589,22 @@ unisolated; the capture does not establish a rendering-regression pass. The last
 3,400/3,500/3,600 took 10.187/10.541/11.850 seconds. These timings are for the default path and
 different race-start phases, and establish no native gameplay I/O or rate improvement.
 
-On Windows, `cargo fmt --all --check`, `cargo lint` and `cargo test` pass: 1,229 tests passed and
-one was ignored.
+The texel-transfer off-mode check completed 3,600 frames in 290 seconds, exit zero, with no
+concurrent builds/tests. Frame 3,500 was inspected: the race-start GO overlay and HUD are
+visible, together with a large black road region on the left/foreground and dark
+character/structure regions. The existing road issue remains unisolated; this is not a
+rendering-regression pass. The last 100 frames at 3,400/3,500/3,600 took
+8.698/8.342/8.356 seconds. Different race-start phases and default-path timing establish no
+native gameplay I/O or rate improvement.
+
+On Windows, `cargo fmt --all --check`, `cargo lint` and `cargo test` pass: 1,241 tests passed and
+one was ignored. Required-Vulkan/SPIR-V runs pass 11 native backend tests and 65 runtime NVN2
+tests; the no-default runtime check and release build also pass.
 
 ## Next
 
-1. Implement TextureWriteTexels and general image residency/coherence at the next initialization
-   boundary. Complete shader resource bindings, remaining texture modes, program control/stage
+1. Implement indexed draws at the next boundary, with checked index storage and actual GPU
+   execution. Complete shader resource bindings, general mapped-image coherence, remaining texture modes, program control/stage
    coverage and dynamic code invalidation.
 2. Extend typed recording/execution to depth/MRT/indexed/indirect draws, copies/dispatch and
    views. Complete resource visibility beyond retained display images and shared event pages.

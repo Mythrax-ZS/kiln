@@ -17,11 +17,15 @@ pub use shared::{SharedMemory, SharedWord};
 mod signal;
 pub use signal::Signal;
 mod scheduled;
+pub(crate) mod texture;
 pub use graphics::{
     Attribute, BlendFactor, BlendOp, ColorBlend, GraphicsPipeline, GraphicsState, InputBuffer,
     NativeDraw, Primitive, Stream, VertexFormat, VertexKind,
 };
 pub use scheduled::{Operation, Recorded, ScheduledQueue};
+pub use texture::{
+    ImageKind, Readback, TexelFormat, Texture, TextureInfo, TextureRegion, TransferStats,
+};
 
 #[derive(Clone)]
 pub struct Context {

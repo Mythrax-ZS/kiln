@@ -1,6 +1,8 @@
 use super::{invalid, layout::Layout, read, view::View, write, Error, NativeCpu, State};
 use crate::rt::nvn2::memory::{label, Objects as Memory, PoolInfo, Validate};
 use std::collections::BTreeMap;
+#[cfg(feature = "vulkan")]
+pub(in crate::rt::nvn2) mod texels;
 
 struct Texture {
     cookie: u64,
@@ -10,6 +12,12 @@ struct Texture {
     label: Vec<u8>,
     #[cfg(feature = "vulkan")]
     surface: Option<std::sync::Arc<nx_vulkan::render::native::Surface>>,
+    #[cfg(feature = "vulkan")]
+    image: Option<std::sync::Arc<nx_vulkan::native::Texture>>,
+    #[cfg(feature = "vulkan")]
+    busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "vulkan")]
+    image_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(feature = "vulkan")]
@@ -31,9 +39,54 @@ pub(in crate::rt::nvn2) struct DisplayImage {
 pub(in crate::rt::nvn2) struct Objects {
     live: BTreeMap<u64, Texture>,
     next_id: u32,
+    #[cfg(feature = "vulkan")]
+    retired_transfers: nx_vulkan::native::TransferStats,
 }
 
 impl Objects {
+    #[cfg(feature = "vulkan")]
+    fn check_image_alias(
+        &self,
+        object: u64,
+        memory: &Memory,
+        devices: &crate::rt::nvn2::device::Devices,
+    ) -> Result<(), Error> {
+        let t = self.texture(object, memory, &|d| devices.identity(d))?;
+        let hosts = texels::host_spans(&memory.backing_spans(
+            t.parent,
+            t.state.word(24),
+            t.layout.size,
+        )?)?;
+        for (&other, v) in &self.live {
+            if other == object || v.image.is_none() && v.surface.is_none() {
+                continue;
+            }
+            let spans = texels::host_spans(&memory.backing_spans(
+                v.parent,
+                v.state.word(24),
+                v.layout.size,
+            )?)?;
+            if hosts
+                .iter()
+                .any(|&(a, n)| spans.iter().any(|&(b, m)| a < b + m && b < a + n))
+            {
+                return Err(invalid(
+                    "overlapping native image storage is not implemented",
+                ));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(feature = "vulkan")]
+    pub(in crate::rt::nvn2) fn texel_stats(&self) -> (usize, nx_vulkan::native::TransferStats) {
+        let mut stats = self.retired_transfers;
+        let mut count = 0;
+        for t in self.live.values() {
+            count += usize::from(t.image.is_some() || t.surface.is_some());
+            add_transfers(&mut stats, texture_transfers(t));
+        }
+        (count, stats)
+    }
     #[cfg(feature = "vulkan")]
     pub(in crate::rt::nvn2) fn display_image(
         &mut self,
@@ -42,6 +95,7 @@ impl Objects {
         devices: &crate::rt::nvn2::device::Devices,
     ) -> Result<DisplayImage, Error> {
         use nx_vulkan::render::native::SurfaceFormat;
+        self.check_image_alias(object, memory, devices)?;
         let t = self.texture(object, memory, &|d| devices.identity(d))?;
         if t.state.int(32) & 1 == 0
             || t.state.int(32) & 0x50 != 0
@@ -253,6 +307,12 @@ impl Objects {
                 label: Vec::new(),
                 #[cfg(feature = "vulkan")]
                 surface: None,
+                #[cfg(feature = "vulkan")]
+                image: None,
+                #[cfg(feature = "vulkan")]
+                busy: Default::default(),
+                #[cfg(feature = "vulkan")]
+                image_ready: Default::default(),
             },
         );
         cpu.state.x[0] = 1;
@@ -271,8 +331,19 @@ impl Objects {
         let result = match op {
             "Initialize" => self.initialize(cpu, memory, validate),
             "Finalize" => (|| {
-                self.texture(object, memory, validate)?;
+                let t = self.texture(object, memory, validate)?;
+                #[cfg(feature = "vulkan")]
+                if t.busy.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(invalid("has a CPU texel operation in progress"));
+                }
+                #[cfg(not(feature = "vulkan"))]
+                let _ = t;
                 write(object.wrapping_add(120), &0u64.to_le_bytes())?;
+                #[cfg(feature = "vulkan")]
+                add_transfers(
+                    &mut self.retired_transfers,
+                    texture_transfers(self.live.get(&object).expect("live texture")),
+                );
                 self.live.remove(&object);
                 Ok(())
             })(),
@@ -360,5 +431,32 @@ impl Objects {
             _ => return None,
         };
         Some(result)
+    }
+}
+
+#[cfg(feature = "vulkan")]
+fn add_transfers(
+    total: &mut nx_vulkan::native::TransferStats,
+    stats: nx_vulkan::native::TransferStats,
+) {
+    total.uploads += stats.uploads;
+    total.upload_bytes += stats.upload_bytes;
+    total.reads += stats.reads;
+    total.readback_bytes += stats.readback_bytes;
+}
+#[cfg(feature = "vulkan")]
+fn texture_transfers(t: &Texture) -> nx_vulkan::native::TransferStats {
+    if let Some(image) = &t.image {
+        image.stats()
+    } else if let Some(image) = &t.surface {
+        let s = image.stats();
+        nx_vulkan::native::TransferStats {
+            uploads: s.uploads,
+            upload_bytes: s.upload_bytes,
+            reads: s.texel_reads,
+            readback_bytes: s.texel_readback_bytes,
+        }
+    } else {
+        Default::default()
     }
 }

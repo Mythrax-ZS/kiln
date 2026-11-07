@@ -1,7 +1,7 @@
 use super::{read, write, Error, NativeCpu};
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct View([u8; 16]);
+pub(super) struct View(pub(super) [u8; 16]);
 
 impl View {
     pub(super) fn read_optional(address: u64) -> Result<Self, Error> {

@@ -794,6 +794,33 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// Validate a byte-copy destination without changing bytes or write-watch state. Callers
+    /// that scatter one logical operation can detect an invalid later page before any write.
+    #[cfg(feature = "vulkan")]
+    pub(crate) fn check_write_range(&self, addr: u64, size: u64) -> Result<(), (u64, FaultKind)> {
+        if size == 0 {
+            return Ok(());
+        }
+        let last = addr
+            .checked_add(size - 1)
+            .ok_or((addr, FaultKind::Unmapped))?;
+        let mut at = addr;
+        loop {
+            let e = self.entry(at);
+            if e & PRESENT == 0 {
+                return Err((at, FaultKind::Unmapped));
+            }
+            if e & (WRITE | TRAP | WAS_W) == 0 {
+                return Err((at, FaultKind::Permission));
+            }
+            let next = (at | (PAGE_SIZE - 1)).saturating_add(1);
+            if next > last || next <= at {
+                return Ok(());
+            }
+            at = next;
+        }
+    }
+
     pub fn write_bytes(&self, addr: u64, data: &[u8], check: bool) -> Result<(), FaultKind> {
         let mut at = addr;
         let mut done = 0;

@@ -72,7 +72,7 @@ fn texture_builders_preserve_padding_and_views_have_optional_checked_outputs() {
     );
 }
 
-fn state(target: u32, dims: [u32; 3], levels: u32, format: u32) -> State {
+pub(super) fn state(target: u32, dims: [u32; 3], levels: u32, format: u32) -> State {
     let mut s = State([0; 104]);
     for (at, value) in [
         (36, target),
