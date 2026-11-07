@@ -6,6 +6,8 @@ use crate::rt::nvn2::{
 };
 use std::cell::RefCell;
 
+mod programs;
+
 thread_local! {
     static CALLBACK_SESSION: RefCell<Option<Arc<Session>>> = const { RefCell::new(None) };
 }
@@ -21,6 +23,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Option<Self> {
+        Self::with_pool_flags(0x22)
+    }
+    fn with_pool_flags(flags: u64) -> Option<Self> {
         let page = GuestPage::new();
         let session = Arc::new(Session::new(Mode::Hle));
         let b = page.0;
@@ -48,7 +53,7 @@ impl Fixture {
         };
         f.call("nvnMemoryPoolBuilderSetDefaults", &[b + 0x400]);
         f.call("nvnMemoryPoolBuilderSetDevice", &[b + 0x400, b]);
-        f.call("nvnMemoryPoolBuilderSetFlags", &[b + 0x400, 0x22]);
+        f.call("nvnMemoryPoolBuilderSetFlags", &[b + 0x400, flags]);
         f.call(
             "nvnMemoryPoolBuilderSetStorage",
             &[b + 0x400, backing, 0x10000],

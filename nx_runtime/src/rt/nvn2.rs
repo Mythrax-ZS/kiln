@@ -22,6 +22,8 @@ mod command;
 mod descriptors;
 mod device;
 mod memory;
+#[cfg(feature = "vulkan")]
+mod program;
 mod queue;
 mod sampler;
 mod texture;
@@ -33,6 +35,8 @@ struct Driver {
     memory: memory::Objects,
     descriptors: descriptors::Objects,
     textures: texture::Objects,
+    #[cfg(feature = "vulkan")]
+    programs: program::Objects,
     #[cfg(feature = "vulkan")]
     queues: queue::Objects,
     #[cfg(feature = "vulkan")]
@@ -56,10 +60,11 @@ impl Driver {
         if name == "nvnDeviceFinalize"
             && (self.queues.has_children(cpu.state.x[0])
                 || self.windows.has_device_children(cpu.state.x[0])
-                || self.commands.has_device_children(cpu.state.x[0]))
+                || self.commands.has_device_children(cpu.state.x[0])
+                || self.programs.has_device_children(cpu.state.x[0]))
         {
             return Some(Err(device::Error::Invalid(
-                "NVN2 device still owns queues, syncs or windows".to_string(),
+                "NVN2 device still owns queues, syncs, windows or programs".to_string(),
             )));
         }
         if let Some(result) =
@@ -108,11 +113,16 @@ impl Driver {
         #[cfg(feature = "vulkan")]
         if name == "nvnMemoryPoolFinalize"
             && (self.commands.has_pool_children(cpu.state.x[0])
-                || self.queues.has_pool_children(cpu.state.x[0]))
+                || self.queues.has_pool_children(cpu.state.x[0])
+                || self.programs.has_pool_children(cpu.state.x[0]))
         {
             return Some(Err(device::Error::Invalid(
-                "NVN2 memory pool still supplies live command buffers".to_string(),
+                "NVN2 memory pool still supplies commands or program binaries".to_string(),
             )));
+        }
+        #[cfg(feature = "vulkan")]
+        if let Some(result) = self.programs.call(name, cpu, &self.devices, &self.memory) {
+            return Some(result);
         }
         if let Some(result) = self.devices.call(name, cpu) {
             if name == "nvnDeviceFinalize" && result.is_ok() {
@@ -437,10 +447,11 @@ impl Session {
                                 devices,
                                 memory,
                                 textures,
+                                programs,
                                 ..
                             } = &mut *driver;
                             commands
-                                .call(&proc.name, c, devices, memory, textures)
+                                .call(&proc.name, c, devices, memory, textures, programs)
                                 .expect("command entry")
                         };
                         match step {
@@ -611,6 +622,10 @@ impl Session {
             {
                 let (submissions, scratch) = driver.queues.command_stats();
                 let _ = writeln!(out, "# native queue GPU submissions: {submissions}\n# native queue scratch binding bytes: {scratch}");
+                let (bindings, sample) = driver.queues.binding_stats();
+                let _ = writeln!(out, "# native queue shader stage bindings: {bindings}\n# native queue forced sample shading bindings: {sample}");
+                let (programs, binaries, modules) = driver.programs.counts();
+                let _ = writeln!(out, "# native programs owned: {programs}\n# native shader binaries owned: {binaries}\n# native shader modules translated: {modules}\n# native shader GPU input bytes captured: {}", driver.programs.captured_bytes);
             }
             let _ = writeln!(
                 out,

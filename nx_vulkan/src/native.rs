@@ -8,6 +8,9 @@ use ash::vk;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod shader;
+pub use shader::{ShaderBinary, ShaderModule, ShaderOptions, ShaderStage};
+
 #[derive(Clone)]
 pub struct Context {
     vk: Arc<Vk>,

@@ -1,5 +1,6 @@
 use super::*;
 use crate::rt::nvn2::command::{Lease, Op, Recording};
+use crate::rt::nvn2::program::Binding;
 use crate::rt::nvn2::texture::DisplayImage;
 use nx_vulkan::render::native::SurfaceCommand;
 
@@ -7,6 +8,7 @@ use nx_vulkan::render::native::SurfaceCommand;
 pub(super) struct Execution {
     colors: Vec<Option<DisplayImage>>,
     scratch: Option<(Lease, u64, u64)>,
+    programs: [Option<Binding>; 6],
 }
 
 impl Execution {
@@ -28,6 +30,16 @@ impl Execution {
             match op {
                 Op::Targets(colors) => self.colors.clone_from(colors),
                 Op::Scratch(scratch) => self.scratch = *scratch,
+                Op::Program { mask, binding } => {
+                    for (stage, current) in self.programs.iter_mut().enumerate() {
+                        if mask & (1 << stage) != 0 {
+                            *current = binding
+                                .as_ref()
+                                .filter(|b| b.link.shaders.iter().any(|s| s.stage == stage))
+                                .cloned();
+                        }
+                    }
+                }
                 Op::Clear { index, color } => {
                     let image = self
                         .colors
@@ -98,6 +110,22 @@ impl Queue {
 }
 
 impl Objects {
+    pub(in crate::rt::nvn2) fn binding_stats(&self) -> (usize, usize) {
+        (
+            self.queues
+                .values()
+                .map(|q| q.execution.programs.iter().flatten().count())
+                .sum(),
+            self.queues
+                .values()
+                .filter(|q| {
+                    q.execution.programs[1]
+                        .as_ref()
+                        .is_some_and(|b| b.sample_shading == 1)
+                })
+                .count(),
+        )
+    }
     pub(in crate::rt::nvn2) fn command_stats(&self) -> (u64, u64) {
         (
             self.queues.values().map(|q| q.gpu.submissions()).sum(),

@@ -2,6 +2,7 @@
 
 use super::device::{read, write, Devices, Error};
 use super::memory::{label, Objects as Memory, PoolInfo, Validate};
+use super::program::{Binding, Objects as Programs};
 use super::texture::{DisplayImage, Objects as Textures};
 use super::{returned, rt, slow_path, GuestFunction, NativeCpu};
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,6 +44,7 @@ pub(super) enum Op {
     Clear { index: usize, color: [f32; 4] },
     Scratch(Option<(Lease, u64, u64)>),
     Barrier(u32),
+    Program { mask: u32, binding: Option<Binding> },
     Call(Arc<Recording>),
 }
 
@@ -251,9 +253,12 @@ impl Objects {
             b.command
                 .as_ref()
                 .is_some_and(|c| c.lease.is_some_and(|l| l.pool == pool))
-                || b.building
-                    .as_ref()
-                    .is_some_and(|r| r.commands.iter().any(|c| c.lease.pool == pool))
+                || b.building.as_ref().is_some_and(|r| {
+                    let mut leases = Vec::new();
+                    recording::collect_leases(&r.ops, &mut leases);
+                    r.commands.iter().any(|c| c.lease.pool == pool)
+                        || leases.iter().any(|l| l.pool == pool)
+                })
         })
     }
     fn buffer(&self, object: u64, devices: &Devices) -> Result<&Buffer, Error> {
@@ -473,6 +478,7 @@ impl Objects {
         devices: &Devices,
         memory: &Memory,
         textures: &mut Textures,
+        programs: &Programs,
     ) -> Option<Result<Step, Error>> {
         let op = name.strip_prefix("nvnCommandBuffer")?;
         Some((|| {
@@ -594,7 +600,7 @@ impl Objects {
                 "IsRecording" => {
                     cpu.state.x[0] = u64::from(read::<1>(object.wrapping_add(17))?[0] != 0)
                 }
-                _ => return self.record(op, cpu, devices, memory, textures),
+                _ => return self.record(op, cpu, devices, memory, textures, programs),
             }
             Ok(Step::Done)
         })())

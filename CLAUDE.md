@@ -37,7 +37,7 @@ exports (`nx_runtime/src/rt/hle.rs`, `src/codegen/native.rs`, A-187): `nn::util`
 and deflate decompressors. Add one only with its signature pinned by a test and a row in
 `docs/ASSUMPTIONS.md`; the build report lists them.
 
-NVN2 replacement starts at `nx_runtime/src/rt/nvn2.rs` (A-298 through A-320), off by default.
+NVN2 replacement starts at `nx_runtime/src/rt/nvn2.rs` (A-298 through A-323), off by default.
 `NX_NVN2=trace` forwards the API to the guest driver and counts calls by name;
 `NX_NVN2=hle` uses native entries and stops at the first missing API. It currently implements
 procedure resolution, device ownership backed by an initialized Vulkan renderer, a limited
@@ -46,9 +46,11 @@ ownership, sampler construction/registration, texture builders/views/storage and
 native queue ownership, GPU-backed completion markers/sync waits and window ownership with
 retained Vulkan display images, acquisition and presentation. Command buffers now own typed
 recordings, allocation callbacks and called/copied sets; native queues execute batched image
-clears/barriers with ordered fences. Sparse textures, general image/texel operations, programs
-and draw/copy/dispatch recording/execution remain open. The real program creates three
-3840×2160 GPU images and a command buffer, then stops at `nvnProgramInitialize`.
+clears/barriers with ordered fences. Programs now retain bounded sm_86 binaries and recorded
+shader bindings; a native translation cache creates Vulkan modules for actual draw/launch
+variations. Sparse textures, general image/texel coherence, render state and draw/copy/dispatch
+recording/execution remain open. The real program creates three 3840×2160 GPU images, a command
+buffer and a program with two binaries, then stops at `nvnVertexAttribStateSetDefaults`.
 Synthetic GPU execution is verified; no native title frame or gameplay speed-up yet.
 These modes require an NX2 NPDM and a rebuilt optional loader stub: `kiln build --reuse-objects`
 rebuilds that unit; relink alone cannot add it to older artifacts. `NX_NVN2_REPORT=<file>` writes

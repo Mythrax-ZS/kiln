@@ -42,7 +42,7 @@ fn merge_spans(spans: &mut Vec<Span>) {
     spans.truncate(used);
 }
 
-fn collect_leases(ops: &[Op], out: &mut Vec<Lease>) {
+pub(super) fn collect_leases(ops: &[Op], out: &mut Vec<Lease>) {
     for op in ops {
         match op {
             Op::Targets(images) => out.extend(images.iter().flatten().map(|t| Lease {
@@ -50,6 +50,9 @@ fn collect_leases(ops: &[Op], out: &mut Vec<Lease>) {
                 info: t.parent,
             })),
             Op::Scratch(Some((lease, _, _))) => out.push(*lease),
+            Op::Program {
+                binding: Some(b), ..
+            } => out.extend(b.link.shaders.iter().map(|s| s.lease)),
             Op::Call(r) => out.extend(r.leases.iter().copied()),
             _ => {}
         }
@@ -232,6 +235,7 @@ impl Objects {
         devices: &Devices,
         memory: &Memory,
         textures: &mut Textures,
+        programs: &Programs,
     ) -> Result<Step, Error> {
         let (object, a, b, c, d, e) = (
             cpu.state.x[0],
@@ -256,12 +260,29 @@ impl Objects {
                 | "Barrier"
                 | "CallCommands"
                 | "CopyCommands"
+                | "BindProgram"
         ) {
             return Err(invalid(&format!("nvnCommandBuffer{op} is not implemented")));
         }
         self.adopt_inline_begin(object)?;
         let owner = self.live[&object].device;
         let (ops, command_bytes, control_bytes) = match op {
+            "BindProgram" => {
+                let mask = b as u32;
+                if mask & !0x3F != 0 {
+                    return Err(invalid("shader stage mask is not implemented"));
+                }
+                let binding = if a == 0 || mask == 0 {
+                    None
+                } else {
+                    let binding = programs.snapshot(a, devices, memory)?;
+                    if binding.link.device != owner {
+                        return Err(invalid("program belongs to another device"));
+                    }
+                    Some(binding)
+                };
+                (vec![Op::Program { mask, binding }], 32, 8)
+            }
             "SetRenderTargets" => {
                 let n = a as u32 as usize;
                 if n > 8 || d != 0 || e != 0 {
@@ -335,6 +356,11 @@ impl Objects {
                 (vec![Op::Scratch(scratch)], 0, 16)
             }
             "Barrier" => {
+                if a as u32 & 0x20 != 0 {
+                    return Err(invalid(
+                        "dynamic shader-code cache invalidation is not implemented",
+                    ));
+                }
                 if a as u32 & !0x1FF != 0 {
                     return Err(invalid("unknown barrier bits are not implemented"));
                 }

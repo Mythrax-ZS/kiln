@@ -85,6 +85,45 @@ pub(super) fn label(address: u64) -> Result<Vec<u8>, Error> {
 }
 
 impl Objects {
+    /// Capture a GPU input through its owned pool, without assuming GPU addresses are CPU ones.
+    #[cfg(feature = "vulkan")]
+    pub(super) fn read_shader(
+        &self,
+        device: u64,
+        address: u64,
+        size: u64,
+        validate: Validate<'_>,
+    ) -> Result<(u64, PoolInfo, Vec<u8>), Error> {
+        let (&object, _) = self
+            .pools
+            .iter()
+            .find(|(_, p)| {
+                p.device == device
+                    && p.gpu != 0
+                    && address >= p.gpu
+                    && inside(address - p.gpu, size, p.size)
+            })
+            .ok_or_else(|| invalid("shader data is outside its device's GPU pools"))?;
+        let info = self.pool_info(object, validate)?;
+        if info.flags & 0x40 == 0 {
+            return Err(invalid("shader data needs executable pool storage"));
+        }
+        let spans = self.backing_spans(info, address - info.gpu, size)?;
+        let mut bytes = vec![0; size as usize];
+        let mut offset = 0;
+        for (cpu, n) in spans {
+            rt().mem
+                .read_bytes(cpu, &mut bytes[offset..offset + n], false)
+                .map_err(|kind| Error::Memory {
+                    address: cpu,
+                    write: false,
+                    kind,
+                })?;
+            offset += n;
+        }
+        Ok((object, info, bytes))
+    }
+
     /// Resolve an owned pool range to checked guest spans, including split virtual mappings.
     pub(super) fn backing_spans(
         &self,

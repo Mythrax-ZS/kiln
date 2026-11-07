@@ -25,6 +25,7 @@ mod frame;
 mod global;
 pub mod native;
 mod shaders;
+pub use shaders::Variation;
 mod surfaces;
 mod targets;
 mod textures;
