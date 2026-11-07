@@ -207,6 +207,44 @@ Where 100 frames of the race go now, on that one thread (with `NX_TRACE_PERF`):
 an image could not be allocated. ASTC textures are now encoded as BC7 on the device (A-291): they
 hold about 4.7 GB, all the textures 9.4 GB, and no allocation failed in a run into the race.
 
+### The device does more of the work (2026-11-07, afternoon)
+
+What changed, at 0c1ef78:
+
+- **Eight batches in flight** (A-123), not three. Nearly every pass that sent a batch used to
+  wait for the device.
+- **Writes are tracked by the page table** (A-126, A-277), not by the system's write watch. That
+  walked 4.9 GB at every frame (4.8 ms); beginning an epoch now takes about 27 µs.
+- **Textures are found by the memory they are made of.** A write of the renderer used to look at
+  each of about 7,700 textures.
+- **Texture bindings stay from frame to frame** (A-282). The tracking says what was written, and
+  only the bindings over it are dropped.
+- **The device lays compute surfaces out into guest memory itself** (A-292). It lays out 709 of
+  the 1,022 MiB put there per 100 frames, which the host used to copy out, lay out and write.
+
+The race, per 100 frames (with `NX_TRACE_PERF`; the frames dumped at 3,250 and 3,500 looked at):
+
+| | Before (646f12e) | After (0c1ef78) |
+|---|---|---|
+| 100 frames | 10.56 s | 9.77 to 9.94 s |
+| The renderer's part | 6.36 s | 4.85 to 4.93 s |
+| Draws: textures | 2.15 s | 1.46 to 1.81 s |
+| Clears | 0.52 s | 0.11 s |
+| Surfaces put into memory by the host | 631 ms for 1,022 MiB | 164 ms for 313 MiB |
+| The GPU thread with nothing to run | about 4% | about 16% |
+
+`NX_GPU_SPLIT=1` gives 9.53 to 9.69 s per 100 frames.
+
+**What limits the rate now: the waits for the device.** The GPU thread has nothing to run about
+a sixth of the time, and waits for the device at the settles of launches and at the ends of
+submissions. The game's own threads wait on those fences in turn.
+
+**Tried and taken out:** with the renderer on its own thread, the front read back its own
+writes still on their way, without waiting, from a copy of them (the compute descriptors it
+writes inline). Its waits for those reads went from 2,640 to none. But the front then waited
+longer at the reads left (the indirect draws' arguments that launches write, and the acquires),
+3.5 s instead of 2.6 s per 100 frames, and 100 frames took 10.05 s.
+
 ## Open
 
 - **The road was sometimes black.** In about a quarter of the runs that reached the race (7 of
@@ -220,6 +258,9 @@ hold about 4.7 GB, all the textures 9.4 GB, and no allocation failed in a run in
   - Since then, 4 runs of 4 draw the road, with its lane lines (frame 3,500 looked at), at 10.5
     to 11.1 s per 100 frames of the race. With black in one run of four before, that is not yet
     proof.
+  - It is not fixed. On 2026-11-07 the road was black at frame 3,500 in 3 of about 20 runs into
+    the race, by the brightness of the road on either side of the kart: twice before the work of
+    the afternoon (646f12e and before) and once after it.
 - **The rate:**
   - the waits for the device (the host reading what launches wrote, and the ends of
     submissions);
