@@ -41,11 +41,42 @@ impl Lease {
 #[derive(Clone)]
 pub(super) enum Op {
     Targets(Vec<Option<DisplayImage>>),
-    Clear { index: usize, color: [f32; 4] },
+    Clear {
+        index: usize,
+        color: [f32; 4],
+        lower_left: bool,
+    },
     Scratch(Option<(Lease, u64, u64)>),
     Barrier(u32),
-    Program { mask: u32, binding: Option<Binding> },
+    Program {
+        mask: u32,
+        binding: Option<Binding>,
+    },
+    State(super::state::Value),
+    Vertex {
+        index: usize,
+        binding: Option<VertexBinding>,
+    },
+    Draw(Draw),
     Call(Arc<Recording>),
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct VertexBinding {
+    pub lease: Lease,
+    pub offset: u64,
+    pub size: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Draw {
+    pub primitive: u32,
+    pub first: u32,
+    pub count: u32,
+    pub first_instance: u32,
+    pub instances: u32,
+    pub lower_left: bool,
+    pub depth_minus_one_to_one: bool,
 }
 
 #[derive(Clone, Copy)]

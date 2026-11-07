@@ -129,6 +129,12 @@ impl Devices {
     }
 
     #[cfg(feature = "vulkan")]
+    pub(super) fn modes(&self, address: u64) -> Result<(u32, u32), Error> {
+        self.device(address)
+            .map(|device| (device.origin, device.depth))
+    }
+
+    #[cfg(feature = "vulkan")]
     pub(super) fn context(&self, address: u64) -> Result<nx_vulkan::native::Context, Error> {
         Ok(self.device(address)?._host.context.clone())
     }

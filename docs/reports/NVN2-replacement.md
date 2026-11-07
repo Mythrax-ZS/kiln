@@ -1,14 +1,16 @@
-# NVN2 replacement: native shader binaries
+# NVN2 replacement: native state and array draws
 
 Updated 2026-11-07. The objective is to replace the guest graphics driver and remove the GPU
 front's command decoding from its draws. The optional API boundary now owns native devices,
 memory pools, buffers, descriptor pools, samplers, textures/views, queues, syncs, windows,
 command buffers and programs. Typed command sets execute native GPU color clears and barriers,
 with allocation callbacks, shader bindings and ordered fences. Programs retain sm_86 binaries
-and feed a native Vulkan module cache. The owner's NX2 program creates three real Vulkan display
-images, its first command buffer and a program containing two graphics binaries, then stops at
-`nvnVertexAttribStateSetDefaults`. Synthetic tests record, submit and present GPU clears and
-execute a translated native compute module. The title has not rendered an HLE frame.
+and feed native Vulkan module/pipeline caches. Typed render state drives scissored clears and
+a limited single-target array-draw path; watched immutable vertex buffers reuse device memory
+until their CPU backing changes. The owner's NX2 program passes render-state construction and
+stops at `nvnEventBuilderSetDefaults`. Synthetic tests execute translated graphics shaders,
+draw instances, check fixed state against pixels and dispatch a translated compute module.
+The title has not rendered an HLE frame.
 No race-rate improvement is established. The default
 remains off.
 
@@ -26,7 +28,7 @@ remains off.
 - `NX_NVN2=hle` owns procedure resolution and the native objects described below. An
   unimplemented entry stops at its first call, with its name and calling address. No API falls
   back to the guest driver in this mode: their state cannot be mixed. Native binaries use the
-  existing sm_86 translator; draw/dispatch API execution still needs connecting.
+  existing sm_86 translator; shader-resource binding and wider draw/dispatch execution remain open.
 
 Enabled modes require `Npdm::platform == Nx2`. The module descriptor advertises whether its
 loader stub was built; an older descriptor refuses an enabled mode. Building once with
@@ -46,14 +48,17 @@ separate initialization check validates native automatic layout selection.
 Keep reports from real programs outside the repository. A killed process leaves the initial
 `running` marker instead of a completed report.
 HLE reports also count owned native textures/windows and display GPU clears, presentations and
-pixel-readback bytes across live windows. These counters cover the explicit display-image
+pixel-readback bytes and draws across live windows. These counters cover the explicit display-image
 boundary, excluding GPU-to-GPU display blits and other resource transfers.
 They also count owned command buffers, recorded command sets, GPU submissions across live
 native queues and the scratch-binding byte ranges retained in those queues' state. Scratch
 binding metadata alone does not implement shader execution or allocate shader scratch storage.
 Program counters describe live program objects, their retained binaries and their cached
 Vulkan modules; code-input bytes count successful copies at program linking. Queue binding
-counters describe retained stage/sample-shading state. These are scoped counters, not a measure
+counters describe retained stage/sample-shading state. Vertex-input counters separate logical
+CPU bytes copied, padded GPU upload bytes and unchanged-input cache hits; queue submissions
+include those input uploads. State updates count executed typed state operations. These are
+scoped counters, not a measure
 of total process CPU/GPU traffic; object retirement can reduce the live-resource counts.
 
 ## Native devices and storage
@@ -96,12 +101,12 @@ unmapping. Buffers are bounded views of ordinary or virtual pools; physical pool
 used directly as buffers. CPU mapping respects the pool's access flags. Labels are stored
 without logging their contents.
 
-Flush/invalidate validate ranges and fence coherent host storage. Native queues submit
-completion markers; no accepted draw/copy/dispatch payload can write guest storage yet.
-Completion/writeback, resource lifetimes during execution and sparse GPU access semantics must
-be connected before draw/copy/dispatch submissions are accepted. Native-handle and allocator-backed pools
-remain unsupported. Display-image initialization additionally submits native GPU clears;
-the title does not yet submit draw/copy/dispatch payloads through HLE.
+Flush/invalidate validate ranges and fence coherent host storage. Native queues execute clears,
+limited array draws and completion markers. Display-image writes stay in their Vulkan images;
+general writeback to guest pool bytes, aliasing, sparse GPU access and copy/dispatch visibility
+remain open. Watched vertex inputs retain immutable GPU versions through real submission
+fences. Native-handle and allocator-backed pools remain unsupported. The title does not yet
+submit draw/copy/dispatch payloads through HLE.
 
 Sampler builders and objects now retain their full observed state, including FP arguments and
 returns, raw border words, labels and immutable object snapshots. Sampler registration encodes
@@ -141,9 +146,8 @@ Finish appends a completion and waits. A sync created without a fence reports FA
 unflushed fence can time out, and re-fencing keeps an older waiter's completion alive. CPU waits
 release the driver lock and modeled core, and notice process termination. Renderer and native
 queues share the actual Vulkan device and serialize access to its physical queue. Typed clear
-and barrier payloads now execute alongside those markers. Draw/copy/dispatch payloads remain
-unimplemented. Graphics submission must also implement the distinct vertex-stage
-completion condition and connect guest resource visibility before those payloads are accepted.
+and limited array-draw payloads execute alongside those markers. Copies, dispatch and general
+guest resource visibility remain open. Unsupported fence conditions/flags stop explicitly.
 
 ## Native windows
 
@@ -193,16 +197,16 @@ again at submission and flush. CallCommands retains referenced sets; CopyCommand
 typed operations independently. Called graphs are limited to 64 levels and one million expanded
 operations. No host pointers or guest GPU method streams are stored in the command handles.
 
-The current payload subset binds display render targets and program stages, records full-image
-RGBA color clears, binds scratch-memory ranges and records supported ordering/cache barriers.
-Views, depth/stencil targets, partial color masks, scissors, draws, copies and dispatch remain
-unsupported and stop at their named entries. Scratch bindings retain validated state for
-future shader execution; they do not execute a shader.
+The payload subset binds display render targets, program stages, vertex buffers and typed
+render state, records full-channel RGBA clears with optional scissors and records array draws
+and supported ordering/cache barriers. Views, depth/stencil targets, partial-channel clears,
+indexed/indirect draws, copies and dispatch remain unsupported and stop explicitly. Scratch
+bindings retain validated state for future shader execution; they do not allocate scratch storage.
 
 QueueSubmitCommands snapshots and validates the complete handle array before enqueueing any
 prefix, including device identities and cross-page faults. Queued sets retain their resources
 and block premature command-pool retirement. Flush expands the typed sets in order, batching
-image clears/barriers into a Vulkan command buffer between fence markers. Image locks remain
+image clears/draws/barriers into a Vulkan command buffer between fence markers. Image locks remain
 held through GPU submission, and real completion fences retain their image lifetimes. Recording,
 clear execution and headless presentation upload/read back no pixel buffers. Explicit diagnostic
 reads and configured dumps still copy pixels out and are counted separately.
@@ -235,12 +239,42 @@ BindProgram records the current linked stages and sample-shading mode, retaining
 generations. Relinking/finalizing the original program does not change existing recordings.
 Stage masks support partial replacement and null-program unbinding. Active recordings and
 queued sets guard their pool lifetimes; pool retirement invalidates cached command handles.
-Queue flush updates bindings without submitting GPU work for a bind alone. Resource binding,
-pipeline state and draw/dispatch execution remain to complete. Dynamic shader-code invalidation
+Queue flush updates bindings without submitting GPU work for a bind alone. Shader-resource
+binding and wider graphics/dispatch execution remain to complete. Dynamic shader-code invalidation
 barriers stop explicitly until writable shader storage is connected to execution; they cannot
 silently reuse the immutable link snapshot after a caller requests invalidation.
 
-The layouts, ownership policy and remaining limits are recorded in A-299 through A-323.
+The layouts, ownership policy and remaining limits are recorded in A-299 through A-327.
+
+## Render state and array execution
+
+Vertex attributes/streams, blend, channel-mask, color, depth/stencil, polygon and multisample
+objects preserve their observed packed layouts and output widths. Recording copies the
+consumed state and arrays, including viewport/scissor/depth-range slots, blend constants,
+stencil masks/reference and primitive restart. Unsupported execution modes are refused;
+owning their state does not establish execution support. FP depth-range arguments come from
+FP registers and clamp to [0, 1]. Clears obey scissor zero, ignore the viewport and capture the
+device origin at recording. Negative scissor origins clip to the image using wide arithmetic.
+
+DrawArrays/Instanced currently support points, lines, line strips, triangles, triangle strips
+and fans, with one single-sample display color target and vertex/fragment stages. Native
+Vulkan pipelines consume the retained sm_86 modules and cache the consumed vertex/fixed state.
+Basic blending, constants, logic, write masks, face culling, viewport/depth range and scissor
+are connected. Lower-left viewports reverse height; culling and fragment-coordinate Y follow
+that origin, including pixel centers. Instance IDs include the base and advance within one
+Vulkan instanced draw. Vertex formats 1..48 and divisors zero/one are supported. Descriptor or
+global-memory shaders, depth/stencil testing, multiple targets, packed/scaled formats, larger
+divisors, advanced blending and multisample execution remain explicit stops.
+
+Vertex bindings retain owned pool/device generations. Execution resolves their current backing
+and copies only the required prefix on a miss. The cache arms existing CPU page-write tracking
+before its snapshot; unchanged mappings/pages reuse the GPU buffer without hashing, copying or
+uploading the bytes again. A rewrite creates a fresh device-local version, leaving earlier GPU
+submissions' buffers alive through their fences. Staging uploads are asynchronous; completed
+staging resources are reaped without a draw-path wait. Native budgets cap each input at 16 MiB
+and each queue cache at 64 MiB/4,096 entries; retained in-flight versions can outlive eviction.
+Unbound fixed state uses the API defaults, and unbound viewport/scissor use the full target.
+These are native initialization policies, not wider hardware-state coverage.
 
 ## Validation
 
@@ -277,10 +311,12 @@ native memory pool, initializes both descriptor pools, and constructs/registers 
 It creates a native queue with flags `0x9`, 1 MiB command and control budgets and a 256 KiB compute
 budget. It constructs three display textures and a native window with three 3840×2160 Vulkan
 images, initializes its first command buffer and callbacks, creates a native program, and captures
-its vertex/fragment binaries before stopping at `nvnVertexAttribStateSetDefaults`. Its report
+its vertex/fragment binaries and passes the render-state constructors before stopping at
+`nvnEventBuilderSetDefaults`. Its report
 confirms three textures, one window, one command buffer, one program, two binaries (1,536 bytes)
 and three GPU clears, with zero translated title modules, recorded sets, native queue submissions,
-presentations or display readback bytes. It also constructs/maps its first native buffer. Recording, callback
+presentations or display readback bytes. Vertex copies/uploads and executed state updates are
+also zero at this boundary. It also constructs/maps its first native buffer. Recording, callback
 execution and queued payloads currently have synthetic evidence; the real program stops before
 using them. Virtual mappings have not yet been reached by this real-program HLE probe.
 
@@ -295,7 +331,7 @@ clears do not establish native title rendering or a gameplay I/O/performance imp
 window tests also pass with Vulkan required; opt-in real-title differential tests are outside
 the standard gate used here.
 
-All 39 NVN2-focused runtime tests pass with Vulkan required. Six command tests cover callback
+All 50 NVN2-focused runtime tests pass with Vulkan required. Six command tests cover callback
 reentry, preserved caller state and callback side effects, disabled/insufficient allocation,
 faults/unwinds, inline begin/queries, recorder and handle lifetimes, called versus copied sets,
 memory reuse, cross-device rejection, atomic handle-array validation and cancellation of
@@ -315,6 +351,19 @@ Three native backend tests check variation reuse, branch-table-dependent invalid
 translation rejection and real dispatch of a translated compute module. The dispatch uses a
 synthetic EXIT kernel and its real fence; it does not establish resource-bearing title compute
 or draw execution. All seven new tests run with Vulkan required.
+
+Eleven further runtime tests cover the packed state ABI, output widths/faults, FP depth-range
+arguments, incomplete arrays, native array graphics, fixed state and input residency. Six use
+real Vulkan execution with SPIR-V validation required. Synthetic vertex and fragment binaries
+draw a green triangle over blue; diagnostic pixels and its external PNG were checked. Replaying
+the unchanged input keeps cumulative CPU copies/GPU uploads at 48 bytes and adds one cache hit.
+Rewriting the watched vertices changes the pixels and raises both totals to 96 bytes. Program
+and recorder finalization do not invalidate the retained execution; headless presentation adds
+no readback. Other GPU tests check culling in both origins, blend constants, write masks, logic
+operations, nonzero-base instancing, fragment Y pixel centers, out-of-range inputs and every
+pixel of a clipped scissored clear. That clear ignores a 1×1 viewport and preserves recorded
+state after caller memory changes. These are synthetic results, not native title rendering or
+a gameplay I/O/performance improvement.
 
 The texture validation trace completed 3,600 frames through the race. These comparisons all
 had zero differences:
@@ -411,18 +460,26 @@ and large foreground geometry still present. This different start phase and over
 isolate the earlier road issue. Builds/tests overlapped the capture; its timing establishes
 neither a performance gain nor a rendering-regression pass.
 
-On Windows, `cargo fmt --all --check`, `cargo lint` and `cargo test` pass: 1,208 tests passed and
+The state/array-draw off-mode check completed 3,600 frames in 370 seconds, exit zero, without
+concurrent builds/tests. Frame 3,500 was inspected: race road and HUD are visible at countdown
+2, with dark character/structure regions still present. The last 100 frames at 3,400, 3,500 and
+3,600 took 12.572, 12.378 and 11.854 seconds respectively. This checks the rebuilt default path
+through the race start; the different start phase prevents a matched rendering/performance
+comparison. It establishes no native gameplay I/O or rate improvement.
+
+On Windows, `cargo fmt --all --check`, `cargo lint` and `cargo test` pass: 1,219 tests passed and
 one was ignored.
 
 ## Next
 
-1. Render state, starting with vertex attributes/streams, plus remaining texture modes and
-   image/texel coherence. Extend program control/stage coverage and dynamic code invalidation.
-2. Extend typed recording to draws/copies/dispatch, views/scissors and indirect arguments;
-   complete resource visibility and event semantics beyond the current clear/barrier subset.
-3. Connect queued payloads to the renderer, retained display images and owned address
-   spaces without replaying method streams. Complete GPU visibility, sparse access and in-flight
-   resource lifetime handling here. Validate frames and time the race before enabling HLE by default.
+1. Implement event ownership/CPU/GPU visibility at the next initialization boundary. Complete
+   shader resource bindings, remaining texture modes and image/texel coherence; extend program
+   control/stage coverage and dynamic code invalidation.
+2. Extend typed recording/execution to depth/MRT/indexed/indirect draws, copies/dispatch and
+   views. Complete resource visibility beyond the current retained display-image subset.
+3. Complete GPU visibility, sparse access and in-flight resource lifetime handling without
+   replaying method streams. Validate native title frames and compare race I/O/rate before
+   enabling HLE by default.
 
 The traced route reaches 247 API functions on the path into the race. That is an observed minimum,
 not complete coverage of NVN2 or of later gameplay.

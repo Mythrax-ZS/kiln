@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[path = "draw.rs"]
+mod draw;
 #[path = "execute.rs"]
 mod execute;
 
@@ -25,6 +27,7 @@ struct Queue {
     gpu: GpuQueue,
     pending: Vec<Pending>,
     execution: execute::Execution,
+    inputs: draw::Inputs,
     _storage: Vec<u8>,
     _guest_storage: (u64, u64),
     _compute_size: u64,
@@ -344,6 +347,7 @@ impl Objects {
                 gpu,
                 pending: Vec::new(),
                 execution: execute::Execution::default(),
+                inputs: draw::Inputs::default(),
                 _storage: storage,
                 _guest_storage: (builder.memory, builder.memory_size),
                 _compute_size: builder.compute,

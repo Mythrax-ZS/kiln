@@ -84,7 +84,7 @@ pub struct Config {
     /// Vertex stage: clip space depth runs from -w to w (OpenGL) and is moved to 0 to w.
     pub depth_minus_one_to_one: bool,
     /// Pixel stage: the position's y counts from the bottom of the target (OpenGL window origin);
-    /// the value read is `target_height - 1 - y`... see [`Config::flip_y_height`].
+    /// pixel centers map to `target_height - y`.
     pub flip_y_height: Option<f32>,
     /// Write a human-readable name for every register variable and block (for `spirv-dis`).
     pub debug_names: bool,

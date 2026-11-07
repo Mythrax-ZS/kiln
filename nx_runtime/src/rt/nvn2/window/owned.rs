@@ -103,6 +103,7 @@ impl Objects {
         for image in self.live.values().flat_map(|w| &w.images) {
             let stats = image.surface.stats();
             total.clears += stats.clears;
+            total.draws += stats.draws;
             total.presents += stats.presents;
             total.readback_bytes += stats.readback_bytes;
         }

@@ -6,6 +6,7 @@ use crate::rt::nvn2::{
 };
 use std::cell::RefCell;
 
+mod draws;
 mod programs;
 
 thread_local! {

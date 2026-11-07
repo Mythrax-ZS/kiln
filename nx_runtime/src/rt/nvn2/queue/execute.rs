@@ -1,5 +1,5 @@
 use super::*;
-use crate::rt::nvn2::command::{Lease, Op, Recording};
+use crate::rt::nvn2::command::{Lease, Op, Recording, VertexBinding};
 use crate::rt::nvn2::program::Binding;
 use crate::rt::nvn2::texture::DisplayImage;
 use nx_vulkan::render::native::SurfaceCommand;
@@ -9,6 +9,8 @@ pub(super) struct Execution {
     colors: Vec<Option<DisplayImage>>,
     scratch: Option<(Lease, u64, u64)>,
     programs: [Option<Binding>; 6],
+    state: crate::rt::nvn2::state::Bindings,
+    vertices: [Option<VertexBinding>; 32],
 }
 
 impl Execution {
@@ -18,7 +20,7 @@ impl Execution {
         out: &mut Vec<SurfaceCommand>,
         depth: u32,
         visited: &mut usize,
-        validation: Option<(&Memory, &Devices)>,
+        scope: &mut super::draw::Scope<'_>,
     ) -> Result<(), Error> {
         *visited += r.ops.len();
         if depth > 64 || *visited > 1 << 20 {
@@ -30,6 +32,28 @@ impl Execution {
             match op {
                 Op::Targets(colors) => self.colors.clone_from(colors),
                 Op::Scratch(scratch) => self.scratch = *scratch,
+                Op::State(value) => self.state.apply(value),
+                Op::Vertex { index, binding } => self.vertices[*index] = *binding,
+                Op::Draw(draw) => {
+                    if self.colors.iter().skip(1).any(Option::is_some) {
+                        return Err(invalid(
+                            "array draws with multiple targets are not implemented",
+                        ));
+                    }
+                    let image = self
+                        .colors
+                        .first()
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| invalid("array draw has no color target"))?;
+                    if let Some(draw) =
+                        scope.draw(draw, image, &self.state, &self.vertices, &self.programs)?
+                    {
+                        out.push(SurfaceCommand::Draw {
+                            surface: Arc::clone(&image.surface),
+                            draw,
+                        });
+                    }
+                }
                 Op::Program { mask, binding } => {
                     for (stage, current) in self.programs.iter_mut().enumerate() {
                         if mask & (1 << stage) != 0 {
@@ -40,22 +64,32 @@ impl Execution {
                         }
                     }
                 }
-                Op::Clear { index, color } => {
+                Op::Clear {
+                    index,
+                    color,
+                    lower_left,
+                } => {
                     let image = self
                         .colors
                         .get(*index)
                         .and_then(Option::as_ref)
                         .ok_or_else(|| invalid("color clear has no bound native render target"))?;
-                    if let Some((memory, devices)) = validation {
+                    if let Some((memory, devices)) = scope.validation {
                         Lease {
                             pool: image.pool,
                             info: image.parent,
                         }
                         .validate(memory, &|d| devices.identity(d))?;
                     }
+                    let rect = self.state.scissors[0]
+                        .map(|s| super::draw::clip(s, image.dimensions, *lower_left));
+                    if rect.is_some_and(|r| r[2] == 0 || r[3] == 0) {
+                        continue;
+                    }
                     out.push(SurfaceCommand::Clear {
                         surface: Arc::clone(&image.surface),
                         color: *color,
+                        rect,
                     });
                 }
                 Op::Barrier(bits) => {
@@ -63,7 +97,7 @@ impl Execution {
                         out.push(SurfaceCommand::Barrier);
                     }
                 }
-                Op::Call(child) => self.expand(child, out, depth + 1, visited, validation)?,
+                Op::Call(child) => self.expand(child, out, depth + 1, visited, scope)?,
             }
         }
         Ok(())
@@ -79,11 +113,20 @@ impl Queue {
         let mut state = self.execution.clone();
         let mut operations = Vec::new();
         let mut visited = 0;
+        let context = self.gpu.context().clone();
         for item in pending {
             match item {
-                Pending::Commands(r) => {
-                    state.expand(r, &mut operations, 0, &mut visited, validation)?
-                }
+                Pending::Commands(r) => state.expand(
+                    r,
+                    &mut operations,
+                    0,
+                    &mut visited,
+                    &mut super::draw::Scope {
+                        validation,
+                        context: &context,
+                        inputs: &mut self.inputs,
+                    },
+                )?,
                 Pending::Fence(completion, for_cpu) => {
                     self.send_operations(&mut operations)?;
                     self.gpu
@@ -110,6 +153,19 @@ impl Queue {
 }
 
 impl Objects {
+    pub(in crate::rt::nvn2) fn input_stats(&self) -> (u64, u64, u64) {
+        (
+            self.queues.values().map(|q| q.inputs.copied).sum(),
+            self.queues.values().map(|q| q.inputs.hits).sum(),
+            self.queues.values().map(|q| q.inputs.uploaded).sum(),
+        )
+    }
+    pub(in crate::rt::nvn2) fn state_updates(&self) -> u64 {
+        self.queues
+            .values()
+            .map(|q| q.execution.state.updates)
+            .sum()
+    }
     pub(in crate::rt::nvn2) fn binding_stats(&self) -> (usize, usize) {
         (
             self.queues
@@ -128,7 +184,10 @@ impl Objects {
     }
     pub(in crate::rt::nvn2) fn command_stats(&self) -> (u64, u64) {
         (
-            self.queues.values().map(|q| q.gpu.submissions()).sum(),
+            self.queues
+                .values()
+                .map(|q| q.gpu.submissions() + q.inputs.uploads)
+                .sum(),
             self.queues
                 .values()
                 .filter_map(|q| q.execution.scratch.map(|(_, _, size)| size))

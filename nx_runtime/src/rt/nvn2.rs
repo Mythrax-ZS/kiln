@@ -26,6 +26,7 @@ mod memory;
 mod program;
 mod queue;
 mod sampler;
+mod state;
 mod texture;
 mod window;
 
@@ -47,6 +48,9 @@ struct Driver {
 
 impl Driver {
     fn call(&mut self, name: &str, cpu: &mut NativeCpu) -> Option<Result<(), device::Error>> {
+        if let Some(result) = state::call(name, cpu) {
+            return Some(result);
+        }
         if name == "nvnDeviceFinalize"
             && (self.memory.has_children(cpu.state.x[0])
                 || self.descriptors.has_device_children(cpu.state.x[0])
@@ -603,6 +607,7 @@ impl Session {
             #[cfg(feature = "vulkan")]
             {
                 let stats = driver.windows.stats();
+                let _ = writeln!(out, "# native display GPU draws: {}", stats.draws);
                 let _ = writeln!(out, "# native display GPU clears: {}\n# native display presentations: {}\n# native display readback bytes: {}",
                     stats.clears, stats.presents, stats.readback_bytes);
             }
@@ -623,6 +628,13 @@ impl Session {
                 let (submissions, scratch) = driver.queues.command_stats();
                 let _ = writeln!(out, "# native queue GPU submissions: {submissions}\n# native queue scratch binding bytes: {scratch}");
                 let (bindings, sample) = driver.queues.binding_stats();
+                let (copied, hits, uploaded) = driver.queues.input_stats();
+                let _=writeln!(out,"# native vertex input bytes copied: {copied}\n# native vertex input cache hits: {hits}\n# native vertex GPU upload bytes: {uploaded}");
+                let _ = writeln!(
+                    out,
+                    "# native queue state updates: {}",
+                    driver.queues.state_updates()
+                );
                 let _ = writeln!(out, "# native queue shader stage bindings: {bindings}\n# native queue forced sample shading bindings: {sample}");
                 let (programs, binaries, modules) = driver.programs.counts();
                 let _ = writeln!(out, "# native programs owned: {programs}\n# native shader binaries owned: {binaries}\n# native shader modules translated: {modules}\n# native shader GPU input bytes captured: {}", driver.programs.captured_bytes);

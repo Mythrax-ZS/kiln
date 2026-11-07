@@ -50,6 +50,9 @@ pub(super) fn collect_leases(ops: &[Op], out: &mut Vec<Lease>) {
                 info: t.parent,
             })),
             Op::Scratch(Some((lease, _, _))) => out.push(*lease),
+            Op::Vertex {
+                binding: Some(b), ..
+            } => out.push(b.lease),
             Op::Program {
                 binding: Some(b), ..
             } => out.extend(b.link.shaders.iter().map(|s| s.lease)),
@@ -252,21 +255,104 @@ impl Objects {
             return self.end(cpu);
         }
         // Refuse unknown entries before adopting or changing any recording state.
-        if !matches!(
-            op,
-            "SetRenderTargets"
-                | "ClearColor"
-                | "SetShaderScratchMemory"
-                | "Barrier"
-                | "CallCommands"
-                | "CopyCommands"
-                | "BindProgram"
-        ) {
+        let is_state = super::super::state::is_command(op);
+        if !is_state
+            && !matches!(
+                op,
+                "SetRenderTargets"
+                    | "ClearColor"
+                    | "SetShaderScratchMemory"
+                    | "Barrier"
+                    | "CallCommands"
+                    | "CopyCommands"
+                    | "BindProgram"
+                    | "BindVertexBuffer"
+                    | "BindVertexBuffers"
+                    | "DrawArrays"
+                    | "DrawArraysInstanced"
+            )
+        {
             return Err(invalid(&format!("nvnCommandBuffer{op} is not implemented")));
         }
         self.adopt_inline_begin(object)?;
         let owner = self.live[&object].device;
         let (ops, command_bytes, control_bytes) = match op {
+            _ if is_state => {
+                let value = super::super::state::snapshot(op, cpu)?;
+                (vec![Op::State(value)], 32, 8)
+            }
+            "BindVertexBuffer" | "BindVertexBuffers" => {
+                let first = a as u32 as usize;
+                let count = if op == "BindVertexBuffer" {
+                    1
+                } else {
+                    b as u32 as usize
+                };
+                if first > 32 || count > 32 - first {
+                    return Err(invalid("vertex buffer range exceeds thirty-two slots"));
+                }
+                let mut ops = Vec::with_capacity(count);
+                for i in 0..count {
+                    let (address, size) = if op == "BindVertexBuffer" {
+                        (b, c)
+                    } else {
+                        let bytes = read::<16>(c.wrapping_add(i as u64 * 16))?;
+                        (
+                            u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                            u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+                        )
+                    };
+                    let binding = if address == 0 && size == 0 {
+                        None
+                    } else {
+                        if size == 0 {
+                            return Err(invalid("vertex buffer has an empty non-null range"));
+                        }
+                        let (pool, info, offset) =
+                            memory.gpu_range(owner, address, size, &|d| devices.identity(d))?;
+                        Some(VertexBinding {
+                            lease: Lease { pool, info },
+                            offset,
+                            size,
+                        })
+                    };
+                    ops.push(Op::Vertex {
+                        index: first + i,
+                        binding,
+                    });
+                }
+                (ops, 32 + count as u64 * 16, 8)
+            }
+            "DrawArrays" | "DrawArraysInstanced" => {
+                let (first, count) = (b as u32, c as u32);
+                let (first_instance, instances) = if op == "DrawArraysInstanced" {
+                    (d as u32, e as u32)
+                } else {
+                    (0, 1)
+                };
+                if first > i32::MAX as u32
+                    || count > i32::MAX as u32
+                    || instances > i32::MAX as u32
+                    || first.checked_add(count).is_none()
+                    || first_instance.checked_add(instances).is_none()
+                {
+                    return Err(invalid("array draw range is invalid"));
+                }
+                let modes = devices.modes(owner)?;
+                (
+                    vec![Op::Draw(Draw {
+                        primitive: a as u32,
+                        first,
+                        count,
+                        first_instance,
+                        instances,
+                        lower_left: modes.0 == 0,
+                        depth_minus_one_to_one: modes.1 == 0,
+                    })],
+                    32,
+                    8,
+                )
+            }
             "BindProgram" => {
                 let mask = b as u32;
                 if mask & !0x3F != 0 {
@@ -327,6 +413,7 @@ impl Objects {
                         vec![Op::Clear {
                             index: a as u32 as usize,
                             color,
+                            lower_left: devices.modes(owner)?.0 == 0,
                         }]
                     },
                     32,

@@ -10,10 +10,16 @@ use std::time::{Duration, Instant};
 
 mod shader;
 pub use shader::{ShaderBinary, ShaderModule, ShaderOptions, ShaderStage};
+mod graphics;
+pub use graphics::{
+    Attribute, BlendFactor, BlendOp, ColorBlend, GraphicsPipeline, GraphicsState, InputBuffer,
+    NativeDraw, Primitive, Stream, VertexFormat, VertexKind,
+};
 
 #[derive(Clone)]
 pub struct Context {
     vk: Arc<Vk>,
+    graphics: Arc<Mutex<graphics::Cache>>,
 }
 
 impl Context {
@@ -21,7 +27,10 @@ impl Context {
         Arc::ptr_eq(&self.vk, vk)
     }
     pub(crate) fn new(vk: Arc<Vk>) -> Self {
-        Self { vk }
+        Self {
+            vk,
+            graphics: Arc::new(Mutex::new(graphics::Cache::default())),
+        }
     }
 
     pub fn queue(&self) -> Result<Queue, String> {
@@ -166,14 +175,28 @@ impl Drop for Completion {
     }
 }
 
+struct Flight {
+    command: vk::CommandBuffer,
+    done: Arc<Completion>,
+    objects: Vec<Arc<dyn Send + Sync>>,
+}
 pub struct Queue {
     context: Context,
     pool: vk::CommandPool,
-    flying: Vec<(vk::CommandBuffer, Arc<Completion>)>,
+    flying: Vec<Flight>,
     submissions: u64,
 }
 
 impl Queue {
+    pub(crate) fn keep_alive(
+        &mut self,
+        done: &Arc<Completion>,
+        objects: Vec<Arc<dyn Send + Sync>>,
+    ) {
+        let flight = self.flying.last_mut().expect("submitted commands");
+        assert!(Arc::ptr_eq(&flight.done, done));
+        flight.objects.extend(objects);
+    }
     pub fn context(&self) -> &Context {
         &self.context
     }
@@ -276,7 +299,11 @@ impl Queue {
         match result {
             Ok(()) => {
                 self.submissions += 1;
-                self.flying.push((cmd, Arc::clone(completion)));
+                self.flying.push(Flight {
+                    command: cmd,
+                    done: Arc::clone(completion),
+                    objects: Vec::new(),
+                });
                 Ok(())
             }
             Err(e) => {
@@ -290,14 +317,14 @@ impl Queue {
     fn reap(&mut self) -> Result<(), String> {
         let mut index = 0;
         while index < self.flying.len() {
-            if self.flying[index].1.signaled()? {
-                let (cmd, _) = self.flying.swap_remove(index);
+            if self.flying[index].done.signaled()? {
+                let flight = self.flying.swap_remove(index);
                 // SAFETY: this command buffer's fence completed, and the pool is exclusive.
                 unsafe {
                     self.context
                         .vk
                         .device
-                        .free_command_buffers(self.pool, &[cmd])
+                        .free_command_buffers(self.pool, &[flight.command])
                 };
             } else {
                 index += 1;
@@ -309,8 +336,8 @@ impl Queue {
 
 impl Drop for Queue {
     fn drop(&mut self) {
-        for (_, completion) in &self.flying {
-            let _ = completion.wait(u64::MAX);
+        for flight in &self.flying {
+            let _ = flight.done.wait(u64::MAX);
         }
         // SAFETY: submitted work has completed or the device was lost; no buffer remains in use.
         unsafe { self.context.vk.device.destroy_command_pool(self.pool, None) };

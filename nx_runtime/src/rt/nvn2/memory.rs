@@ -85,6 +85,28 @@ pub(super) fn label(address: u64) -> Result<Vec<u8>, Error> {
 }
 
 impl Objects {
+    #[cfg(feature = "vulkan")]
+    pub(super) fn gpu_range(
+        &self,
+        device: u64,
+        address: u64,
+        size: u64,
+        validate: Validate<'_>,
+    ) -> Result<(u64, PoolInfo, u64), Error> {
+        let (&object, _) = self
+            .pools
+            .iter()
+            .find(|(_, p)| {
+                p.device == device
+                    && p.gpu != 0
+                    && address >= p.gpu
+                    && inside(address - p.gpu, size, p.size)
+            })
+            .ok_or_else(|| invalid("buffer range is outside its device's GPU pools"))?;
+        let info = self.pool_info(object, validate)?;
+        Ok((object, info, address - info.gpu))
+    }
+
     /// Capture a GPU input through its owned pool, without assuming GPU addresses are CPU ones.
     #[cfg(feature = "vulkan")]
     pub(super) fn read_shader(

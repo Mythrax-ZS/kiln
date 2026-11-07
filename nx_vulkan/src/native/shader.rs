@@ -24,6 +24,10 @@ pub enum ShaderStage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShaderOptions {
     Graphics(Variation),
+    LowerLeftFragment {
+        variation: Variation,
+        target_height: u32,
+    },
     Compute {
         block: [u32; 3],
         shared_bytes: u32,
@@ -32,7 +36,7 @@ pub enum ShaderOptions {
 }
 
 pub struct ShaderModule {
-    vk: Arc<Vk>,
+    pub(super) vk: Arc<Vk>,
     pub module: vk::ShaderModule,
     pub info: Info,
     pub stage: Stage,
@@ -124,7 +128,7 @@ impl ShaderBinary {
             return Ok(Arc::clone(&e.module));
         }
         let mut config = match &options {
-            ShaderOptions::Graphics(v) => {
+            ShaderOptions::Graphics(v) | ShaderOptions::LowerLeftFragment { variation: v, .. } => {
                 let expected = match self.stage {
                     ShaderStage::Vertex => Stage::Vertex,
                     ShaderStage::Fragment => Stage::Pixel,
@@ -133,7 +137,17 @@ impl ShaderBinary {
                 if v.stage_index != expected.index() || v.mesh.is_some() {
                     return Err("native graphics variation has a different shader stage".into());
                 }
-                v.config()
+                let mut config = v.config();
+                if let ShaderOptions::LowerLeftFragment { target_height, .. } = &options {
+                    if self.stage != ShaderStage::Fragment || *target_height == 0 {
+                        return Err(
+                            "native fragment origin needs a fragment stage and target height"
+                                .into(),
+                        );
+                    }
+                    config.flip_y_height = Some(*target_height as f32);
+                }
+                config
             }
             ShaderOptions::Compute {
                 block,

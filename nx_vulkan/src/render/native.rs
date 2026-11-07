@@ -20,6 +20,7 @@ struct State {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SurfaceStats {
     pub clears: u64,
+    pub draws: u64,
     pub presents: u64,
     pub readback_bytes: u64,
 }
@@ -43,7 +44,7 @@ pub enum SurfaceFormat {
 }
 
 impl SurfaceFormat {
-    fn vulkan(self) -> vk::Format {
+    pub(crate) fn vulkan(self) -> vk::Format {
         match self {
             Self::Rgba8 => vk::Format::R8G8B8A8_UNORM,
             Self::Rgba8Srgb => vk::Format::R8G8B8A8_SRGB,
@@ -64,6 +65,12 @@ pub enum SurfaceCommand {
     Clear {
         surface: Arc<Surface>,
         color: [f32; 4],
+        /// A checked top-left rectangle in pixels. None clears the complete image.
+        rect: Option<[u32; 4]>,
+    },
+    Draw {
+        surface: Arc<Surface>,
+        draw: Arc<crate::native::NativeDraw>,
     },
     Barrier,
 }
@@ -96,7 +103,9 @@ impl Queue {
         let mut surfaces: Vec<_> = commands
             .iter()
             .filter_map(|c| match c {
-                SurfaceCommand::Clear { surface, .. } => Some(Arc::clone(surface)),
+                SurfaceCommand::Clear { surface, .. } | SurfaceCommand::Draw { surface, .. } => {
+                    Some(Arc::clone(surface))
+                }
                 SurfaceCommand::Barrier => None,
             })
             .collect();
@@ -109,11 +118,88 @@ impl Queue {
             .iter()
             .map(|s| s.state.lock().unwrap_or_else(|e| e.into_inner()))
             .collect();
+        for operation in commands {
+            if let SurfaceCommand::Draw { surface, draw } = operation {
+                let i = surfaces
+                    .binary_search_by_key(&(Arc::as_ptr(surface) as usize), |s| {
+                        Arc::as_ptr(s) as usize
+                    })
+                    .expect("retained image");
+                let target = guards[i].target.as_ref().expect("live surface");
+                draw.validate(
+                    self.context(),
+                    target.key.format,
+                    [target.key.width, target.key.height],
+                )?;
+            }
+            if let SurfaceCommand::Clear {
+                surface,
+                rect: Some([x, y, width, height]),
+                ..
+            } = operation
+            {
+                let i = surfaces
+                    .binary_search_by_key(&(Arc::as_ptr(surface) as usize), |s| {
+                        Arc::as_ptr(s) as usize
+                    })
+                    .expect("retained image");
+                let target = guards[i].target.as_ref().expect("live surface");
+                if *width == 0
+                    || *height == 0
+                    || !x.checked_add(*width).is_some_and(|v| v <= target.key.width)
+                    || !y
+                        .checked_add(*height)
+                        .is_some_and(|v| v <= target.key.height)
+                {
+                    return Err("native clear rectangle is empty or outside the image".into());
+                }
+            }
+        }
         let mut clears = vec![0; guards.len()];
+        let mut draws = vec![0; guards.len()];
         self.submit_commands(Arc::clone(&done), false, |vk, cmd| {
             for operation in commands {
                 match operation {
-                    SurfaceCommand::Clear { surface, color } => {
+                    SurfaceCommand::Draw { surface, draw } => {
+                        let i = surfaces
+                            .binary_search_by_key(&(Arc::as_ptr(surface) as usize), |s| {
+                                Arc::as_ptr(s) as usize
+                            })
+                            .expect("retained image");
+                        let target = guards[i].target.as_mut().expect("live surface");
+                        memory_barrier(vk, cmd);
+                        target.transition(vk, cmd, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+                        let attachments = [vk::RenderingAttachmentInfo::default()
+                            .image_view(target.image.view)
+                            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                            .load_op(vk::AttachmentLoadOp::LOAD)
+                            .store_op(vk::AttachmentStoreOp::STORE)];
+                        let rendering = vk::RenderingInfo::default()
+                            .render_area(vk::Rect2D {
+                                offset: vk::Offset2D::default(),
+                                extent: vk::Extent2D {
+                                    width: target.key.width,
+                                    height: target.key.height,
+                                },
+                            })
+                            .layer_count(1)
+                            .color_attachments(&attachments);
+                        // SAFETY: resources and target were validated before recording.
+                        unsafe {
+                            vk.device.cmd_begin_rendering(cmd, &rendering);
+                        }
+                        draw.record(vk, cmd);
+                        // SAFETY: this rendering instance was begun immediately above.
+                        unsafe {
+                            vk.device.cmd_end_rendering(cmd);
+                        }
+                        draws[i] += 1;
+                    }
+                    SurfaceCommand::Clear {
+                        surface,
+                        color,
+                        rect,
+                    } => {
                         let i = surfaces
                             .binary_search_by_key(&(Arc::as_ptr(surface) as usize), |s| {
                                 Arc::as_ptr(s) as usize
@@ -122,6 +208,51 @@ impl Queue {
                         let target = guards[i].target.as_mut().expect("live surface");
                         // Same-layout consecutive transfer writes need an explicit dependency.
                         memory_barrier(vk, cmd);
+                        if let Some([x, y, width, height]) = *rect {
+                            target.transition(vk, cmd, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+                            let attachments = [vk::RenderingAttachmentInfo::default()
+                                .image_view(target.image.view)
+                                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                                .load_op(vk::AttachmentLoadOp::LOAD)
+                                .store_op(vk::AttachmentStoreOp::STORE)];
+                            let rendering = vk::RenderingInfo::default()
+                                .render_area(vk::Rect2D {
+                                    offset: vk::Offset2D::default(),
+                                    extent: vk::Extent2D {
+                                        width: target.key.width,
+                                        height: target.key.height,
+                                    },
+                                })
+                                .layer_count(1)
+                                .color_attachments(&attachments);
+                            // SAFETY: one retained single-sample color view; the rectangle is
+                            // inside its extent. This clear ignores viewport/blend/channel state.
+                            unsafe {
+                                vk.device.cmd_begin_rendering(cmd, &rendering);
+                                vk.device.cmd_clear_attachments(
+                                    cmd,
+                                    &[vk::ClearAttachment::default()
+                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                        .color_attachment(0)
+                                        .clear_value(vk::ClearValue {
+                                            color: vk::ClearColorValue { float32: *color },
+                                        })],
+                                    &[vk::ClearRect::default()
+                                        .rect(vk::Rect2D {
+                                            offset: vk::Offset2D {
+                                                x: x as i32,
+                                                y: y as i32,
+                                            },
+                                            extent: vk::Extent2D { width, height },
+                                        })
+                                        .base_array_layer(0)
+                                        .layer_count(1)],
+                                );
+                                vk.device.cmd_end_rendering(cmd);
+                            }
+                            clears[i] += 1;
+                            continue;
+                        }
                         target.transition(vk, cmd, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
                         // SAFETY: a retained single-layer color image with transfer usage, in
                         // the correct layout. Every use of its state remains locked until submit.
@@ -143,9 +274,21 @@ impl Queue {
                 }
             }
         })?;
+        let retained: Vec<Arc<dyn Send + Sync>> = commands
+            .iter()
+            .filter_map(|operation| {
+                if let SurfaceCommand::Draw { draw, .. } = operation {
+                    Some(Arc::clone(draw) as Arc<dyn Send + Sync>)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        self.keep_alive(&done, retained);
         for (i, state) in guards.iter_mut().enumerate() {
             state.last = Arc::clone(&done);
             state.stats.clears += clears[i];
+            state.stats.draws += draws[i];
         }
         Ok(())
     }

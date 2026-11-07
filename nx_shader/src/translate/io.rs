@@ -676,9 +676,15 @@ pub(super) fn interpolated(tx: &mut Tx<'_>, addr: u32) -> R<Id> {
             let vec = tx.f.load(&mut tx.m, v4, fc);
             let f = tx.t.f32;
             let comp = (addr - 0x70) / 4;
-            Ok(tx
-                .f
-                .emit_result(&mut tx.m, op::COMPOSITE_EXTRACT, f, &[vec, comp]))
+            let value =
+                tx.f.emit_result(&mut tx.m, op::COMPOSITE_EXTRACT, f, &[vec, comp]);
+            if comp == 1 {
+                if let Some(height) = tx.cfg.flip_y_height {
+                    let height = tx.cf32(height);
+                    return Ok(tx.op2(op::F_SUB, f, height, value));
+                }
+            }
+            Ok(value)
         }
         0x80..=0x27f => {
             let loc = (addr - 0x80) / 16;
