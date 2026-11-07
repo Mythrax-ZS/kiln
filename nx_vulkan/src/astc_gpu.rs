@@ -57,7 +57,8 @@ impl Decoder {
         Decoder::with(vk, &bc7_spirv(), "the BC7 encoder")
     }
 
-    fn with(vk: &Vk, code: &[u32], what: &str) -> Result<Decoder, String> {
+    /// A program of the same shape (three storage buffers in set 0) from `code`.
+    pub(crate) fn with(vk: &Vk, code: &[u32], what: &str) -> Result<Decoder, String> {
         let d = &vk.device;
         // SAFETY: valid create infos; everything made is destroyed in `destroy`.
         unsafe {

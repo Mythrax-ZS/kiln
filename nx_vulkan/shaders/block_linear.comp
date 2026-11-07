@@ -1,0 +1,61 @@
+// The texels a launch stored in a surface, in packed rows, laid out block-linear into the guest's
+// own memory by the device (A-292): what the host did after waiting for the launch, the device does
+// in the same batch. Sixteen bytes an invocation: a GOB is 64 bytes across and 8 rows down, and its
+// bytes go in chunks of 16 whose places the table says (the Switch's order or the Switch 2's). The
+// surface fills its blocks (rows of whole GOBs, whole blocks down and through the depth).
+//
+// Compiled by hand with `glslc --target-env=vulkan1.2 -O block_linear.comp -o block_linear.spv`;
+// the SPIR-V is kept beside this file (`include_bytes!` in `src/render/surfaces.rs`).
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer Chunks {
+    uvec4 c[];
+};
+
+// What the launch lays out: `units` chunks of 16 bytes, rows of `row_units` of them, `height` rows
+// a slice; blocks of `1 << block_height_log2` GOBs down and `1 << block_depth_log2` through, the
+// surface `blocks_x` blocks across and `blocks_y` down; the texels from chunk `in_at` of `texels`,
+// the surface's memory at device address `memory`.
+layout(std430, set = 0, binding = 0) readonly buffer Params {
+    uint64_t memory;
+    uint units;
+    uint row_units;
+    uint height;
+    uint blocks_x;
+    uint blocks_y;
+    uint block_height_log2;
+    uint block_depth_log2;
+    uint in_at;
+    uint pad0;
+    uint pad1;
+    // Where chunk `x` (0..4) of row `y` (0..8) of a GOB is, in bytes: entry `4 * y + x`.
+    uint chunk[32];
+} p;
+
+layout(std430, set = 0, binding = 1) readonly buffer Texels {
+    uvec4 texels[];
+};
+
+void main() {
+    Chunks dst = Chunks(p.memory);
+    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    uint block_bytes = 512u << (p.block_height_log2 + p.block_depth_log2);
+    uint bh = 1u << p.block_height_log2;
+    uint bd = 1u << p.block_depth_log2;
+    for (uint u = gl_GlobalInvocationID.x; u < p.units; u += stride) {
+        uint xu = u % p.row_units;
+        uint rest = u / p.row_units;
+        uint y = rest % p.height;
+        uint z = rest / p.height;
+        uint gob_x = xu / 4u;
+        uint gob_y = y / 8u;
+        uint block = ((z / bd) * p.blocks_y + gob_y / bh) * p.blocks_x + gob_x;
+        uint gob_in_block = (z % bd) * bh + gob_y % bh;
+        uint at = block * block_bytes + gob_in_block * 512u + p.chunk[(y % 8u) * 4u + xu % 4u];
+        dst.c[at / 16u] = texels[p.in_at + u];
+    }
+}

@@ -194,6 +194,10 @@ struct Core {
     /// The GPU addresses the kept surfaces lie in (an upper bound).
     residents_span: Option<(u64, u64)>,
     staging_buffers: crate::fast::FastMap<u64, Vec<crate::compute::HostBuffer>>,
+    /// The device buffers surfaces are copied into for the device to lay out into memory
+    /// (A-292), by size, and the program that does it.
+    layout_buffers: crate::fast::FastMap<u64, Vec<crate::compute::DeviceBuffer>>,
+    layout: Option<crate::astc_gpu::Decoder>,
     /// Textures let go to keep to the device memory budget (A-260), for the report.
     textures_trimmed: u64,
     /// 2D copies made in guest memory (A-249), for the report of every 100 frames.
@@ -295,6 +299,8 @@ struct Phases {
     hazard_kinds: [u64; 7],
     /// How long putting the launches' surfaces into memory took and how many bytes they were.
     surfaces_put: (std::time::Duration, u64),
+    /// The bytes of surfaces the device laid out into memory itself (A-292).
+    surfaces_on_device: u64,
     /// Surfaces made from memory for launches: how many, how long it took, and the bytes.
     surfaces_filled: (u64, std::time::Duration, u64),
 
@@ -445,6 +451,8 @@ impl Renderer {
                     attached: None,
                     residents_span: None,
                     staging_buffers: crate::fast::FastMap::default(),
+                    layout_buffers: crate::fast::FastMap::default(),
+                    layout: None,
                     textures_trimmed: 0,
                     memory_copies: 0,
                     batch_draws: 0,
@@ -1332,6 +1340,7 @@ impl Renderer {
                 let full = textures::take_full_compares();
                 eprintln!(
                     "[vulkan] frame {}: textures looked up {} times in {:?} (compared this frame), {} in {:?} (unchanged as the tracking says), {} in {:?} (compared in full)",
+                let kept = std::mem::take(&mut core.textures.kept_bindings);
                     p.frame,
                     compares[0].0,
                     compares[0].1,
@@ -1441,10 +1450,11 @@ impl Renderer {
                         ph.forwarded
                     );
                     eprintln!(
-                        "[vulkan] frame {}: putting the surfaces into memory took {:?} for {} MiB; {} surfaces were made from memory in {:?} ({} MiB); {} textures were sampled from a launch's image; kept surfaces were used by launches {} and sampled {} times; draws waited for launches {:?} (constant buffers, vertices, indices, texture pools, memory in place, textures)",
+                        "[vulkan] frame {}: putting the surfaces into memory took {:?} for {} MiB ({} MiB more laid out by the device); {} surfaces were made from memory in {:?} ({} MiB); {} textures were sampled from a launch's image; kept surfaces were used by launches {} and sampled {} times; draws waited for launches {:?} (constant buffers, vertices, indices, texture pools, memory in place, textures)",
                         p.frame,
                         ph.surfaces_put.0,
                         ph.surfaces_put.1 >> 20,
+                        ph.surfaces_on_device >> 20,
                         ph.surfaces_filled.0,
                         ph.surfaces_filled.1,
                         ph.surfaces_filled.2 >> 20,
@@ -1885,6 +1895,14 @@ impl Drop for Renderer {
                 for buffer in buffers {
                     core.vk.destroy_host_buffer(buffer);
                 }
+            }
+            for (_, buffers) in core.layout_buffers.drain() {
+                for buffer in buffers {
+                    core.vk.destroy_device_buffer(buffer);
+                }
+            }
+            if let Some(layout) = core.layout.take() {
+                layout.destroy(&core.vk);
             }
             core.layouts.destroy(&core.vk);
             core.shaders.destroy(&core.vk);

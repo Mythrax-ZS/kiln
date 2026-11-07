@@ -429,7 +429,7 @@ impl Core {
         // What the launch writes reaches memory when something needs it there (A-274): its
         // surfaces are copied out for the host after it, and what it reaches of global memory is
         // noted for the commands after it to wait for when they read it.
-        let staged = self.stage_surfaces(surfaces.into_iter().map(|(_, s)| s).collect())?;
+        let staged = self.stage_surfaces(scene, surfaces.into_iter().map(|(_, s)| s).collect())?;
         if program.info.global_memory {
             self.phases.launch_kinds[2] += 1;
             self.global_pending = true;

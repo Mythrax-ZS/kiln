@@ -174,6 +174,35 @@ impl GlobalMemory {
         Ok(address + page_offset)
     }
 
+    /// The device address of the `len` bytes of guest memory at `cpu`, which the device is to
+    /// write in place: imported now (with what follows them, up to `IMPORT_WINDOW`) unless an
+    /// import covers them. `None` when they are not one run of host memory or cannot be imported.
+    pub fn device_address(
+        &mut self,
+        vk: &Vk,
+        scene: &Scene<'_>,
+        cpu: u64,
+        len: u64,
+        now: u64,
+    ) -> Option<u64> {
+        let (ptr, run) = scene.mem.host_run(cpu, len)?;
+        if run < len {
+            return None;
+        }
+        if let Some(device) = self.covering(ptr, len, now) {
+            return Some(device);
+        }
+        let want = len.clamp(IMPORT_WINDOW, MAX_IMPORT);
+        let (window, size) = scene.mem.host_run(cpu, want).unwrap_or((ptr, run));
+        match self.import(vk, window, size.max(len), now) {
+            Ok(device) => Some(device),
+            Err(why) => {
+                *self.failures.entry(why).or_default() += 1;
+                None
+            }
+        }
+    }
+
     /// The device address of the host bytes `[ptr, ptr + len)` in an import that covers them.
     fn covering(&mut self, ptr: *mut u8, len: u64, now: u64) -> Option<u64> {
         let start = ptr as usize;

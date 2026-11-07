@@ -25,11 +25,13 @@ impl Geometry {
         u64::from(self.width) * u64::from(self.bytes_per_element)
     }
 
-    fn blocks_x(&self) -> u64 {
+    /// The blocks across the surface.
+    pub fn blocks_x(&self) -> u64 {
         self.row_bytes().div_ceil(64)
     }
 
-    fn blocks_y(&self) -> u64 {
+    /// The blocks down the surface.
+    pub fn blocks_y(&self) -> u64 {
         u64::from(self.height)
             .div_ceil(8)
             .div_ceil(1 << self.block_height_log2)
@@ -134,6 +136,60 @@ const fn chunks(switch_2: bool) -> [[u16; 4]; 8] {
 
 const CHUNK_X1: [[u16; 4]; 8] = chunks(false);
 const CHUNK_SWITCH_2: [[u16; 4]; 8] = chunks(true);
+
+/// The words of the program that lays a surface's texels out block-linear on the device
+/// (`shaders/block_linear.comp`, A-292). Its bindings (set 0, storage buffers): 0 the parameters
+/// ([`device_params`]), 1 the texels in packed rows (16 bytes a unit); 2 is not used. Workgroups
+/// of 64 invocations, as many as there are units of 16 bytes or fewer (each goes on through the
+/// units a workgroup count apart). The surface must fill its blocks.
+pub fn device_spirv() -> Vec<u32> {
+    let bytes = include_bytes!("../shaders/block_linear.spv");
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| u32::from_le_bytes(*w))
+        .collect()
+}
+
+/// The 176 bytes of parameters of [`device_spirv`] for the surface `g`, its memory at device
+/// address `memory`, its texels from unit (16 bytes) `in_at` of the texels' buffer.
+pub fn device_params(g: &Geometry, memory: u64, in_at: u32) -> Vec<u8> {
+    let units = g.linear_size() / 16;
+    let row_units = g.row_bytes() / 16;
+    let mut bytes = Vec::with_capacity(176);
+    bytes.extend(memory.to_le_bytes());
+    for w in [
+        units as u32,
+        row_units as u32,
+        g.height,
+        g.blocks_x() as u32,
+        g.blocks_y() as u32,
+        g.block_height_log2,
+        g.block_depth_log2,
+        in_at,
+        0,
+        0,
+    ] {
+        bytes.extend(w.to_le_bytes());
+    }
+    for row in chunk_table() {
+        for &c in row {
+            bytes.extend(u32::from(c).to_le_bytes());
+        }
+    }
+    bytes
+}
+
+/// Where each 16-byte chunk of a row of a GOB lies inside it, for the process's GPU: entry
+/// `[y][x]` for chunk `x` (0..4) of row `y` (0..8).
+pub fn chunk_table() -> &'static [[u16; 4]; 8] {
+    if nx_gpu::gob::is_switch_2() {
+        &CHUNK_SWITCH_2
+    } else {
+        &CHUNK_X1
+    }
+}
 
 /// Visit the surface in runs of up to 16 bytes that are contiguous in both layouts, calling
 /// `f(tiled offset, linear offset, length)`: GOB by GOB, so that the position of a GOB is worked

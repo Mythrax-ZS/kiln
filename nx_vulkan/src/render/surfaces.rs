@@ -121,9 +121,18 @@ impl SurfaceImage {
 /// memory once the launch has run (A-274), and the image it stored it in, kept for a later launch
 /// of the run that uses the same surface (A-280).
 pub struct Staged {
-    staging: crate::compute::HostBuffer,
+    /// The texels in host memory, for the host to put into memory; none when the device lays
+    /// them out into memory itself (A-292), from `linear`.
+    staging: Option<crate::compute::HostBuffer>,
+    linear: Option<crate::compute::DeviceBuffer>,
     place: Place,
     image: Option<Image>,
+}
+
+/// `NX_SURFACES_HOST=1`: the host puts every surface into memory, as before A-292.
+fn host_only() -> bool {
+    static HOST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HOST.get_or_init(|| std::env::var_os("NX_SURFACES_HOST").is_some())
 }
 
 impl Staged {
@@ -713,13 +722,30 @@ impl Core {
 
     /// After a launch is recorded: copy what it stored in its surfaces out for the host (after
     /// it, in the same batch), and let the images go once the batch is over (A-274).
-    pub(super) fn stage_surfaces(&mut self, surfaces: Vec<Surface>) -> Result<Vec<Staged>, String> {
+    pub(super) fn stage_surfaces(
+        &mut self,
+        scene: &Scene<'_>,
+        surfaces: Vec<Surface>,
+    ) -> Result<Vec<Staged>, String> {
         let mut staged = Vec::new();
         if surfaces.iter().any(|s| s.written) {
-            let cmd = self.frame.cmd(&self.vk)?;
+            let mut to_host = false;
             for s in surfaces.iter().filter(|s| s.written) {
                 let per_layer = s.place.geometry.linear_size();
-                let staging = self.staging_buffer(per_layer * u64::from(s.place.layers))?;
+                let bytes = per_layer * u64::from(s.place.layers);
+                // The device lays the texels out into memory itself where it can (A-292); else
+                // they are copied out for the host.
+                let on_device = self.device_layout(scene, &s.place);
+                let (staging, linear) = match on_device {
+                    Some(_) => (None, Some(self.layout_buffer(bytes)?)),
+                    None => (Some(self.staging_buffer(bytes)?), None),
+                };
+                let into = match (&staging, &linear) {
+                    (Some(h), _) => h.buffer,
+                    (None, Some(d)) => d.buffer,
+                    (None, None) => unreachable!("one of them was made"),
+                };
+                let cmd = self.frame.cmd(&self.vk)?;
                 let regions: Vec<vk::BufferImageCopy> = (0..s.place.layers)
                     .map(|layer| s.region(layer, u64::from(layer) * per_layer))
                     .collect();
@@ -751,7 +777,7 @@ impl Core {
                         cmd,
                         s.image.image(),
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        staging.buffer,
+                        into,
                         &regions,
                     );
                     // Back to the general layout, for a later launch to use as it is (A-280) and
@@ -777,26 +803,36 @@ impl Core {
                         )],
                     );
                 }
+                match (&linear, on_device) {
+                    (Some(linear), Some(addresses)) => {
+                        self.lay_out_on_device(cmd, &s.place, linear.buffer, &addresses)?
+                    }
+                    _ => to_host = true,
+                }
                 staged.push(Staged {
                     staging,
+                    linear,
                     place: s.place,
                     image: None,
                 });
             }
-            let to_host = [vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)];
-            // SAFETY: the command buffer is recording.
-            unsafe {
-                self.vk.device.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::HOST,
-                    vk::DependencyFlags::empty(),
-                    &to_host,
-                    &[],
-                    &[],
-                );
+            if to_host {
+                let cmd = self.frame.cmd(&self.vk)?;
+                let barrier = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)];
+                // SAFETY: the command buffer is recording.
+                unsafe {
+                    self.vk.device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::HOST,
+                        vk::DependencyFlags::empty(),
+                        &barrier,
+                        &[],
+                        &[],
+                    );
+                }
             }
         }
         // A written image stays with its staged texels (a forwarded one is taken from the launch
@@ -843,6 +879,168 @@ impl Core {
         }
     }
 
+    /// Where the device can lay a surface out into memory itself (A-292): the device address of
+    /// each layer's memory, when every layer fills its blocks in one run of host memory that the
+    /// device can reach, at an address of whole 16 bytes, and no surface the host is still to put
+    /// into memory overlaps it (the host puts those after the batch, over what the device wrote).
+    fn device_layout(&mut self, scene: &Scene<'_>, place: &Place) -> Option<Vec<u64>> {
+        if host_only() || place.pitch.is_some() || !place.geometry.fills_its_blocks() {
+            return None;
+        }
+        let (from, to) = (place.address, place.end());
+        if self
+            .deferred
+            .iter()
+            .any(|d| d.staging.is_some() && d.overlaps(from, to))
+        {
+            return None;
+        }
+        let now = self.textures.frame;
+        let mut addresses = Vec::new();
+        for layer in 0..place.layers {
+            let at = place.address + u64::from(layer) * place.layer_stride;
+            let (cpu, run) = scene.space.translate(at)?;
+            if run < place.layer_bytes() {
+                return None;
+            }
+            let device =
+                self.global
+                    .device_address(&self.vk, scene, cpu, place.layer_bytes(), now)?;
+            if !device.is_multiple_of(16) {
+                return None;
+            }
+            addresses.push(device);
+        }
+        Some(addresses)
+    }
+
+    /// Record the laying out of a surface's texels (`linear`, in packed rows, layer after layer)
+    /// into its memory, each layer at its device address, after the copy that filled `linear`
+    /// (A-292).
+    fn lay_out_on_device(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        place: &Place,
+        linear: vk::Buffer,
+        addresses: &[u64],
+    ) -> Result<(), String> {
+        if self.layout.is_none() {
+            self.layout = Some(crate::astc_gpu::Decoder::with(
+                &self.vk,
+                &crate::blocklinear::device_spirv(),
+                "the program that lays surfaces out",
+            )?);
+        }
+        let program = self.layout.as_ref().expect("made above");
+        let (pipeline, layout, set_layout) = (program.pipeline, program.layout, program.set_layout);
+        let g = place.geometry;
+        let per_layer = g.linear_size();
+        let units = per_layer / 16;
+        let align = self.vk.caps.min_storage_buffer_offset_alignment.max(16);
+        let mut launches = Vec::new();
+        for (layer, &address) in addresses.iter().enumerate() {
+            let bytes =
+                crate::blocklinear::device_params(&g, address, (layer as u64 * units) as u32);
+            let params = self.frame.upload(&self.vk, &bytes, align)?;
+            let set = self.frame.descriptor_set(&self.vk, set_layout)?;
+            launches.push((params, set));
+        }
+        self.phases.surfaces_on_device += per_layer * addresses.len() as u64;
+        let d = &self.vk.device;
+        let copied = [vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(linear)
+            .offset(0)
+            .size(vk::WHOLE_SIZE)];
+        // SAFETY: the command buffer is recording outside a rendering; the buffers and the set
+        // live until the batch has run.
+        unsafe {
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &copied,
+                &[],
+            );
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            for ((params, at), set) in launches {
+                let infos = [
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(params)
+                        .offset(at)
+                        .range(176),
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(linear)
+                        .offset(0)
+                        .range(vk::WHOLE_SIZE),
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(linear)
+                        .offset(0)
+                        .range(vk::WHOLE_SIZE),
+                ];
+                let writes: Vec<vk::WriteDescriptorSet> = infos
+                    .iter()
+                    .enumerate()
+                    .map(|(b, info)| {
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(b as u32)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(std::slice::from_ref(info))
+                    })
+                    .collect();
+                d.update_descriptor_sets(&writes, &[]);
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                let groups = units.div_ceil(64).clamp(1, 65_535) as u32;
+                d.cmd_dispatch(cmd, groups, 1, 1);
+            }
+            // What the device wrote into memory is there for the host once the batch has run, and
+            // for the commands after it that read memory in place.
+            let written = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::HOST_READ
+                        | vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::SHADER_WRITE
+                        | vk::AccessFlags::TRANSFER_READ,
+                )];
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &written,
+                &[],
+                &[],
+            );
+        }
+        Ok(())
+    }
+
+    /// A device buffer of `size` bytes for a surface's texels that the device lays out: one used
+    /// before, else a new one.
+    fn layout_buffer(&mut self, size: u64) -> Result<crate::compute::DeviceBuffer, String> {
+        match self.layout_buffers.get_mut(&size).and_then(Vec::pop) {
+            Some(buffer) => Ok(buffer),
+            None => self.vk.create_device_buffer(
+                size,
+                vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+            ),
+        }
+    }
+
     /// A host buffer of `size` bytes for a surface's texels: one used before, else a new one.
     fn staging_buffer(&mut self, size: u64) -> Result<crate::compute::HostBuffer, String> {
         match self.staging_buffers.get_mut(&size).and_then(Vec::pop) {
@@ -870,8 +1068,15 @@ impl Core {
                 if result.is_err() {
                     break;
                 }
-                let linear = &s.staging.as_slice()[layer * per_layer..(layer + 1) * per_layer];
                 let at = place.address + layer as u64 * place.layer_stride;
+                // Laid out by the device in the batch (A-292): what memory holds is said.
+                let Some(staging) = &s.staging else {
+                    if let Some((cpu, _)) = space.translate(at) {
+                        self.memory_put(cpu, cpu + place.layer_bytes());
+                    }
+                    continue;
+                };
+                let linear = &staging.as_slice()[layer * per_layer..(layer + 1) * per_layer];
                 let mut tiled = vec![0u8; place.layer_bytes() as usize];
                 // What memory holds is kept where the texels do not reach; a surface of whole
                 // blocks reaches every byte, and memory need not be read.
@@ -893,17 +1098,7 @@ impl Core {
                     break;
                 }
                 if let Some((cpu, _)) = space.translate(at) {
-                    let end = cpu + tiled.len() as u64;
-                    self.textures.memory_written(cpu, end);
-                    let stale: Vec<_> = self
-                        .targets
-                        .covering(cpu, end)
-                        .into_iter()
-                        .map(|c| c.key)
-                        .collect();
-                    if !stale.is_empty() {
-                        self.targets.release(&stale, &mut self.frame);
-                    }
+                    self.memory_put(cpu, cpu + tiled.len() as u64);
                 }
             }
             if let Some(image) = s.image {
@@ -915,13 +1110,38 @@ impl Core {
                         .push(super::frame::Garbage::Surface(image));
                 }
             }
-            let list = self.staging_buffers.entry(s.staging.size).or_default();
-            if list.len() < POOLED {
-                list.push(s.staging);
-            } else {
-                self.vk.destroy_host_buffer(s.staging);
+            if let Some(staging) = s.staging {
+                let list = self.staging_buffers.entry(staging.size).or_default();
+                if list.len() < POOLED {
+                    list.push(staging);
+                } else {
+                    self.vk.destroy_host_buffer(staging);
+                }
+            }
+            if let Some(linear) = s.linear {
+                let list = self.layout_buffers.entry(linear.size).or_default();
+                if list.len() < POOLED {
+                    list.push(linear);
+                } else {
+                    self.vk.destroy_device_buffer(linear);
+                }
             }
         }
         result
+    }
+
+    /// A surface was put into the guest memory `[cpu, end)`: the textures made of it are compared
+    /// with it again, and the render targets over it let go.
+    fn memory_put(&mut self, cpu: u64, end: u64) {
+        self.textures.memory_written(cpu, end);
+        let stale: Vec<_> = self
+            .targets
+            .covering(cpu, end)
+            .into_iter()
+            .map(|c| c.key)
+            .collect();
+        if !stale.is_empty() {
+            self.targets.release(&stale, &mut self.frame);
+        }
     }
 }

@@ -312,7 +312,11 @@ Set `KILN_REQUIRE_EXTERNAL=1` to turn those skips into failures.
   after any change), which `nx_vulkan/tests/astc_gpu.rs` holds to the host decoder's bytes;
   `NX_ASTC_HOST=1` decodes on the host instead. A decoded 2D texture is then encoded as BC7 on the
   device (`nx_vulkan/shaders/bc7_encode.comp`, its SPIR-V made the same way, A-291), held to an
-  error bound by the same test; `NX_ASTC_RGBA=1` keeps the decoded texels.
+  error bound by the same test; `NX_ASTC_RGBA=1` keeps the decoded texels. The surfaces compute launches store
+  in are laid out into guest memory by the device where they fill their blocks
+  (`nx_vulkan/shaders/block_linear.comp`, A-292, made the same way with `--target-env=vulkan1.2`,
+  held to the host's layout by `nx_vulkan/tests/block_linear_gpu.rs`); `NX_SURFACES_HOST=1` has the
+  host put them.
 - Opus decoder: `nx_opus/tests/vectors.rs` decodes the official test vectors (RFC 8251 section 11;
   `KILN_OPUS_VECTORS` = the directory of `testvector01.bit` and the rest) to stereo and mono at every
   output rate, checks the final range of every packet, and applies the reference's quality metric
