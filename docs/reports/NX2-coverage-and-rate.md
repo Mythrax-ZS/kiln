@@ -285,6 +285,13 @@ the device's fences about 8%.
     while the asphalt beside it is drawn: whole parts of the mesh draws are missing rather than
     drawn with a wrong texture. The next suspect is what the task programs cull by (a depth
     pyramid or visibility that launches compute).
+  - It goes with the title's dynamic resolution. Of four runs whose render targets were logged
+    as they were let go, the one with the black road had drawn into targets of sizes the others
+    had not (1840x1036, 1856x1044, 1408x788, 704x394, 928x518 and the like: the title rendering
+    smaller than 1920x1080 when frames take long). How fast frames come differs from run to run,
+    and with it the sizes the title picks. What to look at next: targets of one address in
+    different sizes, and what reads them (a depth pyramid for culling sampled from a picture of
+    the size before).
 - **The rate:**
   - the waits for the device (the host reading what launches wrote, and the ends of
     submissions);
