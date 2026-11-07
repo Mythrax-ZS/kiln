@@ -25,7 +25,7 @@ const CHUNK: u64 = 16 << 20;
 const KEPT_UPLOAD: u64 = 256 << 20;
 
 /// How many batches there are: one is recorded while the others run.
-const SLOTS: usize = 3;
+const SLOTS: usize = 8;
 
 struct Chunk {
     buffer: HostBuffer,
