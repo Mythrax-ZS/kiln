@@ -239,11 +239,30 @@ The race, per 100 frames (with `NX_TRACE_PERF`; the frames dumped at 3,250 and 3
 a sixth of the time, and waits for the device at the settles of launches and at the ends of
 submissions. The game's own threads wait on those fences in turn.
 
-**Tried and taken out:** with the renderer on its own thread, the front read back its own
-writes still on their way, without waiting, from a copy of them (the compute descriptors it
-writes inline). Its waits for those reads went from 2,640 to none. But the front then waited
-longer at the reads left (the indirect draws' arguments that launches write, and the acquires),
-3.5 s instead of 2.6 s per 100 frames, and 100 frames took 10.05 s.
+Later the same day:
+
+- **A draw does not bind or set again what its batch already has** (A-294). Recording went
+  from about 0.42 to 0.25 s per 100 frames, and 100 frames took 9.65 to 9.67 s.
+- **The texture pools are read through their host address** (A-295). Reading headers and
+  samplers went from about 90 to 55 ms per 100 frames.
+
+A sample of the GPU thread in the race, by crate: the GPU front 33%, the renderer 30% (mostly
+calls into the driver), waiting with nothing to run 16%, the driver itself 9%, and waiting for
+the device's fences about 8%.
+
+**Tried and taken out:**
+
+- With the renderer on its own thread, the front read back its own writes still on their way
+  from a copy of them (the compute descriptors it writes inline), without waiting. Its waits for
+  those reads went from 2,640 to none. But the front then waited longer at the reads that were
+  left (the indirect draws' arguments that launches write, and the acquires): 3.5 s instead of
+  2.6 s per 100 frames, and 100 frames took 10.05 s.
+- MME64 calls done again from a record of an earlier call with the same parameters and data RAM.
+  99% of the calls were, but the front took as long: a call runs about 8 instructions, and the
+  method writes it makes cost the same either way.
+- A draw took a descriptor set an earlier draw of the batch made with the same writes. 13% of
+  the draws found one, and building and looking up the key for every draw cost more: 100 frames
+  took 10.1 to 10.3 s.
 
 ## Open
 
