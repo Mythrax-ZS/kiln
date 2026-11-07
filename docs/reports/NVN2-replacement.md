@@ -1,9 +1,9 @@
-# NVN2 replacement: native queues and completion
+# NVN2 replacement: textures and descriptor views
 
 Updated 2026-11-07. The objective is to replace the guest graphics driver and remove the GPU
 front's command decoding from its draws. The optional API boundary now owns native devices,
-memory pools, buffers, descriptor pools, samplers, queues and syncs. The owner's NX2 program
-creates its first native queue and stops at texture-builder initialization. HLE does not yet
+memory pools, buffers, descriptor pools, samplers, textures/views, queues and syncs. The owner's
+NX2 program creates its display textures and stops at window construction. HLE does not yet
 render a frame or improve the race's rate. The default remains off.
 
 ## What runs
@@ -33,6 +33,10 @@ Trace now also records integer query results as `# integer <selector> <signed va
 using arguments captured before the guest call even if that call overwrites the registers.
 Sampler registrations also report how many descriptors matched the native encoder, differed,
 or could not be observed. Unreadable observations leave forwarding and guest faults/unwinds intact.
+Texture observations additionally compare storage sizes, alignments, initialized block geometry
+and descriptor fields, grouped by flags/format. Descriptor checks exclude hardware cache,
+compression and sample-location policy bits; they use the guest's block choice, while the
+separate initialization check validates native automatic layout selection.
 Keep reports from real programs outside the repository. A killed process leaves the initial
 `running` marker instead of a completed report.
 
@@ -77,8 +81,8 @@ Flush/invalidate validate ranges and fence coherent host storage. Native queues 
 completion markers; no accepted draw/copy/dispatch payload can write guest storage yet.
 Completion/writeback, resource lifetimes during execution and sparse GPU access semantics must
 be connected before payload submissions are accepted. Native-handle and allocator-backed pools
-remain unsupported. The owned renderer is
-initialized; HLE currently submits only completion markers through its shared device.
+remain unsupported. The owned renderer is initialized; HLE currently submits only completion
+markers through its shared device.
 
 Sampler builders and objects now retain their full observed state, including FP arguments and
 returns, raw border words, labels and immutable object snapshots. Sampler registration encodes
@@ -86,8 +90,24 @@ one 32-byte descriptor, writes its backing storage and retains the encoded entry
 pool. Both sampler and texture descriptor pools have checked ranges and parent lifetimes,
 preserve fields read by inline SDK accessors, and install their reserved entries. Partial
 descriptor-table writes stage the source before changing storage and refresh the native entries.
-Texture objects and texture registration remain open. The retained entries are ready for the
-native queue path; the renderer does not yet consume them through HLE.
+Texture registration now copies native resource/view snapshots alongside their encoded
+descriptors; partial raw table writes retire the affected snapshots. Views select mip/layer
+ranges and compatible format/swizzle/depth-stencil overrides. Layer views rebase their address
+using the texture's layer stride. The renderer does not yet consume these entries through HLE.
+
+Texture builders and 16-byte views preserve observed SDK fields and optional getter outputs.
+Native textures own immutable state and checked ordinary or virtual pool storage, preserve
+inline object accessors, and prevent their parents from retiring. Packaged uploads stage the
+checked source before writing backing, including overlapping ranges and split virtual pages.
+Native storage classes are opaque tags interpreted by the native address-space model. Labels
+and debug identities are retained without exposing host pointers.
+
+Storage sizing models buffer, pitched, block-linear, array/cube, volume, mipmapped, multisample
+and BC/ASTC geometry. Packaged layouts override the block choice; automatic layout uses bounded
+GOB dimensions, and minimal layout selects smaller blocks only when that saves storage. Sparse,
+video/external textures and depth ZCull storage still stop explicitly. Vulkan image
+materialization, texel transfers, resident-image updates/readback and in-flight lifetimes must
+be connected before graphics payloads can consume these resources.
 
 Queue builders now preserve the observed NX2 ABI, including boolean size getters with output
 pointers. Native queues own Vulkan command pools on the device already created by HLE. They
@@ -105,7 +125,7 @@ recording, draw/copy/dispatch payloads and presentation remain unimplemented; co
 exercise marker submissions. Graphics submission must also implement the distinct vertex-stage
 completion condition and connect guest resource visibility before those payloads are accepted.
 
-The layouts, ownership policy and remaining limits are recorded in A-299 through A-309.
+The layouts, ownership policy and remaining limits are recorded in A-299 through A-314.
 
 ## Validation
 
@@ -126,6 +146,10 @@ Queue tests cover the NX2 builder ABI, native parent/secondary creation, pending
 cross-thread flushing, fence replacement and resource retirement. A Vulkan backend test checks
 real GPU completion, cancellation, refusal to reuse a fence and device lifetime after the
 original queue/renderer retire. Builds also pass without the Vulkan feature.
+Texture tests check builder/view padding and output faults, mip/layer/volume/pitch geometry,
+minimal layouts, immutable pool-backed objects, inline address/size fields, copied registrations,
+overlapping packaged uploads and uploads across remapped virtual pages. Unreadable trace
+observations preserve both normal returns and guest unwinds.
 
 Synthetic NSO executables exercise direct loader calls and indirect procedure calls in all
 three modes. A guest setter writes 7 into a builder; off and trace return that value, while HLE
@@ -136,9 +160,29 @@ The owner's NX2 program resolves 731 procedures in HLE mode, creates a real nati
 device with flags zero, queries its profile, sets its origin/depth modes, and creates the first
 native memory pool, initializes both descriptor pools, and constructs/registers a native sampler.
 It creates a native queue with flags `0x9`, 1 MiB command and control budgets and a 256 KiB compute
-budget, then stops at `nvnTextureBuilderSetDevice`, with the missing entry named. This
-validates progress through initialization; the buffer and virtual-mapping paths have synthetic
+budget and constructs three display textures, then stops at `nvnWindowBuilderSetDefaults`, with
+the missing entry named. This validates progress through initialization; the buffer and
+virtual-mapping paths have synthetic
 coverage and have not yet been reached by this real-program HLE probe.
+
+The texture validation trace completed 3,600 frames through the race. These comparisons all
+had zero differences:
+
+| Observation | Matched | Unavailable |
+|---|---:|---:|
+| Storage size | 18,358 | 284 |
+| Storage alignment | 6,561 | 142 |
+| Initialized size/block layout | 80,560 | 258 |
+| Consumed texture descriptor fields | 203,123 | 258 |
+
+The unavailable observations are sparse layouts, which HLE still refuses. Descriptor field
+matches do not establish full descriptor-byte equality or native GPU consumption. Sampler
+registration also compared 551 complete descriptors: all matched. Frame 3,500 was inspected:
+road, starting grid and HUD drawn, with dark lighting/characters. An earlier diagnostic capture
+also showed a white rectangle behind the countdown; that rendering issue remains unisolated.
+The final trace refused 18 texture-header/type draws and one unsupported-format compute launch.
+These are guest-driver trace frames. They do not establish native HLE rendering, a rendering
+regression pass, or an I/O/performance improvement.
 
 A trace through the race to frame 3,600 compares the native sampler encoder against the 32-byte
 descriptors the guest driver actually writes: 888 matched, zero differed and zero were
@@ -192,13 +236,13 @@ a large black road region under/left of the kart. The intermittent road issue de
 does not isolate its cause or establish a rendering-regression pass. The baseline/new runs
 refused 20/17 texture-header/type draws and one unsupported-format compute launch each.
 
-On Windows, `cargo fmt --all --check`, `cargo lint` and `cargo test` pass: 1,186 tests passed and
+On Windows, `cargo fmt --all --check`, `cargo lint` and `cargo test` pass: 1,191 tests passed and
 one was ignored.
 
 ## Next
 
-1. Texture objects/registration, programs and render state. Program creation must retain sm_86
-   programs for the existing native translator.
+1. Window ownership, programs and render state, plus remaining texture modes and image/texel
+   operations. Program creation must retain sm_86 programs for the existing native translator.
 2. Command buffers that record draw-level operations and preserve API ordering, callbacks,
    indirect arguments, memory visibility and events.
 3. Connect queued payloads and window presentation to the renderer and owned address

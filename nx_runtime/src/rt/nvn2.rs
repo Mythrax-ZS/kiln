@@ -22,12 +22,14 @@ mod device;
 mod memory;
 mod queue;
 mod sampler;
+mod texture;
 
 #[derive(Default)]
 struct Driver {
     devices: device::Devices,
     memory: memory::Objects,
     descriptors: descriptors::Objects,
+    textures: texture::Objects,
     #[cfg(feature = "vulkan")]
     queues: queue::Objects,
 }
@@ -36,7 +38,8 @@ impl Driver {
     fn call(&mut self, name: &str, cpu: &mut NativeCpu) -> Option<Result<(), device::Error>> {
         if name == "nvnDeviceFinalize"
             && (self.memory.has_children(cpu.state.x[0])
-                || self.descriptors.has_device_children(cpu.state.x[0]))
+                || self.descriptors.has_device_children(cpu.state.x[0])
+                || self.textures.has_device_children(cpu.state.x[0]))
         {
             return Some(Err(device::Error::Invalid(
                 "NVN2 device still owns native resources".to_string(),
@@ -53,13 +56,21 @@ impl Driver {
         {
             return Some(result);
         }
+        if let Some(result) =
+            texture::builder_call(name, cpu, &|address| self.devices.identity(address))
+        {
+            return Some(result);
+        }
         #[cfg(feature = "vulkan")]
         if let Some(result) = self.queues.call(name, cpu, &self.devices) {
             return Some(result);
         }
-        if name == "nvnMemoryPoolFinalize" && self.descriptors.has_pool_children(cpu.state.x[0]) {
+        if name == "nvnMemoryPoolFinalize"
+            && (self.descriptors.has_pool_children(cpu.state.x[0])
+                || self.textures.has_pool_children(cpu.state.x[0]))
+        {
             return Some(Err(device::Error::Invalid(
-                "NVN2 memory pool still owns descriptor pools".to_string(),
+                "NVN2 memory pool still owns descriptor pools or textures".to_string(),
             )));
         }
         if let Some(result) = self.devices.call(name, cpu) {
@@ -68,7 +79,20 @@ impl Driver {
             }
             return Some(result);
         }
+        if name == "nvnTexturePoolRegisterTexture" {
+            return Some(self.descriptors.register_texture(
+                cpu,
+                &self.textures,
+                &self.memory,
+                &|address| self.devices.identity(address),
+            ));
+        }
         if let Some(result) = self.descriptors.call(name, cpu, &self.memory, &|address| {
+            self.devices.identity(address)
+        }) {
+            return Some(result);
+        }
+        if let Some(result) = self.textures.call(name, cpu, &self.memory, &|address| {
             self.devices.identity(address)
         }) {
             return Some(result);
@@ -132,6 +156,8 @@ pub(crate) struct Session {
     integers: Mutex<BTreeMap<(u32, i32), u64>>,
     /// Matched, different, unavailable sampler descriptors observed after forwarded registration.
     sampler_checks: Mutex<[u64; 3]>,
+    texture_checks: Mutex<BTreeMap<(u8, u32, u32), [u64; 3]>>,
+    texture_details: Mutex<BTreeMap<(u8, u32, u32), String>>,
     driver: Mutex<Driver>,
 }
 
@@ -143,6 +169,8 @@ impl Session {
             bootstraps: AtomicU64::new(0),
             integers: Mutex::new(BTreeMap::new()),
             sampler_checks: Mutex::new([0; 3]),
+            texture_checks: Mutex::new(BTreeMap::new()),
+            texture_details: Mutex::new(BTreeMap::new()),
             driver: Mutex::new(Driver::default()),
         }
     }
@@ -246,6 +274,7 @@ impl Session {
             let integer =
                 (proc.name == "nvnDeviceGetInteger").then_some((c.state.x[1] as u32, c.state.x[2]));
             let sampler = sampler::observe(&proc.name, c);
+            let texture = texture::observe(&proc.name, c);
             let lr = c.state.x[30];
             c.state.pc = proc.guest;
             // SAFETY: this is the exclusively used CPU of the calling thread. The pointer came
@@ -259,6 +288,26 @@ impl Session {
                 }
             }
             if returned(c, lr) {
+                if let Some(observation) = texture {
+                    let key = observation.key;
+                    let (index, detail) = match observation.compare(c) {
+                        Ok(None) => (0, None),
+                        Ok(Some(detail)) => (1, Some(detail)),
+                        Err(e) => (2, Some(format!("unavailable: {e:?}"))),
+                    };
+                    if let Some(detail) = detail {
+                        self.texture_details
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .entry(key)
+                            .or_insert(detail);
+                    }
+                    self.texture_checks
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .entry(key)
+                        .or_default()[index] += 1;
+                }
                 if let Some(observation) = sampler {
                     let index = match observation.and_then(|o| o.matches()) {
                         Ok(true) => 0,
@@ -410,6 +459,32 @@ impl Session {
             "# sampler descriptors: {} matched, {} different, {} unavailable",
             checks[0], checks[1], checks[2]
         );
+        for (&(kind, flags, format), counts) in self
+            .texture_checks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            let kind = [
+                "size",
+                "alignment",
+                "descriptor-fields",
+                "initialization-layout",
+            ][usize::from(kind)];
+            let _ = writeln!(out, "# texture {kind} flags={flags:#x} format={format}: {} matched, {} different, {} unavailable",
+                counts[0], counts[1], counts[2]);
+        }
+        for (&(kind, flags, format), detail) in self
+            .texture_details
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            let _ = writeln!(
+                out,
+                "# texture detail {kind} flags={flags:#x} format={format}: {detail}"
+            );
+        }
         out
     }
 }

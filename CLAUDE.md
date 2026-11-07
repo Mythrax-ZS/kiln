@@ -37,14 +37,15 @@ exports (`nx_runtime/src/rt/hle.rs`, `src/codegen/native.rs`, A-187): `nn::util`
 and deflate decompressors. Add one only with its signature pinned by a test and a row in
 `docs/ASSUMPTIONS.md`; the build report lists them.
 
-NVN2 replacement starts at `nx_runtime/src/rt/nvn2.rs` (A-298 through A-309), off by default.
+NVN2 replacement starts at `nx_runtime/src/rt/nvn2.rs` (A-298 through A-314), off by default.
 `NX_NVN2=trace` forwards the API to the guest driver and counts calls by name;
 `NX_NVN2=hle` uses native entries and stops at the first missing API. It currently implements
 procedure resolution, device ownership backed by an initialized Vulkan renderer, a limited
 capability profile, memory-pool/buffer ownership with virtual mappings, descriptor-pool
-ownership, sampler construction/registration, native queue ownership and GPU-backed completion
-markers/sync waits. Texture objects, programs, command recording/submission and presentation
-remain open; HLE does not render a frame yet.
+ownership, sampler construction/registration, texture builders/views/storage and registration,
+native queue ownership and GPU-backed completion markers/sync waits. Sparse textures, native
+image execution, programs, command recording/submission and presentation remain open; HLE does
+not render a frame yet. The real program currently stops at window construction.
 These modes require an NX2 NPDM and a rebuilt optional loader stub: `kiln build --reuse-objects`
 rebuilds that unit; relink alone cannot add it to older artifacts. `NX_NVN2_REPORT=<file>` writes
 the procedure counts, observed trace-mode integer properties and sampler descriptor comparisons

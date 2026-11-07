@@ -85,6 +85,39 @@ pub(super) fn label(address: u64) -> Result<Vec<u8>, Error> {
 }
 
 impl Objects {
+    /// Resolve an owned pool range to checked guest spans, including split virtual mappings.
+    pub(super) fn backing_spans(
+        &self,
+        pool: PoolInfo,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<(u64, usize)>, Error> {
+        if !inside(offset, size, pool.size) || pool.gpu == 0 {
+            return Err(invalid(
+                "texture upload is outside GPU-accessible pool storage",
+            ));
+        }
+        let mut spans = Vec::new();
+        let mut done = 0;
+        while done < size {
+            let (cpu, available) = if pool.flags & VIRTUAL != 0 {
+                self.spaces
+                    .get(&pool.device)
+                    .and_then(|s| s.translate(pool.gpu + offset + done))
+                    .ok_or_else(|| invalid("texture upload reaches an unmapped virtual page"))?
+            } else {
+                (pool.memory + offset + done, size - done)
+            };
+            let n = available.min(size - done);
+            if n == 0 || !rt().mem.is_mapped(cpu, n) {
+                return Err(invalid("texture upload backing is no longer mapped"));
+            }
+            spans.push((cpu, n as usize));
+            done += n;
+        }
+        Ok(spans)
+    }
+
     pub(super) fn pool_info(
         &self,
         address: u64,

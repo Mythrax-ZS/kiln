@@ -3,6 +3,7 @@
 use super::device::{read, write, Error};
 use super::memory::{Objects as Memory, PoolInfo, Validate};
 use super::sampler::{self, State};
+use super::texture;
 use super::NativeCpu;
 use std::collections::BTreeMap;
 
@@ -20,6 +21,7 @@ struct Pool {
     count: u32,
     kind: Kind,
     entries: BTreeMap<u32, [u8; 32]>,
+    textures: BTreeMap<u32, texture::Descriptor>,
     label: Vec<u8>,
 }
 
@@ -133,6 +135,7 @@ impl Objects {
                 count: count as u32,
                 kind,
                 entries,
+                textures: BTreeMap::new(),
                 label: Vec::new(),
             },
         );
@@ -228,8 +231,43 @@ impl Objects {
         write(base + start, &bytes)?;
         let pool = self.pools.get_mut(&object).expect("validated pool");
         for id in start / 32..=(start + size - 1) / 32 {
+            pool.textures.remove(&(id as u32));
             pool.entries.insert(id as u32, read(base + id * 32)?);
         }
+        Ok(())
+    }
+
+    pub(super) fn register_texture(
+        &mut self,
+        cpu: &mut NativeCpu,
+        textures: &texture::Objects,
+        memory: &Memory,
+        validate: Validate<'_>,
+    ) -> Result<(), Error> {
+        let (object, id, source, view) = (
+            cpu.state.x[0],
+            cpu.state.x[1] as u32,
+            cpu.state.x[2],
+            cpu.state.x[3],
+        );
+        let pool = self.pool(object, Kind::Texture, memory, validate)?;
+        if id < 256 || id >= pool.count {
+            return Err(invalid("texture index is reserved or outside its pool"));
+        }
+        let descriptor = textures.descriptor(source, view, memory, validate)?;
+        if descriptor.state.device() != pool.parent.device {
+            return Err(invalid(
+                "texture and descriptor pool belong to different devices",
+            ));
+        }
+        let bytes = descriptor.bytes()?;
+        write(
+            pool.parent.memory + pool.offset + u64::from(id) * 32,
+            &bytes,
+        )?;
+        let pool = self.pools.get_mut(&object).expect("validated pool");
+        pool.entries.insert(id, bytes);
+        pool.textures.insert(id, descriptor);
         Ok(())
     }
 
