@@ -284,6 +284,8 @@ struct Phases {
     cbuf_copies: std::time::Duration,
     /// Bytes of constant buffers a draw took from a copy made earlier in the batch (A-289).
     cbuf_reused: u64,
+    /// Settles after writes in place to memory whose buffers were not known (A-297).
+    unattributed_writes: u64,
     /// Of the descriptors: building the tables of global memory, and writing the sets.
     global_tables: std::time::Duration,
     set_writes: std::time::Duration,
@@ -1447,7 +1449,7 @@ impl Renderer {
                         .map(|d| format!("{:.0}", d.as_secs_f64() * 1000.0))
                         .collect();
                     eprintln!(
-                        "[vulkan] frame {}: the compute launches spent {} ms (program, constant buffers, textures, pipeline, recording, sending and waiting, putting surfaces back); {} wrote {} surfaces, {} reached global memory, in {} runs; waited for at the GPU front {} (for bytes it reaches {}), at another command {}, at a launch reading what one before it wrote {} {:?}, at once {}; {} surfaces were the image of a launch before",
+                        "[vulkan] frame {}: the compute launches spent {} ms (program, constant buffers, textures, pipeline, recording, sending and waiting, putting surfaces back); {} wrote {} surfaces, {} reached global memory, in {} runs; waited for at the GPU front {} (for bytes it reaches {}), at another command {}, at a launch reading what one before it wrote {} {:?}, at once {}; {} surfaces were the image of a launch before; {} settles followed writes in place to buffers not known",
                         p.frame,
                         ms.join(", "),
                         ph.launch_kinds[0],
@@ -1460,7 +1462,8 @@ impl Renderer {
                         ph.settles[2],
                         ph.hazard_kinds,
                         ph.settles[3],
-                        ph.forwarded
+                        ph.forwarded,
+                        ph.unattributed_writes
                     );
                     eprintln!(
                         "[vulkan] frame {}: putting the surfaces into memory took {:?} for {} MiB ({} MiB more laid out by the device); {} surfaces were made from memory in {:?} ({} MiB); {} textures were sampled from a launch's image; kept surfaces were used by launches {} and sampled {} times; draws waited for launches {:?} (constant buffers, vertices, indices, texture pools, memory in place, textures)",

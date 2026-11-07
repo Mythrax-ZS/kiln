@@ -5,8 +5,8 @@ mod render_common;
 
 use nx_gpu::render::{Backend, Clear, Draw, Present, Source};
 use nx_gpu::GuestMemory;
-use nx_shader::asm::{exit, Enc};
-use nx_shader::inst::Guard;
+use nx_shader::asm::{exit, mov32i, Enc};
+use nx_shader::inst::{Guard, RZ};
 use nx_shader::ops::Op;
 use nx_vulkan::blocklinear::{swizzle, Geometry};
 use nx_vulkan::{RenderConfig, Renderer};
@@ -412,6 +412,89 @@ fn with_writes_tracked_a_layer_written_since_is_read_again_and_the_others_kept()
     // SAFETY: the run is inside the test memory, which nothing else uses meanwhile.
     unsafe { std::ptr::write_bytes(ptr, 0xFF, 4096) };
     assert_eq!(sampled(&mut r), colors[2], "an unseen write is not read");
+}
+
+/// `LDC.64 rd, c[0][offset]`.
+fn ldc64(rd: u8, offset: i32) -> u64 {
+    Enc::op(Op::Ldc)
+        .rd(rd)
+        .ra(RZ)
+        .field(20, 16, offset as u32 as u64)
+        .field(36, 5, 0)
+        .field(48, 3, 5)
+        .build()
+}
+
+/// `STG` of `size` (the store's size code) from `rd` at the address in `ra` plus `offset`.
+fn stg(rd: u8, ra: u8, offset: i32, size: u64) -> u64 {
+    Enc::op(Op::Stg)
+        .rd(rd)
+        .ra(ra)
+        .field(20, 24, offset as u32 as u64)
+        .bit(45, true)
+        .field(48, 3, size)
+        .build()
+}
+
+#[test]
+fn a_texture_whose_memory_a_launch_writes_in_place_is_read_again() {
+    let Some(vk) = vulkan() else { return };
+    if !vk.caps.external_memory_host || !vk.caps.buffer_device_address {
+        eprintln!("SKIPPED: the device cannot import host memory");
+        return;
+    }
+    let target = GPU_BASE + 0x20_0000;
+    // A texture of one texel, red, in memory whose writes are tracked.
+    let w = textured(8, target, header(0x08, 2, 1, 1, TEXELS), nearest_sampler());
+    w.mem.track_writes();
+    w.put(TEXELS, &[255, 0, 0, 255]);
+    let mut r = Renderer::new(RenderConfig::default());
+    let sampled = |r: &mut Renderer, w: &World| {
+        r.draw(&w.scene(), &DRAW).unwrap();
+        let (rgba, _, _) = r.picture_at(w.cpu(target)).unwrap().expect("a target");
+        [rgba[0], rgba[1], rgba[2], rgba[3]]
+    };
+    assert_eq!(sampled(&mut r, &w), [255, 0, 0, 255]);
+    // A frame later the texture is found unchanged by the tracking, and its binding kept.
+    next_frame(&mut r, &w, target, 1);
+    assert_eq!(sampled(&mut r, &w), [255, 0, 0, 255]);
+    // A launch stores a green texel over it in place, through the storage buffer at c[0][0]
+    // (its size at c[0][8]): the device's write, which the tracking of writes does not see.
+    let cbuf = GPU_BASE + 0x45_0000;
+    let mut words = TEXELS.to_le_bytes().to_vec();
+    words.extend_from_slice(&0x1000u32.to_le_bytes());
+    words.extend_from_slice(&[0; 4]);
+    w.put(cbuf, &words);
+    let program = GPU_BASE + 0x46_0000;
+    let code = [
+        ldc64(8, 0),
+        mov32i(12, 0xFF00_FF00),
+        stg(12, 8, 0, 4),
+        exit(Guard::ALWAYS),
+    ];
+    w.put(program, &nx_shader::asm::assemble(&code));
+    let mut cbufs = [None; 8];
+    cbufs[0] = Some(nx_gpu::compute::CbufBinding {
+        address: cbuf,
+        size: 16,
+    });
+    let launch = nx_gpu::compute::Dispatch {
+        qmd: 0,
+        program,
+        grid: [1, 1, 1],
+        block: [1, 1, 1],
+        shared_bytes: 0,
+        cbufs,
+        sm86: false,
+    };
+    r.dispatch(&w.scene(), &launch).unwrap();
+    r.settle(&w.space, &w.mem, None).unwrap();
+    let mut texel = [0u8; 4];
+    assert!(w.mem.read(w.cpu(TEXELS), &mut texel));
+    assert_eq!(texel, [0, 255, 0, 255], "the launch wrote it");
+    // The next frame samples the texel the launch left (A-297).
+    next_frame(&mut r, &w, target, 2);
+    assert_eq!(sampled(&mut r, &w), [0, 255, 0, 255]);
 }
 
 #[test]

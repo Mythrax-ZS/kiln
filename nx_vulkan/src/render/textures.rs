@@ -2480,15 +2480,19 @@ impl Textures {
             }
             return;
         }
-        let mut keys = self.unplaced.clone();
+        // Each texture once, however many of the blocks it is in.
+        let mut keys: FastMap<(Tic, Shape), ()> = FastMap::default();
+        keys.extend(self.unplaced.iter().map(|k| (*k, ())));
         for b in reached {
-            for k in self.by_block.get(&b).into_iter().flatten() {
-                if !keys.contains(k) {
-                    keys.push(*k);
-                }
-            }
+            keys.extend(
+                self.by_block
+                    .get(&b)
+                    .into_iter()
+                    .flatten()
+                    .map(|k| (*k, ())),
+            );
         }
-        for k in &keys {
+        for k in keys.keys() {
             if let Some(t) = self.map.get_mut(k) {
                 mark_written(t, start, end);
             }

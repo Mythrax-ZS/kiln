@@ -540,7 +540,33 @@ impl Core {
         let put = std::time::Instant::now();
         let written = waited.and_then(|()| self.write_staged(space, mem, deferred));
         self.phases.surfaces_put.0 += put.elapsed();
-        self.pending_writes.clear();
+        // What the launches and draws wrote in place the tracking of writes does not see: the
+        // textures made of that memory are compared with it again (A-297); after writes whose
+        // buffers are not known (Maxwell code), every texture is.
+        let mut ranges = std::mem::take(&mut self.pending_writes);
+        ranges.sort_unstable();
+        let mut joined: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (from, to) in ranges {
+            match joined.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => joined.push((from, to)),
+            }
+        }
+        for (from, to) in joined {
+            let mut at = from;
+            while at < to {
+                let Some((cpu, left)) = space.translate(at) else {
+                    break;
+                };
+                let n = left.min(to - at);
+                self.textures.memory_written(cpu, cpu + n);
+                at += n;
+            }
+        }
+        if self.writes_everywhere {
+            self.phases.unattributed_writes += 1;
+            self.textures.memory_written(0, u64::MAX);
+        }
         self.pending_reach.clear();
         self.writes_everywhere = false;
         self.reach_everywhere = false;
