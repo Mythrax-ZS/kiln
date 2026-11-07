@@ -12,7 +12,18 @@ const VIRTUAL: u32 = 0x200;
 const PAGE: u64 = 65536;
 const VIRTUAL_BASE: u64 = 1 << crate::rt::mem::ADDRESS_BITS;
 
-type Validate<'a> = &'a dyn Fn(u64) -> Result<u64, Error>;
+pub(super) type Validate<'a> = &'a dyn Fn(u64) -> Result<u64, Error>;
+
+#[derive(Clone, Copy)]
+pub(super) struct PoolInfo {
+    pub cookie: u64,
+    pub device: u64,
+    pub generation: u64,
+    pub memory: u64,
+    pub gpu: u64,
+    pub size: u64,
+    pub flags: u32,
+}
 
 struct Pool {
     cookie: u64,
@@ -58,7 +69,7 @@ fn invalid(message: &str) -> Error {
     Error::Invalid(format!("NVN2 {message}"))
 }
 
-fn label(address: u64) -> Result<Vec<u8>, Error> {
+pub(super) fn label(address: u64) -> Result<Vec<u8>, Error> {
     if address == 0 {
         return Ok(Vec::new());
     }
@@ -74,6 +85,23 @@ fn label(address: u64) -> Result<Vec<u8>, Error> {
 }
 
 impl Objects {
+    pub(super) fn pool_info(
+        &self,
+        address: u64,
+        validate: Validate<'_>,
+    ) -> Result<PoolInfo, Error> {
+        let pool = self.pool(address, validate)?;
+        Ok(PoolInfo {
+            cookie: pool.cookie,
+            device: pool.device,
+            generation: pool.generation,
+            memory: pool.memory,
+            gpu: pool.gpu,
+            size: pool.size,
+            flags: pool.flags,
+        })
+    }
+
     pub(super) fn has_children(&self, device: u64) -> bool {
         self.pools.values().any(|p| p.device == device)
     }

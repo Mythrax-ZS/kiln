@@ -1,9 +1,10 @@
-# NVN2 replacement: devices and storage
+# NVN2 replacement: descriptors and samplers
 
 Updated 2026-11-07. The objective is to replace the guest graphics driver and remove the GPU
 front's command decoding from its draws. The optional API boundary now owns native devices,
-memory pools and buffers. The owner's NX2 program creates its first native device and pool,
-then stops at sampler-pool initialization. HLE does not yet render a frame or improve the race's
+memory pools, buffers, descriptor pools and samplers. The owner's NX2 program creates its first
+native device, storage and descriptor pools, and registers a sampler, then stops at queue-builder
+initialization. HLE does not yet render a frame or improve the race's
 rate. The default remains off.
 
 ## What runs
@@ -31,6 +32,8 @@ units. A runtime-only relink is sufficient for subsequent implementation changes
 procedures, and each procedure's count, original guest address (zero for HLE), and API name.
 Trace now also records integer query results as `# integer <selector> <signed value> <count>`,
 using arguments captured before the guest call even if that call overwrites the registers.
+Sampler registrations also report how many descriptors matched the native encoder, differed,
+or could not be observed. Unreadable observations leave forwarding and guest faults/unwinds intact.
 Keep reports from real programs outside the repository. A killed process leaves the initial
 `running` marker instead of a completed report.
 
@@ -77,7 +80,16 @@ during execution and sparse GPU access semantics must be connected before submis
 accepted. Native-handle and allocator-backed pools remain unsupported. The owned renderer is
 initialized but has no native API commands submitted to it yet.
 
-The layouts, ownership policy and remaining limits are recorded in A-299 through A-303.
+Sampler builders and objects now retain their full observed state, including FP arguments and
+returns, raw border words, labels and immutable object snapshots. Sampler registration encodes
+one 32-byte descriptor, writes its backing storage and retains the encoded entry in the native
+pool. Both sampler and texture descriptor pools have checked ranges and parent lifetimes,
+preserve fields read by inline SDK accessors, and install their reserved entries. Partial
+descriptor-table writes stage the source before changing storage and refresh the native entries.
+Texture objects and texture registration remain open. The retained entries are ready for the
+native queue path; the renderer does not yet consume them through HLE.
+
+The layouts, ownership policy and remaining limits are recorded in A-299 through A-306.
 
 ## Validation
 
@@ -91,6 +103,9 @@ pool/buffer aliasing, inline accessor fields, empty views, bounds, access flags 
 map two physical pages into one virtual buffer and read across their boundary; and reject bad
 mapping arrays and stale owners. Vulkan-dependent tests retain the usual external-tool skip
 policy when no device is available.
+Descriptor tests additionally cover sampler FP state and snapshots, pool counts/alignment and
+inline fields, reserved and out-of-range indices, same-device registration, copied entries
+after sampler retirement, partial table writes, stale identities and parent-finalization guards.
 
 Synthetic NSO executables exercise direct loader calls and indirect procedure calls in all
 three modes. A guest setter writes 7 into a builder; off and trace return that value, while HLE
@@ -99,9 +114,18 @@ name and stop. Corrupting the loader's old object before `--reuse-objects` verif
 
 The owner's NX2 program resolves 731 procedures in HLE mode, creates a real native Vulkan
 device with flags zero, queries its profile, sets its origin/depth modes, and creates the first
-native memory pool. It stops at `nvnSamplerPoolInitialize`, with the missing entry named. This
+native memory pool, initializes both descriptor pools, and constructs/registers a native sampler.
+It stops at `nvnQueueBuilderSetDefaults`, with the missing entry named. This
 validates progress through initialization; the buffer and virtual-mapping paths have synthetic
 coverage and have not yet been reached by this real-program HLE probe.
+
+A trace through the race to frame 3,600 compares the native sampler encoder against the 32-byte
+descriptors the guest driver actually writes: 888 matched, zero differed and zero were
+unavailable. Frame 3,500 was inspected: the race road and HUD are drawn, with the existing
+lighting/texture limitations. The run refused 18 texture-header/type mismatches and one
+unsupported surface format. The full test gate ran alongside this diagnostic capture, so its
+timing is not used as a performance comparison. This validates the observed sampler states and
+their bytes; native queue consumption and wider state coverage remain open.
 
 At entry-point revision `f8acfed`, trace mode completed the scripted route through the race to
 frame 3,600, with three loader calls, 733 resolved procedure names and 59,857,523 calls to 247
@@ -129,13 +153,13 @@ shows the race starting grid, road and HUD drawn. No speed-up is attributed to t
 initialization work; HLE still stops before rendering. This off run still refused 16 commands
 with a texture-header/type mismatch and one unsupported surface format; those cases remain open.
 
-On Windows, `cargo fmt --all --check`, `cargo lint` and `cargo test` pass: 1,178 tests passed and
+On Windows, `cargo fmt --all --check`, `cargo lint` and `cargo test` pass: 1,183 tests passed and
 one was ignored.
 
 ## Next
 
-1. Programs, textures, samplers, descriptor pools and render state. Program creation must retain
-   sm_86 programs for the existing native translator.
+1. Native queue ownership and builders, then programs, texture objects/registration and render
+   state. Program creation must retain sm_86 programs for the existing native translator.
 2. Command buffers that record draw-level operations and preserve API ordering, callbacks,
    indirect arguments, memory visibility and events.
 3. Native queues, syncs and window presentation, connected to the renderer and owned address

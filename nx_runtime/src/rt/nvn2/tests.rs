@@ -469,3 +469,45 @@ fn trace_records_property_outputs_using_arguments_captured_before_the_guest_call
     assert_eq!(c.state.x[1], 99);
     assert!(session.report().contains("# integer 0x18 -17 1"));
 }
+
+#[test]
+fn unreadable_sampler_observations_do_not_change_forwarded_results_or_unwinds() {
+    const FORWARD: u64 = 0x7D00_0400;
+    const UNWIND: u64 = 0x7D00_0404;
+    rt().register(&[
+        FuncEntry {
+            addr: FORWARD,
+            func: guest_leaf as *const c_void,
+        },
+        FuncEntry {
+            addr: UNWIND,
+            func: guest_unwinds as *const c_void,
+        },
+    ]);
+    let session = Session::new(Mode::Trace);
+    let mut c = cpu();
+    c.state.pc = session
+        .bind("nvnSamplerPoolRegisterSampler", FORWARD)
+        .unwrap();
+    c.state.x[0] = u64::MAX;
+    c.state.x[1] = 7;
+    c.state.x[7] = 19;
+    session.call(&mut c);
+    assert_eq!(c.ctl.stop, stop::NONE);
+    assert_eq!(c.ctl.fault_flag, 0);
+    assert_eq!(c.state.x[0], 26);
+    assert!(session
+        .report()
+        .contains("# sampler descriptors: 0 matched, 0 different, 1 unavailable"));
+    let mut c = cpu();
+    c.state.pc = session
+        .bind("nvnSamplerPoolRegisterSampler", UNWIND)
+        .unwrap();
+    c.state.x[0] = u64::MAX;
+    session.call(&mut c);
+    assert_eq!(c.ctl.stop, stop::NONE);
+    assert_eq!(c.state.pc, 0x0800_2000);
+    assert!(session
+        .report()
+        .contains("# sampler descriptors: 0 matched, 0 different, 1 unavailable"));
+}

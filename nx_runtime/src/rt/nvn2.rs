@@ -17,26 +17,42 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+mod descriptors;
 mod device;
 mod memory;
+mod sampler;
 
 #[derive(Default)]
 struct Driver {
     devices: device::Devices,
     memory: memory::Objects,
+    descriptors: descriptors::Objects,
 }
 
 impl Driver {
     fn call(&mut self, name: &str, cpu: &mut NativeCpu) -> Option<Result<(), device::Error>> {
-        if name == "nvnDeviceFinalize" && self.memory.has_children(cpu.state.x[0]) {
+        if name == "nvnDeviceFinalize"
+            && (self.memory.has_children(cpu.state.x[0])
+                || self.descriptors.has_device_children(cpu.state.x[0]))
+        {
             return Some(Err(device::Error::Invalid(
-                "NVN2 device still owns memory pools".to_string(),
+                "NVN2 device still owns native resources".to_string(),
+            )));
+        }
+        if name == "nvnMemoryPoolFinalize" && self.descriptors.has_pool_children(cpu.state.x[0]) {
+            return Some(Err(device::Error::Invalid(
+                "NVN2 memory pool still owns descriptor pools".to_string(),
             )));
         }
         if let Some(result) = self.devices.call(name, cpu) {
             if name == "nvnDeviceFinalize" && result.is_ok() {
                 self.memory.forget_device(cpu.state.x[0]);
             }
+            return Some(result);
+        }
+        if let Some(result) = self.descriptors.call(name, cpu, &self.memory, &|address| {
+            self.devices.identity(address)
+        }) {
             return Some(result);
         }
         self.memory
@@ -96,6 +112,8 @@ pub(crate) struct Session {
     bootstraps: AtomicU64,
     /// The values the guest driver wrote for each DeviceGetInteger property in trace mode.
     integers: Mutex<BTreeMap<(u32, i32), u64>>,
+    /// Matched, different, unavailable sampler descriptors observed after forwarded registration.
+    sampler_checks: Mutex<[u64; 3]>,
     driver: Mutex<Driver>,
 }
 
@@ -106,6 +124,7 @@ impl Session {
             registry: RwLock::new(Registry::default()),
             bootstraps: AtomicU64::new(0),
             integers: Mutex::new(BTreeMap::new()),
+            sampler_checks: Mutex::new([0; 3]),
             driver: Mutex::new(Driver::default()),
         }
     }
@@ -208,6 +227,7 @@ impl Session {
             let name = (proc.name == "nvnDeviceGetProcAddress").then(|| read_name(c.state.x[1]));
             let integer =
                 (proc.name == "nvnDeviceGetInteger").then_some((c.state.x[1] as u32, c.state.x[2]));
+            let sampler = sampler::observe(&proc.name, c);
             let lr = c.state.x[30];
             c.state.pc = proc.guest;
             // SAFETY: this is the exclusively used CPU of the calling thread. The pointer came
@@ -221,6 +241,16 @@ impl Session {
                 }
             }
             if returned(c, lr) {
+                if let Some(observation) = sampler {
+                    let index = match observation.and_then(|o| o.matches()) {
+                        Ok(true) => 0,
+                        Ok(false) => 1,
+                        Err(_) => 2,
+                    };
+                    self.sampler_checks
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())[index] += 1;
+                }
                 if let Some((property, output)) = integer {
                     let mut bytes = [0; 4];
                     if rt().mem.read_bytes(output, &mut bytes, true).is_ok() {
@@ -328,6 +358,15 @@ impl Session {
         {
             let _ = writeln!(out, "# integer {property:#x} {value} {calls}");
         }
+        let checks = self
+            .sampler_checks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            out,
+            "# sampler descriptors: {} matched, {} different, {} unavailable",
+            checks[0], checks[1], checks[2]
+        );
         out
     }
 }
