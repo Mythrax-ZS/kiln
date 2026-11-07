@@ -1340,7 +1340,6 @@ impl Renderer {
                 let full = textures::take_full_compares();
                 eprintln!(
                     "[vulkan] frame {}: textures looked up {} times in {:?} (compared this frame), {} in {:?} (unchanged as the tracking says), {} in {:?} (compared in full)",
-                let kept = std::mem::take(&mut core.textures.kept_bindings);
                     p.frame,
                     compares[0].0,
                     compares[0].1,
