@@ -1323,8 +1323,9 @@ impl Renderer {
                     }
                 }
                 let misses = std::mem::take(&mut core.textures.bound_misses);
+                let kept = std::mem::take(&mut core.textures.kept_bindings);
                 eprintln!(
-                    "[vulkan] frame {}: texture bindings not found {:?} (not kept, a target over them changed; then not kept: a target's own view, written back, copies made, a layout of its own)",
+                    "[vulkan] frame {}: texture bindings not found {:?} (not kept, a target over them changed; then not kept: a target's own view, written back, copies made, a layout of its own); {kept} kept from a frame before",
                     p.frame, misses
                 );
                 let compares = std::mem::take(&mut core.textures.compares);

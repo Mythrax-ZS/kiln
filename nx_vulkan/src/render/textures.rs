@@ -957,17 +957,66 @@ pub fn levels_left_out(
     skip
 }
 
+/// The textures are found by the blocks of `1 << BLOCK_SHIFT` bytes of memory they are made of.
+const BLOCK_SHIFT: u32 = 21;
+
+/// The blocks that `bytes` bytes of memory at `cpu` reach.
+fn blocks_of(cpu: u64, bytes: u64) -> std::ops::RangeInclusive<u64> {
+    (cpu >> BLOCK_SHIFT)..=(cpu.saturating_add(bytes.max(1) - 1) >> BLOCK_SHIFT)
+}
+
+/// The renderer wrote `[start, end)`: a texture made of memory there is compared with it again
+/// when next used.
+fn mark_written(t: &mut Texture, start: u64, end: u64) {
+    if t.cpu != 0 && (t.cpu >= end || t.cpu + t.bytes <= start) {
+        return;
+    }
+    t.checked = UNCHECKED;
+    // The layers the write reaches are hashed again; the others keep what the tracking of writes
+    // says of them (A-279). Without a layout to go by, all are.
+    let layers = t.stale.len() as u64;
+    if t.cpu == 0 || t.layer_stride == 0 || layers == 0 {
+        t.epoch = 0;
+        return;
+    }
+    let first = start.saturating_sub(t.cpu) / t.layer_stride;
+    let last = (end - 1).saturating_sub(t.cpu) / t.layer_stride;
+    for l in first..=last.min(layers - 1) {
+        let base = t.cpu + l * t.layer_stride;
+        let range = (start.saturating_sub(base), (end - base).min(t.layer_stride));
+        let list = &mut t.stale[l as usize];
+        // A layer written in many places is read again whole.
+        if list.len() < 16 {
+            list.push(range);
+        } else {
+            list.truncate(1);
+            list[0] = (0, t.layer_stride);
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Textures {
     map: FastMap<(Tic, Shape), Texture>,
+    /// The textures by the blocks of memory they are made of, and those whose memory is not known
+    /// (which every write reaches): a write of the renderer looks at the textures over it, not at
+    /// every texture (there are thousands).
+    by_block: FastMap<u64, Vec<(Tic, Shape)>>,
+    unplaced: Vec<(Tic, Shape)>,
     /// The bindings found in this frame for textures no render target is over, with the memory
     /// they are made of, and the frame they are for (A-282).
     bound: FastMap<BoundKey, BoundEntry>,
+    /// The bindings by the blocks of memory they are made of: a write looks at the bindings over
+    /// it. A binding forgotten otherwise stays named here until a frame begins and this is made
+    /// again.
+    bound_blocks: FastMap<u64, Vec<BoundKey>>,
     /// Why bindings were not found (for the report): not kept, a target over them changed, then
     /// those not kept after: a render target's own view, another target near, copies made, a
     /// layout of their own.
     pub bound_misses: [u64; 6],
     bound_frame: u64,
+    /// Bindings taken again from a frame before, their texture found unchanged (for the report).
+    pub kept_bindings: u64,
     /// Why layers were hashed, for the report: (times, bytes) with nothing to compare with, after
     /// the renderer wrote into them, after the tracking saw a write, the tracking not knowing.
     pub hash_reasons: [(u64, u64); 4],
@@ -985,6 +1034,8 @@ pub struct Textures {
     /// The epoch of write tracking begun for the frame in `epoch_frame`.
     epoch: u32,
     epoch_frame: u64,
+    /// The ranges of memory the tracking said may have changed when the epoch began.
+    changed: Vec<(u64, u64)>,
     /// Say what each new image is made of (`NX_TRACE_TEXTURES`).
     pub trace: bool,
     /// How many bytes of memory a texture takes (see [`Textures::span`]), by header and shape.
@@ -1024,7 +1075,19 @@ struct BoundEntry {
     start: u64,
     end: u64,
     targets: Vec<(Key, u64, bool)>,
+    /// The texture made from memory that `view` is the image of: the binding stays from frame to
+    /// frame while the texture is what memory holds (A-282). None for the others, which are
+    /// found again each frame.
+    texture: Option<(Tic, Shape)>,
+    /// The frame the binding was last found good in, and the one the tracking of writes was last
+    /// told it is kept in.
+    frame: u64,
+    watched: u64,
 }
+
+/// How often (in frames) a binding kept from frame to frame tells the tracking of writes to go on
+/// watching its memory, which it lets go after 60 epochs nobody asked about it (A-277).
+const KEEP_WATCHING: u64 = 16;
 
 /// The guest memory a texture is made of and the render targets over it, as a binding found for
 /// it depends on them (A-282).
@@ -1105,22 +1168,98 @@ impl Textures {
         }
     }
 
+    /// Put a texture made of `bytes` bytes of memory at `cpu` (0: not known) in the index.
+    fn index(&mut self, key: (Tic, Shape), cpu: u64, bytes: u64) {
+        if cpu == 0 {
+            self.unplaced.push(key);
+            return;
+        }
+        for b in blocks_of(cpu, bytes) {
+            self.by_block.entry(b).or_default().push(key);
+        }
+    }
+
+    /// Take a texture out of the index.
+    fn unindex(&mut self, key: &(Tic, Shape), cpu: u64, bytes: u64) {
+        if cpu == 0 {
+            self.unplaced.retain(|k| k != key);
+            return;
+        }
+        for b in blocks_of(cpu, bytes) {
+            if let Some(list) = self.by_block.get_mut(&b) {
+                list.retain(|k| k != key);
+                if list.is_empty() {
+                    self.by_block.remove(&b);
+                }
+            }
+        }
+    }
+
     /// The view and sampler found in this frame for a texture, while the render targets over its
     /// memory are as they were then (`state` says how each is now; A-282).
     pub fn bound(
         &mut self,
         key: &BoundKey,
+        scene: &Scene<'_>,
         state: impl Fn(&Key) -> Option<(u64, bool)>,
     ) -> Option<(vk::ImageView, vk::Sampler, vk::ImageLayout, Option<Key>)> {
         if self.bound_frame != self.frame {
-            self.bound.clear();
+            // The bindings of textures made from memory stay while the tracking of writes says
+            // nothing changed under them (the epoch's beginning forgets the others); render
+            // targets' pictures and kept surfaces are found again.
+            self.begin_epoch(scene);
+            if self.always_compare {
+                self.bound.clear();
+            } else {
+                self.bound.retain(|_, e| e.texture.is_some());
+            }
             self.bound_frame = self.frame;
-            return None;
+            let Textures {
+                bound,
+                bound_blocks,
+                ..
+            } = self;
+            bound_blocks.clear();
+            for (k, e) in bound.iter() {
+                for b in blocks_of(e.start, e.end.saturating_sub(e.start)) {
+                    bound_blocks.entry(b).or_default().push(*k);
+                }
+            }
         }
         let Some(e) = self.bound.get(key) else {
             self.bound_misses[0] += 1;
             return None;
         };
+        if e.frame != self.frame {
+            // The first use in this frame: nothing was written under it (or it would have been
+            // forgotten), and its texture is still the one with its image, compared with memory
+            // now for this frame.
+            let (texture, view) = (e.texture, e.view);
+            let (frame, epoch) = (self.frame, self.epoch);
+            let alive = texture
+                .and_then(|t| self.map.get_mut(&t))
+                .filter(|t| t.image.view == view && t.stale.iter().all(Vec::is_empty));
+            match alive {
+                // As it was when the binding was made, and so now.
+                Some(t) => {
+                    t.checked = frame;
+                    t.epoch = epoch;
+                }
+                None => {
+                    self.bound.remove(key);
+                    self.bound_misses[0] += 1;
+                    return None;
+                }
+            }
+            self.kept_bindings += 1;
+            let e = self.bound.get_mut(key).expect("just found");
+            e.frame = frame;
+            if frame >= e.watched + KEEP_WATCHING {
+                e.watched = frame;
+                scene.keep_watching(e.start, e.end.saturating_sub(e.start));
+            }
+        }
+        let e = self.bound.get(key).expect("just found");
         let found = e
             .targets
             .iter()
@@ -1148,7 +1287,7 @@ impl Textures {
         sampler: vk::Sampler,
         near: Near,
     ) {
-        self.remember_bound(key, view, sampler, near);
+        self.remember_bound(key, view, sampler, near, None);
         if let Some(e) = self.bound.get_mut(&key) {
             e.layout = vk::ImageLayout::GENERAL;
         }
@@ -1163,24 +1302,33 @@ impl Textures {
         sampler: vk::Sampler,
         near: Near,
     ) {
-        self.remember_bound(key, view, sampler, near);
+        self.remember_bound(key, view, sampler, near, None);
         if let Some(e) = self.bound.get_mut(&key) {
             e.target = true;
         }
     }
 
-    /// Keep what a texture made of the guest memory `[start, end)` was bound with, for the rest
-    /// of the frame or until that memory is written, a render target is placed over it, or one
-    /// of the `targets` over it (with when each was drawn to and whether it was put into memory)
-    /// changes.
+    /// Keep what a texture made of the guest memory `[start, end)` was bound with, until that
+    /// memory is written, a render target is placed over it, or one of the `targets` over it
+    /// (with when each was drawn to and whether it was put into memory) changes: for the rest of
+    /// the frame, and for the frames after while `texture` (the texture the view is the image
+    /// of, read with `used`) is what memory holds.
     pub fn remember_bound(
         &mut self,
         key: BoundKey,
         view: vk::ImageView,
         sampler: vk::Sampler,
         near: Near,
+        used: Option<(&TextureUse, &Scene<'_>)>,
     ) {
         if self.bound_frame == self.frame {
+            // Kept from frame to frame only where the tracking of writes watches the memory, and
+            // so says when it changes.
+            let texture = used.and_then(|(u, scene)| {
+                let len = near.end.saturating_sub(near.start);
+                scene.untouched_since(near.start, len, self.epoch)?;
+                Some((key.0, shape_of(&key.0, u).ok()?))
+            });
             self.bound.insert(
                 key,
                 BoundEntry {
@@ -1191,15 +1339,45 @@ impl Textures {
                     start: near.start,
                     end: near.end,
                     targets: near.targets,
+                    texture,
+                    frame: self.frame,
+                    watched: self.frame,
                 },
             );
+            for b in blocks_of(near.start, near.end.saturating_sub(near.start)) {
+                self.bound_blocks.entry(b).or_default().push(key);
+            }
         }
     }
 
     /// Forget the bindings of textures made of memory in `[start, end)`.
     pub fn forget_bound(&mut self, start: u64, end: u64) {
-        if !self.bound.is_empty() {
+        if self.bound.is_empty() || end <= start {
+            return;
+        }
+        let reached = blocks_of(start, end - start);
+        // A range over more blocks than the index has is looked for in every binding.
+        if reached.end() - reached.start() >= self.bound_blocks.len() as u64 {
             self.bound.retain(|_, e| e.end <= start || e.start >= end);
+            return;
+        }
+        let Textures {
+            bound,
+            bound_blocks,
+            ..
+        } = self;
+        for b in reached {
+            let Some(list) = bound_blocks.get_mut(&b) else {
+                continue;
+            };
+            list.retain(|k| match bound.get(k) {
+                Some(e) if e.end > start && e.start < end => {
+                    bound.remove(k);
+                    false
+                }
+                Some(_) => true,
+                None => false,
+            });
         }
     }
 
@@ -1430,6 +1608,60 @@ impl Textures {
         Ok(s)
     }
 
+    /// Begin the frame's epoch of write tracking, once a frame, at the first comparison or binding:
+    /// the bindings over memory that may have changed since the last epoch began are forgotten.
+    fn begin_epoch(&mut self, scene: &Scene<'_>) {
+        if self.epoch_frame == self.frame {
+            return;
+        }
+        let mut changed = std::mem::take(&mut self.changed);
+        self.epoch = scene.begin_write_epoch_into(&mut changed);
+        self.epoch_frame = self.frame;
+        for &(at, len) in &changed {
+            self.forget_bound(at, at.saturating_add(len));
+        }
+        self.changed = changed;
+    }
+
+    /// The view of the texture `key` when memory holds what the texture was made of: it was
+    /// compared with memory in this frame already, or the renderer did not write into it and the
+    /// tracking of writes says its memory is as it was when the texture last looked (asked of the
+    /// levels each layer holds, not of the levels left out, which nobody asks about; A-126).
+    fn unchanged_view(&mut self, scene: &Scene<'_>, key: (Tic, Shape)) -> Option<vk::ImageView> {
+        let current = self.frame;
+        let entered = std::time::Instant::now();
+        let t = self.map.get(&key)?;
+        if t.checked == current {
+            self.compares[0].0 += 1;
+            self.compares[0].1 += entered.elapsed();
+            return Some(t.image.view);
+        }
+        self.begin_epoch(scene);
+        if self.always_compare {
+            return None;
+        }
+        let t = self.map.get_mut(&key)?;
+        let (from, len) = t.held;
+        let layers = t.stale.len() as u64;
+        let unchanged = t.epoch != 0
+            && len > 0
+            && layers > 0
+            && t.stale.iter().all(Vec::is_empty)
+            && (0..layers).all(|l| {
+                let at = key.0.address() + l * t.layer_stride + from;
+                scene.untouched_since(at, len, t.epoch) == Some(true)
+            });
+        if !unchanged {
+            return None;
+        }
+        t.checked = current;
+        t.epoch = self.epoch;
+        let view = t.image.view;
+        self.compares[1].0 += 1;
+        self.compares[1].1 += entered.elapsed();
+        Some(view)
+    }
+
     fn texture(
         &mut self,
         vk: &Vk,
@@ -1438,47 +1670,11 @@ impl Textures {
         tic: Tic,
         shape: Shape,
     ) -> Result<vk::ImageView, String> {
-        // A texture compared with memory in this frame already is not read again.
         let current = self.frame;
         let key = (tic, shape);
         let entered = std::time::Instant::now();
-        if let Some(t) = self.map.get(&key) {
-            if t.checked == current {
-                self.compares[0].0 += 1;
-                self.compares[0].1 += entered.elapsed();
-                return Ok(t.image.view);
-            }
-        }
-        // The epoch of tracking is begun once a frame, at the first comparison.
-        if self.epoch_frame != current {
-            self.epoch = scene.begin_write_epoch();
-            self.epoch_frame = current;
-        }
-        // A texture the renderer did not write into, whose memory the tracking of writes says is
-        // as it was when the texture last looked, is as it was: asked of the levels each layer
-        // holds (not of the levels left out, which nobody asks about), before anything is worked
-        // out again (A-126).
-        if !self.always_compare {
-            if let Some(t) = self.map.get_mut(&key) {
-                let (from, len) = t.held;
-                let layers = t.stale.len() as u64;
-                if t.epoch != 0
-                    && len > 0
-                    && layers > 0
-                    && t.stale.iter().all(Vec::is_empty)
-                    && (0..layers).all(|l| {
-                        let at = tic.address() + l * t.layer_stride + from;
-                        scene.untouched_since(at, len, t.epoch) == Some(true)
-                    })
-                {
-                    t.checked = current;
-                    t.epoch = self.epoch;
-                    let view = t.image.view;
-                    self.compares[1].0 += 1;
-                    self.compares[1].1 += entered.elapsed();
-                    return Ok(view);
-                }
-            }
+        if let Some(view) = self.unchanged_view(scene, key) {
+            return Ok(view);
         }
         let mut _full = FullCompare(entered, tic.address(), 0, String::new());
         let types = tic.types();
@@ -1536,12 +1732,8 @@ impl Textures {
             shape.kind,
             tic.is_pitch()
         );
-        // Memory that the system tracks the writes of needs no reading to be found unchanged;
-        // the epoch of tracking is begun once a frame, at the first comparison.
-        if self.epoch_frame != current {
-            self.epoch = scene.begin_write_epoch();
-            self.epoch_frame = current;
-        }
+        // Memory that the system tracks the writes of needs no reading to be found unchanged.
+        self.begin_epoch(scene);
         // The tracking is asked about each layer's levels the image holds (below), not about the
         // whole texture: a large array's memory is gigabytes of levels the image leaves out
         // (A-250), whose pages the question walks, and a layer the renderer wrote into this epoch
@@ -1668,6 +1860,7 @@ impl Textures {
                 update = Some((t.image.image, t.image.view, changed));
             } else if let Some(old) = self.map.remove(&key) {
                 // The contents changed: the old image goes once the submission is over.
+                self.unindex(&key, old.cpu, old.bytes);
                 frame.garbage.push(Garbage::Image(old.image));
             }
         }
@@ -2239,7 +2432,8 @@ impl Textures {
                 }
             }
             Some(image) => {
-                self.map.insert(
+                let cpu = scene.host_address(tic.address()).map_or(0, |(cpu, _)| cpu);
+                let replaced = self.map.insert(
                     key,
                     Texture {
                         image,
@@ -2247,7 +2441,7 @@ impl Textures {
                         hash,
                         epoch: self.epoch,
                         bytes: total,
-                        cpu: scene.host_address(tic.address()).map_or(0, |(cpu, _)| cpu),
+                        cpu,
                         overlays: FastMap::default(),
                         levels: levels - skip,
                         layers,
@@ -2259,6 +2453,11 @@ impl Textures {
                         held: (held_from, held_len),
                     },
                 );
+                if let Some(old) = replaced {
+                    self.unindex(&key, old.cpu, old.bytes);
+                    frame.garbage.push(Garbage::Image(old.image));
+                }
+                self.index(key, cpu, total);
             }
         }
         self.making += making.elapsed();
@@ -2270,30 +2469,28 @@ impl Textures {
     /// others keep what they were found to be this frame.
     pub fn memory_written(&mut self, start: u64, end: u64) {
         self.forget_bound(start, end);
-        for t in self.map.values_mut() {
-            if t.cpu == 0 || (t.cpu < end && t.cpu + t.bytes > start) {
-                t.checked = UNCHECKED;
-                // The layers the write reaches are hashed again; the others keep what the
-                // tracking of writes says of them (A-279). Without a layout to go by, all are.
-                let layers = t.stale.len() as u64;
-                if t.cpu == 0 || t.layer_stride == 0 || layers == 0 {
-                    t.epoch = 0;
-                    continue;
+        if end <= start {
+            return;
+        }
+        let reached = blocks_of(start, end - start);
+        // A write over more blocks than the index has is checked against every texture.
+        if reached.end() - reached.start() >= self.by_block.len() as u64 {
+            for t in self.map.values_mut() {
+                mark_written(t, start, end);
+            }
+            return;
+        }
+        let mut keys = self.unplaced.clone();
+        for b in reached {
+            for k in self.by_block.get(&b).into_iter().flatten() {
+                if !keys.contains(k) {
+                    keys.push(*k);
                 }
-                let first = start.saturating_sub(t.cpu) / t.layer_stride;
-                let last = (end - 1).saturating_sub(t.cpu) / t.layer_stride;
-                for l in first..=last.min(layers - 1) {
-                    let base = t.cpu + l * t.layer_stride;
-                    let range = (start.saturating_sub(base), (end - base).min(t.layer_stride));
-                    let list = &mut t.stale[l as usize];
-                    // A layer written in many places is read again whole.
-                    if list.len() < 16 {
-                        list.push(range);
-                    } else {
-                        list.truncate(1);
-                        list[0] = (0, t.layer_stride);
-                    }
-                }
+            }
+        }
+        for k in &keys {
+            if let Some(t) = self.map.get_mut(k) {
+                mark_written(t, start, end);
             }
         }
     }
@@ -2305,6 +2502,8 @@ impl Textures {
         if let Some(encoder) = self.bc7.take() {
             encoder.destroy(vk);
         }
+        self.by_block.clear();
+        self.unplaced.clear();
         for (_, t) in self.map.drain() {
             vk.destroy_image(t.image);
         }
@@ -2353,6 +2552,7 @@ impl Textures {
                 break;
             }
             if let Some(t) = self.map.remove(&key) {
+                self.unindex(&key, t.cpu, t.bytes);
                 frame.garbage.push(Garbage::Image(t.image));
                 left -= bytes;
                 gone += 1;

@@ -1173,7 +1173,7 @@ impl Core {
                 (tic, tsc, used.dim as u8, used.arrayed, used.shadow);
             if reuse {
                 let targets = &self.targets;
-                let found = self.textures.bound(&bound_key, |k| targets.state(k));
+                let found = self.textures.bound(&bound_key, scene, |k| targets.state(k));
                 // A render target's picture is taken again only while it is in the layout for
                 // sampling and the draw does not write it or test against it.
                 let found = match found {
@@ -1291,6 +1291,7 @@ impl Core {
                                     bound.view,
                                     bound.sampler,
                                     near,
+                                    Some((used, scene)),
                                 );
                             } else {
                                 self.textures.bound_misses[5] += 1;

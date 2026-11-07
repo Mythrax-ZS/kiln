@@ -117,6 +117,25 @@ impl GuestMemory for Memory {
         }
     }
 
+    fn begin_write_epoch_into(&self, changed: &mut Vec<(u64, u64)>) -> u32 {
+        changed.clear();
+        match self.tracking.lock().unwrap().as_mut() {
+            Some((epoch, stamps)) => {
+                for (page, s) in stamps.iter().enumerate() {
+                    if *s == *epoch + 1 {
+                        changed.push((CPU_BASE + page as u64 * 4096, 4096));
+                    }
+                }
+                *epoch += 1;
+                *epoch
+            }
+            None => {
+                changed.push((0, u64::MAX));
+                0
+            }
+        }
+    }
+
     fn untouched_since(&self, addr: u64, len: u64, epoch: u32) -> Option<bool> {
         let guard = self.tracking.lock().unwrap();
         let (_, stamps) = guard.as_ref()?;
