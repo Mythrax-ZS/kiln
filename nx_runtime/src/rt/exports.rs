@@ -294,6 +294,20 @@ pub extern "C" fn nx_hle(p: *mut NativeCpu, id: u32, pc: u64) {
     super::hle::run(cpu(p), id, pc);
 }
 
+/// Optional NVN2 loader interception; `guest` is the preserved generated guest body (A-298).
+///
+/// # Safety
+/// `p` must be the exclusively used CPU of the calling guest thread, and `guest` its generated
+/// loader implementation, with the native runtime's function ABI.
+#[no_mangle]
+pub unsafe extern "C" fn nx_nvn2_bootstrap(
+    p: *mut NativeCpu,
+    pc: u64,
+    guest: super::nvn2::GuestFunction,
+) {
+    super::nvn2::bootstrap(&mut *p, pc, guest);
+}
+
 #[no_mangle]
 pub extern "C" fn nx_clrex(p: *mut NativeCpu) {
     let c = cpu(p);
@@ -582,6 +596,7 @@ pub const GENERATED_CODE_SYMBOLS: &[&str] = &[
     "nx_stlr64",
     "nx_ldx",
     "nx_hle",
+    "nx_nvn2_bootstrap",
     "nx_stx",
     "nx_clrex",
     "nx_atomic",

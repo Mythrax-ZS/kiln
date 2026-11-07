@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 /// The id the runtime's exclusive monitors see for the kernel's own stores to guest memory.
@@ -174,6 +174,8 @@ pub struct ThreadCtx {
 
 pub struct Kernel {
     pub process: ProcessInfo,
+    /// Optional NVN2 interception, installed before any guest thread starts (A-298).
+    pub(crate) nvn2: OnceLock<Arc<crate::rt::nvn2::Session>>,
     pub(super) state: Mutex<State>,
     wake: Condvar,
     registry: Mutex<BTreeMap<String, ServiceFactory>>,
@@ -449,6 +451,7 @@ impl Kernel {
         };
         Arc::new(Kernel {
             process,
+            nvn2: OnceLock::new(),
             state: Mutex::new(state),
             wake: Condvar::new(),
             registry: Mutex::new(BTreeMap::new()),

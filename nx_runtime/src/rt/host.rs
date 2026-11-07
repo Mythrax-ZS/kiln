@@ -25,6 +25,8 @@ pub(crate) unsafe fn c_slice<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
 
 /// Bump when [`ModuleDesc`] or [`SegmentDesc`] change.
 pub const MODULE_ABI_VERSION: u32 = 3;
+/// The formerly reserved descriptor word advertises an optional loader stub (A-298).
+pub const MODULE_HAS_NVN2_BOOTSTRAP: u32 = 1;
 
 /// How [`nx_rt_main`] starts the module: as a plain function (hosts and tests), as the `main` NSO
 /// of a title, or as a homebrew NRO. The last two run on the Horizon kernel layer.
@@ -68,6 +70,7 @@ pub struct ModuleDesc {
     pub nsegs: u32,
     /// One of [`kind`].
     pub kind: u32,
+    /// Optional capabilities; zero in descriptors produced before NVN2 interception.
     pub pad: u32,
     pub entry: u64,
     pub segs: *const SegmentDesc,

@@ -64,6 +64,7 @@ pub fn declarations(defines_dispatcher: bool) -> String {
         "declare void @nx_trap(ptr, i32, i64, i64, i64)",
         "declare void @nx_svc(ptr, i32)",
         "declare void @nx_hle(ptr, i32, i64)",
+        "declare void @nx_nvn2_bootstrap(ptr, i64, ptr)",
         "declare void @nx_interp1(ptr)",
         "declare ptr @nx_lookup(i64)",
         "declare void @nx_slow_path(ptr)",
@@ -735,6 +736,17 @@ pub fn emit_function(
     intrinsics: &mut BTreeSet<String>,
     callees: &mut BTreeSet<u64>,
 ) {
+    emit_function_named(f, &func_symbol(f.addr), out, intrinsics, callees);
+}
+
+/// Keep a guest body under a second symbol when its entry is optionally intercepted.
+pub(super) fn emit_function_named(
+    f: &Func,
+    name: &str,
+    out: &mut String,
+    intrinsics: &mut BTreeSet<String>,
+    callees: &mut BTreeSet<u64>,
+) {
     let mut e = Emitter {
         f,
         out: String::new(),
@@ -784,7 +796,6 @@ pub fn emit_function(
     if needs_unwind {
         e.out.push_str("unwind:\n  ret void\n");
     }
-    let name = func_symbol(f.addr);
     let _ = writeln!(out, "define hidden void @{name}(ptr %cpu) nounwind {{");
     // The first block is the entry: it gets the pointers to the CPU fields before anything else.
     let (first, rest) = e.out.split_once('\n').expect("a block label");

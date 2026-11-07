@@ -36,6 +36,15 @@ pub fn function_unit(triple: &str, funcs: &[&Func], native: &BTreeMap<u64, u32>)
     for f in funcs {
         if let Some(&id) = native.get(&f.addr) {
             native::emit_stub(f.addr, id, &mut body);
+            if id == nx_runtime::rt::hle::NVN2_BOOTSTRAP {
+                llvm::emit_function_named(
+                    f,
+                    &format!("{}_guest", func_symbol(f.addr)),
+                    &mut body,
+                    &mut intrinsics,
+                    &mut callees,
+                );
+            }
         } else {
             emit_function(f, &mut body, &mut intrinsics, &mut callees);
         }

@@ -237,9 +237,23 @@ fn write_report(r: &BuildReport, program: &Program, path: &Path) -> Result<()> {
         );
     }
     let native = codegen::native::routines(&program.modules);
-    let _ = writeln!(s, "routines run natively (A-187): {}", native.len());
-    for (addr, id) in &native {
+    let always_native: Vec<_> = native
+        .iter()
+        .filter(|(_, id)| **id != nx_runtime::rt::hle::NVN2_BOOTSTRAP)
+        .collect();
+    let _ = writeln!(s, "routines run natively (A-187): {}", always_native.len());
+    for (addr, id) in always_native {
         let _ = writeln!(s, "  {addr:#x} {}", nx_runtime::rt::hle::name(*id));
+    }
+    for (addr, id) in native
+        .iter()
+        .filter(|(_, id)| **id == nx_runtime::rt::hle::NVN2_BOOTSTRAP)
+    {
+        let _ = writeln!(
+            s,
+            "optional loader (A-298): {addr:#x} {}",
+            nx_runtime::rt::hle::name(*id)
+        );
     }
     let _ = writeln!(s, "entry {:#x}", program.entry_module().entry());
     let _ = writeln!(
@@ -340,7 +354,13 @@ pub fn build(program: &Program, tc: &Toolchain, opts: &BuildOptions) -> Result<B
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(group) = groups.get(i) else { break };
                     let obj = work.join(format!("unit{i}.{obj_ext}"));
-                    if opts.reuse_objects && obj.is_file() {
+                    // Optional loader stubs must exist when the descriptor advertises them.
+                    // Reusing an object from before interception would silently run the guest
+                    // driver even with HLE selected (A-298).
+                    let has_optional_stub = group
+                        .iter()
+                        .any(|a| native.get(a) == Some(&nx_runtime::rt::hle::NVN2_BOOTSTRAP));
+                    if opts.reuse_objects && obj.is_file() && !has_optional_stub {
                         progress(
                             "compiling",
                             done.fetch_add(1, Ordering::Relaxed) + 1,

@@ -160,7 +160,9 @@ impl Runtime {
         }
         let table = self.func_table.load(Ordering::Acquire);
         // SAFETY: published by `publish_funcs` and never freed.
-        unsafe { table.as_ref() }?.get(pc)
+        unsafe { table.as_ref() }?
+            .get(pc)
+            .or_else(|| super::nvn2::lookup(pc))
     }
 
     pub fn set_svc_handler(&self, h: Option<SvcHandler>) {

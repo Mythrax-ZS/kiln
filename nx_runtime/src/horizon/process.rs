@@ -257,6 +257,10 @@ pub unsafe fn run_module(m: &crate::rt::host::ModuleDesc) -> i32 {
     crate::rt::runtime::rt()
         .set_counter_frequency(super::platform::counter_frequency(info.platform()));
     let kernel = Kernel::new(info);
+    if let Err(e) = crate::rt::nvn2::start(&kernel, m) {
+        eprintln!("kiln runtime: {e}");
+        return STOPPED_EXIT_CODE;
+    }
     super::services::register_defaults(&kernel);
     let segments = c_slice(m.segs, m.nsegs as usize)
         .iter()

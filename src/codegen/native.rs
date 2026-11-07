@@ -27,6 +27,17 @@ pub fn routines(modules: &[Module]) -> BTreeMap<u64, u32> {
 /// The generated function of a routine run natively: the call, the test of the fault flag that
 /// every access has, and the return to the link register.
 pub fn emit_stub(addr: u64, id: u32, out: &mut String) {
+    if id == nx_runtime::rt::hle::NVN2_BOOTSTRAP {
+        let symbol = super::llvm::func_symbol(addr);
+        let _ = writeln!(out, "define hidden void @{symbol}(ptr %cpu) nounwind {{");
+        let _ = writeln!(
+            out,
+            "  call void @nx_nvn2_bootstrap(ptr %cpu, i64 {}, ptr @{symbol}_guest)",
+            addr as i64
+        );
+        let _ = writeln!(out, "  ret void\n}}\n");
+        return;
+    }
     let _ = writeln!(
         out,
         "define hidden void @{}(ptr %cpu) nounwind {{",

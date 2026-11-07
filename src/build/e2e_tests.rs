@@ -271,6 +271,136 @@ fn the_sdks_decompressors_run_natively() {
     );
 }
 
+/// A guest loader and setter that visibly differ from the HLE builder. This exercises both a
+/// direct call to the exported loader and the indirect call through the pointer it returned.
+fn nvn2_program(api: &str) -> Program {
+    use nx_runtime::npdm::{builder, Platform};
+    use nx_runtime::testing::prog::Prog;
+    let mut p = Prog::new(CODE_OFF as u64);
+    p.emit(asm::ldst_pair(2, 3, false, -6, 30, 31, 19)); // save x19/lr, reserve 48 bytes
+    p.adr(0, "name");
+    p.bl("loader");
+    p.emit(asm::add_imm(true, 19, 0, 0));
+    p.emit(asm::add_imm(true, 0, 31, 16)); // builder, 24 bytes on the stack
+    p.emit(asm::blr(19));
+    p.emit(asm::ldst_unsigned(2, 1, 4, 31, 0)); // ldr w0, [sp, #16]
+    p.emit(asm::ldst_pair(2, 1, true, 6, 30, 31, 19));
+    p.emit(asm::ret(30));
+    p.label("loader");
+    let loader = p.addr_of("loader");
+    p.adr(0, "setter");
+    p.emit(asm::ret(30));
+    p.label("setter");
+    p.emit(asm::movz(false, 8, 7, 0));
+    p.emit(asm::ldst_unsigned(2, 0, 0, 0, 8)); // str w8, [x0]
+    p.emit(asm::ret(30));
+    p.label("name");
+    let mut name = api.as_bytes().to_vec();
+    name.push(0);
+    for chunk in name.chunks(4) {
+        let mut word = [0; 4];
+        word[..chunk.len()].copy_from_slice(chunk);
+        p.emit(u32::from_le_bytes(word));
+    }
+    let mut program = program_from(&Spec {
+        code: p.finish(),
+        with_mod0: true,
+        exports: vec![("nnMain", CODE_OFF as u64), ("nvnBootstrapLoader", loader)],
+        ..Spec::default()
+    });
+    program.npdm = Some(builder::build(&builder::NpdmSpec {
+        platform: Platform::Nx2,
+        ..builder::NpdmSpec::default()
+    }));
+    program
+}
+
+#[test]
+fn nvn2_interception_runs_off_trace_and_hle_through_generated_code() {
+    let Some(tc) = toolchain_or_skip() else {
+        return;
+    };
+    let program = nvn2_program("nvnDeviceBuilderSetDefaults");
+    let dir = TempDir::new("e2e-nvn2");
+    let opts = BuildOptions::new(dir.path(), "nvn2");
+    let report = build(&program, &tc, &opts).unwrap();
+    for (mode, expected) in [("off", 7), ("trace", 7), ("hle", 0)] {
+        let counts = dir.join(&format!("{mode}.txt"));
+        let out = Command::new(&report.exe)
+            .env("NX_NVN2", mode)
+            .env("NX_NVN2_REPORT", &counts)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(expected),
+            "{mode}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if mode != "off" {
+            let text = std::fs::read_to_string(&counts).unwrap();
+            assert!(
+                text.contains("1 loader calls, 1 resolved procedures"),
+                "{text}"
+            );
+            assert!(text.contains("nvnDeviceBuilderSetDefaults"), "{text}");
+        }
+    }
+    let invalid = Command::new(&report.exe)
+        .env("NX_NVN2", "typo")
+        .output()
+        .unwrap();
+    assert_eq!(
+        invalid.status.code(),
+        Some(nx_runtime::rt::host::STOPPED_EXIT_CODE)
+    );
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("NX_NVN2 must be off, trace or hle"));
+    // An old object without interception must be rebuilt even with --reuse-objects. Corrupting
+    // just this object's bytes makes the test fail to link if the build blindly reuses it.
+    let obj = if cfg!(windows) {
+        "work/unit0.obj"
+    } else {
+        "work/unit0.o"
+    };
+    std::fs::write(dir.join(obj), b"stale object").unwrap();
+    let mut opts = opts;
+    opts.reuse_objects = true;
+    let report = build(&program, &tc, &opts).unwrap();
+    let out = Command::new(&report.exe)
+        .env("NX_NVN2", "hle")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn an_unimplemented_nvn2_call_reports_its_name_without_running_guest_code() {
+    let Some(tc) = toolchain_or_skip() else {
+        return;
+    };
+    let dir = TempDir::new("e2e-nvn2-missing");
+    let program = nvn2_program("nvnSyntheticMissing");
+    let report = build(&program, &tc, &BuildOptions::new(dir.path(), "missing")).unwrap();
+    let out = Command::new(&report.exe)
+        .env("NX_NVN2", "hle")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(nx_runtime::rt::host::STOPPED_EXIT_CODE)
+    );
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        text.contains("NVN2 HLE nvnSyntheticMissing is not implemented (called at 0x"),
+        "{text}"
+    );
+}
+
 #[test]
 fn a_program_that_stops_says_why_and_exits_nonzero() {
     let Some(tc) = toolchain_or_skip() else {

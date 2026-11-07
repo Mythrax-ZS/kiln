@@ -113,10 +113,19 @@ pub fn descriptor_unit(triple: &str, d: &Descriptor, shared: bool) -> String {
     s.push_str("\n]\n\n");
 
     let export = if shared { "dllexport " } else { "" };
+    let capabilities = if d
+        .exports
+        .iter()
+        .any(|(name, _)| name == "nvnBootstrapLoader")
+    {
+        nx_runtime::rt::host::MODULE_HAS_NVN2_BOOTSTRAP
+    } else {
+        0
+    };
     let _ = writeln!(
         s,
         "@nx_module = {export}constant {{ i32, i32, i32, i32, i64, ptr, ptr, i64, ptr, i64, ptr, i64, ptr, i64 }} {{\n  \
-         i32 {}, i32 {}, i32 {}, i32 0, i64 {}, ptr @nx_segments, ptr @nx_image, i64 {}, ptr @nx_npdm,\n  \
+         i32 {}, i32 {}, i32 {}, i32 {capabilities}, i64 {}, ptr @nx_segments, ptr @nx_image, i64 {}, ptr @nx_npdm,\n  \
          i64 {}, ptr @nx_exports, i64 {}, ptr @nx_romfs, i64 {}\n}}\n",
         nx_runtime::rt::host::MODULE_ABI_VERSION,
         d.segments.len(),

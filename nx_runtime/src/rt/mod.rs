@@ -12,6 +12,7 @@ pub mod exports;
 pub mod hle;
 pub mod host;
 pub mod mem;
+pub mod nvn2;
 pub mod runtime;
 pub mod trap;
 

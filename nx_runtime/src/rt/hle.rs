@@ -1,7 +1,8 @@
 //! SDK routines run natively in place of their recompiled code (docs/ASSUMPTIONS.md A-187).
 //!
 //! The code generator puts a stub where a module exports one of the names in [`ROUTINES`]; the
-//! stub calls `nx_hle` with the routine's number and returns to the link register. A routine
+//! stub calls `nx_hle` with the routine's number and returns to the link register. The optional
+//! NVN2 loader stub instead calls `nx_nvn2_bootstrap`, keeping its guest body (A-298). A routine
 //! reads its arguments from the registers as the AArch64 procedure call standard places them and
 //! leaves its result in `x0`; the rest of the state is left as it was (a caller may not rely on
 //! the scratch registers a callee leaves anyway).
@@ -18,10 +19,13 @@ use super::runtime::{record_fault, rt};
 pub const DECOMPRESS_GZIP: u32 = 1;
 pub const DECOMPRESS_ZLIB: u32 = 2;
 pub const DECOMPRESS_DEFLATE: u32 = 3;
+/// Optional NVN2 entry: its stub keeps the guest implementation (A-298).
+pub const NVN2_BOOTSTRAP: u32 = 4;
 
-/// The exported names (as the SDK mangles them) and the routine each stands for. The three share
+/// The exported names and the routine each stands for. The three decompressors share
 /// one signature: `(void* dst, size_t dstSize, const void* src, size_t srcSize, void* work,
-/// size_t workSize)`, the result a `bool`.
+/// size_t workSize)`, the result a `bool`. The NVN2 loader takes a name pointer in x0 and returns
+/// a guest procedure pointer in x0; its optional stub keeps the guest implementation.
 pub const ROUTINES: &[(&str, u32)] = &[
     ("_ZN2nn4util14DecompressGzipEPvmPKvmS1_m", DECOMPRESS_GZIP),
     ("_ZN2nn4util14DecompressZlibEPvmPKvmS1_m", DECOMPRESS_ZLIB),
@@ -29,6 +33,7 @@ pub const ROUTINES: &[(&str, u32)] = &[
         "_ZN2nn4util17DecompressDeflateEPvmPKvmS1_m",
         DECOMPRESS_DEFLATE,
     ),
+    ("nvnBootstrapLoader", NVN2_BOOTSTRAP),
 ];
 
 /// A routine's name for a report.
@@ -37,6 +42,7 @@ pub fn name(id: u32) -> &'static str {
         DECOMPRESS_GZIP => "nn::util::DecompressGzip",
         DECOMPRESS_ZLIB => "nn::util::DecompressZlib",
         DECOMPRESS_DEFLATE => "nn::util::DecompressDeflate",
+        NVN2_BOOTSTRAP => "nvnBootstrapLoader (optional NVN2 interception)",
         _ => "an unknown routine",
     }
 }
@@ -161,7 +167,9 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), ROUTINES.len());
-        assert!(ROUTINES.iter().all(|(n, _)| n.starts_with("_ZN2nn4util")));
+        assert!(ROUTINES[..3]
+            .iter()
+            .all(|(n, _)| n.starts_with("_ZN2nn4util")));
         assert_eq!(name(DECOMPRESS_ZLIB), "nn::util::DecompressZlib");
     }
 }
